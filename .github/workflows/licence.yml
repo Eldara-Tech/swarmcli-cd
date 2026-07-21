@@ -1,0 +1,42 @@
+name: License checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: read-all
+
+concurrency:
+  group: licence-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Detect whether the SPDX checker needs to run; spdx job gates on the output.
+  # Filtering at the job level (not the workflow trigger) preserves a "skipped"
+  # status that satisfies branch-protection required checks.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      spdx: ${{ steps.f.outputs.spdx }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: f
+        with:
+          filters: |
+            spdx:
+              - '**.go'
+              - '**.sh'
+              - '.github/workflows/licence.yml'
+
+  spdx:
+    needs: [changes]
+    if: needs.changes.outputs.spdx == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check SPDX headers
+        run: |
+          ./scripts/check-spdx.sh
