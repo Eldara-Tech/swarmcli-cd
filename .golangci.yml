@@ -1,0 +1,47 @@
+version: "2"
+
+# Mirrors Eldara-Tech/swarmcli's config so a contributor moving between repos
+# meets the same rules. The Bubble Tea-specific gocritic exclusions carried by
+# CE are omitted deliberately: this repo is a server, not a TUI, so those
+# patterns do not arise and silencing them pre-emptively would hide real findings.
+linters:
+  default: none
+  enable:
+    - goheader
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - gocritic
+    - misspell
+    - revive
+    - bodyclose
+  settings:
+    goheader:
+      template: |-
+        SPDX-License-Identifier: Apache-2.0
+        Copyright © 2026 Eldara Tech
+    gocritic:
+      enabled-tags:
+        - diagnostic
+      disabled-checks:
+        - ifElseChain # stylistic; not worth rewriting
+    govet:
+      disable:
+        - fieldalignment
+    revive:
+      rules:
+        - name: var-naming
+    staticcheck:
+      checks:
+        - "default"
+        - "-QF1008"
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

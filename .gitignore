@@ -1,0 +1,15 @@
+# Go build/module cache inside repo
+.go/
+.cache/
+
+# Build output. `go build ./...` writes each main package's binary into the
+# working directory, so cmd/<name> becomes ./<name> at the repo root.
+dist/
+/swarmcli-cd
+/controller
+
+# Editors
+.vscode/
+.idea/
+
+debug.log
