@@ -2,7 +2,7 @@ module github.com/Eldara-Tech/swarmcli-cd
 
 go 1.26
 
-require github.com/Eldara-Tech/swarmcli v1.13.0-rc2
+require github.com/Eldara-Tech/swarmcli v1.13.0-rc3
 
 require (
 	dario.cat/mergo v1.0.1 // indirect
