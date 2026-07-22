@@ -65,6 +65,15 @@ func (b *Backend) DeployStack(name, manifest, resolve string) error {
 // below cannot see them — which is what lets a release be uninstalled and its
 // history still be readable.
 func (b *Backend) RemoveStack(name string) error {
+	// A destructive call with no stack to scope to would build the filter
+	// "com.docker.stack.namespace=", and what that matches is the daemon's
+	// business rather than something to find out here. The engine validates
+	// release names, so this is unreachable today; it costs one line to keep it
+	// that way.
+	if name == "" {
+		return fmt.Errorf("refusing to remove a stack with no name")
+	}
+
 	ctx := context.Background()
 
 	services, err := b.api.ServiceList(ctx, swarm.ServiceListOptions{Filters: stackFilter(name)})
@@ -85,6 +94,17 @@ func (b *Backend) RemoveStack(name string) error {
 		return fmt.Errorf("listing the stack's configs: %w", err)
 	}
 	for _, c := range configs {
+		// Belt and braces over the namespace filter above. The engine stores
+		// each release revision as a Docker config, and those survive an
+		// uninstall — that is what makes a release's history readable after it
+		// is gone. They survive only because they carry com.swarmcli.* labels
+		// and no stack namespace, which is a property of how the engine happens
+		// to stamp them rather than anything this code enforces. Saying so here
+		// means a future change that did put a namespace on them would not
+		// silently turn uninstall into "delete the history too".
+		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
+			continue
+		}
 		if err := b.api.ConfigRemove(ctx, c.ID); err != nil {
 			return fmt.Errorf("removing config %q: %w", c.Spec.Name, err)
 		}

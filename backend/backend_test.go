@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,8 @@ import (
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
+
+	"github.com/Eldara-Tech/swarmcli/charts"
 
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
@@ -528,4 +531,49 @@ func (e *errAPI) VolumeRemove(context.Context, string, bool) error { return e.er
 
 func (e *errAPI) NodeList(context.Context, swarm.NodeListOptions) ([]swarm.Node, error) {
 	return nil, e.err
+}
+
+// The engine stores each release revision as a Docker config, and those must
+// survive an uninstall — a release's history stays readable after it is gone.
+// They survive today because they carry com.swarmcli.* labels and no stack
+// namespace, so the filter cannot see them. This asserts the second line of
+// defence: even a release config that somehow did carry the namespace label is
+// left alone, because deleting one turns uninstall into "and lose the history".
+func TestRemoveStackNeverDeletesReleaseRecords(t *testing.T) {
+	api := &fakeAPI{configs: []swarm.Config{
+		{ID: "app", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}},
+		{ID: "rel", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+			Name: "swarmcli.release.s.v3",
+			Labels: map[string]string{
+				charts.LabelType: charts.TypeRelease,
+				// Deliberately mislabelled, which is the case the namespace
+				// filter alone would not survive.
+				convert.LabelNamespace: "s",
+			},
+		}}},
+	}}
+
+	if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
+		t.Fatalf("RemoveStack = %v, want nil", err)
+	}
+	for _, r := range api.removed {
+		if r == "config:rel" {
+			t.Fatal("a release history record was deleted by an uninstall")
+		}
+	}
+	if !slices.Contains(api.removed, "config:app") {
+		t.Errorf("removed %v, want the stack's own config gone", api.removed)
+	}
+}
+
+// A destructive call with nothing to scope to must not proceed and find out
+// what the daemon makes of an empty filter value.
+func TestRemoveStackRefusesAnEmptyName(t *testing.T) {
+	api := &fakeAPI{}
+	if err := testBackend(t, api, nil).RemoveStack(""); err == nil {
+		t.Fatal("RemoveStack = nil, want an unnamed stack refused")
+	}
+	if len(api.removed) != 0 {
+		t.Errorf("removed %v before refusing", api.removed)
+	}
 }
