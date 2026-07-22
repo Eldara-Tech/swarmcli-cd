@@ -49,7 +49,9 @@ golangci-lint run ./...
 
 ```
 cmd/swarmcli-cd/   one-line main; the entry point is controller/
-controller/        entry point, command dispatch, daemon wiring
+controller/        entry point, command dispatch, daemon wiring, CLI rendering
+client/            HTTP client for the API; the CLI goes through it, not the
+                   reconciler, so a UI can do everything the CLI can (D3)
 application/       Application spec + status: the wire contract
 scripts/           check-spdx.sh
 docs/
