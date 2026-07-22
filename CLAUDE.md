@@ -48,14 +48,24 @@ golangci-lint run ./...
 
 ```
 cmd/controller/    the daemon (scaffold)
+application/       Application spec + status: the wire contract
 scripts/           check-spdx.sh
 docs/
 .github/workflows/ ci.yml, check_labels.yml, licence.yml
 ```
 
-The `internal/` tree sketched in issue #1 (`app`, `git`, `render`, `reconcile`,
-`health`, `swarms`, `store`, `api`, `audit`) is **not created yet** — packages
-land with the code that needs them rather than as empty directories.
+Packages land with the code that needs them rather than as empty directories,
+so this grows one issue at a time.
+
+**Do not put them under `internal/`.** Issue #1 sketches an `internal/` tree
+(`app`, `git`, `render`, `reconcile`, `health`, `swarms`, `store`, `api`,
+`audit`), but that is incompatible with D6: the private `swarmcli-cd-be`
+companion is a separate *module*, and Go's internal rule is per-module, not
+per-repository — it could not import any of it. This is exactly why
+`Eldara-Tech/swarmcli` has no `internal/` directory anywhere, and why
+swarmcli-be imports `app`, `views`, `registry` and `docker` as top-level
+packages. Anything the companion touches — the seams, the core types, the
+reconciler, the API — is top-level here too.
 
 ## Design constraints worth not rediscovering
 
