@@ -14,8 +14,12 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/Eldara-Tech/swarmcli-cd/seam"
+	"github.com/docker/docker/client"
+
 	"github.com/Eldara-Tech/swarmcli/charts"
+
+	"github.com/Eldara-Tech/swarmcli-cd/backend"
+	"github.com/Eldara-Tech/swarmcli-cd/seam"
 )
 
 // Registry resolves a swarm name to a backend.
@@ -52,6 +56,7 @@ func init() { Register("local", &local{}) }
 type local struct {
 	once    sync.Once
 	backend charts.Backend
+	err     error
 }
 
 // Backend returns the ambient-context backend. charts.NewDockerBackend("")
@@ -61,6 +66,16 @@ func (l *local) Backend(_ context.Context, swarm string) (charts.Backend, error)
 	if swarm != "" {
 		return nil, fmt.Errorf("unknown swarm %q: this build resolves only the swarm the controller runs in", swarm)
 	}
-	l.once.Do(func() { l.backend = charts.NewDockerBackend("") })
-	return l.backend, nil
+	// The client is built once and reused: it holds a connection pool, and the
+	// reconcile loop asks on every tick for every application.
+	l.once.Do(func() {
+		var cli *client.Client
+		cli, l.err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		if l.err != nil {
+			l.err = fmt.Errorf("connecting to the local docker daemon: %w", l.err)
+			return
+		}
+		l.backend = backend.New(cli, backend.Options{})
+	})
+	return l.backend, l.err
 }
