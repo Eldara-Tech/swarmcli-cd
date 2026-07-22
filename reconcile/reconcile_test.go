@@ -53,7 +53,10 @@ func (f *fakeBuilder) Build(context.Context, string, application.Source, git.Che
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &source.Built{ReleaseFile: &charts.ReleaseFile{}}, nil
+	return &source.Built{
+		ReleaseFile: &charts.ReleaseFile{},
+		ReadFile:    func(string) ([]byte, error) { return nil, nil },
+	}, nil
 }
 
 type fakeRegistry struct{ err error }
@@ -76,12 +79,14 @@ type fakeEngine struct {
 	applied   int
 	planCalls int
 	opts      []charts.InstallOptions
+	planOpts  []charts.PlanOptions
 }
 
-func (e *fakeEngine) PlanApply(context.Context, *charts.ReleaseFile, charts.ChartSource) (*charts.Plan, error) {
+func (e *fakeEngine) PlanApply(_ context.Context, _ *charts.ReleaseFile, _ charts.ChartSource, opts charts.PlanOptions) (*charts.Plan, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.planCalls++
+	e.planOpts = append(e.planOpts, opts)
 	if e.planErr != nil && e.planCalls >= max(e.planErrAt, 1) {
 		return nil, e.planErr
 	}
@@ -269,9 +274,12 @@ func TestManualPolicyReportsDriftButDoesNotDeploy(t *testing.T) {
 }
 
 // The controller stamps its own namespace so a release file applied by hand and
-// an application reconciled here can never claim each other's releases.
+// an application reconciled here can never claim each other's releases — and it
+// plans against that same id, or its own releases would come back Unmanaged.
 func TestApplyStampsTheControllersOwner(t *testing.T) {
-	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}}
+	planned := outOfSync()
+	planned.Owner = "cd/edge" // what PlanApply returns for the owner it was given
+	engine := &fakeEngine{plans: []*charts.Plan{planned, synced()}}
 	r := newTest(t, []application.Spec{{
 		Name:           "edge",
 		Source:         application.Source{RepoURL: "https://example.com/x.git", Revision: "main"},
@@ -283,12 +291,33 @@ func TestApplyStampsTheControllersOwner(t *testing.T) {
 		t.Fatalf("Sync = %v, want nil", err)
 	}
 
+	if got := engine.planOpts[0].Owner; got != "cd/edge" {
+		t.Errorf("plan owner = %q, want cd/edge", got)
+	}
+
 	got := engine.opts[0]
+	// From the plan, not recomputed: stamping an id the plan did not classify
+	// against would install under one owner and hunt for orphans under another.
 	if got.Owner != "cd/edge" {
 		t.Errorf("owner = %q, want cd/edge", got.Owner)
 	}
 	if !got.Wait || got.Timeout != 90*time.Second || got.HistoryMax != 20 {
 		t.Errorf("options = %+v, want the sync policy carried through", got)
+	}
+}
+
+// The values reader is what carries repository content through the
+// SecretProvider seam, so a plan built without it would read values files
+// straight off disk and silently bypass the seam.
+func TestPlanIsGivenTheValuesReader(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if engine.planOpts[0].ReadFile == nil {
+		t.Error("PlanApply was given no ReadFile; values would bypass the secrets seam")
 	}
 }
 

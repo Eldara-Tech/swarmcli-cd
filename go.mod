@@ -3,7 +3,7 @@ module github.com/Eldara-Tech/swarmcli-cd
 go 1.26
 
 require (
-	github.com/Eldara-Tech/swarmcli v1.13.0-rc4
+	github.com/Eldara-Tech/swarmcli v1.13.0-rc4.0.20260722084148-d53411b89cdf
 	github.com/go-git/go-git/v5 v5.19.1
 	gopkg.in/yaml.v3 v3.0.1
 )

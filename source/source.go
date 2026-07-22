@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
-// Package source turns a checked-out working tree into the two things the
-// chart engine's PlanApply takes: a release file and a chart source.
+// Package source turns a checked-out working tree into what the chart engine's
+// PlanApply takes: a release file, a chart source, and the reader it uses for
+// values files.
 //
 // There are two source types and they converge here. A releaseFile application
 // points at a swarmcli-release.yaml the repository already contains. A chart
@@ -13,7 +14,6 @@
 package source
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -33,6 +33,10 @@ import (
 type Built struct {
 	ReleaseFile *charts.ReleaseFile
 	Charts      charts.ChartSource
+	// ReadFile is charts.PlanOptions.ReadFile: it reads one values file the
+	// release file names, checks it really is repository content, and runs it
+	// through the SecretProvider seam on the way past.
+	ReadFile func(path string) ([]byte, error)
 }
 
 // Builder turns working trees into plans' inputs.
@@ -45,9 +49,8 @@ type Builder struct {
 //
 // Root must not be the directory the git sourcer clones into. Everything under
 // a clone is inside a working tree that gets force-checked-out and cleaned on
-// every fetch, so a repository cache or a decrypted values file living there
-// would be deleted underneath this package — or, worse, show up as repository
-// content.
+// every fetch, so a repository cache living there would be deleted underneath
+// this package — or, worse, show up as repository content.
 //
 // Warnf receives the chart repository store's warnings. Without it they are
 // dropped: a repository index that could not be refreshed is best-effort in the
@@ -75,11 +78,11 @@ func (b *Builder) Build(ctx context.Context, app string, spec application.Source
 		return nil, fmt.Errorf("application %q: %w", app, err)
 	}
 
-	if err := b.resolveSecrets(ctx, app, co, rf); err != nil {
-		return nil, fmt.Errorf("application %q: %w", app, err)
-	}
-
-	return &Built{ReleaseFile: rf, Charts: charts.NewChartSource(store)}, nil
+	return &Built{
+		ReleaseFile: rf,
+		Charts:      charts.NewChartSource(store),
+		ReadFile:    valuesReader(ctx, app, co, rf),
+	}, nil
 }
 
 // releaseFile returns the release file for either source type.
@@ -150,77 +153,59 @@ func synthesise(app string, c application.ChartSource, co git.Checkout) (*charts
 	return charts.ParseReleaseFile(doc, filepath.Join(co.Dir, "<application "+app+">"))
 }
 
-// resolveSecrets runs every values file through the SecretProvider seam.
+// valuesReader is the reader the engine uses for every values file the plan
+// reads: it checks the path really is repository content, then runs the bytes
+// through the SecretProvider seam.
 //
-// The chart engine reads values files itself, from the paths the release file
-// names (charts/apply.go, readFiles), so there is nowhere to hand it bytes.
-// Until Eldara-Tech/swarmcli#501 adds an injectable reader, material a provider
-// transformed is written to a scratch directory and the release file is
-// repointed at it.
+// The engine used to read these files itself, so material a provider had
+// transformed could only reach it by being written to a scratch directory the
+// release file was then repointed at — decrypted secrets on the controller's
+// filesystem purely because there was nowhere to hand over bytes. That is what
+// Eldara-Tech/swarmcli#501 removed; the material now exists only in the map the
+// engine merges it into.
 //
-// With the OSS plaintext provider nothing is transformed, so nothing is written
-// and nothing is repointed: the cost is one read per values file. It is only
-// when a provider actually decrypts that plaintext reaches the filesystem,
-// which is the trade #501 exists to remove.
-func (b *Builder) resolveSecrets(ctx context.Context, app string, co git.Checkout, rf *charts.ReleaseFile) error {
+// The engine names the file with the path it resolved from the release file, so
+// containment is checked against that absolute path rather than the declared
+// one. Failing here aborts the whole plan before anything is deployed, which is
+// where a values file that resolves outside the repository belongs.
+func valuesReader(ctx context.Context, app string, co git.Checkout, rf *charts.ReleaseFile) func(string) ([]byte, error) {
 	provider := secrets.Get()
 
-	// Stale material from an earlier revision must not survive: a values file
-	// dropped from the release file would otherwise stay readable indefinitely.
-	scratch := filepath.Join(b.root, app, "values")
-	if err := os.RemoveAll(scratch); err != nil {
-		return fmt.Errorf("clearing %s: %w", scratch, err)
-	}
-
-	for i := range rf.Releases {
-		release := &rf.Releases[i]
-		for j, declared := range release.Values {
-			path, err := contained(rf.Dir, declared)
-			if err != nil {
-				return fmt.Errorf("release %q: values: %w", release.Name, err)
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return fmt.Errorf("release %q: reading values: %w", release.Name, err)
-			}
-
-			// The provider is given the path as the repository sees it, so it
-			// can decide by name or extension.
-			relative, err := filepath.Rel(co.Dir, path)
-			if err != nil {
-				relative = declared
-			}
-			resolved, err := provider.Resolve(ctx, secrets.Request{Path: filepath.ToSlash(relative), Data: data})
-			if err != nil {
-				return fmt.Errorf("release %q: resolving %s: %w", release.Name, relative, err)
-			}
-			if bytes.Equal(resolved, data) {
-				continue
-			}
-
-			written, err := writeScratch(scratch, release.Name, j, resolved)
-			if err != nil {
-				return fmt.Errorf("release %q: %w", release.Name, err)
-			}
-			// The engine passes absolute values paths through untouched, so
-			// the scratch file does not have to live in the working tree.
-			release.Values[j] = written
+	return func(path string) ([]byte, error) {
+		resolved, err := containedAbs(rf.Dir, path)
+		if err != nil {
+			return nil, fmt.Errorf("application %q: values: %w", app, err)
 		}
+		data, err := os.ReadFile(resolved)
+		if err != nil {
+			return nil, err
+		}
+
+		// The provider is given the path as the repository sees it, so it can
+		// decide by name or extension.
+		relative, err := filepath.Rel(co.Dir, resolved)
+		if err != nil {
+			relative = filepath.Base(resolved)
+		}
+		out, err := provider.Resolve(ctx, secrets.Request{Path: filepath.ToSlash(relative), Data: data})
+		if err != nil {
+			return nil, fmt.Errorf("resolving %s: %w", relative, err)
+		}
+		return out, nil
 	}
-	return nil
 }
 
-// writeScratch stores resolved material outside the working tree, readable only
-// by the controller.
-func writeScratch(dir, release string, index int, data []byte) (string, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("creating %s: %w", dir, err)
+// containedAbs is contained for a path the caller already joined, which is what
+// the engine hands its values reader: ReleaseFile.ValuesPaths has resolved the
+// declared path against the manifest's directory before the reader ever sees it.
+// A path outside root becomes a "../" relative one and is refused by the check
+// below rather than by a second copy of it.
+func containedAbs(root, path string) (string, error) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", fmt.Errorf("%q is not under the repository", path)
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%s-%d.yaml", release, index))
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return "", fmt.Errorf("writing %s: %w", path, err)
-	}
-	return path, nil
+	return contained(root, rel)
 }
 
 // contained resolves rel against root and refuses anything that ends up
