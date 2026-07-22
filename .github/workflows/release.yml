@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  update_release_draft:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: release-drafter/release-drafter@4d75298e00d9e34c483e5ff8c68d0ea1c1940c1e # v7.5.1
+        with:
+          config-name: release_template.yml
+          tag: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  goreleaser:
+    needs: update_release_draft
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The chart engine's version is the swarmcli release go.mod pins, which is
+      # not this binary's tag. Reading it here rather than hard-coding it is what
+      # keeps the stamp from drifting away from what is actually compiled in.
+      - name: Read the pinned chart-engine version
+        run: echo "ENGINE_VERSION=$(go list -m -f '{{.Version}}' github.com/Eldara-Tech/swarmcli)" >> "$GITHUB_ENV"
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Force goreleaser to use the pushed tag rather than `git describe`,
+          # which is non-deterministic when two tags (e.g. v1.1.0-rc1 and
+          # v1.1.0) point at the same commit. Without this, promoting an RC to
+          # GA at the same commit fails because goreleaser tries to re-publish
+          # the RC. The docker job does the equivalent via metadata-action's
+          # semver parser.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+
+  docker:
+    needs: update_release_draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Multi-arch: a swarm of Raspberry Pis or Graviton nodes is a perfectly
+      # ordinary place to run this, and the controller has to be schedulable on
+      # a manager whatever that manager is.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: eldaratech/swarmcli-cd
+          # latest=auto: a prerelease tag does not become :latest, so an rc
+          # cannot become what stack.yml pulls by default.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}

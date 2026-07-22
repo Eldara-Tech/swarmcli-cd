@@ -38,14 +38,23 @@ Swarm are:
 - charts as a first-class source, with the revision history and rollback that
   already exist
 
-## Building
+## Installing
+
+Released binaries (Linux and macOS, amd64 and arm64) are attached to each
+[release](https://github.com/Eldara-Tech/swarmcli-cd/releases); the controller
+image is `eldaratech/swarmcli-cd`. The same binary is both the controller and
+its client, so a laptop needs only the archive.
+
+Building it instead:
 
 ```bash
 go build -o swarmcli-cd ./cmd/swarmcli-cd
 ./swarmcli-cd version
 ```
 
-Requires Go 1.26+.
+Requires Go 1.26+. A plain `go build` leaves the chart-engine version unstamped,
+which makes every chart compatibility check report Unknown — fine for
+development, not for anything that deploys. See [RELEASING.md](RELEASING.md).
 
 ## Using it
 
