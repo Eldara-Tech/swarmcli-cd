@@ -59,7 +59,7 @@ type Builder interface {
 // Engine is the part of the chart engine this loop uses. *charts.Engine
 // implements it.
 type Engine interface {
-	PlanApply(ctx context.Context, rf *charts.ReleaseFile, src charts.ChartSource) (*charts.Plan, error)
+	PlanApply(ctx context.Context, rf *charts.ReleaseFile, src charts.ChartSource, opts charts.PlanOptions) (*charts.Plan, error)
 	Apply(ctx context.Context, plan *charts.Plan, opts charts.InstallOptions) ([]charts.ApplyResult, error)
 }
 
@@ -266,7 +266,15 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	}
 	engine := r.newEngine(backend)
 
-	plan, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts)
+	plan, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{
+		// The controller's own namespace. The command line stamps "apply/", so
+		// a release file applied by hand and an application reconciled here can
+		// never claim each other's releases — and classifying against this id
+		// rather than the file's is what lets this application recognise the
+		// releases it installed itself.
+		Owner:    ownerID(spec.Name),
+		ReadFile: built.ReadFile,
+	})
 	if err != nil {
 		return fmt.Errorf("planning: %w", err)
 	}
@@ -306,6 +314,12 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 // also surfaces a chart whose render is not deterministic — one that would
 // otherwise sit permanently out of sync, deploying on every single tick — on
 // the first sync rather than never.
+// ownerID is the id this controller stamps its releases with and classifies
+// them against. It is per application rather than per controller: several
+// applications share one swarm, and a per-controller id would make each of them
+// report the others' releases as its own orphans.
+func ownerID(app string) string { return "cd/" + app }
+
 func (r *Reconciler) apply(ctx context.Context, spec application.Spec, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout) error {
 	started := r.now()
 	notify.Dispatch(ctx, notify.Event{
@@ -316,10 +330,10 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, engine En
 	})
 
 	results, applyErr := engine.Apply(ctx, plan, charts.InstallOptions{
-		// The controller's own namespace. The command line stamps "apply/",
-		// so a release file applied by hand and an application reconciled
-		// here can never claim each other's releases.
-		Owner:      "cd/" + spec.Name,
+		// From the plan, not recomputed: apply must stamp the same owner it
+		// classified against, or a release is installed under one id and the
+		// next plan goes looking for its orphans under another.
+		Owner:      plan.Owner,
 		Wait:       spec.SyncPolicy.Wait,
 		Timeout:    time.Duration(spec.SyncPolicy.Timeout),
 		HistoryMax: spec.SyncPolicy.HistoryMax,
@@ -355,7 +369,10 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, engine En
 		return fmt.Errorf("applying: %w", applyErr)
 	}
 
-	after, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts)
+	after, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{
+		Owner:    ownerID(spec.Name),
+		ReadFile: built.ReadFile,
+	})
 	if err != nil {
 		// The deploy landed; only the confirmation failed. Reporting the sync
 		// as failed would be wrong, so the result stands and the error is the

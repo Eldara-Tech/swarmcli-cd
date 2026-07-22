@@ -245,29 +245,6 @@ func TestMissingWorkingTree(t *testing.T) {
 	}
 }
 
-// Failing to store resolved material fails the build: rendering from
-// ciphertext, or from a stale copy, is worse than not deploying.
-func TestUnusableScratchDirectoryFailsTheBuild(t *testing.T) {
-	useProvider(t, decrypter{})
-
-	root := filepath.Join(t.TempDir(), "root")
-	if err := os.WriteFile(root, []byte("not a directory"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	co := tree(t, map[string]string{
-		"charts/hello/Chart.yaml": "apiVersion: v1\nname: hello\nversion: 0.1.0\n",
-		"values/secret.yaml":      "ENC[replicas: 3]\n",
-	})
-
-	_, err := NewBuilder(root, nil).Build(context.Background(), "edge", application.Source{
-		Chart: &application.ChartSource{Release: "hello", Path: "charts/hello", Values: []string{"values/secret.yaml"}},
-	}, co)
-	if err == nil {
-		t.Fatal("Build = nil, want an error when resolved material cannot be stored")
-	}
-}
-
 // Repository content is not trusted the way the operator's own configuration
 // is: anyone who can land a commit can add a symlink, and a values file
 // pointing at /run/secrets would be merged and rendered into a manifest that is
@@ -283,11 +260,18 @@ func TestSymlinkOutOfTheTreeIsRejected(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	_, err := builder(t).Build(context.Background(), "edge", application.Source{
+	got, err := builder(t).Build(context.Background(), "edge", application.Source{
 		Chart: &application.ChartSource{Release: "hello", Path: "charts/hello", Values: []string{"values.yaml"}},
 	}, co)
+	if err != nil {
+		t.Fatalf("Build = %v, want nil", err)
+	}
+
+	// The reader is where the check lives now, and the engine calls it while
+	// planning — so an escaping path still aborts before anything is deployed.
+	_, err = got.ReadFile(got.ReleaseFile.ValuesPaths(got.ReleaseFile.Releases[0])[0])
 	if err == nil {
-		t.Fatal("Build = nil, want the escaping symlink to be refused")
+		t.Fatal("ReadFile = nil, want the escaping symlink to be refused")
 	}
 	if !strings.Contains(err.Error(), "outside the repository") {
 		t.Errorf("error %q does not say the path escaped", err)
@@ -315,8 +299,9 @@ func useProvider(t *testing.T, p secrets.Provider) {
 	secrets.Register("test", p)
 }
 
-func TestProviderResolvesValuesOutsideTheWorkingTree(t *testing.T) {
+func TestProviderTransformsValuesWithoutTouchingTheFilesystem(t *testing.T) {
 	useProvider(t, decrypter{})
+	root := t.TempDir()
 
 	co := tree(t, map[string]string{
 		"charts/hello/Chart.yaml": "apiVersion: v1\nname: hello\nversion: 0.1.0\n",
@@ -324,7 +309,7 @@ func TestProviderResolvesValuesOutsideTheWorkingTree(t *testing.T) {
 		"values/plain.yaml":       "image: whoami\n",
 	})
 
-	got, err := builder(t).Build(context.Background(), "edge", application.Source{
+	got, err := NewBuilder(root, nil).Build(context.Background(), "edge", application.Source{
 		Chart: &application.ChartSource{
 			Release: "hello",
 			Path:    "charts/hello",
@@ -340,29 +325,37 @@ func TestProviderResolvesValuesOutsideTheWorkingTree(t *testing.T) {
 		t.Fatalf("got %d values paths, want 2", len(paths))
 	}
 
-	// The transformed file is repointed out of the working tree, which a fetch
-	// force-checks-out and cleans.
-	if strings.HasPrefix(paths[0], co.Dir) {
-		t.Errorf("resolved values were written into the working tree: %s", paths[0])
+	// Both files stay where the repository put them. Before swarmcli#501 the
+	// transformed one had to be copied out and the release file repointed at
+	// the copy, because the engine read the paths itself.
+	for i, want := range []string{
+		filepath.Join(co.Dir, "values", "secret.yaml"),
+		filepath.Join(co.Dir, "values", "plain.yaml"),
+	} {
+		if paths[i] != want {
+			t.Errorf("values path %d = %s, want %s", i, paths[i], want)
+		}
 	}
-	content, err := os.ReadFile(paths[0])
+
+	data, err := got.ReadFile(paths[0])
 	if err != nil {
-		t.Fatalf("reading resolved values: %v", err)
+		t.Fatalf("ReadFile = %v, want nil", err)
 	}
-	if string(content) != "replicas: 3" {
-		t.Errorf("resolved values = %q, want the decrypted body", content)
+	if string(data) != "replicas: 3" {
+		t.Errorf("resolved values = %q, want the decrypted body", data)
 	}
-	info, err := os.Stat(paths[0])
+
+	// The decrypted body existed only in that return value. Nothing was
+	// written, so there is nothing left readable and nothing to go stale.
+	if _, err := os.Stat(filepath.Join(root, "edge", "values")); !os.IsNotExist(err) {
+		t.Errorf("decrypted material reached the filesystem: %v", err)
+	}
+	onDisk, err := os.ReadFile(paths[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("resolved values are mode %o, want 0600", perm)
-	}
-
-	// Material the provider did not transform is left where it is.
-	if want := filepath.Join(co.Dir, "values", "plain.yaml"); paths[1] != want {
-		t.Errorf("untransformed values moved to %s, want %s", paths[1], want)
+	if string(onDisk) != "ENC[replicas: 3]\n" {
+		t.Errorf("the working tree was rewritten: %q", onDisk)
 	}
 }
 
@@ -391,40 +384,9 @@ func TestPlaintextProviderLeavesValuesInPlace(t *testing.T) {
 	}
 }
 
-// A values file dropped from the release file must not stay readable.
-func TestStaleResolvedMaterialIsCleared(t *testing.T) {
-	useProvider(t, decrypter{})
-	root := t.TempDir()
-
-	co := tree(t, map[string]string{
-		"charts/hello/Chart.yaml": "apiVersion: v1\nname: hello\nversion: 0.1.0\n",
-		"values/a.yaml":           "ENC[replicas: 1]\n",
-		"values/b.yaml":           "ENC[replicas: 2]\n",
-	})
-	b := NewBuilder(root, nil)
-
-	first, err := b.Build(context.Background(), "edge", application.Source{
-		Chart: &application.ChartSource{Release: "hello", Path: "charts/hello", Values: []string{"values/a.yaml", "values/b.yaml"}},
-	}, co)
-	if err != nil {
-		t.Fatalf("Build = %v, want nil", err)
-	}
-	stale := first.ReleaseFile.ValuesPaths(first.ReleaseFile.Releases[0])[1]
-	if _, err := os.Stat(stale); err != nil {
-		t.Fatalf("expected resolved material at %s: %v", stale, err)
-	}
-
-	if _, err := b.Build(context.Background(), "edge", application.Source{
-		Chart: &application.ChartSource{Release: "hello", Path: "charts/hello", Values: []string{"values/a.yaml"}},
-	}, co); err != nil {
-		t.Fatalf("Build = %v, want nil", err)
-	}
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Errorf("material for a dropped values file survived: %v", err)
-	}
-}
-
-func TestProviderErrorFailsTheBuild(t *testing.T) {
+// The provider's error aborts the plan: the engine calls the reader while
+// planning, and a values file that cannot be resolved must not be rendered.
+func TestProviderErrorFailsTheRead(t *testing.T) {
 	useProvider(t, decrypter{})
 
 	co := tree(t, map[string]string{
@@ -432,11 +394,16 @@ func TestProviderErrorFailsTheBuild(t *testing.T) {
 		"values/broken.yaml":      "ENC[unterminated\n",
 	})
 
-	_, err := builder(t).Build(context.Background(), "edge", application.Source{
+	got, err := builder(t).Build(context.Background(), "edge", application.Source{
 		Chart: &application.ChartSource{Release: "hello", Path: "charts/hello", Values: []string{"values/broken.yaml"}},
 	}, co)
+	if err != nil {
+		t.Fatalf("Build = %v, want nil", err)
+	}
+
+	_, err = got.ReadFile(got.ReleaseFile.ValuesPaths(got.ReleaseFile.Releases[0])[0])
 	if err == nil {
-		t.Fatal("Build = nil, want the provider's error")
+		t.Fatal("ReadFile = nil, want the provider's error")
 	}
 	if !strings.Contains(err.Error(), "corrupt ciphertext") {
 		t.Errorf("error %q does not carry the provider's reason", err)
