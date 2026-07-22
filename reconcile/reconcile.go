@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -306,7 +307,40 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	if !spec.SyncPolicy.Automated && !force {
 		return nil
 	}
+	if err := checkCompat(plan); err != nil {
+		return err
+	}
 	return r.apply(ctx, spec, backend, engine, plan, built, checkout)
+}
+
+// checkCompat refuses a plan containing a release this build's chart engine is
+// too old for.
+//
+// PlanApply records the finding and never acts on it, because the layer that
+// knows whether refusing is appropriate is the caller. Here it always is: this
+// is an unattended reconciler with no operator to ask, and a chart declaring an
+// engine floor usually fails inside Render anyway — with whatever error the
+// missing feature happens to produce, minutes later and pointing at the wrong
+// thing. Refusing names the version to upgrade to instead.
+//
+// The whole plan is gated before any of it is applied, matching PlanApply's
+// contract and CE's own gate in cli/apply.go: a release that cannot run must
+// not leave the swarm half converged. Releases that would be unchanged are
+// exempt — they are already deployed, and applying will not touch them.
+func checkCompat(plan *charts.Plan) error {
+	var refused []string
+	for _, release := range plan.Releases {
+		if release.Action == charts.ActionUnchanged {
+			continue
+		}
+		if release.Compat.Status == charts.CompatIncompatible {
+			refused = append(refused, release.Compat.Message(""))
+		}
+	}
+	if len(refused) == 0 {
+		return nil
+	}
+	return fmt.Errorf("refusing to apply: %s", strings.Join(refused, "; "))
 }
 
 // apply deploys the plan and then re-plans.

@@ -53,6 +53,8 @@ controller/        entry point, command dispatch, daemon wiring, CLI rendering
 client/            HTTP client for the API; the CLI goes through it, not the
                    reconciler, so a UI can do everything the CLI can (D3)
 application/       Application spec + status: the wire contract
+Dockerfile         alpine, no docker binary; stamps both version ldflags
+stack.yml          the in-swarm deploy: manager node, docker.sock, config+secret
 scripts/           check-spdx.sh
 docs/
 .github/workflows/ ci.yml, check_labels.yml, licence.yml

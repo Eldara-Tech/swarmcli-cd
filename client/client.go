@@ -177,3 +177,13 @@ func message(body []byte, status string) string {
 	}
 	return strings.ToLower(status)
 }
+
+// Health probes the controller's liveness endpoint.
+//
+// It is the one endpoint that takes no credential, because a container
+// healthcheck runs beside the process and cannot carry one without putting it
+// in the stack file and in `docker inspect` output.
+func (c *Client) Health(ctx context.Context) error {
+	_, err := c.do(ctx, http.MethodGet, "/healthz")
+	return err
+}

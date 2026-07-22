@@ -154,3 +154,20 @@ func TestServerAddressToleratesATrailingSlash(t *testing.T) {
 		t.Errorf("path = %q, want it unchanged", got.path)
 	}
 }
+
+func TestHealth(t *testing.T) {
+	c, got := serve(t, http.StatusOK, "ok\n")
+	if err := c.Health(context.Background()); err != nil {
+		t.Fatalf("Health = %v, want nil", err)
+	}
+	if got.path != "/healthz" {
+		t.Errorf("path = %q, want /healthz", got.path)
+	}
+}
+
+func TestHealthFailsWhenTheControllerIsNotServing(t *testing.T) {
+	c, _ := serve(t, http.StatusServiceUnavailable, "")
+	if err := c.Health(context.Background()); err == nil {
+		t.Error("Health = nil, want an error")
+	}
+}

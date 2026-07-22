@@ -1,0 +1,79 @@
+# swarmcli-cd, deployed the way it is meant to run: on a manager node, reaching
+# the swarm through the mounted socket.
+#
+#   docker config create swarmcli-cd-applications ./applications.yaml
+#   printf '%s' "$(openssl rand -hex 32)" | docker secret create swarmcli-cd-token -
+#   docker stack deploy -c stack.yml swarmcli-cd
+#
+# Both are immutable in Swarm, so changing either means creating a new one and
+# updating this file — there is no hot reload, which is why applications are
+# read-only in the API.
+
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:latest
+    command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml"]
+
+    healthcheck:
+      # The image carries no curl and needs none: the binary probes itself.
+      test: ["CMD", "/swarmcli-cd", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    deploy:
+      replicas: 1
+      placement:
+        # Per D2 the controller talks to the swarm's own API, which only a
+        # manager serves. A worker would fail every apply.
+        constraints: [node.role == manager]
+      restart_policy:
+        condition: any
+
+    volumes:
+      # :ro applies to the socket file, not to the API reached through it —
+      # this controller creates and updates services, and must. It only stops
+      # the file itself being replaced.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Repository clones and the chart cache. On a volume because a restart
+      # would otherwise re-clone every application from scratch.
+      - swarmcli-cd-data:/var/lib/swarmcli-cd
+
+    environment:
+      # A file, not the token itself: a Docker secret is encrypted at rest in
+      # the raft log and delivered in memory, and never appears in
+      # `docker service inspect`.
+      SWARMCLI_CD_ADMIN_TOKEN_FILE: /run/secrets/swarmcli-cd-token
+      # Uncomment for a private repository. The username is often ignored by
+      # the forge, but GitHub wants a non-empty one.
+      # SWARMCLI_CD_GIT_USERNAME: x-access-token
+      # SWARMCLI_CD_GIT_TOKEN_FILE: /run/secrets/swarmcli-cd-git-token
+
+    # The API is deliberately not published. It holds root-equivalent access to
+    # the swarm behind a single shared bearer token over plaintext HTTP, so
+    # publishing this port on a node with a public address puts the swarm on the
+    # internet. Reach it from inside the swarm, or over an SSH tunnel:
+    #
+    #   ssh -L 8080:127.0.0.1:8080 manager
+    #
+    # If it must be published, terminate TLS in front of it.
+    # ports:
+    #   - "8080:8080"
+
+    configs:
+      - source: swarmcli-cd-applications
+        target: /etc/swarmcli-cd/applications.yaml
+    secrets:
+      - swarmcli-cd-token
+
+configs:
+  swarmcli-cd-applications:
+    external: true
+
+secrets:
+  swarmcli-cd-token:
+    external: true
+
+volumes:
+  swarmcli-cd-data:

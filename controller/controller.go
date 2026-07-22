@@ -37,6 +37,7 @@ const usage = `swarmcli-cd — GitOps continuous delivery for Docker Swarm
 Commands:
   controller   Run the reconciler and the HTTP API
   app          Inspect and sync applications through a running controller
+  healthcheck  Probe a controller's liveness endpoint
   version      Print the version
   help         Show this help
 
@@ -61,6 +62,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runController(args[1:], stdout, stderr)
 	case "app":
 		return appMain(args[1:], stdout, stderr)
+	case "healthcheck":
+		return runHealthcheck(args[1:], stdout, stderr)
 	case "version", "--version", "-v":
 		_, _ = fmt.Fprintf(stdout, "swarmcli-cd %s (chart engine %s)\n", version, engineVersion())
 		return 0
