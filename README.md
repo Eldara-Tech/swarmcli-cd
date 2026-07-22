@@ -41,11 +41,12 @@ Swarm are:
 ## Building
 
 ```bash
-go build -o swarmcli-cd ./cmd/controller
+go build -o swarmcli-cd ./cmd/swarmcli-cd
 ./swarmcli-cd version
+./swarmcli-cd controller --help
 ```
 
-Requires Go 1.26+. There is nothing else to run yet.
+Requires Go 1.26+.
 
 ## Licence
 

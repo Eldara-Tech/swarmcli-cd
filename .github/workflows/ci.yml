@@ -95,5 +95,5 @@ jobs:
           cache: true
       - name: Run unit tests
         run: go test -race -count=1 -timeout 5m ./...
-      - name: Build controller
-        run: go build -v -o swarmcli-cd ./cmd/controller
+      - name: Build
+        run: go build -v -o swarmcli-cd ./cmd/swarmcli-cd

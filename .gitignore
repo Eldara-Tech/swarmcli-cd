@@ -6,7 +6,9 @@
 # working directory, so cmd/<name> becomes ./<name> at the repo root.
 dist/
 /swarmcli-cd
-/controller
+
+# Nothing named /controller belongs here: the entry point is the `controller`
+# package at the repository root, and ignoring that path would silently drop it.
 
 # Editors
 .vscode/

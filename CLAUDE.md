@@ -1,8 +1,9 @@
 # swarmcli-cd
 
 GitOps controller for Docker Swarm — "Argo CD for Swarm". Public, Apache-2.0.
-Currently a **scaffold**: only `cmd/controller` exists and it does nothing but
-report its version.
+The entry point is the top-level `controller` package; `cmd/swarmcli-cd` is a
+one-line `main` so that the private companion can build the same binary from a
+main.go differing only by its blank imports.
 
 **Read [issue #1](https://github.com/Eldara-Tech/swarmcli-cd/issues/1) before
 designing anything here.** It is the source of truth for positioning, decisions
@@ -12,7 +13,7 @@ re-derive them.
 ## Quick reference
 
 ```bash
-go build -o swarmcli-cd ./cmd/controller
+go build -o swarmcli-cd ./cmd/swarmcli-cd
 go test ./...
 golangci-lint run ./...
 ./scripts/check-spdx.sh          # CI enforces this on every .go and .sh
@@ -47,7 +48,8 @@ golangci-lint run ./...
 ## Layout
 
 ```
-cmd/controller/    the daemon (scaffold)
+cmd/swarmcli-cd/   one-line main; the entry point is controller/
+controller/        entry point, command dispatch, daemon wiring
 application/       Application spec + status: the wire contract
 scripts/           check-spdx.sh
 docs/
