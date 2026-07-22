@@ -43,20 +43,35 @@ type token struct {
 // newToken takes its environment and file reader as arguments so the tests can
 // drive it without touching the process environment.
 func newToken(getenv func(string) string, readFile func(string) ([]byte, error)) *token {
+	v, err := TokenFromEnv(getenv, readFile)
+	if err != nil {
+		return &token{err: err}
+	}
+	return &token{value: v}
+}
+
+// TokenFromEnv resolves the admin token, preferring the file form. It is
+// exported because the command-line client has to present the same token this
+// authorizer expects, and two copies of the precedence would eventually
+// disagree about which variable wins.
+//
+// It takes its environment and file reader as arguments so the tests can drive
+// it without touching the process environment.
+func TokenFromEnv(getenv func(string) string, readFile func(string) ([]byte, error)) (string, error) {
 	if path := getenv(EnvTokenFile); path != "" {
 		data, err := readFile(path)
 		if err != nil {
-			return &token{err: fmt.Errorf("reading %s: %w", EnvTokenFile, err)}
+			return "", fmt.Errorf("reading %s: %w", EnvTokenFile, err)
 		}
 		if v := strings.TrimSpace(string(data)); v != "" {
-			return &token{value: v}
+			return v, nil
 		}
-		return &token{err: fmt.Errorf("%s names an empty file", EnvTokenFile)}
+		return "", fmt.Errorf("%s names an empty file", EnvTokenFile)
 	}
 	if v := strings.TrimSpace(getenv(EnvToken)); v != "" {
-		return &token{value: v}
+		return v, nil
 	}
-	return &token{err: ErrNoToken}
+	return "", ErrNoToken
 }
 
 // Ready implements Authorizer.

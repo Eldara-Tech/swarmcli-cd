@@ -43,10 +43,37 @@ Swarm are:
 ```bash
 go build -o swarmcli-cd ./cmd/swarmcli-cd
 ./swarmcli-cd version
-./swarmcli-cd controller --help
 ```
 
 Requires Go 1.26+.
+
+## Using it
+
+One binary runs the controller and talks to it. The controller reconciles and
+serves the API; every other command is a client of that API, so anything the
+CLI can show, the TUI view and the web UI will show through the same endpoints.
+
+```bash
+# In the swarm, on a manager node, with docker.sock mounted:
+export SWARMCLI_CD_ADMIN_TOKEN_FILE=/run/secrets/swarmcli-cd-token
+swarmcli-cd controller --config /etc/swarmcli-cd/applications.yaml
+
+# From anywhere that can reach it:
+export SWARMCLI_CD_SERVER=http://controller:8080
+export SWARMCLI_CD_ADMIN_TOKEN=...
+
+swarmcli-cd app list                 # sync state and health, one row each
+swarmcli-cd app get edge             # releases and their services
+swarmcli-cd app diff edge            # what a sync would change
+swarmcli-cd app history edge         # each release's revisions
+swarmcli-cd app sync edge --wait     # reconcile now; non-zero if it failed
+```
+
+Add `-o json` to any read for the controller's own response, unmodified — that
+is the form to script against. The admin token never comes from a flag: a token
+in argv is a token in `ps` and in the shell history.
+
+Run `swarmcli-cd controller --help` or `swarmcli-cd app help` for the rest.
 
 ## Licence
 

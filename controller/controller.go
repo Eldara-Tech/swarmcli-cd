@@ -36,10 +36,11 @@ const usage = `swarmcli-cd — GitOps continuous delivery for Docker Swarm
 
 Commands:
   controller   Run the reconciler and the HTTP API
+  app          Inspect and sync applications through a running controller
   version      Print the version
   help         Show this help
 
-Run "swarmcli-cd controller --help" for the controller's options.
+Run "swarmcli-cd controller --help" or "swarmcli-cd app help" for their options.
 `
 
 // Main runs the process and never returns. It is what cmd/swarmcli-cd calls,
@@ -58,6 +59,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "controller":
 		return runController(args[1:], stdout, stderr)
+	case "app":
+		return appMain(args[1:], stdout, stderr)
 	case "version", "--version", "-v":
 		_, _ = fmt.Fprintf(stdout, "swarmcli-cd %s (chart engine %s)\n", version, engineVersion())
 		return 0
