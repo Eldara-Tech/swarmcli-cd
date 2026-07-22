@@ -1,0 +1,159 @@
+namespace: edge
+services:
+    - name: traefik
+      spec:
+        annotations:
+            name: edge_traefik
+            labels:
+                com.docker.stack.image: traefik:v3.7.1
+                com.docker.stack.namespace: edge
+                traefik.constraint-label: traefik-public
+                traefik.enable: "true"
+                traefik.http.middlewares.admin-auth.basicauth.users: admin:$$apr1$$otIz5Cnl$$/y77Sc88rr1SfA6k0Ospw/
+                traefik.http.middlewares.hsts-header.headers.forceSTSHeader: "false"
+                traefik.http.middlewares.hsts-header.headers.stsIncludeSubdomains: "true"
+                traefik.http.middlewares.hsts-header.headers.stsPreload: "true"
+                traefik.http.middlewares.hsts-header.headers.stsSeconds: "31536000"
+                traefik.http.middlewares.https-redirect.redirectscheme.permanent: "true"
+                traefik.http.middlewares.https-redirect.redirectscheme.scheme: https
+                traefik.http.middlewares.limit.buffering.maxRequestBodyBytes: "2000000"
+                traefik.http.routers.traefik-public-http.entrypoints: http
+                traefik.http.routers.traefik-public-http.middlewares: https-redirect
+                traefik.http.routers.traefik-public-http.rule: Host(`traefik.example.com`)
+                traefik.http.routers.traefik-public-https.entrypoints: https
+                traefik.http.routers.traefik-public-https.middlewares: admin-auth,hsts-header
+                traefik.http.routers.traefik-public-https.rule: Host(`traefik.example.com`)
+                traefik.http.routers.traefik-public-https.service: api@internal
+                traefik.http.routers.traefik-public-https.tls: "true"
+                traefik.http.routers.traefik-public-https.tls.certresolver: le
+                traefik.http.services.traefik-public.loadbalancer.server.port: "8080"
+                traefik.swarm.network: traefik-public
+        tasktemplate:
+            containerspec:
+                image: traefik:v3.7.1
+                labels:
+                    com.docker.stack.namespace: edge
+                command: []
+                args:
+                    - --providers.swarm=true
+                    - --providers.swarm.constraints=Label(`traefik.constraint-label`, `traefik-public`)
+                    - --providers.swarm.exposedByDefault=false
+                    - --entrypoints.http.address=:80
+                    - --entrypoints.https.address=:443
+                    - --entrypoints.https.http.middlewares=hsts-header@swarm
+                    - --entrypoints.http.forwardedHeaders.trustedIPs=127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+                    - --entrypoints.https.forwardedHeaders.trustedIPs=127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+                    - --entrypoints.http.proxyProtocol.trustedIPs=127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+                    - --entrypoints.https.proxyProtocol.trustedIPs=127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+                    - --certificatesresolvers.le.acme.email=admin@example.com
+                    - --certificatesresolvers.le.acme.storage=/certificates/acme.json
+                    - --certificatesresolvers.le.acme.tlschallenge=true
+                    - --accesslog=true
+                    - --log=true
+                    - --log.level=INFO
+                    - --api=true
+                    - --api.dashboard=true
+                    - --api.insecure=false
+                hostname: ""
+                env: []
+                dir: ""
+                user: ""
+                groups: []
+                privileges:
+                    credentialspec: null
+                    selinuxcontext: null
+                    seccomp: null
+                    apparmor: null
+                    nonewprivileges: false
+                init: null
+                stopsignal: ""
+                tty: false
+                openstdin: false
+                readonly: false
+                mounts:
+                    - type: bind
+                      source: /var/run/docker.sock
+                      target: /var/run/docker.sock
+                      readonly: true
+                      consistency: ""
+                      bindoptions: null
+                      volumeoptions: null
+                      imageoptions: null
+                      tmpfsoptions: null
+                      clusteroptions: null
+                    - type: volume
+                      source: edge_traefik-public-certificates
+                      target: /certificates
+                      readonly: false
+                      consistency: ""
+                      bindoptions: null
+                      volumeoptions:
+                        nocopy: false
+                        labels:
+                            com.docker.stack.namespace: edge
+                        subpath: ""
+                        driverconfig: null
+                      imageoptions: null
+                      tmpfsoptions: null
+                      clusteroptions: null
+                stopgraceperiod: null
+                healthcheck: null
+                hosts: []
+                dnsconfig: null
+                secrets: []
+                configs: []
+                isolation: ""
+                sysctls: {}
+                capabilityadd: []
+                capabilitydrop: []
+                ulimits: []
+                oomscoreadj: 0
+            pluginspec: null
+            networkattachmentspec: null
+            resources:
+                limits: null
+                reservations: null
+            restartpolicy: null
+            placement:
+                constraints:
+                    - node.labels.traefik-certs == true
+                preferences: []
+                maxreplicas: 0
+                platforms: []
+            networks:
+                - target: traefik-public
+                  aliases:
+                    - traefik
+                  driveropts: {}
+            logdriver:
+                name: json-file
+                options:
+                    max-file: "3"
+                    max-size: 10m
+            forceupdate: 0
+            runtime: ""
+        mode:
+            replicated:
+                replicas: null
+            global: null
+            replicatedjob: null
+            globaljob: null
+        updateconfig: null
+        rollbackconfig: null
+        networks: []
+        endpointspec:
+            mode: ""
+            ports:
+                - name: ""
+                  protocol: tcp
+                  targetport: 80
+                  publishedport: 80
+                  publishmode: host
+                - name: ""
+                  protocol: tcp
+                  targetport: 443
+                  publishedport: 443
+                  publishmode: host
+networks: []
+externalNetworks:
+    - traefik-public

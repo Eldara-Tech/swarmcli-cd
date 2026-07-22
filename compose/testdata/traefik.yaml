@@ -1,0 +1,74 @@
+networks:
+  traefik-public:
+    external: true
+services:
+  traefik:
+    command:
+      - --providers.swarm=true
+      - --providers.swarm.constraints=Label(`traefik.constraint-label`, `traefik-public`)
+      - --providers.swarm.exposedByDefault=false
+      - --entrypoints.http.address=:80
+      - --entrypoints.https.address=:443
+      - --entrypoints.https.http.middlewares=hsts-header@swarm
+      - --entrypoints.http.forwardedHeaders.trustedIPs=127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      - --entrypoints.https.forwardedHeaders.trustedIPs=127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      - --entrypoints.http.proxyProtocol.trustedIPs=127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      - --entrypoints.https.proxyProtocol.trustedIPs=127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      - --certificatesresolvers.le.acme.email=admin@example.com
+      - --certificatesresolvers.le.acme.storage=/certificates/acme.json
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --accesslog=true
+      - --log=true
+      - --log.level=INFO
+      - --api=true
+      - --api.dashboard=true
+      - --api.insecure=false
+    deploy:
+      labels:
+        - traefik.enable=true
+        - traefik.swarm.network=traefik-public
+        - traefik.constraint-label=traefik-public
+        - traefik.http.middlewares.https-redirect.redirectscheme.scheme=https
+        - traefik.http.middlewares.https-redirect.redirectscheme.permanent=true
+        - traefik.http.middlewares.hsts-header.headers.stsSeconds=31536000
+        - traefik.http.middlewares.hsts-header.headers.stsIncludeSubdomains=true
+        - traefik.http.middlewares.hsts-header.headers.stsPreload=true
+        - traefik.http.middlewares.hsts-header.headers.forceSTSHeader=false
+        - traefik.http.middlewares.admin-auth.basicauth.users=admin:$$apr1$$otIz5Cnl$$/y77Sc88rr1SfA6k0Ospw/
+        - traefik.http.routers.traefik-public-http.rule=Host(`traefik.example.com`)
+        - traefik.http.routers.traefik-public-http.entrypoints=http
+        - traefik.http.routers.traefik-public-http.middlewares=https-redirect
+        - traefik.http.routers.traefik-public-https.rule=Host(`traefik.example.com`)
+        - traefik.http.routers.traefik-public-https.entrypoints=https
+        - traefik.http.routers.traefik-public-https.tls=true
+        - traefik.http.routers.traefik-public-https.tls.certresolver=le
+        - traefik.http.routers.traefik-public-https.service=api@internal
+        - traefik.http.routers.traefik-public-https.middlewares=admin-auth,hsts-header
+        - traefik.http.services.traefik-public.loadbalancer.server.port=8080
+        - traefik.http.middlewares.limit.buffering.maxRequestBodyBytes=2000000
+      placement:
+        constraints:
+          - node.labels.traefik-certs == true
+    image: traefik:v3.7.1
+    logging:
+      driver: json-file
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      - traefik-public
+    ports:
+      - mode: host
+        protocol: tcp
+        published: 80
+        target: 80
+      - mode: host
+        protocol: tcp
+        published: 443
+        target: 443
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-public-certificates:/certificates
+volumes:
+  traefik-public-certificates: {}
+
