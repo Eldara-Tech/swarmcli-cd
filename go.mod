@@ -2,7 +2,10 @@ module github.com/Eldara-Tech/swarmcli-cd
 
 go 1.26
 
-require github.com/Eldara-Tech/swarmcli v1.13.0-rc4
+require (
+	github.com/Eldara-Tech/swarmcli v1.13.0-rc4
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	dario.cat/mergo v1.0.1 // indirect
@@ -53,5 +56,4 @@ require (
 	golang.org/x/text v0.34.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
