@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/compose/convert"
@@ -53,12 +54,15 @@ type Backend struct {
 	// scoped to a swarm and a notification is scoped to an application: only the
 	// caller knows which application's reconcile this write belongs to.
 	onOutOfBandChange func(service string)
+	// now stamps the swarmcli.created label; overridable in tests.
+	now func() time.Time
 }
 
 // Options tune a Backend. Every field has a working default.
 type Options struct {
 	Log               *slog.Logger
 	OnOutOfBandChange func(service string)
+	Now               func() time.Time
 }
 
 // New returns a Backend applying to the swarm the client is connected to.
@@ -69,7 +73,10 @@ func New(api client.APIClient, o Options) *Backend {
 	if o.OnOutOfBandChange == nil {
 		o.OnOutOfBandChange = func(string) {}
 	}
-	return &Backend{api: api, log: o.Log, onOutOfBandChange: o.OnOutOfBandChange}
+	if o.Now == nil {
+		o.Now = time.Now
+	}
+	return &Backend{api: api, log: o.Log, onOutOfBandChange: o.OnOutOfBandChange, now: o.Now}
 }
 
 // ApplyServices creates the stack's services that do not exist and updates

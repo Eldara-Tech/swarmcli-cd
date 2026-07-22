@@ -14,7 +14,11 @@ import (
 
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
+	"github.com/docker/docker/api/types/system"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
@@ -38,6 +42,27 @@ type fakeAPI struct {
 	createOpt []swarm.ServiceCreateOptions
 	updated   []updateCall
 	inspects  int
+
+	// --- resources ---
+	networks   []network.Summary
+	configs    []swarm.Config
+	secrets    []swarm.Secret
+	volumes    []volume.Volume
+	nodes      []swarm.Node
+	tasks      []swarm.Task
+	networkErr error
+
+	// labelFilters records the label filter of every list call, so a test can
+	// assert that a stack-scoped operation was actually scoped.
+	labelFilters []string
+	// order records every mutation in the order it was made.
+	order          []string
+	createdNets    map[string]network.CreateOptions
+	createdConfigs []swarm.ConfigSpec
+	createdSecrets []swarm.SecretSpec
+	updatedConfigs []swarm.ConfigSpec
+	updatedSecrets []swarm.SecretSpec
+	removed        []string
 }
 
 type updateCall struct {
@@ -46,6 +71,10 @@ type updateCall struct {
 	spec    swarm.ServiceSpec
 	opts    swarm.ServiceUpdateOptions
 }
+
+// ClientVersion is what compose conversion reads to gate version-dependent
+// spec fields.
+func (f *fakeAPI) ClientVersion() string { return "1.51" }
 
 func (f *fakeAPI) ServiceList(context.Context, swarm.ServiceListOptions) ([]swarm.Service, error) {
 	return f.existing, nil
@@ -478,3 +507,125 @@ func TestIsVersionConflict(t *testing.T) {
 		t.Error("nil was treated as a version conflict")
 	}
 }
+
+// --- resource methods ---
+
+func labelOf(f filters.Args) string {
+	for _, v := range f.Get("label") {
+		return v
+	}
+	return ""
+}
+
+func (f *fakeAPI) note(what string) { f.order = append(f.order, what) }
+
+func (f *fakeAPI) NetworkList(_ context.Context, o network.ListOptions) ([]network.Summary, error) {
+	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
+	if f.networkErr != nil {
+		return nil, f.networkErr
+	}
+	return f.networks, nil
+}
+
+func (f *fakeAPI) NetworkCreate(_ context.Context, name string, o network.CreateOptions) (network.CreateResponse, error) {
+	if f.createdNets == nil {
+		f.createdNets = map[string]network.CreateOptions{}
+	}
+	f.createdNets[name] = o
+	f.note("network:" + name)
+	return network.CreateResponse{ID: "net-" + name}, nil
+}
+
+func (f *fakeAPI) NetworkRemove(_ context.Context, id string) error {
+	f.removed = append(f.removed, "network:"+id)
+	return nil
+}
+
+func (f *fakeAPI) ConfigList(_ context.Context, o swarm.ConfigListOptions) ([]swarm.Config, error) {
+	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
+	return f.configs, nil
+}
+
+func (f *fakeAPI) ConfigInspectWithRaw(_ context.Context, name string) (swarm.Config, []byte, error) {
+	for _, c := range f.configs {
+		if c.Spec.Name == name {
+			return c, nil, nil
+		}
+	}
+	return swarm.Config{}, nil, errdefs.ErrNotFound
+}
+
+func (f *fakeAPI) ConfigCreate(_ context.Context, spec swarm.ConfigSpec) (swarm.ConfigCreateResponse, error) {
+	f.createdConfigs = append(f.createdConfigs, spec)
+	f.note("config:" + spec.Name)
+	return swarm.ConfigCreateResponse{ID: "cfg-" + spec.Name}, nil
+}
+
+func (f *fakeAPI) ConfigUpdate(_ context.Context, _ string, _ swarm.Version, spec swarm.ConfigSpec) error {
+	f.updatedConfigs = append(f.updatedConfigs, spec)
+	return nil
+}
+
+func (f *fakeAPI) ConfigRemove(_ context.Context, id string) error {
+	f.removed = append(f.removed, "config:"+id)
+	return nil
+}
+
+func (f *fakeAPI) SecretList(_ context.Context, o swarm.SecretListOptions) ([]swarm.Secret, error) {
+	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
+	return f.secrets, nil
+}
+
+func (f *fakeAPI) SecretInspectWithRaw(_ context.Context, name string) (swarm.Secret, []byte, error) {
+	for _, s := range f.secrets {
+		if s.Spec.Name == name {
+			return s, nil, nil
+		}
+	}
+	return swarm.Secret{}, nil, errdefs.ErrNotFound
+}
+
+func (f *fakeAPI) SecretCreate(_ context.Context, spec swarm.SecretSpec) (swarm.SecretCreateResponse, error) {
+	f.createdSecrets = append(f.createdSecrets, spec)
+	f.note("secret:" + spec.Name)
+	return swarm.SecretCreateResponse{ID: "sec-" + spec.Name}, nil
+}
+
+func (f *fakeAPI) SecretUpdate(_ context.Context, _ string, _ swarm.Version, spec swarm.SecretSpec) error {
+	f.updatedSecrets = append(f.updatedSecrets, spec)
+	return nil
+}
+
+func (f *fakeAPI) SecretRemove(_ context.Context, id string) error {
+	f.removed = append(f.removed, "secret:"+id)
+	return nil
+}
+
+func (f *fakeAPI) ServiceRemove(_ context.Context, id string) error {
+	f.removed = append(f.removed, "service:"+id)
+	return nil
+}
+
+func (f *fakeAPI) VolumeList(_ context.Context, o volume.ListOptions) (volume.ListResponse, error) {
+	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
+	out := make([]*volume.Volume, 0, len(f.volumes))
+	for i := range f.volumes {
+		out = append(out, &f.volumes[i])
+	}
+	return volume.ListResponse{Volumes: out}, nil
+}
+
+func (f *fakeAPI) VolumeRemove(_ context.Context, name string, _ bool) error {
+	f.removed = append(f.removed, "volume:"+name)
+	return nil
+}
+
+func (f *fakeAPI) NodeList(context.Context, swarm.NodeListOptions) ([]swarm.Node, error) {
+	return f.nodes, nil
+}
+
+func (f *fakeAPI) TaskList(context.Context, swarm.TaskListOptions) ([]swarm.Task, error) {
+	return f.tasks, nil
+}
+
+func (f *fakeAPI) Info(context.Context) (system.Info, error) { return system.Info{}, nil }
