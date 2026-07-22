@@ -81,12 +81,15 @@ import (
 func main() { controller.Main() }
 ```
 
-That entry point does not exist yet. `cmd/controller` is `package main`, and a
-`main` package cannot be imported, so the companion would have nothing to call.
-Whatever lands in [#17](https://github.com/Eldara-Tech/swarmcli-cd/issues/17)
-has to leave the real entry point in an importable package with `cmd/` reduced
-to a one-line `main`, exactly as swarmcli-be calls `app.Init()` and
-`app.InitialModel()` rather than reimplementing them.
+That entry point is the top-level `controller` package, and `cmd/swarmcli-cd` is
+already the one-line `main` above without the blank imports — a `main` package
+cannot be imported, so anything else would leave the companion with nothing to
+call. The binary's own version is stamped into that package rather than into
+`main`, so the companion stamps the same symbol with its own tag:
+
+```
+-X github.com/Eldara-Tech/swarmcli-cd/controller.version=<version>
+```
 
 ## The companion's go.mod
 
