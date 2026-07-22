@@ -59,14 +59,31 @@ func (f *fakeBuilder) Build(context.Context, string, application.Source, git.Che
 	}, nil
 }
 
-type fakeRegistry struct{ err error }
+type fakeRegistry struct {
+	err     error
+	backend charts.Backend
+}
 
 func (f fakeRegistry) Backend(context.Context, string) (charts.Backend, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	return nil, nil
+	if f.backend != nil {
+		return f.backend, nil
+	}
+	return stubBackend{}, nil
 }
+
+// stubBackend is a charts.Backend that only answers the one question the
+// reconcile loop asks of it directly: which services a release has. charts.Backend
+// is embedded nil, so anything else panics naming the method rather than
+// returning a zero value the loop would then reason about.
+type stubBackend struct {
+	charts.Backend
+	states map[string][]charts.ServiceState
+}
+
+func (s stubBackend) StackServices(name string) []charts.ServiceState { return s.states[name] }
 
 // fakeEngine returns a scripted sequence of plans, so a test can say "out of
 // sync, then synced after the apply".
@@ -653,4 +670,79 @@ func equal(a, b []notify.EventType) bool {
 		}
 	}
 	return true
+}
+
+// Health is a separate axis from sync, and the loop has to fill it: a status
+// left at unknown is what a UI would render as "no idea", which is worse than
+// either answer.
+func TestHealthIsRecordedAlongsideSync(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := New([]application.Spec{spec("edge", false)}, Options{
+		Fetcher: &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder: &fakeBuilder{},
+		Swarms: fakeRegistry{backend: stubBackend{states: map[string][]charts.ServiceState{
+			"whoami": {{Name: "whoami", Running: 2, Desired: 2, NewestTaskAge: time.Hour}},
+		}}},
+		NewEngine: func(charts.Backend) Engine { return engine },
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:       func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthHealthy {
+		t.Errorf("health = %q, want healthy", view.Status.Health.State)
+	}
+	if view.Status.Health.Services != (application.ServiceCounts{Healthy: 1, Total: 1}) {
+		t.Errorf("counts = %+v, want 1/1", view.Status.Health.Services)
+	}
+	if len(view.Status.Releases) != 1 || len(view.Status.Releases[0].Services) != 1 {
+		t.Fatalf("releases = %+v, want per-service detail", view.Status.Releases)
+	}
+	if view.Status.Releases[0].Services[0].Name != "whoami" {
+		t.Errorf("service = %+v", view.Status.Releases[0].Services[0])
+	}
+}
+
+// A release the plan would install has never been deployed, so the swarm is not
+// asked about it at all — and it reads Missing rather than Degraded.
+func TestUninstalledReleaseIsMissingAndNotQueried(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "whoami", Ref: "repo/whoami", Action: charts.ActionInstall, ToVersion: "0.1.0"},
+	}}
+	engine := &fakeEngine{plans: []*charts.Plan{plan}}
+	backend := &countingBackend{}
+	r := New([]application.Spec{spec("edge", false)}, Options{
+		Fetcher:   &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{backend: backend},
+		NewEngine: func(charts.Backend) Engine { return engine },
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:       func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthMissing {
+		t.Errorf("health = %q, want missing", view.Status.Health.State)
+	}
+	if backend.calls != 0 {
+		t.Errorf("asked the swarm %d times about a release that was never deployed", backend.calls)
+	}
+}
+
+type countingBackend struct {
+	charts.Backend
+	calls int
+}
+
+func (c *countingBackend) StackServices(string) []charts.ServiceState {
+	c.calls++
+	return nil
 }

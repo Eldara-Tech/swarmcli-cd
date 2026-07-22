@@ -32,12 +32,12 @@ import (
 // The reconciler fills both. ReleaseStatus.Revision is likewise left zero —
 // the chart revision number lives in the release records, not in the plan.
 //
-// Plan.Orphaned and Plan.Unmanaged are deliberately not surfaced. They are
-// computed against Plan.Owner, which the engine derives by prefixing the
-// release file's declared owner with "apply/" — the command line's namespace,
-// not this controller's (Eldara-Tech/swarmcli#499). Beyond that they answer a
-// per-swarm question, not a per-application one: with several applications on
-// one swarm, each would report the others' releases as unmanaged.
+// Plan.Orphaned and Plan.Unmanaged are deliberately not surfaced. They now
+// classify against this controller's own owner id rather than the command
+// line's (Eldara-Tech/swarmcli#499, adopted in #27), so they are at least about
+// the right releases — but they answer a per-swarm question, not a
+// per-application one: with several applications on one swarm, each would
+// report the others' releases as unmanaged.
 func FromPlan(plan *charts.Plan) (application.Sync, []application.ReleaseStatus) {
 	install, upgrade, unchanged := plan.Counts()
 

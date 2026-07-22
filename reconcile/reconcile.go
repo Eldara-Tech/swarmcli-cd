@@ -23,6 +23,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/drift"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
+	"github.com/Eldara-Tech/swarmcli-cd/health"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
@@ -283,7 +284,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	// against, so asking afterwards would always find them equal and drift
 	// would never look like a transition.
 	was := r.syncState(spec.Name)
-	r.record(spec.Name, plan, checkout.Revision, nil)
+	r.record(spec.Name, backend, plan, checkout.Revision, nil)
 
 	install, upgrade, _ := plan.Counts()
 	if install+upgrade == 0 {
@@ -304,7 +305,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	if !spec.SyncPolicy.Automated && !force {
 		return nil
 	}
-	return r.apply(ctx, spec, engine, plan, built, checkout)
+	return r.apply(ctx, spec, backend, engine, plan, built, checkout)
 }
 
 // apply deploys the plan and then re-plans.
@@ -320,7 +321,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 // report the others' releases as its own orphans.
 func ownerID(app string) string { return "cd/" + app }
 
-func (r *Reconciler) apply(ctx context.Context, spec application.Spec, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout) error {
+func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout) error {
 	started := r.now()
 	notify.Dispatch(ctx, notify.Event{
 		Application: spec.Name,
@@ -380,7 +381,7 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, engine En
 		r.recordResult(spec.Name, result)
 		return fmt.Errorf("re-planning after apply: %w", err)
 	}
-	r.record(spec.Name, after, checkout.Revision, result)
+	r.record(spec.Name, backend, after, checkout.Revision, result)
 	return nil
 }
 
@@ -393,7 +394,7 @@ func (r *Reconciler) syncState(app string) application.SyncState {
 
 // record stores the status a plan implies. A nil result leaves whatever the
 // last sync recorded in place.
-func (r *Reconciler) record(app string, plan *charts.Plan, revision string, result *application.SyncResult) {
+func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Plan, revision string, result *application.SyncResult) {
 	sync, releases := drift.FromPlan(plan)
 	sync.Revision = revision
 
@@ -405,11 +406,30 @@ func (r *Reconciler) record(app string, plan *charts.Plan, revision string, resu
 	if result != nil {
 		sync.LastSync = result
 	}
+
+	// Read the swarm before taking a view on it. A sync that did not succeed is
+	// what separates a rollout that is slow from one that is broken, so the
+	// health of each release is decided against the outcome recorded above
+	// rather than against the previous tick's.
+	syncFailed := sync.LastSync != nil && !sync.LastSync.Succeeded
+	for i := range releases {
+		rel := &releases[i]
+		var states []charts.ServiceState
+		if rel.Action != application.ActionInstall {
+			states = backend.StackServices(rel.Name)
+		}
+		rel.Health, rel.Services = health.Release(health.Input{
+			States: states,
+			// A release the plan would install is declared and not deployed.
+			// That is knowable from the plan, so it costs no call to the swarm.
+			Installed:  rel.Action != application.ActionInstall,
+			SyncFailed: syncFailed,
+		})
+	}
+
 	r.status[app] = application.Status{
-		Sync: sync,
-		// Health is filled by the health rollup; until then it is honestly
-		// unknown rather than optimistically healthy.
-		Health:     application.Health{State: application.HealthUnknown},
+		Sync:       sync,
+		Health:     health.Application(releases),
 		Releases:   releases,
 		ObservedAt: r.now(),
 	}
