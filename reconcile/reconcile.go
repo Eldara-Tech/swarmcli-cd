@@ -62,6 +62,7 @@ type Builder interface {
 type Engine interface {
 	PlanApply(ctx context.Context, rf *charts.ReleaseFile, src charts.ChartSource, opts charts.PlanOptions) (*charts.Plan, error)
 	Apply(ctx context.Context, plan *charts.Plan, opts charts.InstallOptions) ([]charts.ApplyResult, error)
+	History(ctx context.Context, release string) ([]charts.Release, error)
 }
 
 // Options configures a Reconciler. Everything has a working default except the
@@ -507,4 +508,69 @@ func (r *Reconciler) Diffs(app string) ([]application.ReleaseDiff, error) {
 		return nil, ErrNotPlanned
 	}
 	return drift.Diffs(plan), nil
+}
+
+// History returns the recorded revisions of every release the application
+// declares, newest first.
+//
+// It reads the swarm rather than the status cache: history is the one thing
+// that survives a controller restart with no database of its own, because the
+// engine keeps one Docker Config per revision in Raft. Serving it from memory
+// would make it disappear on exactly the restart it is most useful after.
+func (r *Reconciler) History(ctx context.Context, app string) (application.History, error) {
+	spec, ok := r.spec(app)
+	if !ok {
+		return application.History{}, fmt.Errorf("no such application %q", app)
+	}
+
+	r.mu.RLock()
+	plan := r.plans[app]
+	r.mu.RUnlock()
+	if plan == nil {
+		return application.History{}, ErrNotPlanned
+	}
+
+	backend, err := r.swarms.Backend(ctx, spec.Destination.Swarm)
+	if err != nil {
+		return application.History{}, fmt.Errorf("resolving destination: %w", err)
+	}
+	engine := r.newEngine(backend)
+
+	out := application.History{Releases: make([]application.ReleaseHistory, 0, len(plan.Releases))}
+	for _, rp := range plan.Releases {
+		revs, err := engine.History(ctx, rp.Name)
+		if err != nil {
+			// The engine has no record of it. That is expected precisely when
+			// the plan would install it, and only then — anything else is a
+			// real failure and is not worth hiding behind an empty table.
+			if rp.Action == charts.ActionInstall {
+				out.Releases = append(out.Releases, application.ReleaseHistory{Name: rp.Name})
+				continue
+			}
+			return application.History{}, fmt.Errorf("reading the history of release %q: %w", rp.Name, err)
+		}
+		out.Releases = append(out.Releases, application.ReleaseHistory{Name: rp.Name, Revisions: revisions(revs)})
+	}
+	return out, nil
+}
+
+// revisions maps the engine's records to the wire shape, newest first.
+//
+// The engine returns them ascending, which is the order they were written; a
+// history view reads the other way round, and reversing here means every client
+// does not.
+func revisions(revs []charts.Release) []application.Revision {
+	out := make([]application.Revision, 0, len(revs))
+	for i := len(revs) - 1; i >= 0; i-- {
+		rel := revs[i]
+		out = append(out, application.Revision{
+			Revision: rel.Revision,
+			Chart:    rel.Chart.Name,
+			Version:  rel.Chart.Version,
+			Status:   rel.Status,
+			Created:  rel.Created,
+			Owner:    rel.Owner,
+		})
+	}
+	return out
 }

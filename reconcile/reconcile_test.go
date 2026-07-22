@@ -97,6 +97,21 @@ type fakeEngine struct {
 	planCalls int
 	opts      []charts.InstallOptions
 	planOpts  []charts.PlanOptions
+	history   map[string][]charts.Release
+	histErr   error
+}
+
+func (e *fakeEngine) History(_ context.Context, release string) ([]charts.Release, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.histErr != nil {
+		return nil, e.histErr
+	}
+	revs, ok := e.history[release]
+	if !ok {
+		return nil, errors.New("release not found")
+	}
+	return revs, nil
 }
 
 func (e *fakeEngine) PlanApply(_ context.Context, _ *charts.ReleaseFile, _ charts.ChartSource, opts charts.PlanOptions) (*charts.Plan, error) {
@@ -745,4 +760,87 @@ type countingBackend struct {
 func (c *countingBackend) StackServices(string) []charts.ServiceState {
 	c.calls++
 	return nil
+}
+
+// History reads the swarm rather than the status cache: the engine keeps one
+// Docker Config per revision in Raft, which is what makes history survive a
+// restart with no database here — and serving it from memory would make it
+// vanish on exactly the restart it is most useful after.
+func TestHistoryIsNewestFirstAndCoversEveryRelease(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "whoami", Action: charts.ActionUnchanged},
+		{Name: "redis", Action: charts.ActionUnchanged},
+	}}
+	engine := &fakeEngine{plans: []*charts.Plan{plan}, history: map[string][]charts.Release{
+		// The engine returns them ascending, as written.
+		"whoami": {
+			{Name: "whoami", Revision: 1, Status: "superseded", Chart: charts.ReleaseChart{Name: "whoami", Version: "0.1.7"}},
+			{Name: "whoami", Revision: 2, Status: "deployed", Chart: charts.ReleaseChart{Name: "whoami", Version: "0.1.8"}, Owner: "cd/edge:release/whoami"},
+		},
+		"redis": {{Name: "redis", Revision: 1, Status: "deployed"}},
+	}}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	got, err := r.History(context.Background(), "edge")
+	if err != nil {
+		t.Fatalf("History = %v, want nil", err)
+	}
+	if len(got.Releases) != 2 {
+		t.Fatalf("got %d releases, want both", len(got.Releases))
+	}
+	revs := got.Releases[0].Revisions
+	if len(revs) != 2 || revs[0].Revision != 2 || revs[1].Revision != 1 {
+		t.Fatalf("revisions = %+v, want newest first", revs)
+	}
+	if revs[0].Version != "0.1.8" || revs[0].Status != "deployed" || revs[0].Owner != "cd/edge:release/whoami" {
+		t.Errorf("revision = %+v, want the record's own detail", revs[0])
+	}
+}
+
+// A release the plan would install has no history, and the engine says so with
+// an error. That is the one case where an error is the expected answer.
+func TestHistoryOfAnUninstalledReleaseIsEmpty(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{{Name: "whoami", Action: charts.ActionInstall}}}
+	engine := &fakeEngine{plans: []*charts.Plan{plan}}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	got, err := r.History(context.Background(), "edge")
+	if err != nil {
+		t.Fatalf("History = %v, want nil", err)
+	}
+	if len(got.Releases) != 1 || len(got.Releases[0].Revisions) != 0 {
+		t.Errorf("history = %+v, want the release listed with nothing under it", got)
+	}
+}
+
+// A deployed release whose history cannot be read is a real failure, not an
+// empty table: reporting no revisions for a release that has them would say the
+// swarm forgot them.
+func TestHistoryFailureForADeployedReleaseIsAnError(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{{Name: "whoami", Action: charts.ActionUnchanged}}}
+	engine := &fakeEngine{plans: []*charts.Plan{plan}, histErr: errors.New("swarm unreachable")}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	if _, err := r.History(context.Background(), "edge"); err == nil {
+		t.Fatal("History = nil, want the failure surfaced")
+	}
+}
+
+func TestHistoryBeforeAnyReconcile(t *testing.T) {
+	r := newTest(t, []application.Spec{spec("edge", false)}, &fakeEngine{}, nil)
+	if _, err := r.History(context.Background(), "edge"); !errors.Is(err, ErrNotPlanned) {
+		t.Errorf("err = %v, want ErrNotPlanned", err)
+	}
+	if _, err := r.History(context.Background(), "absent"); err == nil {
+		t.Error("History of an unknown application = nil, want an error")
+	}
 }
