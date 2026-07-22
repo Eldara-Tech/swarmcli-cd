@@ -167,6 +167,17 @@ type Compat struct {
 	Reason   string      `json:"reason,omitempty"`
 }
 
+// ReleaseDiff is the manifest change one release would undergo.
+//
+// It is deliberately not part of ReleaseStatus: a diff carries whole
+// manifests, and a list view rendering twenty applications must not drag them
+// along. It is served by its own endpoint, for one application at a time.
+type ReleaseDiff struct {
+	Release string     `json:"release"`
+	Action  SyncAction `json:"action"`
+	Diff    string     `json:"diff"`
+}
+
 // ServiceStatus is one Swarm service under a release.
 type ServiceStatus struct {
 	Name        string      `json:"name"`
