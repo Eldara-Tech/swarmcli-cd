@@ -1,0 +1,61 @@
+version: 2
+
+project_name: swarmcli-cd
+
+before:
+  hooks:
+    - go mod download
+    - go mod verify
+
+release:
+  prerelease: auto
+  draft: false
+  use_existing_draft: true
+
+env:
+  - CGO_ENABLED=0
+
+builds:
+  - id: swarmcli-cd
+    binary: swarmcli-cd
+    main: ./cmd/swarmcli-cd
+    goos:
+      # linux for the controller, which runs in the swarm; darwin because the
+      # same binary is the client, and `swarmcli-cd app list` is run from a
+      # laptop far more often than the controller is started by hand.
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/Eldara-Tech/swarmcli-cd/controller.version={{.Version}}
+      # The chart engine is the swarmcli release this module pins, not this
+      # binary's tag. ENGINE_VERSION is computed from go.mod by the workflow;
+      # without it charts.EngineVersion() is empty and every chart's declared
+      # floor goes unchecked.
+      - -X github.com/Eldara-Tech/swarmcli/charts.engineVersion={{.Env.ENGINE_VERSION}}
+
+archives:
+  - id: default
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - LICENSE*
+      - README.md
+      - stack.yml
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  disable: true
