@@ -14,6 +14,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/docker"
 
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
+	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 )
 
 // Backend is a charts.Backend built on the moby client.
@@ -25,6 +26,20 @@ import (
 // dry-run, --detach returns before convergence, and update order is Go map
 // iteration.
 var _ charts.Backend = (*Backend)(nil)
+
+// WithRegistryAuth returns a copy of the backend that authenticates its image
+// pulls with auth. The copy shares the client — one swarm's connection pool is
+// not duplicated per application — and differs only by the resolver, so the
+// per-swarm backend stays shared while the credential stays per application.
+//
+// It returns charts.Backend so the reconciler can reach it through the swarms
+// seam (which hands back that interface) with an optional-interface upgrade,
+// rather than depending on this concrete type.
+func (b *Backend) WithRegistryAuth(auth regauth.Resolver) charts.Backend {
+	c := *b
+	c.registryAuth = auth
+	return &c
+}
 
 // DeployStack converges the swarm to a rendered manifest.
 //

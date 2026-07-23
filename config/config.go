@@ -58,6 +58,12 @@ type File struct {
 // purpose rather than by convention.
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
+// secretNameRE is what registryAuth may name. It is a Docker secret name, and
+// it is joined onto /run/secrets to find the mounted file — so the charset that
+// keeps it a valid secret name also keeps it from escaping that directory: no
+// slash, and a leading dot (hence "..") is rejected.
+var secretNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
 // Load reads and validates the applications file at path.
 func Load(path string) (*File, error) {
 	data, err := os.ReadFile(path)
@@ -128,6 +134,9 @@ func validateApplication(app application.Spec) error {
 	}
 	if !app.DriftDetection.Valid() {
 		return fmt.Errorf("%q: unsupported driftDetection %q, this build implements %q", app.Name, app.DriftDetection, application.DriftManifest)
+	}
+	if app.RegistryAuth != "" && !secretNameRE.MatchString(app.RegistryAuth) {
+		return fmt.Errorf("%q: invalid registryAuth %q: it names a Docker secret, so letters, digits, dot, dash and underscore only", app.Name, app.RegistryAuth)
 	}
 	if err := validateSource(app.Source); err != nil {
 		return fmt.Errorf("%q: %w", app.Name, err)
