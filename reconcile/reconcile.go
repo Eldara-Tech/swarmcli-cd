@@ -8,6 +8,11 @@
 // Each application runs on its own schedule in its own goroutine. One
 // application whose repository is unreachable must not stall the others, and a
 // shared queue would make exactly that happen.
+//
+// The set of applications is mutable while the loop runs: Add, Remove and
+// Replace start, stop and retune per-application loops under the reconciler's
+// lock. This is what lets the app set itself be reconciled from git (issue #47);
+// the loop that drives those operations from a diff is a separate concern.
 package reconcile
 
 import (
@@ -88,9 +93,32 @@ type Options struct {
 	ForbiddenSecretMounts map[string]struct{}
 }
 
+// appEntry is one application's mutable record: the spec it reconciles against,
+// what was last observed of it, and the handle that stops its loop. Every field
+// is guarded by Reconciler.mu except syncing, which is locked directly through
+// the *appEntry so a long reconcile does not hold the map's lock.
+type appEntry struct {
+	// syncing serialises work for this application, so a manual sync and a
+	// scheduled tick cannot render or deploy it at once. Locked via the
+	// *appEntry, independent of mu.
+	syncing sync.Mutex
+
+	spec   application.Spec
+	status application.Status
+	// plan is the last plan for this application so the diff endpoint can be
+	// served without re-rendering. A plan carries whole manifests, which is why
+	// it is kept per application rather than per revision.
+	plan *charts.Plan
+
+	// cancel stops this application's loop; done is closed when that goroutine
+	// has returned. Both are nil until the loop is started — before Run, or for
+	// an application added to a not-yet-running reconciler.
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
 // Reconciler runs the loop and holds what it last observed.
 type Reconciler struct {
-	apps      []application.Spec
 	fetch     Fetcher
 	build     Builder
 	swarms    swarms.Registry
@@ -101,16 +129,17 @@ type Reconciler struct {
 	regAuth   map[string]regauth.Resolver
 	forbidden map[string]struct{}
 
-	// syncing serialises work for one application, so a manual sync and a
-	// scheduled tick cannot render or deploy the same application at once.
-	syncing map[string]*sync.Mutex
-
-	mu     sync.RWMutex
-	status map[string]application.Status
-	// plans holds the last plan per application so the diff endpoint can be
-	// served without re-rendering. A plan carries whole manifests, which is
-	// why it is kept per application rather than per revision.
-	plans map[string]*charts.Plan
+	mu sync.RWMutex
+	// apps is the reconciled set, keyed by name; order is the sequence they were
+	// declared or added in, which is the order Views reports them. Both are
+	// guarded by mu.
+	apps  map[string]*appEntry
+	order []string
+	// root is the context Run supervises the loops under: every loop's context
+	// derives from it, so cancelling Run cancels them all. It is nil until Run
+	// is called; wg tracks the live loop goroutines so Run can drain them.
+	root context.Context
+	wg   sync.WaitGroup
 }
 
 // New returns a Reconciler for the given applications.
@@ -132,7 +161,6 @@ func New(apps []application.Spec, o Options) *Reconciler {
 	}
 
 	r := &Reconciler{
-		apps:      apps,
 		fetch:     o.Fetcher,
 		build:     o.Builder,
 		swarms:    o.Swarms,
@@ -142,38 +170,134 @@ func New(apps []application.Spec, o Options) *Reconciler {
 		now:       o.Now,
 		regAuth:   o.RegistryAuth,
 		forbidden: o.ForbiddenSecretMounts,
-		syncing:   make(map[string]*sync.Mutex, len(apps)),
-		status:    make(map[string]application.Status, len(apps)),
-		plans:     make(map[string]*charts.Plan, len(apps)),
+		apps:      make(map[string]*appEntry, len(apps)),
+		order:     make([]string, 0, len(apps)),
 	}
 	for _, spec := range apps {
-		r.syncing[spec.Name] = &sync.Mutex{}
-		r.status[spec.Name] = application.Status{Sync: application.Sync{State: application.SyncUnknown}}
+		r.apps[spec.Name] = &appEntry{
+			spec:   spec,
+			status: application.Status{Sync: application.Sync{State: application.SyncUnknown}},
+		}
+		r.order = append(r.order, spec.Name)
 	}
 	return r
 }
 
 // Run reconciles until ctx is cancelled.
 //
-// Destinations are resolved first and a failure is fatal. The config loader
-// deliberately does not validate them — only the swarm registry knows what it
-// can reach — so this is where a typo in a swarm name becomes a startup error
-// rather than a per-application failure discovered three minutes later.
+// It starts a loop for every application in the set and then blocks, so that
+// applications added while it runs are supervised under the same context and a
+// removed one's loop is cancelled with it. A destination the swarm registry
+// cannot resolve is not fatal here: it fails its own application on the next
+// tick, surfaced on that application's status, rather than stopping the loop
+// that observes every other one.
 func (r *Reconciler) Run(ctx context.Context) error {
-	if err := r.checkDestinations(ctx); err != nil {
-		return err
+	r.mu.Lock()
+	r.root = ctx
+	for _, name := range r.order {
+		r.startLoopLocked(r.apps[name])
 	}
+	r.mu.Unlock()
 
-	var wg sync.WaitGroup
-	for i := range r.apps {
-		wg.Add(1)
-		go func(spec application.Spec) {
-			defer wg.Done()
-			r.loop(ctx, spec)
-		}(r.apps[i])
-	}
-	wg.Wait()
+	<-ctx.Done()
+	r.wg.Wait()
 	return ctx.Err()
+}
+
+// startLoopLocked starts an application's reconcile loop under the run context.
+// The caller holds mu. It is a no-op before Run has set that context — an
+// application added to a not-yet-running reconciler is simply recorded and
+// started when Run is — and once the context is cancelled, so nothing is started
+// into a shutdown that is already draining.
+func (r *Reconciler) startLoopLocked(e *appEntry) {
+	if r.root == nil || r.root.Err() != nil || e.cancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(r.root)
+	e.cancel = cancel
+	e.done = make(chan struct{})
+	name := e.spec.Name
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		defer close(e.done)
+		defer cancel()
+		r.loop(ctx, name)
+	}()
+}
+
+// Add starts reconciling a new application. It returns an error if one of that
+// name is already present: the caller that drives the set from a git diff
+// (issue #52) tells add from replace itself and does not rely on this being an
+// upsert.
+func (r *Reconciler) Add(spec application.Spec) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.apps[spec.Name]; ok {
+		return fmt.Errorf("application %q already present", spec.Name)
+	}
+	e := &appEntry{
+		spec:   spec,
+		status: application.Status{Sync: application.Sync{State: application.SyncUnknown}},
+	}
+	r.apps[spec.Name] = e
+	r.order = append(r.order, spec.Name)
+	r.startLoopLocked(e)
+	return nil
+}
+
+// Replace swaps the spec a running application reconciles against, keyed by
+// name, keeping its recorded status and its loop: the next tick reads the new
+// spec, so a healthy loop is retuned rather than restarted. A change of name is
+// not a replace — it is a Remove of the old and an Add of the new, which the
+// caller does, because the two report as different applications.
+func (r *Reconciler) Replace(spec application.Spec) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.apps[spec.Name]
+	if !ok {
+		return fmt.Errorf("no such application %q", spec.Name)
+	}
+	e.spec = spec
+	return nil
+}
+
+// Remove stops reconciling an application and drops what was observed of it. It
+// cancels the application's loop and waits for that goroutine to return before
+// reporting done, so a removed application is provably no longer reconciling —
+// a caller replacing the whole set can rely on that. The deployed stack is left
+// running and becomes unmanaged (D-e); pruning it is separate (issue #54).
+func (r *Reconciler) Remove(name string) error {
+	r.mu.Lock()
+	e, ok := r.apps[name]
+	if !ok {
+		r.mu.Unlock()
+		return fmt.Errorf("no such application %q", name)
+	}
+	delete(r.apps, name)
+	r.order = removeName(r.order, name)
+	cancel, done := e.cancel, e.done
+	r.mu.Unlock()
+
+	// Outside the lock: the loop takes mu to read its spec, so waiting for it
+	// while holding mu would deadlock.
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+	return nil
+}
+
+// removeName returns order without name, leaving the original backing array
+// untouched so a Views slice taken earlier is not mutated underneath it.
+func removeName(order []string, name string) []string {
+	out := order[:0:0]
+	for _, n := range order {
+		if n != name {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // registryAuthBackend is the optional interface a backend implements to
@@ -217,17 +341,9 @@ func withForbiddenSecrets(b charts.Backend, names map[string]struct{}) charts.Ba
 	return b
 }
 
-func (r *Reconciler) checkDestinations(ctx context.Context) error {
-	for _, spec := range r.apps {
-		if _, err := r.swarms.Backend(ctx, spec.Destination.Swarm); err != nil {
-			return fmt.Errorf("application %q: destination: %w", spec.Name, err)
-		}
-	}
-	return nil
-}
-
-// loop reconciles one application on its own schedule.
-func (r *Reconciler) loop(ctx context.Context, spec application.Spec) {
+// loop reconciles one application on its own schedule, reading its current spec
+// each tick so a Replace is picked up without the loop being restarted.
+func (r *Reconciler) loop(ctx context.Context, app string) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
@@ -239,19 +355,19 @@ func (r *Reconciler) loop(ctx context.Context, spec application.Spec) {
 		case <-timer.C:
 		}
 
-		if err := r.Sync(ctx, spec.Name); err != nil {
+		if err := r.Sync(ctx, app); err != nil {
 			// A cancelled context is a shutdown, not a failure to back off
 			// from.
 			if ctx.Err() != nil {
 				return
 			}
 			failures++
-			r.log.Error("reconcile failed", "application", spec.Name, "failures", failures, "error", err)
+			r.log.Error("reconcile failed", "application", app, "failures", failures, "error", err)
 		} else {
 			failures = 0
 		}
 
-		timer.Reset(backoff(r.intervalFor(spec), failures))
+		timer.Reset(backoff(r.intervalFor(r.currentSpec(app)), failures))
 	}
 }
 
@@ -291,14 +407,21 @@ func (r *Reconciler) SyncNow(ctx context.Context, app string) error {
 }
 
 func (r *Reconciler) reconcile(ctx context.Context, app string, force bool) error {
-	spec, ok := r.spec(app)
+	r.mu.RLock()
+	e, ok := r.apps[app]
+	r.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("no such application %q", app)
 	}
 
-	lock := r.syncing[app]
-	lock.Lock()
-	defer lock.Unlock()
+	e.syncing.Lock()
+	defer e.syncing.Unlock()
+
+	// Read the current spec under the lock: a Replace may have swapped it since
+	// this reconcile was scheduled, and the swapped-in spec is the one to act on.
+	r.mu.RLock()
+	spec := e.spec
+	r.mu.RUnlock()
 
 	err := r.reconcileLocked(ctx, spec, force)
 	if err != nil {
@@ -477,15 +600,32 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	return nil
 }
 
-// syncState reports what was last observed for an application.
+// syncState reports what was last observed for an application, or unknown if it
+// has been removed from the set.
 func (r *Reconciler) syncState(app string) application.SyncState {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.status[app].Sync.State
+	if e, ok := r.apps[app]; ok {
+		return e.status.Sync.State
+	}
+	return application.SyncUnknown
+}
+
+// currentSpec returns an application's spec as it stands now, or the zero spec
+// if it has been removed. The loop reads through it so a Replace takes effect on
+// the next tick.
+func (r *Reconciler) currentSpec(app string) application.Spec {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if e, ok := r.apps[app]; ok {
+		return e.spec
+	}
+	return application.Spec{}
 }
 
 // record stores the status a plan implies. A nil result leaves whatever the
-// last sync recorded in place.
+// last sync recorded in place. An application removed while its sync was in
+// flight is skipped, so a late write does not resurrect it.
 func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Plan, revision string, result *application.SyncResult) {
 	sync, releases := drift.FromPlan(plan)
 	sync.Revision = revision
@@ -493,8 +633,12 @@ func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Pla
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	previous := r.status[app]
-	sync.LastSync = previous.Sync.LastSync
+	e, ok := r.apps[app]
+	if !ok {
+		return
+	}
+
+	sync.LastSync = e.status.Sync.LastSync
 	if result != nil {
 		sync.LastSync = result
 	}
@@ -519,22 +663,24 @@ func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Pla
 		})
 	}
 
-	r.status[app] = application.Status{
+	e.status = application.Status{
 		Sync:       sync,
 		Health:     health.Application(releases),
 		Releases:   releases,
 		ObservedAt: r.now(),
 	}
-	r.plans[app] = plan
+	e.plan = plan
 }
 
 func (r *Reconciler) recordResult(app string, result *application.SyncResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	status := r.status[app]
-	status.Sync.LastSync = result
-	status.ObservedAt = r.now()
-	r.status[app] = status
+	e, ok := r.apps[app]
+	if !ok {
+		return
+	}
+	e.status.Sync.LastSync = result
+	e.status.ObservedAt = r.now()
 }
 
 // setError records why a reconcile failed without discarding what was last
@@ -543,40 +689,34 @@ func (r *Reconciler) recordResult(app string, result *application.SyncResult) {
 func (r *Reconciler) setError(app string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	status := r.status[app]
-	status.Error = err.Error()
-	status.ObservedAt = r.now()
-	r.status[app] = status
-}
-
-func (r *Reconciler) spec(app string) (application.Spec, bool) {
-	for _, s := range r.apps {
-		if s.Name == app {
-			return s, true
-		}
+	e, ok := r.apps[app]
+	if !ok {
+		return
 	}
-	return application.Spec{}, false
+	e.status.Error = err.Error()
+	e.status.ObservedAt = r.now()
 }
 
 // View returns one application's spec and last observed status.
 func (r *Reconciler) View(app string) (application.View, bool) {
-	spec, ok := r.spec(app)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.apps[app]
 	if !ok {
 		return application.View{}, false
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return application.View{Spec: spec, Status: r.status[app]}, true
+	return application.View{Spec: e.spec, Status: e.status}, true
 }
 
-// Views returns every application, in the order they were declared.
+// Views returns every application, in the order they were declared or added.
 func (r *Reconciler) Views() []application.View {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	out := make([]application.View, 0, len(r.apps))
-	for _, spec := range r.apps {
-		out = append(out, application.View{Spec: spec, Status: r.status[spec.Name]})
+	out := make([]application.View, 0, len(r.order))
+	for _, name := range r.order {
+		e := r.apps[name]
+		out = append(out, application.View{Spec: e.spec, Status: e.status})
 	}
 	return out
 }
@@ -588,13 +728,17 @@ var ErrNotPlanned = errors.New("no plan yet")
 // Diffs returns the manifest changes the last plan found. It does not
 // re-render: what it reports is what the status reports, which is the point.
 func (r *Reconciler) Diffs(app string) ([]application.ReleaseDiff, error) {
-	if _, ok := r.spec(app); !ok {
-		return nil, fmt.Errorf("no such application %q", app)
-	}
 	r.mu.RLock()
-	plan := r.plans[app]
+	e, ok := r.apps[app]
+	var plan *charts.Plan
+	if ok {
+		plan = e.plan
+	}
 	r.mu.RUnlock()
 
+	if !ok {
+		return nil, fmt.Errorf("no such application %q", app)
+	}
 	if plan == nil {
 		return nil, ErrNotPlanned
 	}
@@ -609,14 +753,21 @@ func (r *Reconciler) Diffs(app string) ([]application.ReleaseDiff, error) {
 // engine keeps one Docker Config per revision in Raft. Serving it from memory
 // would make it disappear on exactly the restart it is most useful after.
 func (r *Reconciler) History(ctx context.Context, app string) (application.History, error) {
-	spec, ok := r.spec(app)
+	r.mu.RLock()
+	e, ok := r.apps[app]
+	var (
+		spec application.Spec
+		plan *charts.Plan
+	)
+	if ok {
+		spec = e.spec
+		plan = e.plan
+	}
+	r.mu.RUnlock()
+
 	if !ok {
 		return application.History{}, fmt.Errorf("no such application %q", app)
 	}
-
-	r.mu.RLock()
-	plan := r.plans[app]
-	r.mu.RUnlock()
 	if plan == nil {
 		return application.History{}, ErrNotPlanned
 	}
