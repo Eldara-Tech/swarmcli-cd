@@ -19,6 +19,7 @@ import (
 
 	"github.com/Eldara-Tech/swarmcli-cd/api"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
+	"github.com/Eldara-Tech/swarmcli-cd/backend"
 	"github.com/Eldara-Tech/swarmcli-cd/config"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
@@ -144,6 +145,14 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		return err
 	}
 
+	// The controller's own secrets, which no reconciled stack may mount: a chart
+	// declaring one as an external secret would otherwise read the admin token,
+	// the git token or another application's registry credential.
+	forbidden, err := backend.MountedSecretNames(regauth.DefaultSecretsDir)
+	if err != nil {
+		return err
+	}
+
 	// Two directories, not one. Everything under a clone is force-checked-out
 	// and cleaned on every fetch, so a chart cache living there would be
 	// deleted underneath the builder — or show up as repository content.
@@ -160,8 +169,9 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		Builder: source.NewBuilder(chartCache, func(format string, a ...any) {
 			log.Warn(fmt.Sprintf(format, a...))
 		}),
-		RegistryAuth: resolvers,
-		Log:          log,
+		RegistryAuth:          resolvers,
+		ForbiddenSecretMounts: forbidden,
+		Log:                   log,
 	})
 
 	srv := api.New(rec, api.Options{Log: log})

@@ -158,7 +158,9 @@ docker secret create swarmcli-cd-regauth-edge /tmp/rc/config.json
 
 The credential reaches the swarm only for the pull: it is stored encrypted in
 the raft log and is never injected into a deployed container or returned by
-`docker service inspect`.
+`docker service inspect`. Nor can a reconciled stack reach it the other way: the
+controller refuses to deploy a stack that mounts one of its own secrets (this
+credential, the admin token, or the git token) as an `external` secret.
 
 **Static credentials only.** The controller image ships no docker credential
 helpers, so a `config.json` using `credsStore` or `credHelpers` is refused at

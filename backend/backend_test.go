@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -64,6 +66,118 @@ func TestDeployStackCreatesReferencesBeforeServices(t *testing.T) {
 	want := []string{"network:s_front"}
 	if !reflect.DeepEqual(api.order, want) {
 		t.Errorf("mutation order = %v, want %v before the service create", api.order, want)
+	}
+}
+
+// A stack referencing one of the controller's own secrets as external is refused
+// whole, before any resource is created — the exfiltration path that would
+// otherwise read the controller's admin token, git token or a registry
+// credential straight out of a tenant container.
+const mountsControllerSecret = `
+services:
+  evil:
+    image: alpine
+    secrets: [stolen]
+secrets:
+  stolen:
+    external: true
+    name: swarmcli-cd-token
+`
+
+func TestDeployStackRefusesMountingAControllerSecret(t *testing.T) {
+	api := &fakeAPI{
+		secrets: []swarm.Secret{{ID: "tok", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-token"}}}},
+	}
+	b := testBackend(t, api, nil).WithForbiddenSecrets(map[string]struct{}{"swarmcli-cd-token": {}}).(*Backend)
+
+	err := b.DeployStack("s", mountsControllerSecret, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the stack refused for mounting a controller secret")
+	}
+	for _, want := range []string{"evil", "swarmcli-cd-token", "controller"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	// Refused whole: nothing was created before the reject.
+	if len(api.order) != 0 || len(api.created) != 0 {
+		t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+	}
+}
+
+func TestRejectForbiddenSecretMounts(t *testing.T) {
+	withSecret := func(name string) swarm.ServiceSpec {
+		return swarm.ServiceSpec{TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{
+			Image:   "nginx",
+			Secrets: []*swarm.SecretReference{{SecretName: name}},
+		}}}
+	}
+	forbidden := map[string]struct{}{"swarmcli-cd-token": {}}
+
+	for name, tc := range map[string]struct {
+		forbidden map[string]struct{}
+		svc       swarm.ServiceSpec
+		wantErr   bool
+	}{
+		"mounts a forbidden secret":  {forbidden, withSecret("swarmcli-cd-token"), true},
+		"mounts an allowed secret":   {forbidden, withSecret("s_apikey"), false},
+		"empty forbidden set skips":  {nil, withSecret("swarmcli-cd-token"), false},
+		"nil container spec is safe": {forbidden, swarm.ServiceSpec{}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := testBackend(t, &fakeAPI{}, nil)
+			b.forbiddenSecrets = tc.forbidden
+			st := stack("s", cdService{"svc", tc.svc})
+
+			err := b.rejectForbiddenSecretMounts(st)
+			if tc.wantErr && err == nil {
+				t.Fatal("rejectForbiddenSecretMounts = nil, want an error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("rejectForbiddenSecretMounts = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// The forbidden set is controller-wide, but it must not leak onto the shared
+// per-swarm backend — the same copy-not-mutate discipline as WithRegistryAuth.
+func TestWithForbiddenSecretsDoesNotMutate(t *testing.T) {
+	shared := testBackend(t, &fakeAPI{}, nil)
+	if _, ok := shared.WithForbiddenSecrets(map[string]struct{}{"swarmcli-cd-token": {}}).(*Backend); !ok {
+		t.Fatal("WithForbiddenSecrets did not return a *Backend")
+	}
+	if shared.forbiddenSecrets != nil {
+		t.Error("WithForbiddenSecrets mutated the shared backend")
+	}
+}
+
+func TestMountedSecretNames(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"swarmcli-cd-token", "swarmcli-cd-regauth-a"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := MountedSecretNames(dir)
+	if err != nil {
+		t.Fatalf("MountedSecretNames = %v, want nil", err)
+	}
+	if _, ok := got["swarmcli-cd-token"]; !ok {
+		t.Error("swarmcli-cd-token not in the mounted set")
+	}
+	if _, ok := got["swarmcli-cd-regauth-a"]; !ok {
+		t.Error("swarmcli-cd-regauth-a not in the mounted set")
+	}
+
+	// A controller outside a swarm has no /run/secrets and must still start.
+	empty, err := MountedSecretNames(filepath.Join(dir, "does-not-exist"))
+	if err != nil {
+		t.Fatalf("MountedSecretNames(missing) = %v, want nil", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("missing dir yielded %d names, want 0", len(empty))
 	}
 }
 
