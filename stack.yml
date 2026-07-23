@@ -1,6 +1,7 @@
 # swarmcli-cd, deployed the way it is meant to run: on a manager node, reaching
 # the swarm through the mounted socket.
 #
+#   # Start from examples/applications.yaml and edit it for your repositories.
 #   docker config create swarmcli-cd-applications ./applications.yaml
 #   printf '%s' "$(openssl rand -hex 32)" | docker secret create swarmcli-cd-token -
 #   docker stack deploy -c stack.yml swarmcli-cd

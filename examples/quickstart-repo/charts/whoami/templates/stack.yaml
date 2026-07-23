@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  whoami:
+    image: {{ .Values.image }}
+    deploy:
+      replicas: {{ .Values.replicas }}
+      labels:
+        # Stamps every task with the release name, so `docker service ls
+        # --filter label=com.swarmcli.release=whoami` shows what this deployed.
+        com.swarmcli.release: {{ .Release.Name }}
+    # This service publishes no port, so nothing outside the swarm reaches it —
+    # matching the controller itself. To try it, add:
+    #   ports: ["8000:80"]

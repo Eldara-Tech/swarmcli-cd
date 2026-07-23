@@ -1,0 +1,12 @@
+# The desired state for the quickstart application: one chart, installed as the
+# release "whoami". swarmcli-cd renders this file, plans it against the swarm,
+# and applies it — exactly what `swarmcli charts apply -f` does, but pulled from
+# git and reconciled continuously.
+#
+# Do not set `owner:` here. When swarmcli-cd applies a release file it stamps
+# every release with its own owner, cd/<application-name>, so the file's owner is
+# ignored — see ../../docs/concepts.md#ownership.
+apiVersion: v1
+releases:
+  - name: whoami
+    chart: ./charts/whoami   # a local chart path, resolved against this file; no version — the Chart.yaml sets it

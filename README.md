@@ -3,9 +3,15 @@
 GitOps continuous delivery for Docker Swarm — reconcile your swarm from Git, the
 way Argo CD does for Kubernetes.
 
-> **Status: scaffold.** The reconcile loop is not implemented yet. The design,
-> decisions and phase plan live in [issue #1](https://github.com/Eldara-Tech/swarmcli-cd/issues/1).
-> Nothing here is usable in production, and there is no release.
+> **Status: Phase 1, pre-release.** The pull loop works end to end — fetch,
+> render, plan, diff, apply, drift detection and health — and is exercised
+> against a real swarm by the integration tests. There is **no tagged release**
+> yet, so build from source (below) and expect rough edges. Live-drift against
+> the running `ServiceSpec` (Phase 2) and the licensed companion (Phase 3) are
+> still to come. The design, decisions and phase plan live in
+> [issue #1](https://github.com/Eldara-Tech/swarmcli-cd/issues/1).
+>
+> **New here?** Start with the [getting-started guide](docs/getting-started.md).
 
 ## Why
 
@@ -84,6 +90,18 @@ in argv is a token in `ps` and in the shell history.
 
 Run `swarmcli-cd controller --help` or `swarmcli-cd app help` for the rest.
 
+## Documentation
+
+- [Getting started](docs/getting-started.md) — from a git repository to a running
+  service, end to end.
+- [Configuration](docs/configuration.md) — every field of the applications file,
+  plus the controller's flags and environment.
+- [Concepts](docs/concepts.md) — sync versus health, drift, ownership, rollback,
+  chart compatibility.
+- [HTTP API](docs/api.md) — the endpoints behind every command.
+- Examples: a commented [`applications.yaml`](examples/applications.yaml) and a
+  ready-to-push [quickstart repository](examples/quickstart-repo/).
+
 ## Deploying it
 
 Per D2 the controller runs **in the swarm, on a manager node**, and reaches the
@@ -93,6 +111,7 @@ deploy`, which is also why it can diff, prune and roll back things that command
 cannot.
 
 ```bash
+# Start from examples/applications.yaml and edit it for your repositories.
 docker config create swarmcli-cd-applications ./applications.yaml
 printf '%s' "$(openssl rand -hex 32)" | docker secret create swarmcli-cd-token -
 docker stack deploy -c stack.yml swarmcli-cd
@@ -112,6 +131,9 @@ ssh -L 8080:127.0.0.1:8080 manager
 ```
 
 ### Configuration
+
+The tables below are the quick reference; [docs/configuration.md](docs/configuration.md)
+is the full one, including every field of the applications file.
 
 The controller takes flags; credentials come from the environment, because they
 arrive as Docker secrets and a flag would put them in `docker service inspect`
