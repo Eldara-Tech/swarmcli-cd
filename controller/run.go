@@ -23,6 +23,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
+	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 	"github.com/Eldara-Tech/swarmcli-cd/secrets"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
@@ -135,6 +136,14 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		return err
 	}
 
+	// Per-application image-pull credentials, read from the Docker secrets each
+	// application's registryAuth names. A missing or unparseable one is fatal
+	// here rather than a convergence timeout three minutes into a deploy.
+	resolvers, err := regauth.Load(cfg.Applications, regauth.DefaultSecretsDir, os.ReadFile)
+	if err != nil {
+		return err
+	}
+
 	// Two directories, not one. Everything under a clone is force-checked-out
 	// and cleaned on every fetch, so a chart cache living there would be
 	// deleted underneath the builder — or show up as repository content.
@@ -151,7 +160,8 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		Builder: source.NewBuilder(chartCache, func(format string, a ...any) {
 			log.Warn(fmt.Sprintf(format, a...))
 		}),
-		Log: log,
+		RegistryAuth: resolvers,
+		Log:          log,
 	})
 
 	srv := api.New(rec, api.Options{Log: log})

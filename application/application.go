@@ -24,8 +24,20 @@ import "time"
 // Spec is what an operator declares in applications.yaml. It is read-only in
 // Phase 1: the file is the only source of truth and the API serves it.
 type Spec struct {
-	Name           string         `json:"name" yaml:"name"`
-	Source         Source         `json:"source" yaml:"source"`
+	Name   string `json:"name" yaml:"name"`
+	Source Source `json:"source" yaml:"source"`
+
+	// RegistryAuth names a Docker secret holding a docker config.json
+	// ({"auths":{...}}). The controller uses only this application's secret to
+	// authenticate the pulls its images need, so one application cannot pull
+	// another's private images even though both credentials are mounted in the
+	// same controller. Empty means the application's images are public.
+	//
+	// It is a secret name, not a path: the controller reads it from the default
+	// mount /run/secrets/<name>, so the secret must be mounted there — the
+	// short form `secrets: [<name>]` in stack.yml does exactly that.
+	RegistryAuth string `json:"registryAuth,omitempty" yaml:"registryAuth,omitempty"`
+
 	Destination    Destination    `json:"destination" yaml:"destination"`
 	SyncPolicy     SyncPolicy     `json:"syncPolicy" yaml:"syncPolicy"`
 	DriftDetection DriftDetection `json:"driftDetection" yaml:"driftDetection"`

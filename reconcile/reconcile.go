@@ -26,6 +26,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/health"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
+	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
 )
@@ -76,6 +77,11 @@ type Options struct {
 	Interval  time.Duration
 	Log       *slog.Logger
 	Now       func() time.Time
+	// RegistryAuth resolves an application's image-pull credential, keyed by
+	// application name. An application absent from the map deploys public images
+	// only. Built at startup by regauth.Load, which is where a missing or
+	// unparseable secret becomes a startup error.
+	RegistryAuth map[string]regauth.Resolver
 }
 
 // Reconciler runs the loop and holds what it last observed.
@@ -88,6 +94,7 @@ type Reconciler struct {
 	interval  time.Duration
 	log       *slog.Logger
 	now       func() time.Time
+	regAuth   map[string]regauth.Resolver
 
 	// syncing serialises work for one application, so a manual sync and a
 	// scheduled tick cannot render or deploy the same application at once.
@@ -128,6 +135,7 @@ func New(apps []application.Spec, o Options) *Reconciler {
 		interval:  o.Interval,
 		log:       o.Log,
 		now:       o.Now,
+		regAuth:   o.RegistryAuth,
 		syncing:   make(map[string]*sync.Mutex, len(apps)),
 		status:    make(map[string]application.Status, len(apps)),
 		plans:     make(map[string]*charts.Plan, len(apps)),
@@ -160,6 +168,28 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	}
 	wg.Wait()
 	return ctx.Err()
+}
+
+// registryAuthBackend is the optional interface a backend implements to
+// authenticate image pulls with an application's credential. *backend.Backend
+// satisfies it; a Phase 3 remote backend reached through the same swarms seam
+// need not, and authenticates its own way.
+type registryAuthBackend interface {
+	WithRegistryAuth(regauth.Resolver) charts.Backend
+}
+
+// withRegistryAuth scopes a backend to one application's credential. A nil
+// resolver — the application declared no registryAuth — or a backend that does
+// not support the upgrade leaves it unchanged, so public-image applications and
+// alternative backends are untouched.
+func withRegistryAuth(b charts.Backend, auth regauth.Resolver) charts.Backend {
+	if auth == nil {
+		return b
+	}
+	if ab, ok := b.(registryAuthBackend); ok {
+		return ab.WithRegistryAuth(auth)
+	}
+	return b
 }
 
 func (r *Reconciler) checkDestinations(ctx context.Context) error {
@@ -267,6 +297,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	if err != nil {
 		return fmt.Errorf("resolving destination: %w", err)
 	}
+	backend = withRegistryAuth(backend, r.regAuth[spec.Name])
 	engine := r.newEngine(backend)
 
 	plan, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{

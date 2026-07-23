@@ -20,6 +20,7 @@ import (
 	"github.com/docker/docker/client"
 
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
+	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 )
 
 // Image resolution modes, matching charts.InstallOptions.ResolveImage and the
@@ -54,6 +55,12 @@ type Backend struct {
 	// scoped to a swarm and a notification is scoped to an application: only the
 	// caller knows which application's reconcile this write belongs to.
 	onOutOfBandChange func(service string)
+	// registryAuth resolves the encoded credential for a service's image, or is
+	// nil when the application deploying through this backend declared none, in
+	// which case pulls are anonymous. It is set per application by
+	// WithRegistryAuth, never shared: a swarm's backend is reused across
+	// applications, and one application must not pull with another's credential.
+	registryAuth regauth.Resolver
 	// now stamps the swarmcli.created label; overridable in tests.
 	now func() time.Time
 }
@@ -132,8 +139,13 @@ func (b *Backend) stackServices(ctx context.Context, namespace string) (map[stri
 }
 
 func (b *Backend) createService(ctx context.Context, name string, spec swarm.ServiceSpec, resolve string) error {
+	auth, err := b.encodedAuth(spec)
+	if err != nil {
+		return fmt.Errorf("creating service %q: %w", name, err)
+	}
 	resp, err := b.api.ServiceCreate(ctx, spec, swarm.ServiceCreateOptions{
-		QueryRegistry: resolve == ResolveAlways || resolve == ResolveChanged,
+		QueryRegistry:       resolve == ResolveAlways || resolve == ResolveChanged,
+		EncodedRegistryAuth: auth,
 	})
 	if err != nil {
 		return fmt.Errorf("creating service %q: %w", name, err)
@@ -155,6 +167,12 @@ func (b *Backend) createService(ctx context.Context, name string, spec swarm.Ser
 func (b *Backend) updateService(ctx context.Context, name string, cur swarm.Service, spec swarm.ServiceSpec, resolve string) error {
 	for attempt := range maxConflictRetries {
 		desired, opts := prepareUpdate(cur, spec, resolve)
+
+		auth, err := b.encodedAuth(desired)
+		if err != nil {
+			return fmt.Errorf("updating service %q: %w", name, err)
+		}
+		opts.EncodedRegistryAuth = auth
 
 		resp, err := b.api.ServiceUpdate(ctx, cur.ID, cur.Version, desired, opts)
 		if err == nil {
@@ -228,6 +246,22 @@ func isVersionConflict(err error) bool {
 		return true
 	}
 	return strings.Contains(err.Error(), "update out of sequence")
+}
+
+// encodedAuth resolves the credential for a service's image to the header value
+// ServiceCreate and ServiceUpdate carry. A nil resolver — the application
+// declared no registryAuth — sends nothing, which is an anonymous pull and the
+// behaviour before this backend authenticated at all.
+//
+// It is set on both create and update because the credential is needed in two
+// places: the manager contacts the registry to resolve a tag to a digest when
+// QueryRegistry is set, and each node contacts it to pull. Sending it when
+// neither happens is harmless — the daemon ignores a credential it does not use.
+func (b *Backend) encodedAuth(spec swarm.ServiceSpec) (string, error) {
+	if b.registryAuth == nil || spec.TaskTemplate.ContainerSpec == nil {
+		return "", nil
+	}
+	return b.registryAuth(spec.TaskTemplate.ContainerSpec.Image)
 }
 
 func (b *Backend) warn(service string, warnings []string) {

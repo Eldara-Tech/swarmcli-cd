@@ -27,6 +27,12 @@ applications:
   # with its own owner, cd/edge, and ignores the file's — see
   # ../docs/concepts.md#ownership.
   - name: edge
+    # registryAuth names a Docker secret holding a docker config.json for the
+    # private registries this application's images come from. The controller
+    # uses only this application's secret, so "edge" cannot pull another
+    # application's private images. The secret is mounted into the controller in
+    # ../stack.yml; static credentials only (no ECR/GCR credential helpers).
+    # registryAuth: swarmcli-cd-regauth-edge
     source:
       repoURL: https://github.com/your-org/infra.git
       revision: main                                # branch, tag or SHA — pin it; an unpinned source deploys whatever the branch happens to point at
