@@ -82,6 +82,10 @@ type Options struct {
 	// only. Built at startup by regauth.Load, which is where a missing or
 	// unparseable secret becomes a startup error.
 	RegistryAuth map[string]regauth.Resolver
+	// ForbiddenSecretMounts names the controller's own mounted secrets, which no
+	// reconciled stack may mount. Controller-wide; built at startup from the
+	// controller's /run/secrets. Empty disables the check.
+	ForbiddenSecretMounts map[string]struct{}
 }
 
 // Reconciler runs the loop and holds what it last observed.
@@ -95,6 +99,7 @@ type Reconciler struct {
 	log       *slog.Logger
 	now       func() time.Time
 	regAuth   map[string]regauth.Resolver
+	forbidden map[string]struct{}
 
 	// syncing serialises work for one application, so a manual sync and a
 	// scheduled tick cannot render or deploy the same application at once.
@@ -136,6 +141,7 @@ func New(apps []application.Spec, o Options) *Reconciler {
 		log:       o.Log,
 		now:       o.Now,
 		regAuth:   o.RegistryAuth,
+		forbidden: o.ForbiddenSecretMounts,
 		syncing:   make(map[string]*sync.Mutex, len(apps)),
 		status:    make(map[string]application.Status, len(apps)),
 		plans:     make(map[string]*charts.Plan, len(apps)),
@@ -188,6 +194,25 @@ func withRegistryAuth(b charts.Backend, auth regauth.Resolver) charts.Backend {
 	}
 	if ab, ok := b.(registryAuthBackend); ok {
 		return ab.WithRegistryAuth(auth)
+	}
+	return b
+}
+
+// forbidSecretsBackend is the optional interface a backend implements to refuse
+// a stack mounting the controller's own secrets. *backend.Backend satisfies it.
+type forbidSecretsBackend interface {
+	WithForbiddenSecrets(map[string]struct{}) charts.Backend
+}
+
+// withForbiddenSecrets scopes a backend to the controller's forbidden secret
+// set. An empty set or a backend that does not support the upgrade leaves it
+// unchanged.
+func withForbiddenSecrets(b charts.Backend, names map[string]struct{}) charts.Backend {
+	if len(names) == 0 {
+		return b
+	}
+	if fb, ok := b.(forbidSecretsBackend); ok {
+		return fb.WithForbiddenSecrets(names)
 	}
 	return b
 }
@@ -298,6 +323,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		return fmt.Errorf("resolving destination: %w", err)
 	}
 	backend = withRegistryAuth(backend, r.regAuth[spec.Name])
+	backend = withForbiddenSecrets(backend, r.forbidden)
 	engine := r.newEngine(backend)
 
 	plan, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{

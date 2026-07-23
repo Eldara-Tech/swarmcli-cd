@@ -61,6 +61,13 @@ type Backend struct {
 	// WithRegistryAuth, never shared: a swarm's backend is reused across
 	// applications, and one application must not pull with another's credential.
 	registryAuth regauth.Resolver
+	// forbiddenSecrets names the secrets mounted into this controller — its own
+	// credentials — that a reconciled stack must not mount. Swarm secrets are
+	// cluster-global and referenced by name, so without this a chart declaring
+	// one of these as an `external` secret would read the controller's admin
+	// token, git token or another application's registry credential. Set
+	// controller-wide by WithForbiddenSecrets; empty disables the check.
+	forbiddenSecrets map[string]struct{}
 	// now stamps the swarmcli.created label; overridable in tests.
 	now func() time.Time
 }

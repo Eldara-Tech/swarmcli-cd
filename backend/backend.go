@@ -5,7 +5,9 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
@@ -41,6 +43,66 @@ func (b *Backend) WithRegistryAuth(auth regauth.Resolver) charts.Backend {
 	return &c
 }
 
+// WithForbiddenSecrets returns a copy of the backend that refuses to deploy a
+// stack mounting any of the named secrets — the controller's own credentials.
+// Controller-wide, not per application, but applied through the same
+// optional-interface upgrade as WithRegistryAuth so the reconciler need not
+// depend on this concrete type.
+func (b *Backend) WithForbiddenSecrets(names map[string]struct{}) charts.Backend {
+	c := *b
+	c.forbiddenSecrets = names
+	return &c
+}
+
+// MountedSecretNames returns the names of the secrets Swarm has mounted into
+// this controller, by listing dir (each secret is a file at /run/secrets/<name>).
+// That set is exactly what a reconciled stack must not be allowed to mount: the
+// admin token, the git token and every registryAuth are the controller's own
+// credentials, and a stack mounting one by an `external` reference would read it.
+//
+// A dir that does not exist yields an empty set and no error: a controller run
+// outside a swarm has no mounted secrets to protect, and must still start.
+func MountedSecretNames(dir string) (map[string]struct{}, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]struct{}{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listing mounted secrets in %s: %w", dir, err)
+	}
+	out := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			out[e.Name()] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// rejectForbiddenSecretMounts refuses a stack whose any service mounts one of
+// the controller's own secrets. The reference resolves by name against the
+// cluster-wide secret store, so the check is a name comparison; a stack's own
+// secrets are namespace-scoped and cannot collide with an unscoped controller
+// name, so only an `external` reference can ever match.
+func (b *Backend) rejectForbiddenSecretMounts(stack *cdcompose.Stack) error {
+	if len(b.forbiddenSecrets) == 0 {
+		return nil
+	}
+	for _, svc := range stack.Services {
+		cs := svc.Spec.TaskTemplate.ContainerSpec
+		if cs == nil {
+			continue
+		}
+		for _, ref := range cs.Secrets {
+			if _, forbidden := b.forbiddenSecrets[ref.SecretName]; forbidden {
+				return fmt.Errorf("service %q mounts secret %q, which is a credential belonging to the "+
+					"controller; a reconciled stack may not mount the controller's own secrets", svc.Name, ref.SecretName)
+			}
+		}
+	}
+	return nil
+}
+
 // DeployStack converges the swarm to a rendered manifest.
 //
 // Order matters and is the same order `docker stack deploy` uses: the things a
@@ -54,6 +116,11 @@ func (b *Backend) DeployStack(name, manifest, resolve string) error {
 
 	stack, err := cdcompose.Convert(ctx, manifest, name, b.api)
 	if err != nil {
+		return err
+	}
+	// Before any resource is created: a stack that mounts one of the controller's
+	// own secrets is refused whole, not half-deployed.
+	if err := b.rejectForbiddenSecretMounts(stack); err != nil {
 		return err
 	}
 	if err := b.applyNetworks(ctx, stack); err != nil {
