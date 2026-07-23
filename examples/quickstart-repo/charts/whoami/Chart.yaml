@@ -1,0 +1,4 @@
+apiVersion: v1
+name: whoami
+version: 0.1.0
+description: A tiny HTTP echo service, for the swarmcli-cd quickstart.

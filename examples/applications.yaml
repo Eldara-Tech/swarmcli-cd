@@ -1,0 +1,67 @@
+# swarmcli-cd applications file — the desired state the controller reconciles.
+#
+# Delivered to the controller as a Docker config (see ../stack.yml):
+#
+#   docker config create swarmcli-cd-applications ./applications.yaml
+#
+# Docker configs are immutable, so changing this file means creating a new
+# config and updating the stack — there is no hot reload, which is why
+# applications are read-only in the API. The full field reference is in
+# ../docs/configuration.md.
+#
+# apiVersion is "v1" (the only version this build reads; absent means the same),
+# mirroring the chart engine's release file so the two read alike.
+apiVersion: v1
+
+applications:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Source type 1 — a release file the repository already contains.
+  #
+  # "edge" points at a swarmcli-release.yaml committed to your repo: the same
+  # file `swarmcli charts apply -f` takes. The controller renders it, plans it
+  # against the swarm, and — because syncPolicy.automated is true — applies it on
+  # a schedule. The release-file format is CE's, documented here:
+  # https://github.com/Eldara-Tech/swarmcli/blob/main/charts/README.md#declarative-releases-gitops
+  #
+  # Do not set `owner:` in that file: swarmcli-cd stamps every release it applies
+  # with its own owner, cd/edge, and ignores the file's — see
+  # ../docs/concepts.md#ownership.
+  - name: edge
+    source:
+      repoURL: https://github.com/your-org/infra.git
+      revision: main                                # branch, tag or SHA — pin it; an unpinned source deploys whatever the branch happens to point at
+      releaseFile: swarm/prod/swarmcli-release.yaml  # path within the repo
+    syncPolicy:
+      automated: true    # reconcile AND apply on a schedule; false = report drift but apply only on an explicit `app sync`
+      interval: 3m        # how often to reconcile this application; omit to use the controller default (3m)
+      wait: true          # block each release until its services converge, and roll back on a failed rollout
+      timeout: 10m        # how long `wait` waits before giving up
+      historyMax: 20      # revisions kept per release (one Docker config each); older ones are pruned
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Source type 2 — one chart, no release file.
+  #
+  # "hello" installs a single chart. swarmcli-cd synthesises the release file
+  # this implies, so the same rules apply: a repository reference (`ref`) must
+  # carry a pinned `version`, and a local chart `path` must not (its Chart.yaml
+  # is its version). Exactly one of releaseFile and chart may be set.
+  - name: hello
+    source:
+      repoURL: https://github.com/your-org/infra.git
+      revision: v1.2.0
+      chart:
+        release: hello                    # the release name to install as
+        ref: swarmcli-charts/whoami       # repository/chart
+        version: "0.1.8"                   # required with a ref — pin it; a floating pin would silently upgrade on the next reconcile
+        values: [values/hello.yaml]        # values files, as paths within the repo (optional)
+        repositories:                      # chart repositories `ref` resolves against
+          - name: swarmcli-charts
+            url: https://eldara-tech.github.io/swarmcli-charts
+        # Instead of ref + version + repositories, a chart committed to the repo:
+        #   path: ./charts/hello           # resolved against the repo root; omit `version`
+    destination:
+      swarm: ""          # "" or omitted = the swarm the controller runs in (the only one the OSS build can resolve)
+    syncPolicy:
+      automated: false   # manual: the controller reports drift but waits for `swarmcli-cd app sync hello` to apply it
+    # driftDetection defaults to "manifest" (compare the rendered manifest to
+    # what was last applied); it is the only mode this build implements.
