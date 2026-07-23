@@ -245,7 +245,13 @@ func applicationsYAML(release, repoDir string) string {
 		// in seconds — the diff and the unapplied-drift state are then real
 		// rather than racing the default three-minute tick.
 		"      automated: false\n" +
-		"      interval: 2s\n"
+		"      interval: 2s\n" +
+		// Wait for convergence before recording the result, so the sync reports
+		// Healthy rather than Progressing: without it apply returns before the
+		// tasks are running, and `app get` right after a sync would be racing
+		// the rollout.
+		"      wait: true\n" +
+		"      timeout: 3m\n"
 }
 
 func writeFile(t *testing.T, path, content string) {
