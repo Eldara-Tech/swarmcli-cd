@@ -18,6 +18,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
+	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
 )
@@ -84,6 +85,29 @@ type stubBackend struct {
 }
 
 func (s stubBackend) StackServices(name string) []charts.ServiceState { return s.states[name] }
+
+// recordingBackend records the scoping the reconciler applies before handing the
+// backend to the engine, through the same optional-interface upgrades
+// *backend.Backend implements. It is how a test proves the forbidden-secret
+// check and the registry resolver are actually wired onto the backend a deploy
+// runs through, not merely that each mechanism works in isolation.
+type recordingBackend struct {
+	charts.Backend
+	forbidden map[string]struct{}
+	auth      regauth.Resolver
+}
+
+func (b recordingBackend) StackServices(string) []charts.ServiceState { return nil }
+
+func (b recordingBackend) WithForbiddenSecrets(names map[string]struct{}) charts.Backend {
+	b.forbidden = names
+	return b
+}
+
+func (b recordingBackend) WithRegistryAuth(auth regauth.Resolver) charts.Backend {
+	b.auth = auth
+	return b
+}
 
 // fakeEngine returns a scripted sequence of plans, so a test can say "out of
 // sync, then synced after the apply".
@@ -233,6 +257,44 @@ func TestSyncedApplicationDeploysNothing(t *testing.T) {
 	}
 	if view.Status.Sync.Revision != strings.Repeat("a", 40) {
 		t.Errorf("revision = %q, want the fetched commit", view.Status.Sync.Revision)
+	}
+}
+
+// The reconciler must apply both the controller-wide forbidden-secret check and
+// the application's registry resolver to the backend the engine deploys through.
+// Every other test injects an engine that ignores the backend it is handed, so
+// only this one would catch a regression that dropped the wiring — which would
+// silently reopen the controller-secret exfiltration (#46) or the private-registry
+// pull failure (#30) while the rest of the suite stayed green.
+func TestReconcileScopesTheBackendItDeploysWith(t *testing.T) {
+	var deployed charts.Backend
+	forbidden := map[string]struct{}{"swarmcli-cd-token": {}}
+	resolver := regauth.Resolver(func(string) (string, error) { return "auth", nil })
+
+	r := New([]application.Spec{spec("edge", true)}, Options{
+		Fetcher:               &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder:               &fakeBuilder{},
+		Swarms:                fakeRegistry{backend: recordingBackend{}},
+		NewEngine:             func(b charts.Backend) Engine { deployed = b; return &fakeEngine{plans: []*charts.Plan{synced()}} },
+		RegistryAuth:          map[string]regauth.Resolver{"edge": resolver},
+		ForbiddenSecretMounts: forbidden,
+		Log:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:                   func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	rb, ok := deployed.(recordingBackend)
+	if !ok {
+		t.Fatalf("engine was handed %T, want a recordingBackend carrying the scoping", deployed)
+	}
+	if rb.forbidden == nil {
+		t.Error("the forbidden-secret set was not applied to the backend the engine deploys with")
+	}
+	if rb.auth == nil {
+		t.Error("the application's registry resolver was not applied to the backend the engine deploys with")
 	}
 }
 
