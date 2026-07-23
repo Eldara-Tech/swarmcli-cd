@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.f.outputs.code }}
+      image: ${{ steps.f.outputs.image }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
@@ -33,6 +34,12 @@ jobs:
               - 'go.mod'
               - 'go.sum'
               - '.golangci.yml'
+              - '.github/workflows/ci.yml'
+            image:
+              - '**.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Dockerfile'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -97,3 +104,47 @@ jobs:
         run: go test -race -count=1 -timeout 5m ./...
       - name: Build
         run: go build -v -o swarmcli-cd ./cmd/swarmcli-cd
+
+  # Builds the image and proves the container runs with no docker binary in it,
+  # which is what makes the moby-client backend worth having. It does not push:
+  # publishing happens on a tag, in release.yml.
+  image:
+    needs: [changes]
+    if: needs.changes.outputs.image == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: swarmcli-cd:ci
+          build-args: |
+            VERSION=ci
+
+      - name: The binary reports both versions
+        run: |
+          out=$(docker run --rm swarmcli-cd:ci version)
+          echo "$out"
+          # An unstamped engine would report "unstamped" here and every chart
+          # compatibility check would silently be Unknown.
+          echo "$out" | grep -q 'chart engine v' || {
+            echo "the chart engine version was not stamped into the image"; exit 1; }
+
+      - name: The image carries no docker binary
+        run: |
+          if docker run --rm --entrypoint sh swarmcli-cd:ci -c 'command -v docker'; then
+            echo "a docker binary is present; the applier does not need one"; exit 1
+          fi
+
+      # The refusal an operator is most likely to meet, and the one that would
+      # otherwise present as an API that rejects every request.
+      - name: The controller refuses to start with no admin token
+        run: |
+          printf 'applications:\n  - name: edge\n    source:\n      repoURL: https://example.com/x.git\n      revision: main\n      releaseFile: r.yaml\n' > applications.yaml
+          out=$(docker run --rm -v "$PWD/applications.yaml:/etc/swarmcli-cd/applications.yaml:ro" swarmcli-cd:ci 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q 'no admin token configured' || {
+            echo "expected it to refuse to start"; exit 1; }

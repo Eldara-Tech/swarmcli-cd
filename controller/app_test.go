@@ -508,3 +508,38 @@ func TestGetRendersAnUnobservedApplication(t *testing.T) {
 		t.Errorf("stdout = %q, want no zero time", stdout)
 	}
 }
+
+func TestHealthcheck(t *testing.T) {
+	server := start(t, &stubReconciler{view: syncedView()})
+
+	code, stdout, stderr := cli(t, server, "healthcheck")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "ok") {
+		t.Errorf("stdout = %q, want ok", stdout)
+	}
+}
+
+// The probe carries no credential, because /healthz takes none: a healthcheck
+// that needed one would have to be given it in the stack file.
+func TestHealthcheckNeedsNoToken(t *testing.T) {
+	server := start(t, &stubReconciler{view: syncedView()})
+	t.Setenv(authz.EnvToken, "")
+
+	if code, _, stderr := cli(t, server, "healthcheck"); code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+}
+
+func TestHealthcheckFailsWhenNothingIsListening(t *testing.T) {
+	// Port 1 on the loopback: nothing binds it, and the connection is refused
+	// immediately rather than hanging.
+	code, _, stderr := cli(t, "http://127.0.0.1:1", "healthcheck", "--timeout", "2s")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if stderr == "" {
+		t.Error("stderr is empty, want the reason")
+	}
+}

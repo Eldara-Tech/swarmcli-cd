@@ -75,6 +75,71 @@ in argv is a token in `ps` and in the shell history.
 
 Run `swarmcli-cd controller --help` or `swarmcli-cd app help` for the rest.
 
+## Deploying it
+
+Per D2 the controller runs **in the swarm, on a manager node**, and reaches the
+daemon through the mounted socket. The image carries no docker binary: the
+applier is built on the moby client rather than shelling out to `docker stack
+deploy`, which is also why it can diff, prune and roll back things that command
+cannot.
+
+```bash
+docker config create swarmcli-cd-applications ./applications.yaml
+printf '%s' "$(openssl rand -hex 32)" | docker secret create swarmcli-cd-token -
+docker stack deploy -c stack.yml swarmcli-cd
+```
+
+Both a config and a secret are immutable in Swarm, so changing either means
+creating a new one and updating `stack.yml`. That is why applications are
+read-only in the API: there is nothing to hot-reload into.
+
+`stack.yml` **does not publish the API port.** The controller holds
+root-equivalent access to the swarm behind one shared bearer token over
+plaintext HTTP, so publishing it on a node with a public address puts the swarm
+on the internet. Reach it from inside the swarm, or tunnel:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 manager
+```
+
+### Configuration
+
+The controller takes flags; credentials come from the environment, because they
+arrive as Docker secrets and a flag would put them in `docker service inspect`
+output and in argv.
+
+| Flag | Default | |
+|---|---|---|
+| `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config |
+| `--listen` | `:8080` | API listen address |
+| `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume |
+
+| Environment | |
+|---|---|
+| `SWARMCLI_CD_ADMIN_TOKEN_FILE` | API admin token, read from a file — the Docker-secret form |
+| `SWARMCLI_CD_ADMIN_TOKEN` | API admin token, given directly |
+| `SWARMCLI_CD_GIT_USERNAME` | git username; forges usually ignore it, GitHub wants it non-empty |
+| `SWARMCLI_CD_GIT_TOKEN_FILE` | git password or token, read from a file |
+| `SWARMCLI_CD_GIT_TOKEN` | git password or token, given directly |
+| `SWARMCLI_CD_SERVER` | for the client commands: which controller to talk to |
+
+The controller **refuses to start** when no admin token is configured. An
+authorizer that merely rejected every request would be indistinguishable, from
+the outside, from a wrong token.
+
+### Chart compatibility
+
+A chart may declare the engine it needs (`swarmcliVersion: ">= 1.13.0"` in
+`Chart.yaml`). The controller **refuses to apply** a plan containing a release
+this build's chart engine is too old for, and records why on the application's
+status — releases that would be unchanged are exempt, since applying will not
+touch them. There is no operator to ask, and the alternative is a failure
+minutes later inside the render, naming whatever feature happened to be missing.
+
+The engine version is stamped into the image from the swarmcli release this
+module pins. A plain `go build` leaves it empty, and every compatibility check
+then reports Unknown rather than blocking.
+
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE).

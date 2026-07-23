@@ -844,3 +844,89 @@ func TestHistoryBeforeAnyReconcile(t *testing.T) {
 		t.Error("History of an unknown application = nil, want an error")
 	}
 }
+
+// An unattended reconciler has no operator to ask, so a chart declaring an
+// engine floor this build does not meet is refused rather than deployed. The
+// alternative is a failure minutes later, inside Render, naming whatever
+// feature happened to be missing.
+func TestIncompatibleChartIsRefusedBeforeApplying(t *testing.T) {
+	rec := listen(t)
+	engine := &fakeEngine{plans: []*charts.Plan{incompatible()}}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	err := r.Sync(context.Background(), "edge")
+	if err == nil {
+		t.Fatal("Sync = nil, want a refusal")
+	}
+	if !strings.Contains(err.Error(), ">= 1.14.0") {
+		t.Errorf("Sync = %v, want the error to name what the chart requires", err)
+	}
+	if engine.applyCount() != 0 {
+		t.Errorf("applied %d times, want 0 — the plan was gated before converging any of it", engine.applyCount())
+	}
+	// The plan is still recorded: an operator needs to see the drift that is
+	// not being applied, and why.
+	view, _ := r.View("edge")
+	if view.Status.Sync.State != application.SyncOutOfSync {
+		t.Errorf("state = %q, want out-of-sync", view.Status.Sync.State)
+	}
+	if got := rec.types(); len(got) != 1 || got[0] != notify.DriftDetected {
+		t.Errorf("events = %v, want drift only — nothing was synced", got)
+	}
+}
+
+// The gate is per release and skips the ones apply would not touch: a release
+// already deployed is not made unrunnable by a constraint it never satisfied.
+func TestUnchangedIncompatibleReleaseDoesNotBlockTheRest(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "old", Action: charts.ActionUnchanged, Compat: charts.CompatFinding{
+			Status: charts.CompatIncompatible, Chart: "old 1.0.0", Required: ">= 1.14.0", Engine: "1.13.0",
+		}},
+		{Name: "whoami", Ref: "repo/whoami", Action: charts.ActionUpgrade, ToVersion: "0.1.8",
+			CurrentManifest: "replicas: 1\n", Manifest: "replicas: 3\n"},
+	}}
+	engine := &fakeEngine{plans: []*charts.Plan{plan, synced()}}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if engine.applyCount() != 1 {
+		t.Errorf("applied %d times, want 1", engine.applyCount())
+	}
+}
+
+func incompatible() *charts.Plan {
+	plan := outOfSync()
+	plan.Releases[0].Compat = charts.CompatFinding{
+		Status:   charts.CompatIncompatible,
+		Chart:    "whoami 0.1.8",
+		Required: ">= 1.14.0",
+		Engine:   "1.13.0",
+	}
+	return plan
+}
+
+// The image stamps the chart engine with the swarmcli version go.mod pins, and
+// that pin is a pseudo-version whenever this module tracks a commit rather than
+// a tag. SemVer constraints exclude prereleases, so ">= 1.13.0" would reject
+// "v1.13.0-rc4.0.20260722094010-8b65cf951c7e" — and every chart declaring a
+// floor would be refused by the gate above for a cosmetic reason.
+//
+// charts.coreVersion drops the prerelease, which is what makes the stamped
+// pseudo-version usable. This is a contract test against that behaviour: if it
+// ever changes, the controller starts refusing every chart that declares a
+// version, and it would otherwise be found in production.
+func TestPseudoVersionPinSatisfiesAChartsFloor(t *testing.T) {
+	pinned := "v1.13.0-rc4.0.20260722094010-8b65cf951c7e"
+
+	got := charts.CheckCompatAgainst(charts.Chartfile{
+		Name:            "whoami",
+		Version:         "0.1.8",
+		SwarmcliVersion: ">= 1.13.0",
+	}, pinned)
+
+	if got.Status != charts.CompatOK {
+		t.Errorf("CheckCompatAgainst(%q) = %v (%s), want CompatOK", pinned, got.Status, got.Reason)
+	}
+}
