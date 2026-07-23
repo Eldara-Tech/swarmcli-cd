@@ -598,24 +598,47 @@ func TestViewsAreInDeclarationOrder(t *testing.T) {
 	}
 }
 
-// A destination the registry cannot resolve is a startup error, not a
-// per-application failure discovered three minutes later.
-func TestRunRejectsAnUnresolvableDestination(t *testing.T) {
-	r := New([]application.Spec{spec("edge", true)}, Options{
-		Fetcher:   &fakeFetcher{},
+// A destination the swarm registry cannot resolve fails only its own
+// application, surfaced on that application's status. It is no longer fatal to
+// Run: a sibling with a good destination keeps reconciling and the controller
+// stays up, rather than a single typo taking the whole loop down.
+func TestBadDestinationFailsOnlyItsOwnApplication(t *testing.T) {
+	broken := spec("broken", true)
+	broken.Destination.Swarm = "nope"
+	healthy := spec("healthy", true)
+	healthy.Destination.Swarm = "local"
+
+	fetcher := &fakeFetcher{revision: strings.Repeat("a", 40)}
+	r := New([]application.Spec{broken, healthy}, Options{
+		Fetcher:   fetcher,
 		Builder:   &fakeBuilder{},
-		Swarms:    fakeRegistry{err: errors.New("unknown swarm")},
+		Swarms:    swarmRouter{"local": stubBackend{}},
 		NewEngine: func(charts.Backend) Engine { return &fakeEngine{plans: []*charts.Plan{synced()}} },
-		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Interval:  time.Millisecond,
+		Log:       discardLog(),
+		Now:       func() time.Time { return time.Unix(0, 0).UTC() },
 	})
 
-	err := r.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "destination") {
-		t.Errorf("Run = %v, want a destination error", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	// The bad-destination application surfaces its own error...
+	waitFor(t, "the broken application to record its destination error", func() bool {
+		v, ok := r.View("broken")
+		return ok && strings.Contains(v.Status.Error, "destination")
+	})
+	// ...while Run has not returned and the sibling reconciles to synced.
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned %v; a bad destination must not stop the controller", err)
+	default:
 	}
-	if !strings.Contains(err.Error(), "edge") {
-		t.Errorf("error %q does not name the application", err)
-	}
+	waitFor(t, "the healthy sibling to reconcile despite the failure", func() bool {
+		v, ok := r.View("healthy")
+		return ok && v.Status.Sync.State == application.SyncSynced
+	})
 }
 
 func TestRunReconcilesRepeatedlyAndStops(t *testing.T) {
@@ -990,5 +1013,248 @@ func TestPseudoVersionPinSatisfiesAChartsFloor(t *testing.T) {
 
 	if got.Status != charts.CompatOK {
 		t.Errorf("CheckCompatAgainst(%q) = %v (%s), want CompatOK", pinned, got.Status, got.Reason)
+	}
+}
+
+// ---------------------------------------------------------------- dynamic set
+
+// An application added while the controller runs starts reconciling under the
+// same supervision as the ones it started with.
+func TestAddStartsReconcilingAtRuntime(t *testing.T) {
+	fetcher := &fakeFetcher{revision: strings.Repeat("a", 40)}
+	r := New(nil, Options{
+		Fetcher:   fetcher,
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{},
+		NewEngine: func(charts.Backend) Engine { return &fakeEngine{plans: []*charts.Plan{synced()}} },
+		Interval:  time.Millisecond,
+		Log:       discardLog(),
+		Now:       func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+
+	if err := r.Add(spec("edge", true)); err != nil {
+		t.Fatalf("Add = %v", err)
+	}
+	waitFor(t, "the added application to reconcile to synced", func() bool {
+		v, ok := r.View("edge")
+		return ok && v.Status.Sync.State == application.SyncSynced
+	})
+	if fetcher.count() == 0 {
+		t.Error("the added application never fetched")
+	}
+}
+
+// Remove stops the loop before it returns and drops what was observed, so a
+// removed application no longer reconciles and is gone from the set.
+func TestRemoveCancelsTheLoopAndDropsTheApp(t *testing.T) {
+	fetcher := &fakeFetcher{revision: strings.Repeat("a", 40)}
+	r := New([]application.Spec{spec("edge", true)}, Options{
+		Fetcher:   fetcher,
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{},
+		NewEngine: func(charts.Backend) Engine { return &fakeEngine{plans: []*charts.Plan{synced()}} },
+		Interval:  time.Millisecond,
+		Log:       discardLog(),
+		Now:       func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+	waitFor(t, "the loop to reconcile at least twice", func() bool { return fetcher.count() >= 2 })
+
+	if err := r.Remove("edge"); err != nil {
+		t.Fatalf("Remove = %v", err)
+	}
+
+	// Remove drained the loop synchronously: no further reconcile may happen
+	// once it has returned, which is what makes the absence of a leak testable.
+	after := fetcher.count()
+	time.Sleep(20 * time.Millisecond)
+	if got := fetcher.count(); got != after {
+		t.Errorf("the loop reconciled %d more times after Remove; it was not stopped", got-after)
+	}
+	if _, ok := r.View("edge"); ok {
+		t.Error("a removed application is still in the set")
+	}
+	if got := r.Views(); len(got) != 0 {
+		t.Errorf("Views lists %d applications after removing the only one", len(got))
+	}
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Error("Sync of a removed application = nil, want an error")
+	}
+}
+
+// Replace swaps the spec a running loop reconciles against and keeps the
+// recorded status: the next tick reads the new spec, and the loop is retuned
+// rather than restarted (a remove+add would reset the status to unknown).
+func TestReplaceIsObservedNextTickWithoutResettingStatus(t *testing.T) {
+	fetcher := &specFetcher{}
+	r := New([]application.Spec{spec("edge", false)}, Options{
+		Fetcher:   fetcher,
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{},
+		NewEngine: func(charts.Backend) Engine { return &fakeEngine{plans: []*charts.Plan{synced()}} },
+		Interval:  time.Millisecond,
+		Log:       discardLog(),
+		Now:       func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+
+	waitFor(t, "the first reconcile against the original source", func() bool {
+		return fetcher.lastURL() == "https://example.com/x.git"
+	})
+	waitFor(t, "a recorded status", func() bool {
+		v, ok := r.View("edge")
+		return ok && v.Status.Sync.State != application.SyncUnknown
+	})
+
+	next := spec("edge", false)
+	next.Source.RepoURL = "https://example.com/replaced.git"
+	if err := r.Replace(next); err != nil {
+		t.Fatalf("Replace = %v", err)
+	}
+
+	// The swap kept the observed status rather than resetting it to unknown,
+	// which is what a remove+add would have done.
+	if v, _ := r.View("edge"); v.Status.Sync.State == application.SyncUnknown {
+		t.Error("Replace reset the observed status; it should swap the spec in place")
+	}
+
+	waitFor(t, "the loop to reconcile against the replaced source", func() bool {
+		return fetcher.lastURL() == "https://example.com/replaced.git"
+	})
+	if v, _ := r.View("edge"); v.Spec.Source.RepoURL != "https://example.com/replaced.git" {
+		t.Error("View does not show the replaced spec")
+	}
+}
+
+// The lifecycle operations are strict: the caller driving them from a git diff
+// tells add from replace itself, so an add of an existing application or a
+// replace/remove of an absent one is a mistake worth reporting. Order is kept.
+func TestLifecycleErrorsOnWrongPrecondition(t *testing.T) {
+	r := newTest(t, []application.Spec{spec("edge", true)}, &fakeEngine{plans: []*charts.Plan{synced()}}, nil)
+
+	if err := r.Add(spec("edge", true)); err == nil {
+		t.Error("Add of an existing application = nil, want an error")
+	}
+	if err := r.Replace(spec("ghost", true)); err == nil {
+		t.Error("Replace of an absent application = nil, want an error")
+	}
+	if err := r.Remove("ghost"); err == nil {
+		t.Error("Remove of an absent application = nil, want an error")
+	}
+
+	if err := r.Add(spec("edge2", true)); err != nil {
+		t.Fatalf("Add = %v", err)
+	}
+	if got := r.Views(); len(got) != 2 || got[0].Spec.Name != "edge" || got[1].Spec.Name != "edge2" {
+		t.Errorf("views = %+v, want [edge edge2] in declaration order", got)
+	}
+
+	if err := r.Remove("edge"); err != nil {
+		t.Fatalf("Remove = %v", err)
+	}
+	if got := r.Views(); len(got) != 1 || got[0].Spec.Name != "edge2" {
+		t.Errorf("views = %+v, want [edge2] after removing edge", got)
+	}
+}
+
+// The set mutates while it is read and synced from other goroutines. This is
+// the race the dynamic reconciler exists to make safe; it earns its keep under
+// the race detector (CI runs go test -race).
+func TestConcurrentMutationAndReadsAreRaceFree(t *testing.T) {
+	r := New([]application.Spec{spec("seed", true)}, Options{
+		Fetcher:   &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{},
+		NewEngine: func(charts.Backend) Engine { return &fakeEngine{plans: []*charts.Plan{synced()}} },
+		Interval:  time.Millisecond,
+		Log:       discardLog(),
+		Now:       func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() { _ = r.Run(ctx); close(runDone) }()
+
+	// Each goroutine owns a distinct name, so its own add/replace/remove
+	// sequence is well-formed while it races the others' reads and the seed
+	// application's loop.
+	var wg sync.WaitGroup
+	for _, name := range []string{"a", "b", "c", "d"} {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			for range 40 {
+				_ = r.Add(spec(name, true))
+				_ = r.Sync(context.Background(), name)
+				_ = r.Views()
+				_, _ = r.View(name)
+				_ = r.Replace(spec(name, false))
+				_, _ = r.Diffs(name)
+				_ = r.Remove(name)
+			}
+		}(name)
+	}
+	wg.Wait()
+
+	cancel()
+	<-runDone
+}
+
+// ---------------------------------------------------------------- dynamic-set fakes
+
+// swarmRouter resolves a backend per swarm name and fails any it does not know,
+// so a test can give one application a good destination and another a bad one.
+type swarmRouter map[string]charts.Backend
+
+func (s swarmRouter) Backend(_ context.Context, name string) (charts.Backend, error) {
+	if b, ok := s[name]; ok {
+		return b, nil
+	}
+	return nil, errors.New("unknown swarm")
+}
+
+// specFetcher records the source URL of the most recent fetch, so a test can
+// observe which spec a running loop is reconciling against.
+type specFetcher struct {
+	mu   sync.Mutex
+	last string
+}
+
+func (f *specFetcher) Fetch(_ context.Context, _ string, src application.Source) (git.Checkout, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.last = src.RepoURL
+	return git.Checkout{Revision: strings.Repeat("a", 40)}, nil
+}
+
+func (f *specFetcher) lastURL() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.last
+}
+
+func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// waitFor polls cond until it holds or two seconds pass, so a test can wait on a
+// running loop without a fixed sleep.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if cond() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		default:
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
