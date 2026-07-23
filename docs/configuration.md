@@ -115,6 +115,42 @@ symlink is refused again at render time — repository content is not trusted th
 way your own configuration is, and a values file pointing at `/run/secrets` would
 otherwise be read and merged into a manifest.
 
+### `registryAuth` (optional)
+
+```yaml
+registryAuth: swarmcli-cd-regauth-edge
+```
+
+Names a Docker secret holding a docker `config.json` (`{"auths": {…}}`) — the
+same file `docker login` writes — for the private registries this application's
+images come from. Without it, the controller pulls anonymously and a private
+image fails as a convergence timeout with a pull error.
+
+It is **per application, and that is the isolation**: the controller uses only
+the secret an application names, so one application cannot pull another's private
+images even though every application's credential is mounted in the same
+controller. Two applications that share a registry may name the same secret.
+
+The value is a **secret name**, not a path: the secret must be mounted at the
+default `/run/secrets/<name>`, which the short form `secrets: [<name>]` in
+[stack.yml](../stack.yml) does. Create it from a login and mount it:
+
+```sh
+docker --config /tmp/rc login ghcr.io -u <user> -p <pat>
+docker secret create swarmcli-cd-regauth-edge /tmp/rc/config.json
+# then add swarmcli-cd-regauth-edge to the controller's secrets in stack.yml
+```
+
+The credential reaches the swarm only for the pull: it is stored encrypted in
+the raft log and is never injected into a deployed container or returned by
+`docker service inspect`.
+
+**Static credentials only.** The controller image ships no docker credential
+helpers, so a `config.json` using `credsStore` or `credHelpers` is refused at
+startup. Registries with static credentials (Docker Hub, GHCR, Harbor, GitLab,
+self-hosted) work; short-lived cloud-registry tokens (ECR, GCR) are not
+refreshed and must be rotated out of band for now.
+
 ### `destination` (optional)
 
 ```yaml

@@ -202,6 +202,73 @@ func TestUpdatesServicesThatExist(t *testing.T) {
 	}
 }
 
+func TestCreateSendsRegistryAuth(t *testing.T) {
+	api := &fakeAPI{}
+	b := testBackend(t, api, nil)
+	b.registryAuth = func(image string) (string, error) { return "auth:" + image, nil }
+	st := stack("s", cdService{"web", spec("ghcr.io/team/app:1")})
+
+	if err := b.ApplyServices(context.Background(), st, ResolveAlways); err != nil {
+		t.Fatalf("ApplyServices = %v, want nil", err)
+	}
+	if got, want := api.createOpt[0].EncodedRegistryAuth, "auth:ghcr.io/team/app:1"; got != want {
+		t.Errorf("EncodedRegistryAuth = %q, want %q", got, want)
+	}
+}
+
+func TestUpdateSendsRegistryAuth(t *testing.T) {
+	api := &fakeAPI{existing: []swarm.Service{deployed("s_web", "ghcr.io/team/app:1", "ghcr.io/team/app:1", 4)}}
+	b := testBackend(t, api, nil)
+	b.registryAuth = func(image string) (string, error) { return "auth:" + image, nil }
+	st := stack("s", cdService{"web", spec("ghcr.io/team/app:2")})
+
+	if err := b.ApplyServices(context.Background(), st, ResolveNever); err != nil {
+		t.Fatalf("ApplyServices = %v, want nil", err)
+	}
+	if got, want := api.updated[0].opts.EncodedRegistryAuth, "auth:ghcr.io/team/app:2"; got != want {
+		t.Errorf("EncodedRegistryAuth = %q, want %q", got, want)
+	}
+}
+
+// An application that declared no registryAuth pulls anonymously, exactly as
+// before this backend authenticated at all.
+func TestNoResolverSendsNoAuth(t *testing.T) {
+	api := &fakeAPI{}
+	st := stack("s", cdService{"web", spec("nginx")})
+
+	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveAlways); err != nil {
+		t.Fatalf("ApplyServices = %v, want nil", err)
+	}
+	if got := api.createOpt[0].EncodedRegistryAuth; got != "" {
+		t.Errorf("EncodedRegistryAuth = %q, want empty", got)
+	}
+}
+
+// The isolation property in one test: WithRegistryAuth scopes the credential to
+// a copy and leaves the shared per-swarm backend anonymous, so one application's
+// resolver cannot leak onto another's deploy through the backend they share.
+func TestWithRegistryAuthLeavesTheSharedBackendAnonymous(t *testing.T) {
+	api := &fakeAPI{}
+	shared := testBackend(t, api, nil)
+
+	scoped, ok := shared.WithRegistryAuth(func(image string) (string, error) { return "auth:" + image, nil }).(*Backend)
+	if !ok {
+		t.Fatal("WithRegistryAuth did not return a *Backend")
+	}
+	if shared.registryAuth != nil {
+		t.Error("WithRegistryAuth mutated the shared backend; a per-swarm backend must stay anonymous")
+	}
+
+	// The copy shares the client, so applying through it still reaches the fake.
+	st := stack("s", cdService{"web", spec("ghcr.io/team/app:1")})
+	if err := scoped.ApplyServices(context.Background(), st, ResolveAlways); err != nil {
+		t.Fatalf("ApplyServices = %v, want nil", err)
+	}
+	if got := api.createOpt[0].EncodedRegistryAuth; got != "auth:ghcr.io/team/app:1" {
+		t.Errorf("scoped copy sent %q, want the resolved auth", got)
+	}
+}
+
 // A service on the swarm that the manifest no longer declares is left alone.
 // Phase 1 is explicitly no prune, and the fake panics on any delete call.
 func TestNothingIsDeleted(t *testing.T) {

@@ -135,6 +135,8 @@ func TestValidationErrors(t *testing.T) {
 		"negative history":   {base("      releaseFile: r.yaml\n    syncPolicy: {historyMax: -1}\n"), "historyMax cannot be negative"},
 		"negative interval":  {base("      releaseFile: r.yaml\n    syncPolicy: {interval: -5s}\n"), "cannot be negative"},
 		"unknown drift":      {base("      releaseFile: r.yaml\n    driftDetection: live\n"), "unsupported driftDetection"},
+		"slash regauth":      {base("      releaseFile: r.yaml\n    registryAuth: \"has/slash\"\n"), "invalid registryAuth"},
+		"traversal regauth":  {base("      releaseFile: r.yaml\n    registryAuth: \"..\"\n"), "invalid registryAuth"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Parse([]byte(tc.src), "applications.yaml")
@@ -148,6 +150,22 @@ func TestValidationErrors(t *testing.T) {
 				t.Errorf("error %q does not name the file", err)
 			}
 		})
+	}
+}
+
+func TestValidRegistryAuthAccepted(t *testing.T) {
+	const src = `
+applications:
+  - name: edge
+    registryAuth: swarmcli-cd-regauth-edge
+    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}
+`
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if got := f.Applications[0].RegistryAuth; got != "swarmcli-cd-regauth-edge" {
+		t.Errorf("RegistryAuth = %q, want swarmcli-cd-regauth-edge", got)
 	}
 }
 

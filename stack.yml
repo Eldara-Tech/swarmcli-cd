@@ -50,6 +50,17 @@ services:
       # the forge, but GitHub wants a non-empty one.
       # SWARMCLI_CD_GIT_USERNAME: x-access-token
       # SWARMCLI_CD_GIT_TOKEN_FILE: /run/secrets/swarmcli-cd-git-token
+      #
+      # Private image registries are per application, not here: an application's
+      # `registryAuth:` in applications.yaml names a Docker secret holding a
+      # docker config.json, and that secret is mounted into this controller
+      # under `secrets:` below. One application uses only the secret it names,
+      # so it cannot pull another's private images. Create it from a login:
+      #   docker --config /tmp/rc login ghcr.io -u <user> -p <pat>
+      #   docker secret create swarmcli-cd-regauth-team-a /tmp/rc/config.json
+      # Static credentials only: the image ships no credential helpers, so a
+      # config.json using credsStore/credHelpers is refused at startup, and
+      # short-lived ECR/GCR tokens must be refreshed out of band.
 
     # The API is deliberately not published. It holds root-equivalent access to
     # the swarm behind a single shared bearer token over plaintext HTTP, so
@@ -67,6 +78,10 @@ services:
         target: /etc/swarmcli-cd/applications.yaml
     secrets:
       - swarmcli-cd-token
+      # One per application that pulls from a private registry. The name must
+      # match that application's `registryAuth:`, and the default mount path
+      # /run/secrets/<name> is where the controller reads it.
+      # - swarmcli-cd-regauth-team-a
 
 configs:
   swarmcli-cd-applications:
@@ -75,6 +90,8 @@ configs:
 secrets:
   swarmcli-cd-token:
     external: true
+  # swarmcli-cd-regauth-team-a:
+  #   external: true
 
 volumes:
   swarmcli-cd-data:
