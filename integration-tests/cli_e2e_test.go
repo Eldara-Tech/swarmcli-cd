@@ -26,6 +26,13 @@ import (
 //
 // It is the manual smoke test made automatic. Everything it asserts a human
 // would otherwise have to check by hand before a release.
+//
+// Deploys are driven explicitly, one at a time, against the default reconcile
+// interval. That is deliberate: a fast background loop races `app sync --wait`
+// (a periodic reconcile advances ObservedAt with an intermediate status, so the
+// wait returns on that rather than on the apply). The one reconcile that fires
+// at startup is enough to exercise a real, pending diff; the drift-without-apply
+// nuance is covered precisely by TestDriftIsDetectedAndSynced.
 func TestCLIEndToEnd(t *testing.T) {
 	cli := dockerClient(t) // skips unless the daemon is a swarm manager
 	bin := buildBinary(t)
@@ -56,8 +63,17 @@ func TestCLIEndToEnd(t *testing.T) {
 		t.Errorf("app list with a wrong token = 0, want a rejection (stdout %q)", r.stdout)
 	}
 
+	// The reconcile that fires at startup plans an install and applies nothing
+	// (the application is manual), so the diff shows a real pending change and
+	// the swarm is still empty. This is the diff-shows-a-change assertion.
+	waitForDiff(t, run, release, "install", ctl)
+	if got := runningReplicas(t, cli, release); got != 0 {
+		t.Errorf("running replicas = %d before any sync, want 0 (a manual app must not self-deploy)", got)
+	}
+
 	// The deploy, and the assertion that it actually ran: `--wait` returns 0
-	// only once the swarm has converged.
+	// only once the swarm has converged (the fixture waits, so the recorded
+	// state is Healthy rather than a mid-rollout Progressing).
 	if r := run("app", "sync", release, "--wait", "--timeout", "3m"); r.code != 0 {
 		t.Fatalf("app sync --wait: code=%d stderr=%q\n%s", r.code, r.stderr, ctl.log())
 	}
@@ -66,25 +82,23 @@ func TestCLIEndToEnd(t *testing.T) {
 	if r := run("app", "get", release); !containsFold(r.stdout, "synced") || !containsFold(r.stdout, "healthy") {
 		t.Errorf("app get did not report synced+healthy:\n%s", r.stdout)
 	}
+	// Once converged the diff is empty, which is a different answer from "not
+	// reconciled yet" and worth confirming the CLI renders.
+	if r := run("app", "diff", release); r.code != 0 || !containsFold(r.stdout, "no changes") {
+		t.Errorf("app diff on a synced app: code=%d stdout=%q", r.code, r.stdout)
+	}
 
-	// Drift, both directions. Move the desired state to two replicas and let the
-	// loop notice — a manual application plans but does not apply, so the state
-	// goes out-of-sync with the change unapplied.
+	// A new commit, driven to the swarm through the CLI: the service scales.
 	commitChange(t, repo, chartFiles(release, 2))
-	waitForSyncState(t, run, release, "out-of-sync", ctl)
-	if got := runningReplicas(t, cli, release); got != 1 {
-		t.Errorf("running replicas = %d while drift is only detected, want the change unapplied at 1", got)
-	}
-
-	// The diff shows the pending upgrade...
-	if r := run("app", "diff", release); r.code != 0 || !containsFold(r.stdout, "upgrade") {
-		t.Errorf("app diff did not show the pending upgrade: code=%d stdout=%q", r.code, r.stdout)
-	}
-	// ...and the explicit sync applies it and converges.
 	if r := run("app", "sync", release, "--wait", "--timeout", "3m"); r.code != 0 {
 		t.Fatalf("second app sync --wait: code=%d stderr=%q\n%s", r.code, r.stderr, ctl.log())
 	}
 	waitForRunning(t, cli, release, 2)
+
+	// History now has both revisions.
+	if r := run("app", "history", release); r.code != 0 || !strings.Contains(r.stdout, release) || !strings.Contains(r.stdout, "2") {
+		t.Errorf("app history did not show both revisions: code=%d stdout=%q", r.code, r.stdout)
+	}
 
 	// The clean-shutdown assertion is in ctl's cleanup: SIGTERM must exit 0, or
 	// every rollout under Swarm becomes a restart loop.
@@ -154,8 +168,7 @@ func startController(t *testing.T, bin, configPath, dataDir, addr, token string)
 			return // already gone (a test that killed it, or a crash)
 		}
 		_ = cmd.Process.Signal(syscall.SIGTERM)
-		err := cmd.Wait()
-		if err != nil {
+		if err := cmd.Wait(); err != nil {
 			t.Errorf("controller did not exit cleanly on SIGTERM: %v\n%s", err, c.log())
 		}
 	})
@@ -240,16 +253,10 @@ func applicationsYAML(release, repoDir string) string {
 		"      revision: " + branch + "\n" +
 		"      releaseFile: swarmcli-release.yaml\n" +
 		"    syncPolicy:\n" +
-		// Manual: the loop plans on every tick but never applies, so the test
-		// drives the deploys itself. A short interval so a commit is re-planned
-		// in seconds — the diff and the unapplied-drift state are then real
-		// rather than racing the default three-minute tick.
+		// Manual, and the default interval: the test drives every deploy itself,
+		// and a fast loop would race `app sync --wait`. Wait for convergence so a
+		// sync records Healthy rather than a mid-rollout Progressing.
 		"      automated: false\n" +
-		"      interval: 2s\n" +
-		// Wait for convergence before recording the result, so the sync reports
-		// Healthy rather than Progressing: without it apply returns before the
-		// tasks are running, and `app get` right after a sync would be racing
-		// the rollout.
 		"      wait: true\n" +
 		"      timeout: 3m\n"
 }
@@ -265,19 +272,18 @@ func containsFold(haystack, needle string) bool {
 	return strings.Contains(strings.ToLower(haystack), strings.ToLower(needle))
 }
 
-// waitForSyncState polls `app get` until the reported sync state contains want,
-// so a test can wait for the background loop to observe a change rather than
-// racing it. The reconcile interval is seconds, so this settles quickly.
-func waitForSyncState(t *testing.T, run func(...string) cliResult, release, want string, ctl *controller) {
+// waitForDiff polls `app diff` until it reports a change containing want, so the
+// test waits for the startup reconcile to produce a plan rather than racing it.
+func waitForDiff(t *testing.T, run func(...string) cliResult, release, want string, ctl *controller) {
 	t.Helper()
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
-		r := run("app", "get", release)
+		r := run("app", "diff", release)
 		if r.code == 0 && containsFold(r.stdout, want) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("application never reached sync state %q\nlast:\n%s%s", want, r.stdout, ctl.log())
+			t.Fatalf("app diff never showed %q\nlast:\n%s%s", want, r.stdout, ctl.log())
 		}
 		time.Sleep(time.Second)
 	}
