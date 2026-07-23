@@ -1,0 +1,70 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: read-all
+
+concurrency:
+  group: integration-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Gate the pipeline on a paths-filter OUTPUT, not a workflow-level path filter.
+  # A path-filtered workflow never starts, so a required check would stay pending
+  # forever and a doc-only PR would deadlock; a job skipped on this output still
+  # publishes a "skipped" status that branch protection accepts.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      integration: ${{ steps.f.outputs.integration }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: f
+        with:
+          filters: |
+            integration:
+              - '**.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'integration-tests/**'
+              - '.github/workflows/integration-tests.yml'
+
+  integration:
+    needs: [changes]
+    if: needs.changes.outputs.integration == 'true'
+    name: Run integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # A single node is enough: the OSS build resolves exactly one swarm, the
+      # one it runs in. Directly on the runner's Docker, not nested in a shared
+      # DinD container — CE learned that a nested swarm silently shadows the real
+      # topology, and there is only one node to shadow here anyway.
+      - name: Initialise a single-node swarm
+        run: docker swarm init --advertise-addr 127.0.0.1
+
+      - name: Verify Docker and Go
+        run: |
+          docker version
+          docker node ls
+          go version
+
+      # Pre-pull the fixture image so the first deploy's convergence wait is not
+      # racing a cold pull on a slow runner.
+      - name: Pre-pull the fixture image
+        run: docker pull busybox:1.36
+
+      - name: Run the integration tests
+        run: go test -tags=integration -count=1 -v -timeout=15m ./integration-tests/...
