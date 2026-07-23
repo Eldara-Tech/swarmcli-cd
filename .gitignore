@@ -14,4 +14,12 @@ dist/
 .vscode/
 .idea/
 
+# Devcontainer metadata
+.devcontainer/*.log
+.devcontainer/devcontainer.local.json
+.devcontainer/certs/*.pem
+.devcontainer/certs/*.crt
+.devcontainer/certs/corporate-proxy.crt
+.devcontainer/shared/*
+
 debug.log
