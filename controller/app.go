@@ -406,18 +406,21 @@ func reportSync(out io.Writer, app string, before, after application.Status) err
 	return nil
 }
 
-// awaitSync polls until the controller has observed the application again.
+// awaitSync polls until the controller reaches a terminal state for the sync.
 //
-// ObservedAt is the completion signal rather than LastSync because a sync that
-// fails before it deploys — an unreachable repository, a chart that will not
-// render — never records a SyncResult at all, and neither does one that finds
-// nothing to deploy. Waiting on LastSync would sit through the full timeout for
-// both, and report a failure that had already happened as a timeout.
+// A reconcile records twice: it records the plan before applying it — which
+// advances ObservedAt with the still-out-of-sync state and no result — and then
+// records the outcome after the apply. Waiting on ObservedAt alone returns on
+// that first record, mid-deploy, reporting the rollout as already finished. So
+// the wait keys on what the two later records actually set:
 //
-// It is the controller's own clock on both sides of the comparison. The cost is
-// that a periodic reconcile landing between the read and the request is
-// indistinguishable from the requested one; it is the same application against
-// the same desired state, and the default interval is three minutes.
+//   - an error, from a sync that failed before it could deploy;
+//   - a new SyncResult, from an apply that ran (whether it succeeded or not);
+//   - a Synced state with neither, from a sync that found nothing to deploy.
+//
+// The out-of-sync pre-apply record is none of these, so the wait sits through
+// it — which is the whole point. ObservedAt still gates the check, so a poll
+// that races ahead of the controller's first record does not conclude early.
 func awaitSync(ctx context.Context, c *client.Client, app string, before application.Status, timeout time.Duration) (application.Status, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -438,8 +441,8 @@ func awaitSync(ctx context.Context, c *client.Client, app string, before applica
 			}
 			return application.Status{}, err
 		}
-		if view.Status.ObservedAt.After(before.ObservedAt) {
-			return view.Status, nil
+		if s := view.Status; s.ObservedAt.After(before.ObservedAt) && terminal(before, s) {
+			return s, nil
 		}
 
 		select {
@@ -450,8 +453,22 @@ func awaitSync(ctx context.Context, c *client.Client, app string, before applica
 	}
 }
 
-// changed reports whether last is a different sync result from before.
+// terminal reports whether after is a state the sync will not move on from: it
+// failed, it recorded a result, or it settled synced with nothing to do. An
+// out-of-sync record with no result yet is the apply still in flight.
+func terminal(before, after application.Status) bool {
+	return after.Error != "" ||
+		changed(before.Sync.LastSync, after.Sync.LastSync) ||
+		after.Sync.State == application.SyncSynced
+}
+
+// changed reports whether last is a new sync result relative to before. A nil
+// last is no result at all — the pre-apply record carries the previous one
+// forward — so it is not a change.
 func changed(before, last *application.SyncResult) bool {
+	if last == nil {
+		return false
+	}
 	if before == nil {
 		return true
 	}
