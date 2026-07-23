@@ -196,8 +196,8 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 // runUntilStopped runs the reconciler and the listener as peers and returns
 // once both have stopped. Whichever stops first stops the other: a listener
 // that cannot bind must not leave a controller reconciling with no way to
-// observe it, and a reconciler that cannot resolve its destinations must not
-// leave an API serving views that will never update.
+// observe it, and a reconciler that returns must not leave an API serving
+// views that will never update.
 func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, httpSrv *http.Server, log *slog.Logger) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
