@@ -321,6 +321,53 @@ func TestAppHelp(t *testing.T) {
 	}
 }
 
+// terminal is the heart of --wait, and the two-phase reconcile record is what a
+// stub cannot model: a reconcile records its plan (out of sync, no result)
+// before it applies, and only then records the outcome. Waiting must sit through
+// the first and conclude on the second — the integration test caught --wait
+// returning mid-deploy when this was keyed on ObservedAt alone.
+func TestTerminal(t *testing.T) {
+	at := time.Unix(1_700_000_000, 0)
+	later := at.Add(time.Minute)
+
+	for name, tc := range map[string]struct {
+		before, after application.Status
+		want          bool
+	}{
+		"pre-apply out-of-sync record, apply still in flight": {
+			before: application.Status{Sync: application.Sync{State: application.SyncOutOfSync}},
+			after:  application.Status{Sync: application.Sync{State: application.SyncOutOfSync}},
+			want:   false,
+		},
+		"apply recorded a result": {
+			before: application.Status{},
+			after:  application.Status{Sync: application.Sync{State: application.SyncSynced, LastSync: &application.SyncResult{FinishedAt: at, Succeeded: true}}},
+			want:   true,
+		},
+		"a new result replaces an earlier one, even if still out of sync": {
+			before: application.Status{Sync: application.Sync{LastSync: &application.SyncResult{FinishedAt: at}}},
+			after:  application.Status{Sync: application.Sync{State: application.SyncOutOfSync, LastSync: &application.SyncResult{FinishedAt: later}}},
+			want:   true,
+		},
+		"sync failed before it deployed": {
+			before: application.Status{},
+			after:  application.Status{Error: "fetching source: repository not found"},
+			want:   true,
+		},
+		"nothing to deploy, already synced": {
+			before: application.Status{Sync: application.Sync{State: application.SyncSynced}},
+			after:  application.Status{Sync: application.Sync{State: application.SyncSynced}},
+			want:   true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := terminal(tc.before, tc.after); got != tc.want {
+				t.Errorf("terminal = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveServer(t *testing.T) {
 	env := func(string) string { return "http://from-env:8080" }
 	if got := resolveServer("http://from-flag:9090", env); got != "http://from-flag:9090" {
