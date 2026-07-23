@@ -51,6 +51,11 @@ applications:
   # this implies, so the same rules apply: a repository reference (`ref`) must
   # carry a pinned `version`, and a local chart `path` must not (its Chart.yaml
   # is its version). Exactly one of releaseFile and chart may be set.
+  #
+  # The chart version lives here, and this file is an immutable Docker config, so
+  # bumping it means a new config and a controller redeploy. A chart whose version
+  # changes often is better as a releaseFile (source type 1 above), where the
+  # version is a git commit the controller pulls without a redeploy.
   - name: hello
     source:
       repoURL: https://github.com/your-org/infra.git
@@ -58,8 +63,8 @@ applications:
       chart:
         release: hello                    # the release name to install as
         ref: swarmcli-charts/whoami       # repository/chart
-        version: "0.1.8"                   # required with a ref — pin it; a floating pin would silently upgrade on the next reconcile
-        values: [values/hello.yaml]        # values files, as paths within the repo (optional)
+        version: "0.1.8"                   # which CHART version to pull — not app config (that lives in values); required and pinned with a ref, or it would silently upgrade on the next reconcile
+        values: [values/hello.yaml]        # configure how the chart renders (replicas, image tag, …); paths within the repo (optional)
         repositories:                      # chart repositories `ref` resolves against
           - name: swarmcli-charts
             url: https://eldara-tech.github.io/swarmcli-charts

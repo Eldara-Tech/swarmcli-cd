@@ -57,6 +57,16 @@ Where the desired state lives in git.
 Then **exactly one** of two source types. Which field is present *is* the source
 type — a separate discriminator would be a second thing to keep consistent.
 
+**Which one?** The practical difference is where a version bump lives. A
+`releaseFile` keeps the pinned chart versions in a `swarmcli-release.yaml`
+committed to your repo, so bumping one is an ordinary git commit — the controller
+fetches it on the next reconcile, with no redeploy (Renovate can even open the
+PR). A `chart` source keeps the version here in `applications.yaml`, which is
+delivered as an immutable Docker config, so changing it means creating a new
+config and redeploying the controller. A chart whose version changes often
+therefore belongs in a release file; the `chart` source is the convenience form
+for a single, rarely-changing chart.
+
 #### `source.releaseFile` — a release file in the repo
 
 A path, within the repository, to a `swarmcli-release.yaml`: the same declarative
@@ -98,6 +108,11 @@ source:
       - name: swarmcli-charts
         url: https://eldara-tech.github.io/swarmcli-charts
 ```
+
+`version` and `values` are different axes: `version` selects *which chart
+package* to pull, and the `values` files configure *how it renders* — replica
+counts, the app's own image tag, and so on. Values are consumed by the chart, so
+they cannot select its version, which is why a `ref` carries its own `version`.
 
 | Field | | |
 |---|---|---|
