@@ -26,16 +26,19 @@ import (
 func pruneUntilConverged(t *testing.T, loop *appset.Loop, done func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(120 * time.Second)
-	var last error
-	for {
+	for pass := 1; ; pass++ {
+		// Logged per pass, not only on the timeout. A sweep that deletes the
+		// resources and still reports a failure converges — so the assertions
+		// afterwards pass — while leaving nothing in the status to say what
+		// went wrong, and that is exactly the case worth seeing.
 		if err := loop.Once(context.Background()); err != nil {
-			last = err
+			t.Logf("prune pass %d: %v", pass, err)
 		}
 		if done() {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("prune never converged; last pass error: %v", last)
+			t.Fatalf("prune never converged after %d passes", pass)
 		}
 		time.Sleep(3 * time.Second)
 	}
