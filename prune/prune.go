@@ -246,21 +246,72 @@ func (p *Pruner) Departed(ctx context.Context, desired []string) ([]string, erro
 	var pruned []string
 	var errs []error
 	for _, app := range departed(releases, desired, p.controller) {
-		failed := false
+		var failed []failure
 		for _, release := range app.releases {
 			if err := p.uninstall(ctx, backend, engine, app.name, release); err != nil {
-				errs = append(errs, err)
-				failed = true
+				failed = append(failed, failure{release: release, err: err})
 			}
 		}
-		// Only when the whole application went. A partial deletion is still an
-		// application with resources on the swarm, and reporting it as pruned
-		// would say the opposite of what the errors say.
-		if !failed {
+		if len(failed) == 0 {
 			pruned = append(pruned, app.name)
+			continue
+		}
+
+		// A removal can report a failure and still have done the job. Deleting
+		// a swarm-scoped network is proxied through swarmkit, and its reply for
+		// one that had already gone is neither a not-found the client
+		// recognises nor reflected immediately in the network list — so neither
+		// the error nor a re-list can answer "did this work".
+		//
+		// The release records can. They are ordinary Docker configs, written
+		// and deleted through this node, and a release whose records are gone
+		// is a release that was uninstalled. So the failures are re-examined
+		// against what the swarm still lists, and the ones that turn out to
+		// describe an already-finished deletion are dropped.
+		still, err := p.stillListed(ctx, engine, failed)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if len(still) == 0 {
+			pruned = append(pruned, app.name)
+			continue
+		}
+		for _, f := range still {
+			errs = append(errs, f.err)
 		}
 	}
 	return pruned, errors.Join(errs...)
+}
+
+// failure is one release's uninstall error, kept beside the release it belongs
+// to so it can be re-examined once the swarm has been asked again.
+type failure struct {
+	release string
+	err     error
+}
+
+// stillListed returns the failures whose releases the swarm still has.
+//
+// A release absent from the list has no records left, which is the last thing
+// an uninstall deletes — so whatever the call reported, it finished.
+func (p *Pruner) stillListed(ctx context.Context, engine Engine, failed []failure) ([]failure, error) {
+	releases, err := engine.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("re-checking which releases are left: %w", err)
+	}
+	present := make(map[string]struct{}, len(releases))
+	for _, rel := range releases {
+		present[rel.Name] = struct{}{}
+	}
+
+	var still []failure
+	for _, f := range failed {
+		if _, ok := present[f.release]; ok {
+			still = append(still, f)
+		}
+	}
+	return still, nil
 }
 
 func (p *Pruner) uninstall(ctx context.Context, backend charts.Backend, engine Engine, app, release string) error {

@@ -88,6 +88,10 @@ type fakeEngine struct {
 	releases []charts.Release
 	listErr  error
 	fail     map[string]error
+	// gone marks a release that its failing Uninstall nevertheless finished —
+	// the records are deleted, so a later List no longer has it. That is what a
+	// spurious stack-removal error looks like from the outside.
+	gone     map[string]bool
 	networks map[string][]string
 
 	calls []uninstalled
@@ -99,7 +103,11 @@ func (e *fakeEngine) List(context.Context) ([]charts.Release, error) {
 
 func (e *fakeEngine) Uninstall(_ context.Context, release string, purgeVolumes bool) (*charts.UninstallResult, error) {
 	e.calls = append(e.calls, uninstalled{release, purgeVolumes})
-	if err := e.fail[release]; err != nil {
+	err := e.fail[release]
+	if err == nil || e.gone[release] {
+		e.releases = slices.DeleteFunc(e.releases, func(r charts.Release) bool { return r.Name == release })
+	}
+	if err != nil {
 		return nil, err
 	}
 	return &charts.UninstallResult{OrphanedNetworks: e.networks[release]}, nil
@@ -433,5 +441,43 @@ func TestOwnerRejectsWhatItCannotProve(t *testing.T) {
 		if app, ok := owner(rel, testController); ok {
 			t.Errorf("owner(%q) = %q, true; want it rejected", rel.Owner, app)
 		}
+	}
+}
+
+// The failure CI kept hitting. Uninstall reported that it could not remove the
+// stack — a swarm-scoped network delete proxied through swarmkit, replying
+// about a network that had already gone — while having deleted everything it
+// was asked to. Neither the error nor a re-list of the networks can tell that
+// apart from a real failure; the release no longer being listed can.
+func TestAFailureThatFinishedTheJobCountsAsPruned(t *testing.T) {
+	e := &fakeEngine{
+		releases: []charts.Release{owned("api", "gone")},
+		fail:     map[string]error{"api": errors.New("removing stack: network xyz not found")},
+		gone:     map[string]bool{"api": true},
+	}
+
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"})
+	if err != nil {
+		t.Fatalf("Departed = %v, want nil — the release is gone, whatever the call said", err)
+	}
+	if want := []string{"gone"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("pruned = %v, want %v", got, want)
+	}
+}
+
+// The other half: a failure that left the release in place is a real failure,
+// and must not be explained away by the same check.
+func TestAFailureThatLeftTheReleaseIsStillAFailure(t *testing.T) {
+	e := &fakeEngine{
+		releases: []charts.Release{owned("api", "gone")},
+		fail:     map[string]error{"api": errors.New("network still attached")},
+	}
+
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"})
+	if err == nil {
+		t.Fatal("Departed = nil, want the failure to survive the re-check")
+	}
+	if len(got) != 0 {
+		t.Errorf("pruned = %v, want none", got)
 	}
 }
