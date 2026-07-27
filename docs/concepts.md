@@ -82,8 +82,14 @@ you and one that only tells you what it would deploy.
 Every release swarmcli-cd installs is stamped with an owner, `cd/<application>`,
 recorded in the release-history config and in the stored record. The stamp is
 what lets a later reconcile tell a release *this application* installed from one
-it has never seen — the prerequisite for ever pruning safely, because it
-separates "this is obsolete" from "I do not recognise this".
+it has never seen — the prerequisite for pruning safely, because it separates
+"this is obsolete" from "I do not recognise this".
+
+That stamp lives on the swarm, not in the controller's memory, which is what
+makes [prune](configuration.md#prune) survive a restart: a controller that comes
+up and finds a release stamped for an application its app set no longer declares
+knows the application departed, even though it never watched it leave. It is also
+why prune needs no database — the swarm is the record.
 
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by

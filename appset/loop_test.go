@@ -641,3 +641,188 @@ func TestRunKeepsTickingThroughFailures(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------- prune
+
+type fakePruner struct {
+	mu      sync.Mutex
+	calls   [][]string
+	returns []string
+	err     error
+}
+
+func (p *fakePruner) Departed(_ context.Context, desired []string) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, slices.Clone(desired))
+	return p.returns, p.err
+}
+
+func (p *fakePruner) called() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.calls)
+}
+
+func (p *fakePruner) lastDesired() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.calls) == 0 {
+		return nil
+	}
+	return p.calls[len(p.calls)-1]
+}
+
+// newPruningLoop is newLoop with a pruner attached, which is the only thing that
+// makes the loop destructive.
+func newPruningLoop(t *testing.T, initial string, p Pruner, apps ...application.Spec) (*Loop, *fakeReconciler, func(string)) {
+	t.Helper()
+	m := pathMode(t, initial)
+	rec := newFakeReconciler(apps...)
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Mode: "path", Source: testSource, Log: discard(), Credentials: noCredentials, Pruner: p,
+	})
+	return loop, rec, m.publish
+}
+
+func TestPrunedApplicationLeavesOrphanedAndJoinsPruned(t *testing.T) {
+	p := &fakePruner{returns: []string{"core"}}
+	loop, _, publish := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+
+	publish(oneApp)
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+
+	got := loop.Status().AppSet
+	if len(got.Orphaned) != 0 {
+		t.Errorf("orphaned = %v, want empty once the resources are gone", got.Orphaned)
+	}
+	if want := []string{"core"}; !slices.Equal(got.Pruned, want) {
+		t.Errorf("pruned = %v, want %v", got.Pruned, want)
+	}
+	// The desired set the sweep classifies against is what actually loaded.
+	if want := []string{"edge"}; !slices.Equal(p.lastDesired(), want) {
+		t.Errorf("swept against %v, want %v", p.lastDesired(), want)
+	}
+}
+
+// The D-e default: with no pruner the departure is reported and the stack is
+// left running.
+func TestWithoutAPrunerOrphansAreOnlyReported(t *testing.T) {
+	loop, _, publish := newPruningLoop(t, twoApps, nil,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+
+	publish(oneApp)
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+
+	got := loop.Status().AppSet
+	if want := []string{"core"}; !slices.Equal(got.Orphaned, want) {
+		t.Errorf("orphaned = %v, want %v", got.Orphaned, want)
+	}
+	if len(got.Pruned) != 0 {
+		t.Errorf("pruned = %v, want nothing deleted without a pruner", got.Pruned)
+	}
+}
+
+// The first guard. A set that will not parse leaves the last-good one running,
+// and nothing may be deleted on the strength of a set nobody could read.
+func TestALoadFailureNeverPrunes(t *testing.T) {
+	p := &fakePruner{}
+	loop, _, publish := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+
+	publish(invalidSets["unknown key"])
+	if err := loop.Once(t.Context()); err == nil {
+		t.Fatal("Once = nil, want the load failure")
+	}
+	if p.called() != 0 {
+		t.Errorf("pruned after a failed load (%d calls); the desired set was never known", p.called())
+	}
+}
+
+// The second guard. A set that loaded but could not be brought up is a set
+// whose running state is not yet the declared one.
+func TestAnApplyFailureNeverPrunes(t *testing.T) {
+	p := &fakePruner{}
+	loop, rec, publish := newPruningLoop(t, oneApp, p, spec("edge", "releases/edge.yaml"))
+
+	rec.setFailAdd("core")
+	publish(twoApps)
+	if err := loop.Once(t.Context()); err == nil {
+		t.Fatal("Once = nil, want the apply failure")
+	}
+	if p.called() != 0 {
+		t.Errorf("pruned after a failed apply (%d calls)", p.called())
+	}
+}
+
+// A sweep that partly worked reports both halves: what went is recorded, and
+// what did not surfaces on the status endpoint.
+func TestAPartialSweepRecordsWhatWentAndReportsTheRest(t *testing.T) {
+	p := &fakePruner{returns: []string{"core"}, err: errors.New("network still attached")}
+	loop, _, publish := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+
+	publish(oneApp)
+	if err := loop.Once(t.Context()); err == nil {
+		t.Fatal("Once = nil, want the sweep failure")
+	}
+
+	got := loop.Status().AppSet
+	if want := []string{"core"}; !slices.Equal(got.Pruned, want) {
+		t.Errorf("pruned = %v, want %v recorded even though the sweep errored", got.Pruned, want)
+	}
+	if !strings.Contains(got.Error, "network still attached") {
+		t.Errorf("status error = %q, want the sweep failure in it", got.Error)
+	}
+}
+
+// A sweep repeats every pass, so the same application comes back until its
+// resources are actually gone. It must not accumulate in the report.
+func TestRepeatedPruningDoesNotDuplicateTheReport(t *testing.T) {
+	p := &fakePruner{returns: []string{"core"}}
+	loop, _, publish := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+
+	publish(oneApp)
+	for range 3 {
+		if err := loop.Once(t.Context()); err != nil {
+			t.Fatalf("Once = %v, want nil", err)
+		}
+	}
+
+	if want := []string{"core"}; !slices.Equal(loop.Status().AppSet.Pruned, want) {
+		t.Errorf("pruned = %v, want %v", loop.Status().AppSet.Pruned, want)
+	}
+}
+
+// An application that was deleted and has since been re-declared is running
+// again, reinstalled from git. Reporting it as pruned would say the opposite of
+// what is on the swarm.
+func TestAReturningApplicationLeavesThePrunedList(t *testing.T) {
+	p := &fakePruner{returns: []string{"core"}}
+	loop, _, publish := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+
+	publish(oneApp)
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if len(loop.Status().AppSet.Pruned) != 1 {
+		t.Fatalf("setup: pruned = %v, want core", loop.Status().AppSet.Pruned)
+	}
+
+	p.returns = nil
+	publish(twoApps)
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+
+	if got := loop.Status().AppSet.Pruned; len(got) != 0 {
+		t.Errorf("pruned = %v, want empty once the application is back", got)
+	}
+}

@@ -162,6 +162,7 @@ func TestAppSetSelectorsAreValidated(t *testing.T) {
 		{"a revision with no repository", valid(options{appSetRevision: "main"}), "--appset-revision"},
 		{"a path with no source", valid(options{appSetPath: "applications.yaml"}), "--appset-path"},
 		{"an interval of zero", options{appSetDir: "/var/lib/appset"}, "--appset-interval"},
+		{"volumes without prune", valid(options{pruneVolumes: true}), "--prune-volumes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.o.validate()
@@ -317,6 +318,20 @@ func TestControllerHelpNamesTheAppSetFlags(t *testing.T) {
 	for _, flagName := range []string{"--appset-repo", "--appset-revision", "--appset-dir", "--appset-path", "--appset-interval"} {
 		if !strings.Contains(stdout.String(), flagName) {
 			t.Errorf("stdout = %q, want it to name %s", stdout.String(), flagName)
+		}
+	}
+}
+
+// Prune is the one destructive setting, so the help has to say both that it
+// exists and what turning it on costs.
+func TestControllerHelpNamesThePruneFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run = %d, want 0", code)
+	}
+	for _, want := range []string{"--prune", "--prune-volumes", "outage"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout = %q, want it to mention %q", stdout.String(), want)
 		}
 	}
 }

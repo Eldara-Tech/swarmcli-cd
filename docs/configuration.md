@@ -197,6 +197,8 @@ When and how a plan is applied.
 | `wait` | `false` | block each release until its services converge, and — when the service declares `update_config.failure_action: rollback` — let Swarm roll it back on a failed rollout |
 | `timeout` | engine default | how long `wait` waits for a rollout before giving up |
 | `historyMax` | engine default | revisions kept per release (one Docker config each); older revisions are pruned |
+| `prune` | `false` | delete the resources of a release this application no longer declares. Only ever its own releases — see [prune](#prune) |
+| `pruneVolumes` | `false` | extend `prune` to the named volumes of what it deletes. Requires `prune`; set alone it is a config error |
 
 (The `swarmcli-cd app sync --wait` *client* command has its own, separate
 `--timeout`, defaulting to 5m — that bounds how long the CLI watches, not the
@@ -310,7 +312,87 @@ loaded, so nothing is running; see [startup, below](#startup-when-the-set-is-not
 **An application removed from the set stops being reconciled; its stack stays
 deployed.** It is reported as orphaned rather than deleted — pruning a
 deployment because somebody edited a file is not something this controller does
-by accident.
+by accident. [Prune](#prune) turns that into a deletion, deliberately.
+
+### Prune
+
+By default an application that leaves the app set leaves its stack behind,
+running and unmanaged. Prune deletes it instead. It is off by default and turned
+on controller-wide, because a departed application's spec is gone — there is
+nothing left to carry a per-application setting:
+
+```yaml
+command: ["controller",
+          "--appset-repo", "https://github.com/your-org/apps.git",
+          "--appset-revision", "main",
+          "--appset-path", "apps/applications.yaml",
+          "--prune"]
+```
+
+| flag | effect |
+|---|---|
+| `--prune` | delete the services, networks, configs, secrets and release history of an application that has left the set |
+| `--prune-volumes` | also delete its named volumes; requires `--prune` |
+
+Volumes are a second opt-in because they are the one part nothing can restore.
+Everything else prune deletes is recreated from git the moment the application
+comes back; the data in a volume is not. `--prune-volumes` without `--prune` is
+a startup error rather than a guess in either direction.
+
+**With prune on, removing an application from the app set is an outage, not a
+pause.** Deleting the entry to "park" something deletes the deployment.
+
+A release an application stops declaring is a separate case, and is opted into
+per application rather than controller-wide, because the spec is still there to
+carry it:
+
+```yaml
+applications:
+  - name: edge
+    syncPolicy:
+      automated: true
+      prune: true          # delete releases this application no longer declares
+      pruneVolumes: false  # and their volumes; requires prune
+```
+
+Not to be confused with `historyMax`, which trims a release's revision *history*
+and never touches anything deployed.
+
+Releases are applied first and pruned afterwards, so a failed apply leaves the
+old release running rather than having already deleted it. The cost is that
+**renaming a release makes it briefly coexist with its old name**: the new name
+is an install and the old one becomes an orphan, and if the two collide on an
+ingress port or a network name the new release will not converge until the next
+reconcile prunes the old one. It clears itself; it is not a failure to
+investigate.
+
+#### What prune will not do
+
+Prune only ever deletes what this controller installed, identified by the owner
+stamp on the release rather than by name. A release deployed with
+`swarmcli charts apply`, one belonging to another application, or one another
+tool created is unmanaged here and is never a candidate — the same distinction
+`swarmcli charts` draws between orphaned and unmanaged releases.
+
+Three further guards exist because the alternative is a controller that empties
+a swarm over a transient failure:
+
+- a pass whose app set failed to load prunes nothing — the last-good set keeps
+  running and no departure is inferred from a file nobody could read;
+- a pass whose apply failed prunes nothing, because the running state is not yet
+  the declared one;
+- an app set that declares **no applications at all** prunes nothing. An empty
+  set and a truncated one are indistinguishable from here. To remove every
+  application, remove them one commit at a time.
+
+A controller that has never successfully loaded a set therefore prunes nothing,
+indefinitely — which is the correct reading of "I have no idea what should be
+running".
+
+Networks that swarmcli auto-created for a release are **left in place** and
+reported in the log, not deleted: they may be shared with another stack. The
+same is true of anything prune could not remove — the failure is logged, the
+release keeps its owner stamp, and the next sweep tries again.
 
 ### Startup, when the set is not there yet
 

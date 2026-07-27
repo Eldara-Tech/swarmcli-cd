@@ -90,6 +90,28 @@ type SyncPolicy struct {
 	Wait       bool     `json:"wait,omitempty" yaml:"wait,omitempty"`
 	Timeout    Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
 	HistoryMax int      `json:"historyMax,omitempty" yaml:"historyMax,omitempty"`
+
+	// Prune deletes the resources of a release this application used to declare
+	// and no longer does. Off by default: reporting an orphan is safe and
+	// deleting one is not, so it is a deliberate choice per application.
+	//
+	// It governs only this application's own releases — those carrying its
+	// owner stamp. A release another application or the command line installed
+	// is unmanaged here and is never touched, whatever this says.
+	//
+	// Not to be confused with HistoryMax, which prunes an individual release's
+	// revision history rather than the release itself. Two senses of the word,
+	// one of which is the chart engine's; see the prune package.
+	Prune bool `json:"prune,omitempty" yaml:"prune,omitempty"`
+
+	// PruneVolumes extends Prune to the named volumes of what it deletes, and
+	// means nothing without it — a config declaring one and not the other is
+	// refused rather than half-obeyed.
+	//
+	// Separate from Prune because it is the one irreversible part. Everything
+	// else prune removes can be recreated from git on the next reconcile; the
+	// data in a volume cannot be recreated from anything.
+	PruneVolumes bool `json:"pruneVolumes,omitempty" yaml:"pruneVolumes,omitempty"`
 }
 
 // View is what every API read returns: the declared spec beside what the

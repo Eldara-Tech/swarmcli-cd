@@ -24,10 +24,14 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
+	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
+
+	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
@@ -256,5 +260,108 @@ func removeStack(t *testing.T, release string) {
 	}
 	if err := backend.RemoveStack(release); err != nil {
 		t.Logf("cleanup: removing stack %q: %v", release, err)
+	}
+}
+
+// chartFilesWithResources is chartFiles plus the things prune has to clean up
+// beside the service: an overlay network the stack owns and a named volume it
+// must not touch.
+//
+// Configs and secrets are deliberately absent. Compose sources them with
+// `file:`, which the loader resolves against the controller's own filesystem —
+// a rendered chart has no directory to resolve against, so a fixture cannot
+// declare one without hard-coding a checkout path. That RemoveStack deletes
+// them by namespace filter is settled by its unit tests
+// (backend.TestRemoveStackRemovesServicesFirstThenWhatTheyUsed); what this
+// fixture is for is the two behaviours only a real swarm can show — a network
+// that can only be removed once its tasks are gone, and a volume that survives.
+func chartFilesWithResources(release string, replicas int) map[string]string {
+	files := chartFiles(release, replicas)
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    networks: [internal]\n" +
+		"    volumes:\n" +
+		"      - data:/data\n" +
+		"    deploy:\n" +
+		"      replicas: {{ .Values.replicas }}\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"networks:\n" +
+		"  internal: {}\n" +
+		"volumes:\n" +
+		"  data: {}\n"
+	return files
+}
+
+// stackFilter matches everything Swarm labels with a stack's namespace.
+func stackFilter(release string) filters.Args {
+	return filters.NewArgs(filters.Arg("label", "com.docker.stack.namespace="+release))
+}
+
+// stackServiceCount counts the release's services by namespace label rather
+// than by the chart's own label, because prune's promise is about the stack.
+func stackServiceCount(t *testing.T, cli *dockerclient.Client, release string) int {
+	t.Helper()
+	svcs, err := cli.ServiceList(context.Background(), swarm.ServiceListOptions{Filters: stackFilter(release)})
+	if err != nil {
+		t.Fatalf("listing services of %q: %v", release, err)
+	}
+	return len(svcs)
+}
+
+func stackNetworkCount(t *testing.T, cli *dockerclient.Client, release string) int {
+	t.Helper()
+	nets, err := cli.NetworkList(context.Background(), network.ListOptions{Filters: stackFilter(release)})
+	if err != nil {
+		t.Fatalf("listing networks of %q: %v", release, err)
+	}
+	return len(nets)
+}
+
+func stackVolumeCount(t *testing.T, cli *dockerclient.Client, release string) int {
+	t.Helper()
+	vols, err := cli.VolumeList(context.Background(), volume.ListOptions{Filters: stackFilter(release)})
+	if err != nil {
+		t.Fatalf("listing volumes of %q: %v", release, err)
+	}
+	return len(vols.Volumes)
+}
+
+// releaseRecordCount counts the engine's own history configs for a release.
+// Uninstall deletes them, so this going to zero is what says the release is
+// gone rather than merely undeployed.
+func releaseRecordCount(t *testing.T, cli *dockerclient.Client, release string) int {
+	t.Helper()
+	cfgs, err := cli.ConfigList(context.Background(), swarm.ConfigListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("label", charts.LabelType+"="+charts.TypeRelease),
+			filters.Arg("label", charts.LabelRelease+"="+release),
+		),
+	})
+	if err != nil {
+		t.Fatalf("listing release records of %q: %v", release, err)
+	}
+	return len(cfgs)
+}
+
+// removeVolumes clears the volumes a pruned stack deliberately left behind, so
+// a developer running these repeatedly against one swarm does not accumulate
+// them. Best effort: a volume still attached to a dying task is not worth
+// failing a passing test over.
+func removeVolumes(t *testing.T, cli *dockerclient.Client, release string) {
+	t.Helper()
+	vols, err := cli.VolumeList(context.Background(), volume.ListOptions{Filters: stackFilter(release)})
+	if err != nil {
+		t.Logf("cleanup: listing volumes of %q: %v", release, err)
+		return
+	}
+	for _, v := range vols.Volumes {
+		if err := cli.VolumeRemove(context.Background(), v.Name, true); err != nil {
+			t.Logf("cleanup: removing volume %q: %v", v.Name, err)
+		}
 	}
 }

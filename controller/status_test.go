@@ -40,7 +40,7 @@ func TestStatus(t *testing.T) {
 	}
 	// The three lines that only exist when something is wrong must not appear
 	// on a healthy controller, or an operator learns to skip the block.
-	for _, unwanted := range []string{"Stale", "Error", "Orphaned"} {
+	for _, unwanted := range []string{"Stale", "Error", "Orphaned", "Pruned"} {
 		if strings.Contains(stdout, unwanted) {
 			t.Errorf("stdout = %q, want no %s line on a healthy controller", stdout, unwanted)
 		}
@@ -68,6 +68,23 @@ func TestStatusReportsAStaleAppSet(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
 		}
+	}
+}
+
+// Prune leaves a departed application with no other trace: it is out of the app
+// set, out of Orphaned, and off the swarm. This line is the only thing that
+// distinguishes "deleted" from "the controller never noticed".
+func TestStatusReportsWhatWasPruned(t *testing.T) {
+	s := healthyStatus()
+	s.AppSet.Pruned = []string{"legacy-api", "old-edge"}
+	server := startStatus(t, s)
+
+	code, stdout, stderr := cli(t, server, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "Pruned") || !strings.Contains(stdout, "legacy-api, old-edge") {
+		t.Errorf("stdout = %q, want it to report what was pruned", stdout)
 	}
 }
 

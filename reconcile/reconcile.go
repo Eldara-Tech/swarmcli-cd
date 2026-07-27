@@ -71,6 +71,10 @@ type Engine interface {
 	PlanApply(ctx context.Context, rf *charts.ReleaseFile, src charts.ChartSource, opts charts.PlanOptions) (*charts.Plan, error)
 	Apply(ctx context.Context, plan *charts.Plan, opts charts.InstallOptions) ([]charts.ApplyResult, error)
 	History(ctx context.Context, release string) ([]charts.Release, error)
+	// Uninstall removes a release's stack and its recorded revisions, keeping
+	// its volumes unless asked. Used only by prune, so an application whose
+	// sync policy does not enable it never reaches this.
+	Uninstall(ctx context.Context, release string, purgeVolumes bool) (*charts.UninstallResult, error)
 }
 
 // Options configures a Reconciler. Everything has a working default except the
@@ -492,7 +496,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		// never claim each other's releases — and classifying against this id
 		// rather than the file's is what lets this application recognise the
 		// releases it installed itself.
-		Owner:    ownerID(spec.Name),
+		Owner:    application.OwnerID(spec.Name),
 		ReadFile: built.ReadFile,
 	})
 	if err != nil {
@@ -567,12 +571,6 @@ func checkCompat(plan *charts.Plan) error {
 // also surfaces a chart whose render is not deterministic — one that would
 // otherwise sit permanently out of sync, deploying on every single tick — on
 // the first sync rather than never.
-// ownerID is the id this controller stamps its releases with and classifies
-// them against. It is per application rather than per controller: several
-// applications share one swarm, and a per-controller id would make each of them
-// report the others' releases as its own orphans.
-func ownerID(app string) string { return "cd/" + app }
-
 func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout) error {
 	started := r.now()
 	notify.Dispatch(ctx, notify.Event{
@@ -622,8 +620,18 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 		return fmt.Errorf("applying: %w", applyErr)
 	}
 
+	// After the apply and before the confirming re-plan. After, so a failed
+	// apply leaves the old release running rather than already deleted — the
+	// recoverable half of the two failure modes. Before, so the re-plan below
+	// observes the swarm as prune left it rather than reporting the releases it
+	// has just deleted straight back as orphans.
+	if err := r.prune(ctx, spec, engine, plan.Orphaned); err != nil {
+		r.recordResult(spec.Name, result)
+		return err
+	}
+
 	after, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{
-		Owner:    ownerID(spec.Name),
+		Owner:    application.OwnerID(spec.Name),
 		ReadFile: built.ReadFile,
 	})
 	if err != nil {
@@ -635,6 +643,64 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	}
 	r.record(spec.Name, backend, after, checkout.Revision, result)
 	return nil
+}
+
+// prune deletes the releases this application used to declare and no longer
+// does, when its sync policy asks for it.
+//
+// orphaned is charts' own classification and is already the right list: it
+// names releases carrying this application's owner stamp that its release file
+// has stopped declaring. A release belonging to another application, or applied
+// from the command line, fails that ownership check and is reported as
+// unmanaged instead — so nothing here can reach outside the application it is
+// reconciling.
+//
+// The sync is not failed by a prune that does not work. The deploy landed, and
+// what is left behind is a release that will be classified as orphaned again on
+// the next tick and retried then. The error is still returned, as the re-plan's
+// is, because the reconcile did not do everything it set out to.
+func (r *Reconciler) prune(ctx context.Context, spec application.Spec, engine Engine, orphaned []string) error {
+	if !spec.SyncPolicy.Prune || len(orphaned) == 0 {
+		return nil
+	}
+
+	var errs []error
+	var pruned []string
+	for _, release := range orphaned {
+		result, err := engine.Uninstall(ctx, release, spec.SyncPolicy.PruneVolumes)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("pruning release %q: %w", release, err))
+			continue
+		}
+		pruned = append(pruned, release)
+		r.log.Warn("pruned a release the application no longer declares",
+			"application", spec.Name, "release", release, "volumes", spec.SyncPolicy.PruneVolumes)
+		if result != nil && len(result.OrphanedNetworks) > 0 {
+			// Left in place by the chart engine because they may be shared.
+			// Reported, or an operator believes the cleanup was complete.
+			r.log.Warn("networks created for the release were left in place; they may be shared",
+				"application", spec.Name, "release", release, "networks", result.OrphanedNetworks)
+		}
+	}
+
+	if len(pruned) > 0 {
+		notify.Dispatch(ctx, notify.Event{
+			Application: spec.Name,
+			Type:        notify.ResourcesPruned,
+			At:          r.now(),
+			Message:     "pruned " + strings.Join(pruned, ", "),
+		})
+	}
+	err := errors.Join(errs...)
+	if err != nil {
+		notify.Dispatch(ctx, notify.Event{
+			Application: spec.Name,
+			Type:        notify.PruneFailed,
+			At:          r.now(),
+			Message:     err.Error(),
+		})
+	}
+	return err
 }
 
 // syncState reports what was last observed for an application, or unknown if it

@@ -163,6 +163,8 @@ output and in argv.
 | `--appset-repo` `--appset-revision` `--appset-path` | — | source the application set from a git repository instead |
 | `--appset-dir` | — | source it from a directory a git-sync sidecar keeps current |
 | `--appset-interval` | `3m` | how often the application set is re-read |
+| `--prune` | off | delete the resources of an application that has left the application set, instead of leaving the stack running and reporting it as orphaned |
+| `--prune-volumes` | off | extend `--prune` to named volumes, the one part nothing can restore; requires `--prune` |
 
 | Environment | |
 |---|---|

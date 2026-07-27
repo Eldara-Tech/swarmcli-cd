@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -123,6 +124,37 @@ type fakeEngine struct {
 	planOpts  []charts.PlanOptions
 	history   map[string][]charts.Release
 	histErr   error
+
+	// uninstalled records what prune removed, in order, as "<release>" or
+	// "<release>+volumes" so one field carries both the call and its argument.
+	uninstalled []string
+	// uninstAtPlan is how many PlanApply calls had happened when each uninstall
+	// arrived. Prune runs between the apply and the confirming re-plan, so a 1
+	// here is what proves the ordering rather than merely that both happened.
+	uninstAtPlan []int
+	uninstErr    map[string]error
+	leftNets     map[string][]string
+}
+
+func (e *fakeEngine) Uninstall(_ context.Context, release string, purgeVolumes bool) (*charts.UninstallResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	call := release
+	if purgeVolumes {
+		call += "+volumes"
+	}
+	e.uninstalled = append(e.uninstalled, call)
+	e.uninstAtPlan = append(e.uninstAtPlan, e.planCalls)
+	if err := e.uninstErr[release]; err != nil {
+		return nil, err
+	}
+	return &charts.UninstallResult{OrphanedNetworks: e.leftNets[release]}, nil
+}
+
+func (e *fakeEngine) pruned() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.uninstalled)
 }
 
 func (e *fakeEngine) History(_ context.Context, release string) ([]charts.Release, error) {
@@ -169,6 +201,12 @@ func (e *fakeEngine) applyCount() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.applied
+}
+
+func (e *fakeEngine) planCallCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.planCalls
 }
 
 type recorder struct {
@@ -1318,5 +1356,120 @@ func TestRemoveDropsTheCredential(t *testing.T) {
 	}
 	if r.registryAuth("edge") != nil {
 		t.Error("the departed application's credential survived it")
+	}
+}
+
+// ---------------------------------------------------------------- prune
+
+// orphaning returns an out-of-sync plan that also reports releases this
+// application used to declare — what charts classifies as Orphaned once the
+// release file stops naming them.
+func orphaning(orphaned ...string) *charts.Plan {
+	p := outOfSync()
+	p.Orphaned = orphaned
+	return p
+}
+
+func pruningSpec(name string, volumes bool) application.Spec {
+	s := spec(name, true)
+	s.SyncPolicy.Prune = true
+	s.SyncPolicy.PruneVolumes = volumes
+	return s
+}
+
+func TestPruneRemovesReleasesTheApplicationNoLongerDeclares(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{orphaning("old", "older"), synced()}}
+	r := newTest(t, []application.Spec{pruningSpec("edge", false)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []string{"old", "older"}; !slices.Equal(engine.pruned(), want) {
+		t.Errorf("uninstalled %v, want %v", engine.pruned(), want)
+	}
+}
+
+// The D-e default. An orphan is reported and left running unless the
+// application's own sync policy asks for it to go.
+func TestOrphansSurviveWhenPruneIsOff(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{orphaning("old"), synced()}}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := engine.pruned(); len(got) != 0 {
+		t.Errorf("uninstalled %v with prune off, want nothing", got)
+	}
+}
+
+func TestPruneVolumesIsThreadedThrough(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{orphaning("old"), synced()}}
+	r := newTest(t, []application.Spec{pruningSpec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []string{"old+volumes"}; !slices.Equal(engine.pruned(), want) {
+		t.Errorf("uninstalled %v, want %v", engine.pruned(), want)
+	}
+}
+
+// The deploy landed; only the tidy-up did not. Reporting the sync as failed
+// would say the wrong thing about what is running, so the result stands and the
+// error is the reconcile's — the same split the re-plan failure already makes.
+func TestPruneFailureDoesNotFailTheSync(t *testing.T) {
+	engine := &fakeEngine{
+		plans:     []*charts.Plan{orphaning("old"), synced()},
+		uninstErr: map[string]error{"old": errors.New("network still attached")},
+	}
+	r := newTest(t, []application.Spec{pruningSpec("edge", false)}, engine, nil)
+
+	err := r.Sync(context.Background(), "edge")
+	if err == nil || !strings.Contains(err.Error(), "network still attached") {
+		t.Fatalf("Sync = %v, want the prune failure surfaced", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Sync.LastSync == nil || !view.Status.Sync.LastSync.Succeeded {
+		t.Errorf("lastSync = %+v, want the apply still recorded as successful", view.Status.Sync.LastSync)
+	}
+}
+
+// Prune runs after the apply and before the confirming re-plan. Were it after,
+// the re-plan would report the releases prune is about to delete straight back
+// as orphans.
+func TestPruneRunsBetweenTheApplyAndTheReplan(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{orphaning("old"), synced()}}
+	r := newTest(t, []application.Spec{pruningSpec("edge", false)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if engine.applyCount() != 1 {
+		t.Fatalf("applied %d times, want 1", engine.applyCount())
+	}
+	if want := []int{1}; !slices.Equal(engine.uninstAtPlan, want) {
+		t.Errorf("uninstall happened after %v PlanApply calls, want %v — prune must precede the re-plan", engine.uninstAtPlan, want)
+	}
+	if engine.planCallCount() != 2 {
+		t.Errorf("PlanApply called %d times, want 2 (plan then confirm)", engine.planCallCount())
+	}
+}
+
+// Prune is gated on the apply having happened at all: a synced application has
+// nothing to deploy, so it never reaches the prune step even with orphans
+// declared and prune enabled.
+func TestSyncedApplicationDoesNotPrune(t *testing.T) {
+	plan := synced()
+	plan.Orphaned = []string{"old"}
+	engine := &fakeEngine{plans: []*charts.Plan{plan}}
+	r := newTest(t, []application.Spec{pruningSpec("edge", false)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := engine.pruned(); len(got) != 0 {
+		t.Errorf("uninstalled %v, want nothing — there was nothing to apply", got)
 	}
 }

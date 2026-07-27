@@ -57,6 +57,21 @@ type LoopOptions struct {
 	// application's registryAuth names, which is the same thing the controller
 	// does at startup for the applications it booted with.
 	Credentials func(spec application.Spec) (regauth.Resolver, error)
+
+	// Pruner deletes the resources of an application that has left the set.
+	// Nil is report-only — the default, and what every deployment that has not
+	// asked for prune gets.
+	Pruner Pruner
+}
+
+// Pruner deletes the deployed resources of applications absent from the set it
+// is given. *prune.Pruner implements it.
+//
+// An interface rather than the concrete type because it is the one seam in this
+// loop that deletes things, and a test of the loop's guards must be able to
+// assert that it was never called.
+type Pruner interface {
+	Departed(ctx context.Context, desired []string) ([]string, error)
 }
 
 // Loop keeps the running set equal to the app set.
@@ -78,6 +93,7 @@ type Loop struct {
 	interval time.Duration
 	log      *slog.Logger
 	creds    func(application.Spec) (regauth.Resolver, error)
+	pruner   Pruner
 
 	mu sync.RWMutex
 	// lastErr is why the last attempt failed, and stale reports that the load
@@ -89,6 +105,10 @@ type Loop struct {
 	stale   bool
 	// orphaned names applications removed from the set, in the order they left.
 	orphaned []string
+	// pruned names applications whose resources have been deleted, in the order
+	// they went. With prune enabled a departure passes through orphaned and out
+	// again within the same pass, so the two lists are disjoint by construction.
+	pruned []string
 }
 
 // NewLoop returns a Loop driving rec from src.
@@ -104,7 +124,7 @@ func NewLoop(src *Loader, rec Reconciler, o LoopOptions) *Loop {
 	}
 	return &Loop{
 		src: src, rec: rec, mode: o.Mode, source: o.Source,
-		interval: o.Interval, log: o.Log, creds: o.Credentials,
+		interval: o.Interval, log: o.Log, creds: o.Credentials, pruner: o.Pruner,
 	}
 }
 
@@ -164,11 +184,47 @@ func (l *Loop) Once(ctx context.Context) error {
 	}
 
 	err = l.apply(file.Applications)
+	// Only behind a clean apply. A set that loaded but could not be brought up
+	// is a set whose running state is not yet the declared one, and deletions
+	// derived from it would be acting on a diff that is still half-applied.
+	if err == nil {
+		err = l.pruneDeparted(ctx, file.Applications)
+	}
 	// Recorded either way, so a pass that succeeded clears a previous failure —
 	// including a pass that found nothing to do, because the set having become
 	// readable again is itself the news.
 	l.record(err, false)
 	return err
+}
+
+// pruneDeparted deletes the resources of applications this set no longer
+// declares, when the deployment asked for that.
+//
+// Two of the three guards against a controller mistaking a broken app set for
+// an empty one are in where this is called from: a pass that failed to load
+// returns before reaching it, and a pass whose apply failed skips it. The third
+// is the pruner's own refusal to act on a set that declares no applications.
+//
+// The names go in even when the sweep also returns an error: it reports what it
+// managed to delete alongside what it could not, and a partial success that
+// went unrecorded would leave the status endpoint claiming resources are still
+// there when they are gone.
+func (l *Loop) pruneDeparted(ctx context.Context, desired []application.Spec) error {
+	if l.pruner == nil {
+		return nil
+	}
+
+	names := make([]string, 0, len(desired))
+	for _, spec := range desired {
+		names = append(names, spec.Name)
+	}
+
+	pruned, err := l.pruner.Departed(ctx, names)
+	l.recordPruned(pruned)
+	if err != nil {
+		return fmt.Errorf("pruning departed applications: %w", err)
+	}
+	return nil
 }
 
 // apply drives the reconciler to the desired set.
@@ -311,6 +367,7 @@ func (l *Loop) Status() application.ControllerStatus {
 			// Cloned: the caller is a handler about to serialise it, and the
 			// list keeps changing underneath.
 			Orphaned: slices.Clone(l.orphaned),
+			Pruned:   slices.Clone(l.pruned),
 		},
 		// What is being reconciled, which is not always what the file declares:
 		// an application the set added but that could not be started is in the
@@ -342,8 +399,37 @@ func (l *Loop) orphan(name string) {
 
 // adopt clears an orphan that has come back. The stack it left behind is the one
 // the returning application now reconciles, so it is nobody's orphan.
+//
+// It clears the pruned record too: an application that was deleted and has
+// since been re-declared is running again, reinstalled from git, and reporting
+// it as pruned would describe the opposite of what is on the swarm.
 func (l *Loop) adopt(name string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.orphaned = slices.DeleteFunc(l.orphaned, func(n string) bool { return n == name })
+	l.orphaned = without(l.orphaned, name)
+	l.pruned = without(l.pruned, name)
+}
+
+// recordPruned moves applications out of the orphan list and into the pruned
+// one. An orphan is a stack nobody reconciles; once its resources are gone
+// there is no stack, so reporting it under both headings would name a hazard
+// that no longer exists.
+func (l *Loop) recordPruned(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, name := range names {
+		l.orphaned = without(l.orphaned, name)
+		// Deduplicated like orphan, for the same reason: a sweep that partly
+		// failed re-reports the same application next tick.
+		if !slices.Contains(l.pruned, name) {
+			l.pruned = append(l.pruned, name)
+		}
+	}
+}
+
+func without(names []string, name string) []string {
+	return slices.DeleteFunc(names, func(n string) bool { return n == name })
 }
