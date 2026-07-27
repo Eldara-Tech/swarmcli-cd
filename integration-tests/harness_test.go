@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,11 +136,27 @@ func reconciler(t *testing.T, apps ...application.Spec) *reconcile.Reconciler {
 	t.Helper()
 	data := t.TempDir()
 	return reconcile.New(apps, reconcile.Options{
-		Fetcher: git.New(filepath.Join(data, "repos"), git.Auth{}),
-		Builder: source.NewBuilder(filepath.Join(data, "charts"), nil),
-		Swarms:  swarms.Get(),
-		Log:     testLog(),
+		Fetcher:      git.New(filepath.Join(data, "repos"), git.Auth{}),
+		Builder:      source.NewBuilder(filepath.Join(data, "charts"), nil),
+		Swarms:       swarms.Get(),
+		ControllerID: controllerID(t),
+		Log:          testLog(),
 	})
+}
+
+// controllerID gives each test its own controller identity.
+//
+// These tests share one swarm and leave their release records behind — an
+// uninstall deletes them, but the ordinary teardown removes the stack and
+// deliberately keeps the history. A prune sweep looks at every release on the
+// swarm and deletes the ones stamped for an application its app set does not
+// declare, so under a shared identity one test's sweep would delete another
+// test's releases. Distinct ids are what production requires of two controllers
+// sharing a swarm, and they are what makes these tests independent.
+func controllerID(t *testing.T) string {
+	t.Helper()
+	// Subtests put a slash in the name, which the stamp format forbids.
+	return strings.ReplaceAll(t.Name(), "/", "-")
 }
 
 // testLog keeps the reconciler's own logging out of the test output, which is

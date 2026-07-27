@@ -83,9 +83,26 @@ func (f fakeRegistry) Backend(context.Context, string) (charts.Backend, error) {
 type stubBackend struct {
 	charts.Backend
 	states map[string][]charts.ServiceState
+	// removed records the stacks prune tore down. Prune removes the deployed
+	// resources through the backend and only then lets the engine delete the
+	// release records, so a test that asserts on the engine alone would not see
+	// half of what happened.
+	removed *[]string
 }
 
 func (s stubBackend) StackServices(name string) []charts.ServiceState { return s.states[name] }
+
+func (s stubBackend) RemoveStack(name string) error {
+	if s.removed != nil {
+		*s.removed = append(*s.removed, name)
+	}
+	return nil
+}
+
+// No volumes in these fakes: the reconciler's prune passes the application's
+// pruneVolumes through, and what that does to real volumes is prune's own test.
+func (s stubBackend) StackVolumes(context.Context, string) ([]string, error) { return nil, nil }
+func (s stubBackend) RemoveVolume(context.Context, string) error             { return nil }
 
 // recordingBackend records the scoping the reconciler applies before handing the
 // backend to the engine, through the same optional-interface upgrades
@@ -132,8 +149,11 @@ type fakeEngine struct {
 	// arrived. Prune runs between the apply and the confirming re-plan, so a 1
 	// here is what proves the ordering rather than merely that both happened.
 	uninstAtPlan []int
-	uninstErr    map[string]error
-	leftNets     map[string][]string
+	// uninstAtApply is the same for Apply, which is what distinguishes the two
+	// prune orderings: 0 means nothing had been installed yet.
+	uninstAtApply []int
+	uninstErr     map[string]error
+	leftNets      map[string][]string
 }
 
 func (e *fakeEngine) Uninstall(_ context.Context, release string, purgeVolumes bool) (*charts.UninstallResult, error) {
@@ -145,6 +165,7 @@ func (e *fakeEngine) Uninstall(_ context.Context, release string, purgeVolumes b
 	}
 	e.uninstalled = append(e.uninstalled, call)
 	e.uninstAtPlan = append(e.uninstAtPlan, e.planCalls)
+	e.uninstAtApply = append(e.uninstAtApply, e.applied)
 	if err := e.uninstErr[release]; err != nil {
 		return nil, err
 	}
@@ -263,13 +284,18 @@ func spec(name string, automated bool) application.Spec {
 
 func newTest(t *testing.T, apps []application.Spec, engine Engine, fetcher Fetcher) *Reconciler {
 	t.Helper()
+	return newTestWith(t, apps, engine, fetcher, fakeRegistry{})
+}
+
+func newTestWith(t *testing.T, apps []application.Spec, engine Engine, fetcher Fetcher, swarms swarms.Registry) *Reconciler {
+	t.Helper()
 	if fetcher == nil {
 		fetcher = &fakeFetcher{revision: strings.Repeat("a", 40)}
 	}
 	return New(apps, Options{
 		Fetcher:   fetcher,
 		Builder:   &fakeBuilder{},
-		Swarms:    fakeRegistry{},
+		Swarms:    swarms,
 		NewEngine: func(charts.Backend) Engine { return engine },
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:       func() time.Time { return time.Unix(0, 0).UTC() },
@@ -410,7 +436,7 @@ func TestManualPolicyReportsDriftButDoesNotDeploy(t *testing.T) {
 // plans against that same id, or its own releases would come back Unmanaged.
 func TestApplyStampsTheControllersOwner(t *testing.T) {
 	planned := outOfSync()
-	planned.Owner = "cd/edge" // what PlanApply returns for the owner it was given
+	planned.Owner = "cd/default/edge" // what PlanApply returns for the owner it was given
 	engine := &fakeEngine{plans: []*charts.Plan{planned, synced()}}
 	r := newTest(t, []application.Spec{{
 		Name:           "edge",
@@ -423,15 +449,15 @@ func TestApplyStampsTheControllersOwner(t *testing.T) {
 		t.Fatalf("Sync = %v, want nil", err)
 	}
 
-	if got := engine.planOpts[0].Owner; got != "cd/edge" {
-		t.Errorf("plan owner = %q, want cd/edge", got)
+	if got := engine.planOpts[0].Owner; got != "cd/default/edge" {
+		t.Errorf("plan owner = %q, want cd/default/edge", got)
 	}
 
 	got := engine.opts[0]
 	// From the plan, not recomputed: stamping an id the plan did not classify
 	// against would install under one owner and hunt for orphans under another.
-	if got.Owner != "cd/edge" {
-		t.Errorf("owner = %q, want cd/edge", got.Owner)
+	if got.Owner != "cd/default/edge" {
+		t.Errorf("owner = %q, want cd/default/edge", got.Owner)
 	}
 	if !got.Wait || got.Timeout != 90*time.Second || got.HistoryMax != 20 {
 		t.Errorf("options = %+v, want the sync policy carried through", got)
@@ -1403,15 +1429,25 @@ func TestOrphansSurviveWhenPruneIsOff(t *testing.T) {
 	}
 }
 
-func TestPruneVolumesIsThreadedThrough(t *testing.T) {
+// The deployed resources come down through the backend and only then does the
+// engine delete the release records — never the other way round, because those
+// records carry the owner stamp a later sweep would need if this failed
+// halfway. Uninstall is therefore always asked to purge no volumes: prune has
+// already dealt with them.
+func TestPruneRemovesTheStackBeforeTheRecords(t *testing.T) {
+	var removed []string
 	engine := &fakeEngine{plans: []*charts.Plan{orphaning("old"), synced()}}
-	r := newTest(t, []application.Spec{pruningSpec("edge", true)}, engine, nil)
+	r := newTestWith(t, []application.Spec{pruningSpec("edge", true)}, engine,
+		nil, fakeRegistry{backend: stubBackend{removed: &removed}})
 
 	if err := r.Sync(context.Background(), "edge"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
 	}
-	if want := []string{"old+volumes"}; !slices.Equal(engine.pruned(), want) {
-		t.Errorf("uninstalled %v, want %v", engine.pruned(), want)
+	if want := []string{"old"}; !slices.Equal(removed, want) {
+		t.Errorf("removed stacks %v, want %v", removed, want)
+	}
+	if want := []string{"old"}; !slices.Equal(engine.pruned(), want) {
+		t.Errorf("uninstalled %v, want %v — volumes are prune's own business now", engine.pruned(), want)
 	}
 }
 
@@ -1471,5 +1507,65 @@ func TestSyncedApplicationDoesNotPrune(t *testing.T) {
 	}
 	if got := engine.pruned(); len(got) != 0 {
 		t.Errorf("uninstalled %v, want nothing — there was nothing to apply", got)
+	}
+}
+
+// PruneFirst is for a workload where two instances running at once is worse
+// than none — a validator that would double-sign, a runner that would process a
+// queue twice. The default order installs the replacement and only then deletes
+// what it replaced, which briefly runs both; this inverts that.
+func TestPruneFirstDeletesBeforeItInstalls(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{orphaning("old"), synced()}}
+	spec := pruningSpec("edge", false)
+	spec.SyncPolicy.PruneFirst = true
+	r := newTest(t, []application.Spec{spec}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []string{"old"}; !slices.Equal(engine.pruned(), want) {
+		t.Fatalf("uninstalled %v, want %v", engine.pruned(), want)
+	}
+	// One PlanApply had happened and no Apply had: the deletion landed before
+	// anything was installed, which is the guarantee.
+	if want := []int{1}; !slices.Equal(engine.uninstAtPlan, want) {
+		t.Errorf("uninstall after %v PlanApply calls, want %v", engine.uninstAtPlan, want)
+	}
+	if want := []int{0}; !slices.Equal(engine.uninstAtApply, want) {
+		t.Errorf("uninstall after %v Apply calls, want %v — nothing may be installed first", engine.uninstAtApply, want)
+	}
+}
+
+// The default is the other way round, and this is what pins it: the apply has
+// already happened when prune runs, so a failed apply leaves the old release
+// running rather than deleted.
+func TestTheDefaultOrderInstallsBeforeItDeletes(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{orphaning("old"), synced()}}
+	r := newTest(t, []application.Spec{pruningSpec("edge", false)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []int{1}; !slices.Equal(engine.uninstAtApply, want) {
+		t.Errorf("uninstall after %v Apply calls, want %v", engine.uninstAtApply, want)
+	}
+}
+
+// With PruneFirst the deletion gates the install: if it fails, installing
+// anyway would create exactly the overlap the option exists to prevent.
+func TestPruneFirstFailureStopsTheApply(t *testing.T) {
+	engine := &fakeEngine{
+		plans:     []*charts.Plan{orphaning("old"), synced()},
+		uninstErr: map[string]error{"old": errors.New("network still attached")},
+	}
+	spec := pruningSpec("edge", false)
+	spec.SyncPolicy.PruneFirst = true
+	r := newTest(t, []application.Spec{spec}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Fatal("Sync = nil, want the prune failure to stop the sync")
+	}
+	if engine.applyCount() != 0 {
+		t.Errorf("applied %d times, want 0 — the old release is still deployed", engine.applyCount())
 	}
 }

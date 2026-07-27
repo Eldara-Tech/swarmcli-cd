@@ -32,6 +32,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/health"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
+	"github.com/Eldara-Tech/swarmcli-cd/prune"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
@@ -96,6 +97,11 @@ type Options struct {
 	// reconciled stack may mount. Controller-wide; built at startup from the
 	// controller's /run/secrets. Empty disables the check.
 	ForbiddenSecretMounts map[string]struct{}
+
+	// ControllerID is the identity half of the owner stamp this reconciler
+	// writes, so that a second controller on the same swarm does not read these
+	// releases as its own. Empty is application.DefaultControllerID.
+	ControllerID string
 }
 
 // appEntry is one application's mutable record: the spec it reconciles against,
@@ -124,14 +130,15 @@ type appEntry struct {
 
 // Reconciler runs the loop and holds what it last observed.
 type Reconciler struct {
-	fetch     Fetcher
-	build     Builder
-	swarms    swarms.Registry
-	newEngine func(charts.Backend) Engine
-	interval  time.Duration
-	log       *slog.Logger
-	now       func() time.Time
-	forbidden map[string]struct{}
+	fetch      Fetcher
+	build      Builder
+	swarms     swarms.Registry
+	newEngine  func(charts.Backend) Engine
+	interval   time.Duration
+	log        *slog.Logger
+	now        func() time.Time
+	forbidden  map[string]struct{}
+	controller string
 
 	mu sync.RWMutex
 	// regAuth is the per-application image-pull credential, guarded by mu
@@ -166,16 +173,20 @@ func New(apps []application.Spec, o Options) *Reconciler {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
+	if o.ControllerID == "" {
+		o.ControllerID = application.DefaultControllerID
+	}
 
 	r := &Reconciler{
-		fetch:     o.Fetcher,
-		build:     o.Builder,
-		swarms:    o.Swarms,
-		newEngine: o.NewEngine,
-		interval:  o.Interval,
-		log:       o.Log,
-		now:       o.Now,
-		forbidden: o.ForbiddenSecretMounts,
+		fetch:      o.Fetcher,
+		build:      o.Builder,
+		swarms:     o.Swarms,
+		newEngine:  o.NewEngine,
+		interval:   o.Interval,
+		log:        o.Log,
+		now:        o.Now,
+		forbidden:  o.ForbiddenSecretMounts,
+		controller: o.ControllerID,
 		// Copied, not adopted: the map is written to as the set changes, and the
 		// caller's copy — built once at startup — is not ours to mutate.
 		regAuth: make(map[string]regauth.Resolver, len(o.RegistryAuth)),
@@ -496,7 +507,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		// never claim each other's releases — and classifying against this id
 		// rather than the file's is what lets this application recognise the
 		// releases it installed itself.
-		Owner:    application.OwnerID(spec.Name),
+		Owner:    application.OwnerID(r.controller, spec.Name),
 		ReadFile: built.ReadFile,
 	})
 	if err != nil {
@@ -580,6 +591,17 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 		At:          started,
 	})
 
+	// Before the apply, for a workload where two instances at once is worse
+	// than none: the departing release is gone before its replacement exists,
+	// so a rename cannot make them overlap. A failure here stops the apply,
+	// which is the point — proceeding would create the overlap this ordering
+	// was chosen to avoid.
+	if spec.SyncPolicy.PruneFirst {
+		if err := r.prune(ctx, spec, backend, engine, plan.Orphaned); err != nil {
+			return err
+		}
+	}
+
 	results, applyErr := engine.Apply(ctx, plan, charts.InstallOptions{
 		// From the plan, not recomputed: apply must stamp the same owner it
 		// classified against, or a release is installed under one id and the
@@ -622,16 +644,19 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 
 	// After the apply and before the confirming re-plan. After, so a failed
 	// apply leaves the old release running rather than already deleted — the
-	// recoverable half of the two failure modes. Before, so the re-plan below
-	// observes the swarm as prune left it rather than reporting the releases it
-	// has just deleted straight back as orphans.
-	if err := r.prune(ctx, spec, engine, plan.Orphaned); err != nil {
-		r.recordResult(spec.Name, result)
-		return err
+	// recoverable half of the two failure modes, and the right default for
+	// everything that is not harmed by a moment of overlap. Before, so the
+	// re-plan below observes the swarm as prune left it rather than reporting
+	// the releases it has just deleted straight back as orphans.
+	if !spec.SyncPolicy.PruneFirst {
+		if err := r.prune(ctx, spec, backend, engine, plan.Orphaned); err != nil {
+			r.recordResult(spec.Name, result)
+			return err
+		}
 	}
 
 	after, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{
-		Owner:    application.OwnerID(spec.Name),
+		Owner:    application.OwnerID(r.controller, spec.Name),
 		ReadFile: built.ReadFile,
 	})
 	if err != nil {
@@ -659,7 +684,7 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 // what is left behind is a release that will be classified as orphaned again on
 // the next tick and retried then. The error is still returned, as the re-plan's
 // is, because the reconcile did not do everything it set out to.
-func (r *Reconciler) prune(ctx context.Context, spec application.Spec, engine Engine, orphaned []string) error {
+func (r *Reconciler) prune(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, orphaned []string) error {
 	if !spec.SyncPolicy.Prune || len(orphaned) == 0 {
 		return nil
 	}
@@ -667,7 +692,7 @@ func (r *Reconciler) prune(ctx context.Context, spec application.Spec, engine En
 	var errs []error
 	var pruned []string
 	for _, release := range orphaned {
-		result, err := engine.Uninstall(ctx, release, spec.SyncPolicy.PruneVolumes)
+		result, err := prune.Release(ctx, backend, engine, release, spec.SyncPolicy.PruneVolumes)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("pruning release %q: %w", release, err))
 			continue

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/api"
+	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/appset"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/backend"
@@ -81,6 +82,11 @@ pause:
                             left the app set
   --prune-volumes           Also delete its named volumes, which is the one part
                             nothing can restore (requires --prune)
+  --controller-id <id>      This controller's identity, stamped on every release
+                            it installs (default ` + application.DefaultControllerID + `). Two controllers
+                            sharing a swarm MUST be given distinct ids, or each
+                            will see the other's applications as departed and,
+                            with --prune, delete them
 
 Credentials come from the environment, not from flags, because they arrive as
 Docker secrets and a flag would put them in "docker inspect" output and in argv:
@@ -110,6 +116,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&o.appSetInterval, "appset-interval", appset.DefaultInterval, "")
 	fs.BoolVar(&o.prune, "prune", false, "")
 	fs.BoolVar(&o.pruneVolumes, "prune-volumes", false, "")
+	fs.StringVar(&o.controllerID, "controller-id", application.DefaultControllerID, "")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -167,6 +174,11 @@ type options struct {
 	// gone: there is nothing left to carry the setting.
 	prune        bool
 	pruneVolumes bool
+
+	// controllerID is this controller's half of the owner stamp. It bounds what
+	// prune will even consider, so it is what keeps two controllers on one
+	// swarm from deleting each other's applications.
+	controllerID string
 
 	// configSet records that --config was given explicitly rather than
 	// defaulted. See runController.
@@ -266,6 +278,7 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		}),
 		RegistryAuth:          resolvers,
 		ForbiddenSecretMounts: forbidden,
+		ControllerID:          o.controllerID,
 		Log:                   log,
 	})
 
@@ -277,7 +290,9 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// report-only default rather than a flag read in two places.
 	var pruner appset.Pruner
 	if o.prune {
-		pruner = prune.New(prune.Options{Volumes: o.pruneVolumes, Log: log})
+		pruner = prune.New(prune.Options{
+			Volumes: o.pruneVolumes, ControllerID: o.controllerID, Log: log,
+		})
 	}
 
 	loop := appset.NewLoop(src, rec, appset.LoopOptions{
@@ -306,7 +321,7 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	log.Info("starting",
 		"applications", len(cfg.Applications), "listen", o.listen,
 		"mode", mode, "appSet", sourceDesc,
-		"prune", o.prune, "pruneVolumes", o.pruneVolumes)
+		"prune", o.prune, "pruneVolumes", o.pruneVolumes, "controllerID", o.controllerID)
 	return runUntilStopped(ctx, rec, loop, httpSrv, log)
 }
 
@@ -358,6 +373,8 @@ func (o options) validate() error {
 		// Not silently defaulted: an operator writing 0 means something by it,
 		// and "never re-read" is not a thing this controller can do.
 		return errors.New("--appset-interval must be positive")
+	case application.ValidateControllerID(o.controllerID) != nil:
+		return fmt.Errorf("--controller-id: %w", application.ValidateControllerID(o.controllerID))
 	case o.pruneVolumes && !o.prune:
 		// Refused rather than resolved either way. Read as "prune with volumes"
 		// it destroys data nobody asked to lose; read as "prune nothing" it

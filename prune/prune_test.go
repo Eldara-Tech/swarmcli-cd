@@ -10,17 +10,74 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 )
 
-type fakeSwarms struct{ err error }
+const testController = "prod"
 
-func (f fakeSwarms) Backend(context.Context, string) (charts.Backend, error) { return nil, f.err }
+type fakeSwarms struct {
+	err     error
+	backend charts.Backend
+}
+
+func (f fakeSwarms) Backend(context.Context, string) (charts.Backend, error) {
+	return f.backend, f.err
+}
+
+// fakeBackend is the deployed side of a prune: what RemoveStack and the volume
+// calls did, and whether they were allowed to work. charts.Backend is embedded
+// nil so any other method panics naming itself rather than silently answering.
+type fakeBackend struct {
+	charts.Backend
+	mu sync.Mutex
+
+	removedStacks []string
+	removeErr     map[string]error
+
+	volumes    map[string][]string
+	removedVol []string
+	// volInUse counts, per volume, how many removal attempts still fail before
+	// it frees — the "container has not let go yet" case.
+	volInUse map[string]int
+}
+
+func (b *fakeBackend) RemoveStack(name string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.removedStacks = append(b.removedStacks, name)
+	return b.removeErr[name]
+}
+
+func (b *fakeBackend) StackVolumes(_ context.Context, name string) ([]string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.volumes[name], nil
+}
+
+func (b *fakeBackend) RemoveVolume(_ context.Context, name string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n := b.volInUse[name]; n > 0 {
+		b.volInUse[name] = n - 1
+		return errors.New("volume is in use")
+	}
+	b.removedVol = append(b.removedVol, name)
+	return nil
+}
+
+func (b *fakeBackend) stacks() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.removedStacks)
+}
 
 type uninstalled struct {
 	release string
@@ -58,19 +115,29 @@ func (e *fakeEngine) pruned() []string {
 
 func testPruner(t *testing.T, e *fakeEngine, volumes bool) *Pruner {
 	t.Helper()
+	return prunerWith(t, e, &fakeBackend{}, volumes)
+}
+
+func prunerWith(t *testing.T, e *fakeEngine, b charts.Backend, volumes bool) *Pruner {
+	t.Helper()
 	return New(Options{
-		Swarms:  fakeSwarms{},
-		Engine:  func(charts.Backend) Engine { return e },
-		Volumes: volumes,
-		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Swarms:       fakeSwarms{backend: b},
+		Engine:       func(charts.Backend) Engine { return e },
+		Volumes:      volumes,
+		ControllerID: testController,
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 }
 
 // owned builds a release carrying a well-formed stamp for one of this
 // controller's applications, the way the reconciler writes it.
 func owned(release, app string) charts.Release {
+	return ownedBy(release, testController, app)
+}
+
+func ownedBy(release, controller, app string) charts.Release {
 	return stamped(release, charts.OwnerRef{
-		ID:   application.OwnerID(app),
+		ID:   application.OwnerID(controller, app),
 		Kind: charts.OwnerKindRelease,
 		Name: release,
 	}.String())
@@ -103,14 +170,16 @@ func TestDepartedApplicationIsPruned(t *testing.T) {
 // is one whose application is still declared.
 func TestOnlyProvablyDepartedReleasesArePruned(t *testing.T) {
 	for name, rel := range map[string]charts.Release{
-		"still in the set":        owned("api", "kept"),
-		"installed from the CLI":  stamped("api", "apply/prod:release/api"),
-		"another tool's stamp":    stamped("api", "flux/prod:release/api"),
-		"no stamp at all":         stamped("api", ""),
-		"unparseable stamp":       stamped("api", "not-an-owner-ref"),
-		"stamp names another rel": stamped("api", "cd/gone:release/web"),
-		"stamp is a bare cd/":     stamped("api", "cd/:release/api"),
-		"stamp of the wrong kind": stamped("api", "cd/gone:stack/api"),
+		"still in the set":          owned("api", "kept"),
+		"installed from the CLI":    stamped("api", "apply/prod:release/api"),
+		"another tool's stamp":      stamped("api", "flux/prod:release/api"),
+		"no stamp at all":           stamped("api", ""),
+		"unparseable stamp":         stamped("api", "not-an-owner-ref"),
+		"stamp names another rel":   stamped("api", "cd/prod/gone:release/web"),
+		"stamp is a bare cd/":       stamped("api", "cd/:release/api"),
+		"stamp of the wrong kind":   stamped("api", "cd/prod/gone:stack/api"),
+		"another controller's":      ownedBy("api", "staging", "gone"),
+		"the pre-controller-id fmt": stamped("api", "cd/gone:release/api"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := &fakeEngine{releases: []charts.Release{rel}}
@@ -146,13 +215,94 @@ func TestEmptyDesiredSetPrunesNothing(t *testing.T) {
 func TestVolumesAreOnlyPurgedWhenAsked(t *testing.T) {
 	for _, volumes := range []bool{false, true} {
 		e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+		b := &fakeBackend{volumes: map[string][]string{"api": {"api_data"}}}
 
-		if _, err := testPruner(t, e, volumes).Departed(t.Context(), []string{"kept"}); err != nil {
+		if _, err := prunerWith(t, e, b, volumes).Departed(t.Context(), []string{"kept"}); err != nil {
 			t.Fatalf("Departed = %v, want nil", err)
 		}
-		if len(e.calls) != 1 || e.calls[0].volumes != volumes {
-			t.Errorf("uninstall calls = %+v, want one with volumes=%v", e.calls, volumes)
+
+		var want []string
+		if volumes {
+			want = []string{"api_data"}
 		}
+		if !slices.Equal(b.removedVol, want) {
+			t.Errorf("removed volumes %v with Volumes=%v, want %v", b.removedVol, volumes, want)
+		}
+		// Never through Uninstall: the volumes have to go before the release
+		// records do, so prune does them itself and asks for none here.
+		if len(e.calls) != 1 || e.calls[0].volumes {
+			t.Errorf("uninstall calls = %+v, want one that purges no volumes", e.calls)
+		}
+	}
+}
+
+// The records carry the owner stamp, which is the only thing a later sweep can
+// find this release by. Deleting them when the stack is still up would strand
+// the resources permanently, so a failed removal must leave them alone.
+func TestAFailedStackRemovalKeepsTheReleaseRecords(t *testing.T) {
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	b := &fakeBackend{removeErr: map[string]error{"api": errors.New("network still attached")}}
+
+	got, err := prunerWith(t, e, b, false).Departed(t.Context(), []string{"kept"})
+	if err == nil {
+		t.Fatal("Departed = nil, want the removal failure")
+	}
+	if len(got) != 0 {
+		t.Errorf("pruned = %v, want none — nothing was removed", got)
+	}
+	if len(e.calls) != 0 {
+		t.Error("the release records were deleted even though the stack is still deployed")
+	}
+}
+
+// Same guarantee for the volume half: a volume that will not free must not cost
+// us the stamp that lets the next sweep try again.
+func TestAFailedVolumePurgeKeepsTheReleaseRecords(t *testing.T) {
+	restore := volumeSettleTimeout
+	volumeSettleTimeout, volumeSettleInterval = 0, 0
+	t.Cleanup(func() { volumeSettleTimeout, volumeSettleInterval = restore, 2*time.Second })
+
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	b := &fakeBackend{
+		volumes:  map[string][]string{"api": {"api_data"}},
+		volInUse: map[string]int{"api_data": 100},
+	}
+
+	if _, err := prunerWith(t, e, b, true).Departed(t.Context(), []string{"kept"}); err == nil {
+		t.Fatal("Departed = nil, want the volume failure")
+	}
+	if len(e.calls) != 0 {
+		t.Error("the release records were deleted even though a volume survived")
+	}
+	// The stack came down, which is what makes the retry cheap next time.
+	if !slices.Equal(b.stacks(), []string{"api"}) {
+		t.Errorf("removed stacks %v, want [api]", b.stacks())
+	}
+}
+
+// The services were removed a moment ago, so the first attempt on a volume
+// routinely fails while the container is still letting go. That is a wait, not
+// a failure.
+func TestAVolumeStillInUseIsRetried(t *testing.T) {
+	restore := volumeSettleInterval
+	volumeSettleInterval = 0
+	t.Cleanup(func() { volumeSettleInterval = restore })
+
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	b := &fakeBackend{
+		volumes:  map[string][]string{"api": {"api_data"}},
+		volInUse: map[string]int{"api_data": 3},
+	}
+
+	got, err := prunerWith(t, e, b, true).Departed(t.Context(), []string{"kept"})
+	if err != nil {
+		t.Fatalf("Departed = %v, want nil once the volume frees", err)
+	}
+	if !slices.Equal(b.removedVol, []string{"api_data"}) {
+		t.Errorf("removed volumes %v, want [api_data]", b.removedVol)
+	}
+	if !slices.Equal(got, []string{"gone"}) {
+		t.Errorf("pruned = %v, want [gone]", got)
 	}
 }
 
@@ -231,14 +381,15 @@ func TestUnresolvableSwarmIsReported(t *testing.T) {
 func TestLeftoverNetworksAreLogged(t *testing.T) {
 	var buf bytes.Buffer
 	p := New(Options{
-		Swarms: fakeSwarms{},
+		Swarms: fakeSwarms{backend: &fakeBackend{}},
 		Engine: func(charts.Backend) Engine {
 			return &fakeEngine{
 				releases: []charts.Release{owned("api", "gone")},
 				networks: map[string][]string{"api": {"shared-net"}},
 			}
 		},
-		Log: slog.New(slog.NewTextHandler(&buf, nil)),
+		ControllerID: testController,
+		Log:          slog.New(slog.NewTextHandler(&buf, nil)),
 	})
 
 	if _, err := p.Departed(t.Context(), []string{"kept"}); err != nil {
@@ -258,7 +409,7 @@ func TestReleasesAreGroupedByApplicationInListOrder(t *testing.T) {
 		owned("c-web", "alpha"),
 	}
 
-	got := departed(releases, []string{"kept"})
+	got := departed(releases, []string{"kept"}, testController)
 	want := []departedApp{
 		{name: "alpha", releases: []string{"a-api", "c-web"}},
 		{name: "beta", releases: []string{"b-api"}},
@@ -269,16 +420,17 @@ func TestReleasesAreGroupedByApplicationInListOrder(t *testing.T) {
 }
 
 func TestOwnerRejectsWhatItCannotProve(t *testing.T) {
-	if app, ok := owner(owned("api", "edge")); !ok || app != "edge" {
+	if app, ok := owner(owned("api", "edge"), testController); !ok || app != "edge" {
 		t.Errorf("owner(well-formed) = %q, %v; want edge, true", app, ok)
 	}
 	for _, rel := range []charts.Release{
 		stamped("api", ""),
 		stamped("api", "garbage"),
-		stamped("api", "cd/edge:release/other"),
+		stamped("api", "cd/prod/edge:release/other"),
 		stamped("api", "apply/edge:release/api"),
+		ownedBy("api", "staging", "edge"),
 	} {
-		if app, ok := owner(rel); ok {
+		if app, ok := owner(rel, testController); ok {
 			t.Errorf("owner(%q) = %q, true; want it rejected", rel.Owner, app)
 		}
 	}

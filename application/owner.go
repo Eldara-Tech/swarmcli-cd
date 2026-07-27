@@ -3,38 +3,95 @@
 
 package application
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+	"unicode"
+)
 
 // ownerPrefix namespaces every owner id this controller stamps. The command
 // line stamps "apply/", so a release file applied by hand and an application
 // reconciled here can never claim each other's releases.
 const ownerPrefix = "cd/"
 
-// OwnerID is the id this controller stamps a release with and classifies
-// deployed releases against.
+// DefaultControllerID is the identity a controller stamps with when the
+// deployment does not choose one.
 //
-// It is per application rather than per controller: several applications share
-// one swarm, and a per-controller id would make each of them report the others'
-// releases as its own orphans.
+// It is a real default rather than a required flag because the single-controller
+// case is the overwhelmingly common one and should not need ceremony. Two
+// controllers sharing a swarm must be given distinct ids — see OwnerID.
+const DefaultControllerID = "default"
+
+// OwnerID is the id this controller stamps a release with and classifies
+// deployed releases against: "cd/<controller>/<application>".
+//
+// Both halves are load-bearing and for different reasons.
+//
+// The application half is what keeps sibling applications apart. Several
+// applications share one swarm, and an id that named only the controller would
+// make each of them report the others' releases as its own orphans.
+//
+// The controller half is what keeps whole controllers apart, and exists because
+// prune acts on the difference. A sweep asks "which releases on this swarm
+// belong to an application my app set no longer declares", and without a
+// controller in the id, a second swarmcli-cd on the same swarm answers that
+// question about the first one's applications — and deletes them. Two
+// controllers sharing a swarm must therefore be given distinct ids, or each
+// will treat the other's work as departed.
 //
 // It lives here, in the wire contract, rather than in the reconciler that
 // writes it, because it is also what prune reads back off the swarm to decide
-// what may be deleted. Two copies of this string that drifted apart would not
+// what may be deleted. Two copies of this format that drifted apart would not
 // fail loudly — the reconciler would keep stamping and prune would quietly stop
 // recognising, which is a deletion bug in whichever direction it broke.
-func OwnerID(app string) string { return ownerPrefix + app }
+func OwnerID(controller, app string) string {
+	if controller == "" {
+		controller = DefaultControllerID
+	}
+	return ownerPrefix + controller + "/" + app
+}
 
-// AppFromOwnerID reports which application an owner id names, and whether the
-// id belongs to this controller at all.
+// AppFromOwnerID reports which of this controller's applications an owner id
+// names, and whether the id belongs to this controller at all.
 //
-// False for anything else on the swarm — an "apply/" stamp from the command
-// line, another tool's id, or a bare "cd/" naming no application. Prune treats
-// false as "not mine", which is what keeps it from deleting a release it did
-// not install.
-func AppFromOwnerID(id string) (string, bool) {
-	app, ok := strings.CutPrefix(id, ownerPrefix)
-	if !ok || app == "" {
+// False for everything else on the swarm: an "apply/" stamp from the command
+// line, another tool's id, a bare prefix naming no application, and — the case
+// this exists for — an id belonging to a different swarmcli-cd. Prune treats
+// false as "not mine", which is what stops it deleting a release it did not
+// install.
+//
+// A stamp in the pre-controller-id format ("cd/<app>") is likewise not this
+// controller's. That is deliberate: it reads as unmanaged, so prune leaves it
+// alone, and a release still declared by its application is re-stamped on the
+// next reconcile because ownership plays no part in planning a release the file
+// declares. The migration therefore heals itself and errs towards not deleting.
+func AppFromOwnerID(controller, id string) (string, bool) {
+	if controller == "" {
+		controller = DefaultControllerID
+	}
+	app, ok := strings.CutPrefix(id, ownerPrefix+controller+"/")
+	if !ok || app == "" || strings.Contains(app, "/") {
 		return "", false
 	}
 	return app, true
+}
+
+// ValidateControllerID refuses an id that would produce an unparseable stamp or
+// one that cannot be told apart from another.
+//
+// A slash would make "cd/<controller>/<application>" ambiguous about where the
+// controller ends, and a colon is what the chart engine itself rejects. Space
+// is refused because an id that differs from another only by trailing
+// whitespace is the kind of distinction an operator cannot see and prune would
+// act on.
+func ValidateControllerID(id string) error {
+	switch {
+	case id == "":
+		return fmt.Errorf("the controller id is empty")
+	case strings.ContainsAny(id, "/:"):
+		return fmt.Errorf("invalid controller id %q: it must not contain '/' or ':'", id)
+	case strings.IndexFunc(id, unicode.IsSpace) >= 0:
+		return fmt.Errorf("invalid controller id %q: it must not contain whitespace", id)
+	}
+	return nil
 }

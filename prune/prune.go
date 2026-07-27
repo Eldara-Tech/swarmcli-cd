@@ -33,6 +33,21 @@
 // distinction charts.Plan draws between Orphaned and Unmanaged, for the same
 // reason.
 //
+// # Two controllers on one swarm
+//
+// The stamp names a controller as well as an application, and the sweep only
+// considers its own. Without that, a second swarmcli-cd sharing the swarm would
+// answer "which releases belong to an application my app set no longer
+// declares" about the *first* controller's applications, and delete them — a
+// silent, swarm-wide deletion of somebody else's work, triggered by nothing more
+// than starting a second controller.
+//
+// Two controllers on one swarm must therefore be given distinct ids. The
+// default is shared, so two controllers that both take it will still collide;
+// that is a deployment mistake this package cannot detect from the inside,
+// because a controller cannot tell "my own releases from before a restart" from
+// "another controller using my id".
+//
 // # One swarm
 //
 // The sweep covers the swarm this controller runs in, because swarms.Registry
@@ -47,6 +62,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/Eldara-Tech/swarmcli/charts"
 
@@ -54,14 +70,96 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
 )
 
+// Uninstaller deletes a release's recorded revisions once its resources are
+// gone. *charts.Engine implements it.
+type Uninstaller interface {
+	Uninstall(ctx context.Context, release string, purgeVolumes bool) (*charts.UninstallResult, error)
+}
+
 // Engine is the part of the chart engine a sweep uses. *charts.Engine
 // implements it.
 //
 // Declared here rather than reused from reconcile so that prune does not
-// import the reconciler for a two-method interface it can state itself.
+// import the reconciler for an interface it can state itself.
 type Engine interface {
+	Uninstaller
 	List(ctx context.Context) ([]charts.Release, error)
-	Uninstall(ctx context.Context, release string, purgeVolumes bool) (*charts.UninstallResult, error)
+}
+
+// How long Release waits for a volume to be released by the tasks that were
+// using it, and how often it retries. Variables rather than constants so a test
+// does not spend the real interval discovering that the retry works.
+var (
+	volumeSettleTimeout  = 30 * time.Second
+	volumeSettleInterval = 2 * time.Second
+)
+
+// Release deletes one release's deployed resources and then its records, in
+// that order, and reports the networks the engine left behind.
+//
+// The order is the whole point. charts.Engine.Uninstall aggregates its errors
+// and deletes the release-history configs regardless of whether its own stack
+// removal worked — and those configs carry the owner stamp, which is the only
+// thing that lets a later sweep find this release again. Calling it directly on
+// a stack that will not come down would delete the evidence and strand the
+// resources permanently, invisible to every future prune. So the resources come
+// down first, through the backend, and the records are only deleted once there
+// is nothing left for them to point at.
+//
+// This is shared with the per-application prune in reconcile, which faces the
+// same hazard for the same reason.
+func Release(ctx context.Context, backend charts.Backend, engine Uninstaller, release string, volumes bool) (*charts.UninstallResult, error) {
+	if err := backend.RemoveStack(release); err != nil {
+		return nil, fmt.Errorf("removing the stack: %w", err)
+	}
+	if volumes {
+		if err := purgeVolumes(ctx, backend, release); err != nil {
+			return nil, err
+		}
+	}
+	// Volumes already handled above, so this is only the records now.
+	return engine.Uninstall(ctx, release, false)
+}
+
+// purgeVolumes deletes the stack's named volumes, waiting for the tasks that
+// mounted them to let go.
+//
+// The services were removed a moment ago and Swarm does not wait for their
+// containers to die, so the first attempt routinely fails with "volume is in
+// use". Retrying is not papering over a race — it is the only way to observe
+// the thing this is waiting for; the daemon offers no "tasks have drained"
+// signal to poll instead.
+//
+// A volume that never frees is returned as an error and, because the caller
+// has not yet deleted the release records, is retried by the next sweep rather
+// than left as an untracked volume nobody knows to remove.
+func purgeVolumes(ctx context.Context, backend charts.Backend, release string) error {
+	names, err := backend.StackVolumes(ctx, release)
+	if err != nil {
+		return fmt.Errorf("listing the stack's volumes: %w", err)
+	}
+
+	deadline := time.Now().Add(volumeSettleTimeout)
+	for _, name := range names {
+		for {
+			err := backend.RemoveVolume(ctx, name)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return fmt.Errorf("removing volume %q: %w", name, ctx.Err())
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("removing volume %q: still in use after %s: %w", name, volumeSettleTimeout, err)
+			}
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("removing volume %q: %w", name, ctx.Err())
+			case <-time.After(volumeSettleInterval):
+			}
+		}
+	}
+	return nil
 }
 
 // Options configures a Pruner. Everything has a working default.
@@ -72,15 +170,22 @@ type Options struct {
 	// Off by default, and the only irreversible part: everything else prune
 	// deletes is recreated from git the moment the application comes back.
 	Volumes bool
-	Log     *slog.Logger
+	// ControllerID is this controller's half of the owner stamp, and bounds
+	// what the sweep will consider at all. Empty is
+	// application.DefaultControllerID — which is correct for the single
+	// controller case and wrong the moment there are two, so a second
+	// controller on the swarm must be given its own.
+	ControllerID string
+	Log          *slog.Logger
 }
 
 // Pruner deletes the releases of applications that have left the app set.
 type Pruner struct {
-	swarms  swarms.Registry
-	engine  func(charts.Backend) Engine
-	volumes bool
-	log     *slog.Logger
+	swarms     swarms.Registry
+	engine     func(charts.Backend) Engine
+	volumes    bool
+	controller string
+	log        *slog.Logger
 }
 
 // New returns a Pruner. A nil Pruner is the report-only default, so callers
@@ -95,7 +200,13 @@ func New(o Options) *Pruner {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	return &Pruner{swarms: o.Swarms, engine: o.Engine, volumes: o.Volumes, log: o.Log}
+	if o.ControllerID == "" {
+		o.ControllerID = application.DefaultControllerID
+	}
+	return &Pruner{
+		swarms: o.Swarms, engine: o.Engine, volumes: o.Volumes,
+		controller: o.ControllerID, log: o.Log,
+	}
 }
 
 // Departed deletes the releases of every application this controller owns that
@@ -134,10 +245,10 @@ func (p *Pruner) Departed(ctx context.Context, desired []string) ([]string, erro
 
 	var pruned []string
 	var errs []error
-	for _, app := range departed(releases, desired) {
+	for _, app := range departed(releases, desired, p.controller) {
 		failed := false
 		for _, release := range app.releases {
-			if err := p.uninstall(ctx, engine, app.name, release); err != nil {
+			if err := p.uninstall(ctx, backend, engine, app.name, release); err != nil {
 				errs = append(errs, err)
 				failed = true
 			}
@@ -152,8 +263,8 @@ func (p *Pruner) Departed(ctx context.Context, desired []string) ([]string, erro
 	return pruned, errors.Join(errs...)
 }
 
-func (p *Pruner) uninstall(ctx context.Context, engine Engine, app, release string) error {
-	result, err := engine.Uninstall(ctx, release, p.volumes)
+func (p *Pruner) uninstall(ctx context.Context, backend charts.Backend, engine Engine, app, release string) error {
+	result, err := Release(ctx, backend, engine, release, p.volumes)
 	if err != nil {
 		return fmt.Errorf("pruning release %q of departed application %q: %w", release, app, err)
 	}
@@ -185,7 +296,7 @@ type departedApp struct {
 //
 // The result is in the order List returned the releases, which is by name, so
 // what gets logged and reported does not reshuffle between sweeps.
-func departed(releases []charts.Release, desired []string) []departedApp {
+func departed(releases []charts.Release, desired []string, controller string) []departedApp {
 	keep := make(map[string]struct{}, len(desired))
 	for _, name := range desired {
 		keep[name] = struct{}{}
@@ -194,7 +305,7 @@ func departed(releases []charts.Release, desired []string) []departedApp {
 	var out []departedApp
 	at := map[string]int{}
 	for _, rel := range releases {
-		app, ok := owner(rel)
+		app, ok := owner(rel, controller)
 		if !ok {
 			continue
 		}
@@ -220,7 +331,7 @@ func departed(releases []charts.Release, desired []string) []departedApp {
 // then delete a release nobody installed under that name. A stamp that does not
 // parse is not evidence of anything either, so it counts as unowned — and
 // unowned is never pruned.
-func owner(rel charts.Release) (string, bool) {
+func owner(rel charts.Release, controller string) (string, bool) {
 	ref, err := charts.ParseOwner(rel.Owner)
 	if err != nil {
 		return "", false
@@ -228,5 +339,5 @@ func owner(rel charts.Release) (string, bool) {
 	if ref.Kind != charts.OwnerKindRelease || ref.Name != rel.Name {
 		return "", false
 	}
-	return application.AppFromOwnerID(ref.ID)
+	return application.AppFromOwnerID(controller, ref.ID)
 }

@@ -165,6 +165,7 @@ output and in argv.
 | `--appset-interval` | `3m` | how often the application set is re-read |
 | `--prune` | off | delete the resources of an application that has left the application set, instead of leaving the stack running and reporting it as orphaned |
 | `--prune-volumes` | off | extend `--prune` to named volumes, the one part nothing can restore; requires `--prune` |
+| `--controller-id` | `default` | this controller's identity, stamped on every release it installs. Two controllers on one swarm **must** differ, or each treats the other's applications as departed |
 
 | Environment | |
 |---|---|

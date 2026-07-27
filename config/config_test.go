@@ -246,3 +246,16 @@ func TestLoadMissingFile(t *testing.T) {
 		t.Errorf("Load = %v, want a read error", err)
 	}
 }
+
+func TestPruneFirstNeedsPrune(t *testing.T) {
+	const src = `
+applications:
+  - name: edge
+    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}
+    syncPolicy: {pruneFirst: true}
+`
+	_, err := Parse([]byte(src), "applications.yaml")
+	if err == nil || !strings.Contains(err.Error(), "pruneFirst means nothing without prune") {
+		t.Fatalf("Parse = %v, want pruneFirst refused without prune", err)
+	}
+}

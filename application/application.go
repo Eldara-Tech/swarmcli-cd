@@ -112,6 +112,30 @@ type SyncPolicy struct {
 	// else prune removes can be recreated from git on the next reconcile; the
 	// data in a volume cannot be recreated from anything.
 	PruneVolumes bool `json:"pruneVolumes,omitempty" yaml:"pruneVolumes,omitempty"`
+
+	// PruneFirst deletes before installing, instead of after.
+	//
+	// The default order applies and then prunes, so a failed apply leaves the
+	// old release running rather than nothing at all. The cost is that a
+	// renamed release briefly coexists with the name it replaced: the new name
+	// is an install and the old one an orphan, and between the two steps both
+	// are deployed.
+	//
+	// For a workload where two instances running at once is worse than none —
+	// a blockchain validator that would double-sign and be slashed, a job
+	// runner that must not process a queue twice — that trade is the wrong way
+	// round. This inverts it: the departing release is deleted before its
+	// replacement is installed, so they never overlap, and a failed apply
+	// leaves a gap instead.
+	//
+	// It bounds the overlap this controller creates deliberately; it is not a
+	// distributed lock. Nothing here can prevent two instances during a network
+	// partition or a node recovering with stale state, so a workload that
+	// cannot tolerate that at all needs an external guard — a remote signer
+	// with an anti-slashing record, or a lease.
+	//
+	// Means nothing without Prune, and is refused rather than ignored.
+	PruneFirst bool `json:"pruneFirst,omitempty" yaml:"pruneFirst,omitempty"`
 }
 
 // View is what every API read returns: the declared spec beside what the

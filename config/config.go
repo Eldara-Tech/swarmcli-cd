@@ -164,6 +164,9 @@ func validateApplication(app application.Spec) error {
 	if app.SyncPolicy.PruneVolumes && !app.SyncPolicy.Prune {
 		return fmt.Errorf("%q: syncPolicy pruneVolumes means nothing without prune", app.Name)
 	}
+	if app.SyncPolicy.PruneFirst && !app.SyncPolicy.Prune {
+		return fmt.Errorf("%q: syncPolicy pruneFirst means nothing without prune", app.Name)
+	}
 	return nil
 }
 

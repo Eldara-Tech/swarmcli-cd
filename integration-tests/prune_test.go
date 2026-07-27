@@ -96,7 +96,7 @@ func TestPruneDeletesADepartedApplicationsResources(t *testing.T) {
 	rec := reconciler(t)
 	loop := appset.NewLoop(src, rec, appset.LoopOptions{
 		Mode: "path", Log: testLog(),
-		Pruner: prune.New(prune.Options{Log: testLog()}),
+		Pruner: prune.New(prune.Options{ControllerID: controllerID(t), Log: testLog()}),
 	})
 
 	if err := loop.Once(context.Background()); err != nil {
@@ -201,7 +201,7 @@ func TestPruneVolumesDeletesTheVolumeToo(t *testing.T) {
 	rec := reconciler(t)
 	loop := appset.NewLoop(src, rec, appset.LoopOptions{
 		Mode: "path", Log: testLog(),
-		Pruner: prune.New(prune.Options{Volumes: true, Log: testLog()}),
+		Pruner: prune.New(prune.Options{Volumes: true, ControllerID: controllerID(t), Log: testLog()}),
 	})
 
 	if err := loop.Once(context.Background()); err != nil {
