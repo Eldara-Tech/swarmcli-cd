@@ -81,6 +81,8 @@ minute. Every field is explained in the [configuration reference](configuration.
 The controller runs **in the swarm, on a manager node**, and reaches the daemon
 through the mounted socket. Its two inputs — the applications file and an admin
 token — are delivered as a Docker config and a Docker secret, both immutable.
+(Step 7 moves the applications file into git, where changing it is a commit; the
+mounted form is the simplest place to start and stays the default.)
 
 ```bash
 # The applications file, as a config:
@@ -144,6 +146,7 @@ Within a minute the application should be `synced` and `healthy`. Look closer:
 ```bash
 swarmcli-cd app get quickstart      # releases and their services
 swarmcli-cd app history quickstart  # each release's revisions
+swarmcli-cd status                  # the controller itself, and where its app set comes from
 ```
 
 And confirm on the swarm itself:
@@ -172,6 +175,55 @@ swarmcli-cd app sync quickstart --wait # reconcile now; non-zero exit if it fail
 
 `app sync --wait` blocks until the rollout converges and exits non-zero if it
 did not — which is what makes it usable in a script or a smoke test.
+
+## 7. Optional: put the application *set* in git too
+
+So far `applications.yaml` is a Docker config: adding a second application means
+creating a new config object and redeploying the controller. It does not have to
+be. Point the controller at a repository and the set itself becomes a commit —
+this is "app-of-apps", and it is the same file in a different place.
+
+**Use a separate repository from step 1's.** Whoever can commit to this one
+defines every application the controller runs; it is not the same permission as
+being able to change one app's chart.
+
+```bash
+mkdir -p apps && cp applications.yaml apps/applications.yaml
+git init && git add . && git commit -m "app set"
+git remote add origin https://github.com/your-org/apps.git
+git push -u origin main
+```
+
+Then swap the controller's `command:` in `stack.yml` from `--config` to the git
+selectors, drop the `configs:` block, and redeploy once:
+
+```yaml
+command: ["controller",
+          "--appset-repo", "https://github.com/your-org/apps.git",
+          "--appset-revision", "main",
+          "--appset-path", "apps/applications.yaml",
+          "--appset-interval", "1m"]
+```
+
+Confirm what it is following:
+
+```bash
+swarmcli-cd status
+# Mode          git
+# Source        https://github.com/your-org/apps.git @ main (apps/applications.yaml)
+# Revision      a1b2c3d
+# Loaded        2026-07-27T09:12:04Z
+# Applications  1
+```
+
+Now add a second application by committing to that repository, and within a
+minute `swarmcli-cd app list` shows it — no redeploy. A commit that does not
+validate changes nothing: the last good set keeps running and `swarmcli-cd
+status` reports `Stale` with the reason.
+
+The full model, including the trust boundary that repository now carries, is in
+[configuration § where the app set lives](configuration.md#where-the-app-set-lives).
+A ready-made layout is in [`../examples/appset-repo/`](../examples/appset-repo/).
 
 ## Where to go next
 

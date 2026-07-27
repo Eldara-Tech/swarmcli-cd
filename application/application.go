@@ -21,8 +21,9 @@ package application
 
 import "time"
 
-// Spec is what an operator declares in applications.yaml. It is read-only in
-// Phase 1: the file is the only source of truth and the API serves it.
+// Spec is what an operator declares in applications.yaml. It is read-only over
+// the API: the file is the only source of truth, whether it is mounted at
+// deploy time or committed to git, and the API serves it rather than owning it.
 type Spec struct {
 	Name   string `json:"name" yaml:"name"`
 	Source Source `json:"source" yaml:"source"`

@@ -1,0 +1,70 @@
+# An app set in git — the "app-of-apps" layout.
+#
+# This is the same applications.yaml as ../applications.yaml, with one
+# difference that is not in the file: it lives in a git repository the
+# controller pulls, so adding, removing or retuning an application is a commit
+# rather than a new Docker config and a controller redeploy.
+#
+# The repository this file sits in looks like this, and nothing else is needed:
+#
+#   apps/
+#     applications.yaml       <- this file
+#
+# Point a controller at it:
+#
+#   swarmcli-cd controller \
+#     --appset-repo https://github.com/your-org/apps.git \
+#     --appset-revision main \
+#     --appset-path apps/applications.yaml \
+#     --appset-interval 1m
+#
+# ---------------------------------------------------------------------------
+# This repository is root-equivalent. Read that twice.
+#
+# Whoever can commit here defines every application, every destination and every
+# sync policy the controller applies with its docker socket. It is the one thing
+# nothing else in git can repoint — the controller's bootstrap says which
+# repository, branch and path are authoritative, and this file cannot change
+# that. In the OSS build, protecting it is the deployment's job:
+#
+#   - branch protection on the tracked branch, with review required;
+#   - signed commits, if your forge can enforce them;
+#   - a repository separate from the applications' own — which is why this
+#     example is its own directory and not a file inside ../quickstart-repo/.
+#
+# What a commit here cannot do is deliver a new secret. An application that
+# names a `registryAuth:` still needs that Docker secret mounted into the
+# controller in stack.yml, so private-registry credentials remain a deploy-time
+# act. Adding an application that uses an already-mounted one is just a commit.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+
+applications:
+  # A release file committed to the application's own repository: the versions
+  # live there, so bumping one is a commit in that repo and does not touch this
+  # file at all. Two tiers, two commits, neither of them a redeploy.
+  - name: edge
+    source:
+      repoURL: https://github.com/your-org/infra.git
+      revision: main
+      releaseFile: swarm/prod/swarmcli-release.yaml
+    syncPolicy:
+      automated: true
+      interval: 3m
+      wait: true
+      timeout: 10m
+
+  # A single chart pinned here. In a mounted Docker config this was the awkward
+  # case — bumping the version meant a redeploy — and in a git-sourced set it is
+  # an ordinary commit to this file, picked up within --appset-interval.
+  - name: hello
+    source:
+      repoURL: https://github.com/your-org/infra.git
+      revision: v1.2.0
+      chart:
+        release: hello
+        ref: swarmcli-charts/whoami
+        version: "0.1.8"
+        repositories:
+          - name: swarmcli-charts
+            url: https://eldara-tech.github.io/swarmcli-charts

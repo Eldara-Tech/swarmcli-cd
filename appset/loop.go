@@ -43,7 +43,12 @@ type LoopOptions struct {
 	// Mode labels how the set is sourced for the status endpoint: "static",
 	// "git" or "path". The source does not name itself — the bootstrap decides
 	// what to call the thing it configured.
-	Mode     string
+	Mode string
+	// Source is where that set lives, for the status endpoint to report: the
+	// repository and revision, or the directory. Like Mode it is passed in
+	// rather than derived, because it is the bootstrap anchor and describing it
+	// is the bootstrap's to do.
+	Source   string
 	Interval time.Duration
 	Log      *slog.Logger
 
@@ -65,19 +70,21 @@ type LoopOptions struct {
 // that is the reconciler's, per application, on its own schedule. This loop only
 // decides which applications there are.
 type Loop struct {
-	src  *Loader
-	rec  Reconciler
-	mode string
+	src    *Loader
+	rec    Reconciler
+	mode   string
+	source string
 
 	interval time.Duration
 	log      *slog.Logger
 	creds    func(application.Spec) (regauth.Resolver, error)
 
 	mu sync.RWMutex
-	// lastErr is why the last attempt failed, and stale reports that the failure
-	// was the load itself — so what is running is a last-good set rather than
-	// what the source now says. An error without stale is a set that loaded and
-	// could not be entirely applied.
+	// lastErr is why the last attempt failed, and stale reports that the load
+	// itself failed over a set that is already running — so what is running is
+	// last-good rather than what the source now says. An error without stale is
+	// either a set that loaded and could not be entirely applied, or a first
+	// load that failed and left nothing running at all.
 	lastErr string
 	stale   bool
 	// orphaned names applications removed from the set, in the order they left.
@@ -95,7 +102,10 @@ func NewLoop(src *Loader, rec Reconciler, o LoopOptions) *Loop {
 	if o.Credentials == nil {
 		o.Credentials = mountedCredential
 	}
-	return &Loop{src: src, rec: rec, mode: o.Mode, interval: o.Interval, log: o.Log, creds: o.Credentials}
+	return &Loop{
+		src: src, rec: rec, mode: o.Mode, source: o.Source,
+		interval: o.Interval, log: o.Log, creds: o.Credentials,
+	}
 }
 
 // Run keeps the running set current until ctx is cancelled.
@@ -140,7 +150,12 @@ func (l *Loop) Run(ctx context.Context) error {
 func (l *Loop) Once(ctx context.Context) error {
 	file, changed, err := l.src.Load(ctx)
 	if err != nil {
-		l.record(err, true)
+		// Stale means what is running is a last-good set. A controller that has
+		// never loaded one has nothing running and nothing to be stale about —
+		// a louder problem than a refused commit, not a quieter one, and
+		// reporting it as stale would file it under the wrong heading. The zero
+		// application count beside the error is what says it.
+		l.record(err, l.src.Current() != nil)
 		return err
 	}
 	if changed {
@@ -288,6 +303,7 @@ func (l *Loop) Status() application.ControllerStatus {
 	return application.ControllerStatus{
 		AppSet: application.AppSetStatus{
 			Mode:     l.mode,
+			Source:   l.source,
 			Revision: revision,
 			LoadedAt: at,
 			Error:    l.lastErr,

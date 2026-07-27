@@ -26,6 +26,9 @@ it is and why; the pages here are how to use it.
   commented applications file showing both source types.
 - **[`../examples/quickstart-repo/`](../examples/quickstart-repo/)** — a minimal,
   ready-to-push repository the getting-started guide deploys.
+- **[`../examples/appset-repo/`](../examples/appset-repo/)** — the app-set-in-git
+  layout: the applications file itself under GitOps, with the trust boundary that
+  carries.
 
 ## For contributors
 

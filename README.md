@@ -82,6 +82,7 @@ swarmcli-cd app get edge             # releases and their services
 swarmcli-cd app diff edge            # what a sync would change
 swarmcli-cd app history edge         # each release's revisions
 swarmcli-cd app sync edge --wait     # reconcile now; non-zero if it failed
+swarmcli-cd status                   # the controller itself: where its app set comes from
 ```
 
 Add `-o json` to any read for the controller's own response, unmodified — that
@@ -99,8 +100,9 @@ Run `swarmcli-cd controller --help` or `swarmcli-cd app help` for the rest.
 - [Concepts](docs/concepts.md) — sync versus health, drift, ownership, rollback,
   chart compatibility.
 - [HTTP API](docs/api.md) — the endpoints behind every command.
-- Examples: a commented [`applications.yaml`](examples/applications.yaml) and a
-  ready-to-push [quickstart repository](examples/quickstart-repo/).
+- Examples: a commented [`applications.yaml`](examples/applications.yaml), a
+  ready-to-push [quickstart repository](examples/quickstart-repo/), and an
+  [app-set repository](examples/appset-repo/) for the git-sourced layout.
 
 ## Deploying it
 
@@ -118,8 +120,22 @@ docker stack deploy -c stack.yml swarmcli-cd
 ```
 
 Both a config and a secret are immutable in Swarm, so changing either means
-creating a new one and updating `stack.yml`. That is why applications are
-read-only in the API: there is nothing to hot-reload into.
+creating a new one and updating `stack.yml`. That is right for the controller's
+bootstrap, which rarely changes — and optional for the application set, which
+can live in git instead:
+
+```bash
+swarmcli-cd controller \
+  --appset-repo https://github.com/your-org/apps.git \
+  --appset-revision main \
+  --appset-path apps/applications.yaml
+```
+
+Then adding, removing or retuning an application is a commit rather than a
+redeploy; a commit that does not validate leaves the running set untouched and
+is reported by `swarmcli-cd status`. The mounted-config mode stays the default
+and the air-gap fallback. See
+[configuration § where the app set lives](docs/configuration.md#where-the-app-set-lives).
 
 `stack.yml` **does not publish the API port.** The controller holds
 root-equivalent access to the swarm behind one shared bearer token over
@@ -144,6 +160,9 @@ output and in argv.
 | `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config |
 | `--listen` | `:8080` | API listen address |
 | `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume |
+| `--appset-repo` `--appset-revision` `--appset-path` | — | source the application set from a git repository instead |
+| `--appset-dir` | — | source it from a directory a git-sync sidecar keeps current |
+| `--appset-interval` | `3m` | how often the application set is re-read |
 
 | Environment | |
 |---|---|

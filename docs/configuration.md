@@ -5,25 +5,27 @@ Copyright © 2026 Eldara Tech
 
 # Configuration
 
-swarmcli-cd is configured by two things and nothing else: the **applications
-file**, which lists what to reconcile, and a handful of **environment variables**
-for the listen address, the admin token and git credentials. Everything an
-operator edits about the one thing they think about — which applications exist —
-lives in the file; everything about the process lives in the environment.
+swarmcli-cd is configured in two tiers. The **applications file** — the *app
+set* — lists what to reconcile. The **bootstrap** — a handful of flags and
+environment variables — says where that file lives, which address to listen on,
+and which credentials to use. Everything an operator edits about the one thing
+they think about lives in the app set; everything about the process lives in the
+bootstrap.
 
-A worked, copy-pasteable file is in [`../examples/applications.yaml`](../examples/applications.yaml).
+The split matters because the two change at completely different rates. The
+bootstrap is set once at deploy time and rarely touched. The app set can be
+every day, which is why it can live in git.
+
+Worked, copy-pasteable files: [`../examples/applications.yaml`](../examples/applications.yaml)
+for the set itself, and [`../examples/appset-repo/`](../examples/appset-repo/)
+for the git-sourced layout.
 
 ## The applications file
 
 Declared in a file rather than a database on purpose: a GitOps controller whose
-own desired state lived in mutable storage would have a bootstrap problem. In
-Phase 1 the file is the only source of truth and the API serves it read-only.
-
-It is delivered to the controller as a **Docker config**, which is immutable —
-so changing it means creating a new config object and updating the stack, which
-restarts the container. There is no hot reload because the process that would
-notice a change does not outlive it. Restart is not a limitation here; it is the
-only thing that can happen.
+own desired state lived in mutable storage would have a bootstrap problem. The
+file is the only source of truth and the API serves it read-only — in both
+modes, because the way to change the set is to change the file.
 
 ```yaml
 apiVersion: v1        # "v1", or absent meaning the same
@@ -59,13 +61,17 @@ type — a separate discriminator would be a second thing to keep consistent.
 
 **Which one?** The practical difference is where a version bump lives. A
 `releaseFile` keeps the pinned chart versions in a `swarmcli-release.yaml`
-committed to your repo, so bumping one is an ordinary git commit — the controller
-fetches it on the next reconcile, with no redeploy (Renovate can even open the
-PR). A `chart` source keeps the version here in `applications.yaml`, which is
-delivered as an immutable Docker config, so changing it means creating a new
-config and redeploying the controller. A chart whose version changes often
-therefore belongs in a release file; the `chart` source is the convenience form
-for a single, rarely-changing chart.
+committed to your repo, so bumping one is an ordinary git commit in *that* repo
+— the controller fetches it on the next reconcile (Renovate can even open the
+PR). A `chart` source keeps the version here in `applications.yaml`.
+
+How much that costs depends on where your app set lives. Mounted as a Docker
+config it is the awkward option: the config is immutable, so bumping the version
+means a new config object and a controller redeploy, and a chart whose version
+moves often belongs in a release file instead. [Sourced from
+git](#where-the-app-set-lives), both are commits — one to the application's
+repository, one to the app-set repository — and the `chart` source stops being a
+compromise.
 
 #### `source.releaseFile` — a release file in the repo
 
@@ -210,19 +216,199 @@ compared against what was last applied. Omitting it defaults to `manifest`.
 Comparing the desired `ServiceSpec` against the live one (`live`) is Phase 2 and
 this build rejects it. See [concepts § drift](concepts.md#drift-sync-and-health).
 
+## Where the app set lives
+
+Three modes. The default is the file mounted at deploy time, so an existing
+deployment keeps working untouched; the other two make the set itself
+GitOps-managed.
+
+| Mode | Selected by | The set changes when |
+|---|---|---|
+| **static** | nothing — the default | you create a new Docker config and redeploy |
+| **git** | `--appset-repo` | you commit to the tracked branch |
+| **path** | `--appset-dir` | something else writes the file on a volume |
+
+Which selector you pass *is* the mode; there is no separate mode flag to keep in
+agreement with it. Passing both selectors, or either one alongside an explicit
+`--config`, is refused at startup rather than resolved by a precedence rule — a
+controller silently reconciling a set nobody pointed it at is worse than one that
+will not start.
+
+### static — a file mounted at deploy time
+
+```bash
+swarmcli-cd controller --config /etc/swarmcli-cd/applications.yaml
+```
+
+Delivered as a **Docker config**, which is immutable: changing it means creating
+a new config object and updating the stack, which replaces the container. There
+is nothing to hot-reload into and nothing that can change under the process, and
+for an air-gapped or tightly-controlled deployment that is the feature. This is
+what `stack.yml` does out of the box.
+
+### git — the controller pulls the set itself
+
+```bash
+swarmcli-cd controller \
+  --appset-repo https://github.com/your-org/apps.git \
+  --appset-revision main \
+  --appset-path apps/applications.yaml \
+  --appset-interval 1m
+```
+
+The controller clones the repository — with the same `SWARMCLI_CD_GIT_*`
+credential it uses for the applications, into its own directory under `--data` —
+and re-reads the file every `--appset-interval`. A commit that adds an
+application starts reconciling it; one that removes it stops; one that retunes it
+swaps the spec without restarting anything else.
+
+A layout and a copy-pasteable file are in
+[`../examples/appset-repo/`](../examples/appset-repo/).
+
+### path — something else keeps the set current
+
+```bash
+swarmcli-cd controller --appset-dir /var/lib/swarmcli-cd/appset
+```
+
+For a git-sync sidecar, or the Flux source-controller pattern: the controller
+reads a directory and something else is responsible for what is in it.
+`--appset-path` names the file within that directory and defaults to
+`applications.yaml`.
+
+**The writer must publish atomically** — write a temporary file and `rename` it
+over the target. Rename is atomic, so a reader sees one whole version or the
+other. A writer that rewrites the file in place can be read half-written; that
+read fails to parse, which is safe, but a truncation that happens to still be
+valid YAML is indistinguishable from a set you meant to shrink.
+
+### What a bad commit does — nothing
+
+In every mode the controller parses and **fully validates** before it swaps
+anything in: apiVersion, unknown keys, duplicate names, every per-application
+rule. On any failure — an unreachable repository, a missing file, malformed
+YAML, a duplicate name — the last set that validated keeps running and the
+reason is reported. The set is never partially applied.
+
+`swarmcli-cd status` is where you see it:
+
+```
+Mode          git
+Source        https://github.com/your-org/apps.git @ main (apps/applications.yaml)
+Revision      a1b2c3d
+Loaded        2026-07-27T09:12:04Z
+Applications  4
+Stale         yes — the running set is the last one that validated
+Error         apps/applications.yaml@d4e5f6: applications[1]: duplicate application name "edge"
+```
+
+`Stale` means exactly that: what is running is last-good and a newer version is
+being refused. Fix the commit and the next poll clears it. An `Error` with no
+`Stale` line and `Applications 0` is the louder problem — nothing has ever
+loaded, so nothing is running; see [startup, below](#startup-when-the-set-is-not-there-yet).
+
+**An application removed from the set stops being reconciled; its stack stays
+deployed.** It is reported as orphaned rather than deleted — pruning a
+deployment because somebody edited a file is not something this controller does
+by accident.
+
+### Startup, when the set is not there yet
+
+A **static** set that cannot be read is fatal, as it always has been: the config
+was not mounted, nothing will change under the controller's feet, and the restart
+is your notification.
+
+A **git** or **path** set that cannot be read at startup is not. Both are
+produced by something else that may simply not be ready — a repository briefly
+unreachable, a sidecar that has not finished its first sync — and exiting would
+restart-loop the controller under Swarm and take down the API that could have
+explained it. So the controller starts with **no applications**, logs the reason,
+reports it on `swarmcli-cd status`, and retries every interval until the set
+arrives.
+
+The cost is worth stating plainly: a permanently wrong `--appset-repo` presents
+as a healthy container reconciling nothing. `/healthz` stays a liveness probe —
+tying it to the app set would have Swarm kill and restart the task, which is the
+restart loop this avoids — so **`swarmcli-cd status` is the thing to alert on**,
+not the healthcheck.
+
+### The trust boundary
+
+The app-set repository is **root-equivalent**. Whoever can commit to it defines
+every application, destination and sync policy the controller applies with its
+docker socket. Treat it exactly as you treat access to the swarm itself.
+
+The bootstrap is the anchor that makes that boundary meaningful: it is the sole
+authority on *which* repository, branch, path and credentials are authoritative,
+and **nothing in the app set can repoint it**. There is no field in
+`applications.yaml` that changes where `applications.yaml` comes from.
+
+In the OSS build, protecting that repository is the deployment's responsibility:
+
+- branch protection on the tracked branch, with review required;
+- signed commits, if your forge can enforce them;
+- a repository separate from the applications' own, so that being able to change
+  an app's chart is not the same permission as being able to add an app.
+
+Per-user identity and RBAC over who may change what are a licensed capability;
+see [extensibility.md](extensibility.md).
+
+One thing a commit **cannot** do: deliver a new secret. An application that names
+a `registryAuth:` needs that Docker secret mounted into the controller in
+`stack.yml`, so introducing a new private-registry credential is still a
+deploy-time act. Adding an application that uses an already-mounted one is just a
+commit.
+
+### Moving an existing deployment to git
+
+Nothing forces this move, and the static mode is not deprecated. If you want it:
+
+1. **Commit the file you already have.** Put today's `applications.yaml` into a
+   repository — its own, not an application's — say at `apps/applications.yaml`.
+   The format is identical; nothing in the file changes.
+2. **Point the controller at it.** In `stack.yml`, replace the `--config`
+   argument with the git selectors:
+
+   ```yaml
+   command: ["controller",
+             "--appset-repo", "https://github.com/your-org/apps.git",
+             "--appset-revision", "main",
+             "--appset-path", "apps/applications.yaml",
+             "--appset-interval", "1m"]
+   ```
+3. **Drop the `configs:` block** from the service and the top-level `configs:`
+   entry. Leaving it mounted is harmless but leaves a stale copy on disk that
+   nothing reads.
+4. **Keep the secrets.** The admin token and every `registryAuth` secret stay
+   exactly as they are — see the note above.
+5. **Redeploy once**, and check `swarmcli-cd status`: `Mode` should read `git`
+   and `Revision` the commit you pushed. That is the last redeploy the app set
+   costs you.
+
+To go back, restore the `--config` argument and the `configs:` block. The two
+modes read the same file, so there is nothing to convert in either direction.
+
 ## The controller
 
-The controller takes a few flags; credentials come from the environment, because
-they arrive as Docker secrets and a flag would put them in `docker service
-inspect` output and in `argv`.
+The controller takes flags; credentials come from the environment, because they
+arrive as Docker secrets and a flag would put them in `docker service inspect`
+output and in `argv`. The app-set selectors are flags rather than environment
+variables for the same reason inverted: they are not secrets, and a `command:`
+line that shows exactly what the controller is following is worth having in
+`docker service inspect`.
 
 ### Flags
 
 | Flag | Default | |
 |---|---|---|
-| `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config |
+| `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config. Static mode |
 | `--listen` | `:8080` | API listen address |
 | `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume so a restart does not re-clone everything |
+| `--appset-repo` | — | pull the app set from this repository. Selects **git** mode |
+| `--appset-revision` | — | branch, tag or SHA to track. Required with `--appset-repo`; an unpinned app set would follow whatever the default branch happens to point at |
+| `--appset-dir` | — | read the app set from a directory something else keeps current. Selects **path** mode |
+| `--appset-path` | `applications.yaml` in path mode | the set's path within the repository or the directory. Required with `--appset-repo` |
+| `--appset-interval` | `3m` | how often the app set is re-read |
 
 ### Environment
 
@@ -241,10 +427,13 @@ from a wrong token. The admin token never comes from a flag — a token in `argv
 is a token in `ps` and in the shell history.
 
 For a public repository, the git variables are unnecessary. For a private one,
-set `SWARMCLI_CD_GIT_USERNAME` and a token via `SWARMCLI_CD_GIT_TOKEN_FILE`.
+set `SWARMCLI_CD_GIT_USERNAME` and a token via `SWARMCLI_CD_GIT_TOKEN_FILE`. The
+same credential is used for the app-set repository in git mode — one credential
+for the controller, not one per repository.
 
 ## See also
 
 - [Getting started](getting-started.md) — the end-to-end walkthrough
 - [Concepts](concepts.md) — sync vs health, drift, ownership, chart compatibility
+- [HTTP API](api.md#status--get-apiv1status) — the status endpoint behind `swarmcli-cd status`
 - [Deploying](../README.md#deploying-it) and [`stack.yml`](../stack.yml)

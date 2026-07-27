@@ -100,6 +100,19 @@ func TestCLIEndToEnd(t *testing.T) {
 		t.Errorf("app history did not show both revisions: code=%d stdout=%q", r.code, r.stdout)
 	}
 
+	// The controller's own state, over the same API. In this deployment the set
+	// is the file mounted at startup, so it reports the static mode and names
+	// the file the bootstrap pointed at.
+	r := run("status")
+	if r.code != 0 {
+		t.Fatalf("status: code=%d stderr=%q", r.code, r.stderr)
+	}
+	for _, want := range []string{"static", appsFile, "1"} {
+		if !strings.Contains(r.stdout, want) {
+			t.Errorf("status did not report %q:\n%s", want, r.stdout)
+		}
+	}
+
 	// The clean-shutdown assertion is in ctl's cleanup: SIGTERM must exit 0, or
 	// every rollout under Swarm becomes a restart loop.
 }
@@ -147,13 +160,21 @@ func (c *controller) log() string {
 // non-zero exit on would turn into a restart loop.
 func startController(t *testing.T, bin, configPath, dataDir, addr, token string) *controller {
 	t.Helper()
+	return startControllerWith(t, bin, dataDir, addr, token, "--config", configPath)
+}
+
+// startControllerWith is startController for a bootstrap that is not the
+// mounted-file one — the app-set selectors, which are the whole of issue #53.
+func startControllerWith(t *testing.T, bin, dataDir, addr, token string, appSet ...string) *controller {
+	t.Helper()
 	logPath := filepath.Join(t.TempDir(), "controller.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(bin, "controller", "--config", configPath, "--data", dataDir, "--listen", addr)
+	args := append([]string{"controller", "--data", dataDir, "--listen", addr}, appSet...)
+	cmd := exec.Command(bin, args...)
 	cmd.Env = append(os.Environ(), "SWARMCLI_CD_ADMIN_TOKEN="+token)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

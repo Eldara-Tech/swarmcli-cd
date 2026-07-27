@@ -4,24 +4,34 @@
 // Package config reads the applications the controller reconciles.
 //
 // Applications are declared in a file, not a database. A GitOps controller
-// whose own desired state lives in mutable storage has a bootstrap problem, and
-// Phase 1 has no need for one: the file is the only source of truth and the API
-// serves it read-only.
+// whose own desired state lives in mutable storage has a bootstrap problem: the
+// file is the only source of truth and the API serves it read-only.
 //
-// # Why there is no hot reload
+// # What reloads and what does not
 //
-// The file is delivered as a Docker config, and Docker configs are immutable.
-// Changing one means creating a new config object and updating the service to
-// reference it, which replaces the container. A watcher would therefore never
-// fire: the process that would notice the change does not outlive it. Restart
-// is not a limitation here, it is the only thing that can happen.
+// This package parses the file; where it comes from, and whether it can change
+// under a running controller, is the bootstrap's answer and not this one's
+// (see package appset). The two tiers behave differently on purpose:
+//
+// A file mounted as a Docker config cannot change under the process. Docker
+// configs are immutable, so changing one means creating a new config object and
+// updating the service to reference it, which replaces the container — a
+// watcher would never fire, because the process that would notice the change
+// does not outlive it. Restart is not a limitation there; it is the only thing
+// that can happen.
+//
+// A file the controller sources from git, or from a directory something else
+// keeps current, is re-read on an interval and swapped in once it validates.
+// That is the whole of issue #47: the set of applications became an ordinary
+// git commit rather than a redeploy. The API stays read-only either way, since
+// the way to change the set is to change the file.
 //
 // # Everything else is environment
 //
-// This file holds applications and nothing else. The listen address, the poll
-// interval, the admin token — those are environment variables, matching how
-// swarmcli-rbac-proxy is configured and keeping the one file an operator edits
-// about the one thing they think about.
+// This file holds applications and nothing else. The listen address, the admin
+// token, where the set itself lives — those are flags and environment
+// variables, matching how swarmcli-rbac-proxy is configured and keeping the one
+// file an operator edits about the one thing they think about.
 package config
 
 import (

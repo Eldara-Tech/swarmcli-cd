@@ -29,8 +29,10 @@ so the quickest way to see any shape below is to run the matching command with
 | `GET` | `/api/v1/events` | a live event stream, so a UI never polls |
 
 The paths are nouns so that writable applications can be added later without any
-of them moving. Applications are read-only in Phase 1 — they come from the
-mounted applications file, and there is no hot reload.
+of them moving. Applications are read-only over the API in both directions of the
+two-tier model: with the set mounted as a Docker config there is nothing to write
+into, and with the set in git the way to change it is a commit, which is the
+whole point. See [configuration § where the app set lives](configuration.md#where-the-app-set-lives).
 
 ## Authentication
 
@@ -67,7 +69,8 @@ The controller itself, as distinct from what it reconciles:
 ```json
 {
   "appSet": {
-    "mode": "static",
+    "mode": "git",
+    "source": "https://github.com/your-org/apps.git @ main (apps/applications.yaml)",
     "revision": "a1b2c3d4e5f6...",
     "loadedAt": "2026-07-27T09:12:04Z",
     "error": "apps/applications.yaml@d4e5f6: applications[1]: duplicate application name \"edge\"",
@@ -79,15 +82,24 @@ The controller itself, as distinct from what it reconciles:
 ```
 
 `mode` is how the set is sourced — `static` for the applications file mounted at
-deploy time. `revision` is the commit the running set came from, absent when the
+deploy time, `git` for a repository the controller pulls, `path` for a directory
+something else keeps current (see
+[configuration § where the app set lives](configuration.md#where-the-app-set-lives)).
+`source` is what the bootstrap was pointed at, which `mode` alone cannot tell
+you: it is the anchor nothing in git can repoint, so it is worth being able to
+read back. `revision` is the commit the running set came from, absent when the
 set does not come from a repository, and `loadedAt` is when it last loaded
 **successfully**, not when it was last checked.
 
 `stale` is the field to watch: it means the running set is the last one that
 validated and a newer version is being refused, with `error` saying why. An
-`error` with `stale` false is a set that loaded but could not be applied in full
-— one application that could not be started, say, while the rest of the change
-landed. Both clear on the next attempt that succeeds.
+`error` with `stale` false is one of two other things — a set that loaded but
+could not be applied in full (one application that would not start, say, while
+the rest of the change landed), or, with `applications` at zero and no
+`loadedAt`, a controller that has never managed to load a set at all. That last
+one is the loudest of the three and is what a controller pointed at an
+unreachable repository looks like. All of them clear on the next attempt that
+succeeds.
 
 `orphaned` names applications that have left the set. Their stacks are still
 deployed and nobody reconciles them any more: app-of-apps reports the orphan

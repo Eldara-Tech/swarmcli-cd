@@ -17,10 +17,10 @@
 //	POST /api/v1/applications/{app}/sync         the sync button
 //	GET  /api/v1/events                          live updates, so nothing polls
 //
-// Applications are read-only in Phase 1 — they come from a mounted
-// applications.yaml, and there is no hot reload because Docker configs are
-// immutable. The paths are nouns so that CRUD can be added later without any of
-// them moving.
+// Applications are read-only: they are declared in the app set, which is either
+// mounted at deploy time or committed to git, and changing them means changing
+// that file rather than posting to this API. The paths are nouns so that CRUD
+// can be added later without any of them moving.
 package api
 
 import (

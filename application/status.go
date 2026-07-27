@@ -31,6 +31,14 @@ type AppSetStatus struct {
 	// an operator sees reflected back.
 	Mode string `json:"mode"`
 
+	// Source is what the bootstrap was pointed at, for a human: the repository,
+	// the revision it tracks and the file within it, or the directory and file
+	// an external process keeps current. Mode alone cannot be checked against
+	// anything, and "which branch is this controller following" is the first
+	// question a set that does not look right raises — and the one thing nothing
+	// in git can change (D-f of #47).
+	Source string `json:"source,omitempty"`
+
 	// Revision is the commit the running set was loaded from. Empty when the
 	// set does not come from a repository.
 	Revision string `json:"revision,omitempty"`
@@ -47,8 +55,10 @@ type AppSetStatus struct {
 
 	// Stale reports that the running set is a last-good one and a newer version
 	// is being refused. It is the field a UI colours; Error is what it shows
-	// beside it. An error with Stale false is a set that loaded but could not be
-	// fully applied, which is a different problem.
+	// beside it. An error with Stale false is one of two different problems: a
+	// set that loaded but could not be fully applied, or — with Applications at
+	// zero and LoadedAt unset — a controller that has never managed to load one,
+	// which is the louder of the three.
 	Stale bool `json:"stale"`
 
 	// Orphaned names applications that left the set. Their loops are stopped and
