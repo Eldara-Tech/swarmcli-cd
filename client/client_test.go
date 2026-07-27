@@ -58,6 +58,10 @@ func TestPathsAndMethods(t *testing.T) {
 		wantMethod string
 		wantPath   string
 	}{
+		"status": {func(c *Client) error {
+			_, _, err := c.Status(context.Background())
+			return err
+		}, http.MethodGet, "/api/v1/status"},
 		"get": {func(c *Client) error {
 			_, _, err := c.Get(context.Background(), "edge")
 			return err

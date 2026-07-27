@@ -18,9 +18,9 @@ import (
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/api"
+	"github.com/Eldara-Tech/swarmcli-cd/appset"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/backend"
-	"github.com/Eldara-Tech/swarmcli-cd/config"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
@@ -109,7 +109,19 @@ type options struct {
 // fails. It is the only place in the repository that knows how the whole thing
 // fits together.
 func serve(ctx context.Context, o options, log *slog.Logger) error {
-	cfg, err := config.Load(o.configPath)
+	// The applications file is read through the app-set source rather than
+	// directly, so that the mounted-Docker-config deployment and a set kept
+	// current by something else are one code path instead of two. A Docker
+	// config is immutable, so in this mode the loop below simply finds it
+	// unchanged for ever; issue #53 is what points the same source at git.
+	src := appset.NewPath(appSetPath(o.configPath))
+
+	// Fatal, as it has always been: a controller whose own applications file
+	// cannot be read has nothing to reconcile and nothing worth reporting. Once
+	// the set comes from a remote this deserves revisiting — a repository that
+	// is briefly unreachable at boot should not become a restart loop — which is
+	// issue #53's, with the flags that make it reachable.
+	cfg, _, err := src.Load(ctx)
 	if err != nil {
 		return err
 	}
@@ -174,7 +186,13 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		Log:                   log,
 	})
 
-	srv := api.New(rec, api.Options{Log: log})
+	// The loop that keeps the running set equal to the app set. In this mode it
+	// is watching an immutable Docker config, so it changes nothing — but it is
+	// what serves the controller-status endpoint, and wiring it here rather than
+	// in #53 means the static and sourced deployments are the same program.
+	loop := appset.NewLoop(src, rec, appset.LoopOptions{Mode: appSetModeStatic, Log: log})
+
+	srv := api.New(rec, api.Options{Log: log, Controller: loop})
 	// api.New deliberately does not do this itself: notify is a seam.List that
 	// appends, so a self-registering server would leave one live event stream
 	// behind per server ever constructed.
@@ -190,25 +208,51 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	}
 
 	log.Info("starting", "applications", len(cfg.Applications), "listen", o.listen, "config", cfg.Path)
-	return runUntilStopped(ctx, rec, httpSrv, log)
+	return runUntilStopped(ctx, rec, loop, httpSrv, log)
 }
 
-// runUntilStopped runs the reconciler and the listener as peers and returns
-// once both have stopped. Whichever stops first stops the other: a listener
-// that cannot bind must not leave a controller reconciling with no way to
-// observe it, and a reconciler that returns must not leave an API serving
-// views that will never update.
-func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, httpSrv *http.Server, log *slog.Logger) error {
+// appSetModeStatic is what the status endpoint calls the applications file
+// mounted at deploy time — the deployment's own word for it, not the mechanism
+// that happens to read it.
+const appSetModeStatic = "static"
+
+// appSetPath splits the --config path into what the source takes: the directory
+// the file is resolved inside, and the file within it. A bare filename resolves
+// against the working directory, which is what a bare filename means everywhere
+// else.
+func appSetPath(configPath string) appset.PathConfig {
+	dir, file := filepath.Split(configPath)
+	if dir == "" {
+		dir = "."
+	}
+	return appset.PathConfig{Dir: dir, Path: file}
+}
+
+// runUntilStopped runs the reconciler, the app-set loop and the listener as
+// peers and returns once all three have stopped. Whichever stops first stops the
+// others: a listener that cannot bind must not leave a controller reconciling
+// with no way to observe it, and a reconciler that returns must not leave an API
+// serving views that will never update.
+func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, loop *appset.Loop, httpSrv *http.Server, log *slog.Logger) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 
-	errs := make(chan error, 2)
+	errs := make(chan error, 3)
 
 	go func() {
 		err := rec.Run(ctx)
 		// The loop returns ctx.Err() when it was asked to stop. That is how it
 		// reports a clean shutdown, not a failure — treating it as one would
 		// make every SIGTERM a non-zero exit and, under Swarm, a restart loop.
+		if errors.Is(err, context.Canceled) {
+			err = nil
+		}
+		stop()
+		errs <- err
+	}()
+
+	go func() {
+		err := loop.Run(ctx)
 		if errors.Is(err, context.Canceled) {
 			err = nil
 		}
@@ -236,5 +280,5 @@ func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, httpSrv *ht
 		log.Warn("the API did not shut down cleanly", "error", err)
 	}
 
-	return errors.Join(<-errs, <-errs)
+	return errors.Join(<-errs, <-errs, <-errs)
 }

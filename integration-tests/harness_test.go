@@ -16,6 +16,8 @@ package integration
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -118,18 +120,28 @@ func commit(t *testing.T, repo *gogit.Repository, dir string, files map[string]s
 	}
 }
 
-// reconciler wires the real controller for one application: the real git
+// reconciler wires the real controller for the given applications: the real git
 // sourcer, the real chart builder, and the local swarm registry — which resolves
 // to a real moby-client backend against the daemon the process was started with.
 // It is the wiring controller.serve builds, without the HTTP server.
-func reconciler(t *testing.T, app application.Spec) *reconcile.Reconciler {
+//
+// Passing none is how the app-set tests start: an empty reconciler is what the
+// set itself then fills.
+func reconciler(t *testing.T, apps ...application.Spec) *reconcile.Reconciler {
 	t.Helper()
 	data := t.TempDir()
-	return reconcile.New([]application.Spec{app}, reconcile.Options{
+	return reconcile.New(apps, reconcile.Options{
 		Fetcher: git.New(filepath.Join(data, "repos"), git.Auth{}),
 		Builder: source.NewBuilder(filepath.Join(data, "charts"), nil),
 		Swarms:  swarms.Get(),
+		Log:     testLog(),
 	})
+}
+
+// testLog keeps the reconciler's own logging out of the test output, which is
+// otherwise dominated by it on a real deploy.
+func testLog() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // releaseApp is an application whose repository already contains a release file.

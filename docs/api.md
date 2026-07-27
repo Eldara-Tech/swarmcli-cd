@@ -20,6 +20,7 @@ so the quickest way to see any shape below is to run the matching command with
 | Method | Path | |
 |---|---|---|
 | `GET` | `/healthz` | unauthenticated liveness; says nothing but "something is listening" |
+| `GET` | `/api/v1/status` | the controller's own state — where the app set came from and whether it is loading |
 | `GET` | `/api/v1/applications` | the list view — one row's worth of state per application |
 | `GET` | `/api/v1/applications/{app}` | the detail view — releases and their services |
 | `GET` | `/api/v1/applications/{app}/diff` | what a sync would change |
@@ -58,6 +59,42 @@ The wire types are defined in the [`application`](../application/application.go)
 package; this is the map, not a substitute for it. Enums marshal as their
 lowercase name and decode an unrecognised name to `"unknown"`, so a newer
 controller never breaks an older client.
+
+### Status — `GET /api/v1/status`
+
+The controller itself, as distinct from what it reconciles:
+
+```json
+{
+  "appSet": {
+    "mode": "static",
+    "revision": "a1b2c3d4e5f6...",
+    "loadedAt": "2026-07-27T09:12:04Z",
+    "error": "apps/applications.yaml@d4e5f6: applications[1]: duplicate application name \"edge\"",
+    "stale": true,
+    "orphaned": ["legacy-api"]
+  },
+  "applications": 4
+}
+```
+
+`mode` is how the set is sourced — `static` for the applications file mounted at
+deploy time. `revision` is the commit the running set came from, absent when the
+set does not come from a repository, and `loadedAt` is when it last loaded
+**successfully**, not when it was last checked.
+
+`stale` is the field to watch: it means the running set is the last one that
+validated and a newer version is being refused, with `error` saying why. An
+`error` with `stale` false is a set that loaded but could not be applied in full
+— one application that could not be started, say, while the rest of the change
+landed. Both clear on the next attempt that succeeds.
+
+`orphaned` names applications that have left the set. Their stacks are still
+deployed and nobody reconciles them any more: app-of-apps reports the orphan
+rather than removing it. The list lives in memory, so a restart forgets it.
+
+`applications` counts what is actually being reconciled, which is not always what
+the last loaded file declares.
 
 ### List — `GET /api/v1/applications`
 

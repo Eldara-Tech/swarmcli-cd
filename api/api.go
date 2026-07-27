@@ -9,6 +9,7 @@
 // is one request, and every action a user can take is one endpoint:
 //
 //	GET  /healthz                                unauthenticated liveness
+//	GET  /api/v1/status                          the controller's own state
 //	GET  /api/v1/applications                    the list view
 //	GET  /api/v1/applications/{app}              the detail view
 //	GET  /api/v1/applications/{app}/diff         the diff view
@@ -43,15 +44,22 @@ type Reconciler interface {
 	SyncNow(ctx context.Context, app string) error
 }
 
+// Controller reports the controller's own state, as distinct from the
+// applications'. *appset.Loop implements it.
+type Controller interface {
+	Status() application.ControllerStatus
+}
+
 // Server is the HTTP interface. It is also a notify.Notifier: the event stream
 // is fed by the same seam that feeds the log, which is why notify appends
 // rather than replaces — a companion adding Slack must not silently kill the
 // UI's live updates.
 type Server struct {
-	rec    Reconciler
-	authz  authz.Authorizer
-	log    *slog.Logger
-	events *stream
+	rec        Reconciler
+	controller Controller
+	authz      authz.Authorizer
+	log        *slog.Logger
+	events     *stream
 	// syncing runs a sync detached from the request that asked for it.
 	// Overridable in tests, which otherwise have to race a goroutine.
 	syncing func(app string, run func(context.Context))
@@ -61,6 +69,12 @@ type Server struct {
 type Options struct {
 	Authorizer authz.Authorizer
 	Log        *slog.Logger
+	// Controller reports where the app set came from and whether it is loading.
+	// Absent, the status endpoint still answers — with the application count and
+	// an empty app-set mode, which is what "no app-set source is wired" looks
+	// like. A status endpoint that 404s is a status endpoint a monitor cannot
+	// tell from a dead controller.
+	Controller Controller
 }
 
 // New returns a Server over rec.
@@ -75,7 +89,7 @@ func New(rec Reconciler, o Options) *Server {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	s := &Server{rec: rec, authz: o.Authorizer, log: o.Log, events: newStream(o.Log)}
+	s := &Server{rec: rec, controller: o.Controller, authz: o.Authorizer, log: o.Log, events: newStream(o.Log)}
 	s.syncing = s.detach
 	return s
 }
@@ -93,6 +107,7 @@ func (s *Server) Handler() http.Handler {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
+	mux.Handle("GET /api/v1/status", s.guard(authz.ActionRead, s.status))
 	mux.Handle("GET /api/v1/applications", s.guard(authz.ActionRead, s.list))
 	mux.Handle("GET /api/v1/applications/{app}", s.guard(authz.ActionRead, s.detail))
 	mux.Handle("GET /api/v1/applications/{app}/diff", s.guard(authz.ActionRead, s.diff))
@@ -125,6 +140,22 @@ func (s *Server) guard(act authz.Action, h func(http.ResponseWriter, *http.Reque
 		}
 		h(w, r)
 	})
+}
+
+// status serves the controller's own state: where the app set came from, when
+// it last loaded, and whether what is running is a last-good set because a newer
+// one is being refused.
+//
+// It is guarded like every other read. What it discloses — a repository path, a
+// commit, a validation error naming applications — is exactly what an
+// unauthenticated caller should not be able to enumerate about a controller that
+// holds the docker socket.
+func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
+	if s.controller == nil {
+		write(w, http.StatusOK, application.ControllerStatus{Applications: len(s.rec.Views())})
+		return
+	}
+	write(w, http.StatusOK, s.controller.Status())
 }
 
 // list serves the list view: every application with its sync state, health and

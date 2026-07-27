@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -126,10 +127,12 @@ type Reconciler struct {
 	interval  time.Duration
 	log       *slog.Logger
 	now       func() time.Time
-	regAuth   map[string]regauth.Resolver
 	forbidden map[string]struct{}
 
 	mu sync.RWMutex
+	// regAuth is the per-application image-pull credential, guarded by mu
+	// because an application that joins the set at runtime brings one with it.
+	regAuth map[string]regauth.Resolver
 	// apps is the reconciled set, keyed by name; order is the sequence they were
 	// declared or added in, which is the order Views reports them. Both are
 	// guarded by mu.
@@ -168,11 +171,14 @@ func New(apps []application.Spec, o Options) *Reconciler {
 		interval:  o.Interval,
 		log:       o.Log,
 		now:       o.Now,
-		regAuth:   o.RegistryAuth,
 		forbidden: o.ForbiddenSecretMounts,
-		apps:      make(map[string]*appEntry, len(apps)),
-		order:     make([]string, 0, len(apps)),
+		// Copied, not adopted: the map is written to as the set changes, and the
+		// caller's copy — built once at startup — is not ours to mutate.
+		regAuth: make(map[string]regauth.Resolver, len(o.RegistryAuth)),
+		apps:    make(map[string]*appEntry, len(apps)),
+		order:   make([]string, 0, len(apps)),
 	}
+	maps.Copy(r.regAuth, o.RegistryAuth)
 	for _, spec := range apps {
 		r.apps[spec.Name] = &appEntry{
 			spec:   spec,
@@ -262,6 +268,33 @@ func (r *Reconciler) Replace(spec application.Spec) error {
 	return nil
 }
 
+// SetRegistryAuth installs the image-pull credential an application's images are
+// pulled with, replacing whatever it had. A nil resolver removes it, which is
+// what an application that has just dropped its registryAuth needs — otherwise
+// the credential it no longer declares would keep being sent.
+//
+// It exists because the set is mutable: regauth.Load resolves the applications
+// declared at startup, and an application that joins later brings a credential
+// that map has never seen. The caller driving the set resolves it and puts it
+// here before the application is added, so the first reconcile already has it.
+func (r *Reconciler) SetRegistryAuth(app string, resolver regauth.Resolver) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if resolver == nil {
+		delete(r.regAuth, app)
+		return
+	}
+	r.regAuth[app] = resolver
+}
+
+// registryAuth returns an application's credential, or nil for one that
+// declared none.
+func (r *Reconciler) registryAuth(app string) regauth.Resolver {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.regAuth[app]
+}
+
 // Remove stops reconciling an application and drops what was observed of it. It
 // cancels the application's loop and waits for that goroutine to return before
 // reporting done, so a removed application is provably no longer reconciling —
@@ -275,6 +308,10 @@ func (r *Reconciler) Remove(name string) error {
 		return fmt.Errorf("no such application %q", name)
 	}
 	delete(r.apps, name)
+	// With the entry goes the credential: a name that returns to the set later
+	// is a new application as far as this reconciler is concerned, and must not
+	// inherit a secret the departed one happened to declare.
+	delete(r.regAuth, name)
 	r.order = removeName(r.order, name)
 	cancel, done := e.cancel, e.done
 	r.mu.Unlock()
@@ -445,7 +482,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	if err != nil {
 		return fmt.Errorf("resolving destination: %w", err)
 	}
-	backend = withRegistryAuth(backend, r.regAuth[spec.Name])
+	backend = withRegistryAuth(backend, r.registryAuth(spec.Name))
 	backend = withForbiddenSecrets(backend, r.forbidden)
 	engine := r.newEngine(backend)
 

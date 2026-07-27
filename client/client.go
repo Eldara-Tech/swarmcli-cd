@@ -88,6 +88,13 @@ type Diff struct {
 	Planned  bool                      `json:"planned"`
 }
 
+// Status returns the controller's own state: where the app set is sourced from,
+// the revision and time of the last successful load, and whether what is running
+// is a last-good set because a newer one is being refused.
+func (c *Client) Status(ctx context.Context) (application.ControllerStatus, []byte, error) {
+	return decode[application.ControllerStatus](ctx, c, "/api/v1/status")
+}
+
 // List returns every application with its sync state and health, without
 // per-release detail.
 func (c *Client) List(ctx context.Context) (Applications, []byte, error) {
