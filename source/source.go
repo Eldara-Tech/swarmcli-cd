@@ -89,7 +89,7 @@ func (b *Builder) Build(ctx context.Context, app string, spec application.Source
 func (b *Builder) releaseFile(app string, spec application.Source, co git.Checkout) (*charts.ReleaseFile, error) {
 	switch {
 	case spec.ReleaseFile != "":
-		path, err := contained(co.Dir, spec.ReleaseFile)
+		path, err := Contained(co.Dir, spec.ReleaseFile)
 		if err != nil {
 			return nil, fmt.Errorf("application %q: releaseFile: %w", app, err)
 		}
@@ -195,7 +195,7 @@ func valuesReader(ctx context.Context, app string, co git.Checkout, rf *charts.R
 	}
 }
 
-// containedAbs is contained for a path the caller already joined, which is what
+// containedAbs is Contained for a path the caller already joined, which is what
 // the engine hands its values reader: ReleaseFile.ValuesPaths has resolved the
 // declared path against the manifest's directory before the reader ever sees it.
 // A path outside root becomes a "../" relative one and is refused by the check
@@ -205,11 +205,11 @@ func containedAbs(root, path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%q is not under the repository", path)
 	}
-	return contained(root, rel)
+	return Contained(root, rel)
 }
 
-// contained resolves rel against root and refuses anything that ends up
-// outside it.
+// Contained resolves rel against root and refuses anything that ends up
+// outside it, returning the resolved path.
 //
 // The config loader already rejects an escaping path, but this is the check
 // that matters: it resolves symlinks. Repository content is not trusted the way
@@ -217,7 +217,12 @@ func containedAbs(root, path string) (string, error) {
 // symlink — and a values file pointing at /run/secrets would otherwise be read,
 // merged and rendered into a manifest that is then stored in a Docker config
 // readable by anyone with Docker access.
-func contained(root, rel string) (string, error) {
+//
+// It is exported because the same rule applies to any file read out of a tree
+// the controller did not write: the app-set source (package appset) reads its
+// applications file through it rather than through a second copy of a check
+// whose failure mode is reading whatever the controller can.
+func Contained(root, rel string) (string, error) {
 	if filepath.IsAbs(rel) {
 		return "", fmt.Errorf("%q must be relative to the repository", rel)
 	}
