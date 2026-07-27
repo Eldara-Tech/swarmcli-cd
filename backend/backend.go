@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 
@@ -138,6 +139,18 @@ func (b *Backend) DeployStack(name, manifest, resolve string) error {
 // RemoveStack deletes the services, networks, configs and secrets carrying the
 // stack's namespace label — what `docker stack rm` removes, and nothing more.
 //
+// Removal is idempotent: a resource that has already gone between the list and
+// the delete has reached the state this was asking for, so a "not found" is a
+// success rather than a failure. That is not a rare race. Swarm garbage-collects
+// an overlay network once the last task attached to it goes, which happens while
+// the services removed a few lines above are still shutting down — so the
+// network this listed is routinely gone before it is asked to remove it.
+//
+// It also makes the whole call safely repeatable, which is what prune's retry
+// depends on: a pass that failed part-way is followed by another that re-lists
+// and re-deletes, and treating the already-deleted half as an error would make
+// that retry fail forever.
+//
 // Volumes survive, as they do there: a stack's data outliving the stack is the
 // whole point of a named volume, and charts has RemoveVolume for the caller
 // that means it.
@@ -163,7 +176,7 @@ func (b *Backend) RemoveStack(name string) error {
 		return fmt.Errorf("listing the stack's services: %w", err)
 	}
 	for _, s := range services {
-		if err := b.api.ServiceRemove(ctx, s.ID); err != nil {
+		if err := b.api.ServiceRemove(ctx, s.ID); err != nil && !errdefs.IsNotFound(err) {
 			return fmt.Errorf("removing service %q: %w", s.Spec.Name, err)
 		}
 	}
@@ -187,7 +200,7 @@ func (b *Backend) RemoveStack(name string) error {
 		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
 			continue
 		}
-		if err := b.api.ConfigRemove(ctx, c.ID); err != nil {
+		if err := b.api.ConfigRemove(ctx, c.ID); err != nil && !errdefs.IsNotFound(err) {
 			return fmt.Errorf("removing config %q: %w", c.Spec.Name, err)
 		}
 	}
@@ -197,7 +210,7 @@ func (b *Backend) RemoveStack(name string) error {
 		return fmt.Errorf("listing the stack's secrets: %w", err)
 	}
 	for _, s := range secrets {
-		if err := b.api.SecretRemove(ctx, s.ID); err != nil {
+		if err := b.api.SecretRemove(ctx, s.ID); err != nil && !errdefs.IsNotFound(err) {
 			return fmt.Errorf("removing secret %q: %w", s.Spec.Name, err)
 		}
 	}
@@ -207,7 +220,7 @@ func (b *Backend) RemoveStack(name string) error {
 		return fmt.Errorf("listing the stack's networks: %w", err)
 	}
 	for _, n := range networks {
-		if err := b.api.NetworkRemove(ctx, n.ID); err != nil {
+		if err := b.api.NetworkRemove(ctx, n.ID); err != nil && !errdefs.IsNotFound(err) {
 			return fmt.Errorf("removing network %q: %w", n.Name, err)
 		}
 	}

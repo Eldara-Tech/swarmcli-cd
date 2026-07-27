@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/compose/convert"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
@@ -689,5 +690,51 @@ func TestRemoveStackRefusesAnEmptyName(t *testing.T) {
 	}
 	if len(api.removed) != 0 {
 		t.Errorf("removed %v before refusing", api.removed)
+	}
+}
+
+// Swarm garbage-collects an overlay network once the last task attached to it
+// goes, which happens while the services removed a moment earlier are still
+// shutting down. So the network RemoveStack listed is routinely gone before it
+// is asked to remove it, and that is the state it wanted — not a failure.
+//
+// It matters beyond tidiness: prune retries a pass that failed part-way by
+// re-listing and re-deleting, so a "not found" that failed the call would make
+// every retry fail forever, and the release would never be recorded as gone.
+func TestRemoveStackTreatsAnAlreadyDeletedResourceAsDone(t *testing.T) {
+	for _, missing := range []string{"service:svc", "config:cfg", "secret:sec", "network:net"} {
+		t.Run(missing, func(t *testing.T) {
+			api := &fakeAPI{
+				existing:  []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{Name: "s_web"}}}},
+				configs:   []swarm.Config{{ID: "cfg", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+				secrets:   []swarm.Secret{{ID: "sec", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_key"}}}},
+				networks:  []network.Summary{{ID: "net", Name: "s_front"}},
+				removeErr: map[string]error{missing: errdefs.ErrNotFound},
+			}
+
+			if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
+				t.Fatalf("RemoveStack = %v, want nil when %s had already gone", err, missing)
+			}
+			// Everything else is still attempted: one resource vanishing must
+			// not abandon the rest of the stack.
+			want := []string{"service:svc", "config:cfg", "secret:sec", "network:net"}
+			if !reflect.DeepEqual(api.removed, want) {
+				t.Errorf("removed %v, want %v", api.removed, want)
+			}
+		})
+	}
+}
+
+// A real failure still fails. The tolerance above is for "it is already gone",
+// not for "the daemon refused".
+func TestRemoveStackStillFailsOnARealError(t *testing.T) {
+	api := &fakeAPI{
+		networks:  []network.Summary{{ID: "net", Name: "s_front"}},
+		removeErr: map[string]error{"network:net": errors.New("has active endpoints")},
+	}
+
+	err := testBackend(t, api, nil).RemoveStack("s")
+	if err == nil || !strings.Contains(err.Error(), "has active endpoints") {
+		t.Fatalf("RemoveStack = %v, want the daemon's refusal surfaced", err)
 	}
 }

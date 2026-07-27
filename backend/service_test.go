@@ -51,6 +51,10 @@ type fakeAPI struct {
 	nodes      []swarm.Node
 	tasks      []swarm.Task
 	networkErr error
+	// removeErr fails one removal, keyed as the removed slice records it
+	// ("network:net"). It is how a test reproduces a resource that went away
+	// between the list and the delete.
+	removeErr map[string]error
 
 	// labelFilters records the label filter of every list call, so a test can
 	// assert that a stack-scoped operation was actually scoped.
@@ -605,7 +609,7 @@ func (f *fakeAPI) NetworkCreate(_ context.Context, name string, o network.Create
 
 func (f *fakeAPI) NetworkRemove(_ context.Context, id string) error {
 	f.removed = append(f.removed, "network:"+id)
-	return nil
+	return f.removeErr["network:"+id]
 }
 
 func (f *fakeAPI) ConfigList(_ context.Context, o swarm.ConfigListOptions) ([]swarm.Config, error) {
@@ -635,7 +639,7 @@ func (f *fakeAPI) ConfigUpdate(_ context.Context, _ string, _ swarm.Version, spe
 
 func (f *fakeAPI) ConfigRemove(_ context.Context, id string) error {
 	f.removed = append(f.removed, "config:"+id)
-	return nil
+	return f.removeErr["config:"+id]
 }
 
 func (f *fakeAPI) SecretList(_ context.Context, o swarm.SecretListOptions) ([]swarm.Secret, error) {
@@ -665,12 +669,12 @@ func (f *fakeAPI) SecretUpdate(_ context.Context, _ string, _ swarm.Version, spe
 
 func (f *fakeAPI) SecretRemove(_ context.Context, id string) error {
 	f.removed = append(f.removed, "secret:"+id)
-	return nil
+	return f.removeErr["secret:"+id]
 }
 
 func (f *fakeAPI) ServiceRemove(_ context.Context, id string) error {
 	f.removed = append(f.removed, "service:"+id)
-	return nil
+	return f.removeErr["service:"+id]
 }
 
 func (f *fakeAPI) VolumeList(_ context.Context, o volume.ListOptions) (volume.ListResponse, error) {
