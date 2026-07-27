@@ -16,6 +16,7 @@ package source
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -234,7 +235,11 @@ func Contained(root, rel string) (string, error) {
 	path, err := filepath.EvalSymlinks(filepath.Join(realRoot, rel))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("%q is not in the repository at this revision", rel)
+			// Wrapped rather than reported flat: a caller reading its own
+			// configuration out of a tree — the app-set source does — has to tell
+			// an absent file from a failure to resolve one, and says something
+			// else entirely about it.
+			return "", fmt.Errorf("%q is not in the repository at this revision: %w", rel, fs.ErrNotExist)
 		}
 		return "", fmt.Errorf("resolving %q: %w", rel, err)
 	}

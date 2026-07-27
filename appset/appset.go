@@ -51,10 +51,13 @@ package appset
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/config"
@@ -97,13 +100,17 @@ type PathConfig struct {
 	Path string
 }
 
-// document is one app-set file as it was read. Path is what parse errors are
-// prefixed with, so it names the file the way the operator wrote it — and, for
-// the git mode, the commit it came from, because "which commit broke the app
-// set" is the first question a failed load raises.
+// document is one app-set file as it was read.
+//
+// Path is what parse errors are prefixed with, so it names the file the way the
+// operator wrote it — and, for the git mode, the commit it came from, because
+// "which commit broke the app set" is the first question a failed load raises.
+// Revision is that commit on its own, for the controller's status: an operator
+// reading an error wants it in the message, and a UI wants it in a field.
 type document struct {
-	Data []byte
-	Path string
+	Data     []byte
+	Path     string
+	Revision string
 }
 
 // reader produces the app-set document. It is the only thing the two modes
@@ -129,6 +136,11 @@ type Loader struct {
 	// tick rather than failing once and going quiet.
 	digest [sha256.Size]byte
 	loaded bool
+	// revision and loadedAt describe the last successful load, for the
+	// controller's status endpoint. They move with current, under the same lock,
+	// so what is reported and what is running cannot disagree.
+	revision string
+	loadedAt time.Time
 }
 
 // NewGit returns a Loader that pulls the app set with the given fetcher.
@@ -177,6 +189,7 @@ func (l *Loader) Load(ctx context.Context) (*config.File, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.current, l.digest, l.loaded = file, digest, true
+	l.revision, l.loadedAt = doc.Revision, time.Now()
 	return file, true, nil
 }
 
@@ -186,6 +199,15 @@ func (l *Loader) Current() *config.File {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.current
+}
+
+// LastLoad reports the commit the current set came from and when it was loaded.
+// The revision is empty in path mode, where there is no commit to report, and
+// the time is zero until the first successful load.
+func (l *Loader) LastLoad() (revision string, at time.Time) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.revision, l.loadedAt
 }
 
 // gitReader pulls the app set from a repository.
@@ -211,7 +233,11 @@ func (r *gitReader) read(ctx context.Context) (document, error) {
 	if err != nil {
 		return document{}, err
 	}
-	return document{Data: data, Path: r.cfg.Path + "@" + checkout.Revision}, nil
+	return document{
+		Data:     data,
+		Path:     r.cfg.Path + "@" + checkout.Revision,
+		Revision: checkout.Revision,
+	}, nil
 }
 
 // pathReader reads the app set from a directory an external process keeps
@@ -239,7 +265,14 @@ func (r *pathReader) read(context.Context) (document, error) {
 func readContained(root, path string) ([]byte, error) {
 	file, err := source.Contained(root, path)
 	if err != nil {
-		return nil, fmt.Errorf("the app-set file: %w", err)
+		// An absent file is the one an operator meets — the config was not
+		// mounted, or the path is not what the repository calls it — and the
+		// containment check describes it in terms of a repository at a revision,
+		// which is the wrong sentence for a file on a volume.
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("no app-set file at %s", filepath.Join(root, path))
+		}
+		return nil, fmt.Errorf("the app-set file %s: %w", filepath.Join(root, path), err)
 	}
 	data, err := os.ReadFile(file)
 	if err != nil {

@@ -360,6 +360,7 @@ func TestTriggeredSyncOutlivesTheRequest(t *testing.T) {
 // a root shell. Nothing behind the guard runs until both checks pass.
 func TestEveryApiEndpointIsGuarded(t *testing.T) {
 	paths := []struct{ method, path string }{
+		{"GET", "/api/v1/status"},
 		{"GET", "/api/v1/applications"},
 		{"GET", "/api/v1/applications/edge"},
 		{"GET", "/api/v1/applications/edge/diff"},
@@ -595,4 +596,63 @@ type ctxCapturingReconciler struct {
 func (c *ctxCapturingReconciler) SyncNow(ctx context.Context, app string) error {
 	c.capture(ctx)
 	return c.fakeReconciler.SyncNow(ctx, app)
+}
+
+// fakeController is what the app-set loop is to this package: one call
+// reporting where the set came from and how loading it went.
+type fakeController struct{ status application.ControllerStatus }
+
+func (f *fakeController) Status() application.ControllerStatus { return f.status }
+
+func TestStatusServesTheControllerState(t *testing.T) {
+	want := application.ControllerStatus{
+		AppSet: application.AppSetStatus{
+			Mode:     "git",
+			Revision: strings.Repeat("b", 40),
+			LoadedAt: time.Date(2026, 7, 27, 9, 12, 4, 0, time.UTC),
+			Error:    `applications[1]: duplicate application name "edge"`,
+			Stale:    true,
+			Orphaned: []string{"legacy-api"},
+		},
+		Applications: 2,
+	}
+
+	s, h := testServer(t, &fakeReconciler{views: []application.View{view("edge"), view("core")}}, nil)
+	s.controller = &fakeController{status: want}
+
+	rr := do(t, h, "GET", "/api/v1/status")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/status = %d, want 200", rr.Code)
+	}
+	got := decode[application.ControllerStatus](t, rr)
+	if got.AppSet.Mode != want.AppSet.Mode || got.AppSet.Revision != want.AppSet.Revision {
+		t.Errorf("app set = %+v, want %+v", got.AppSet, want.AppSet)
+	}
+	if !got.AppSet.LoadedAt.Equal(want.AppSet.LoadedAt) {
+		t.Errorf("loadedAt = %v, want %v", got.AppSet.LoadedAt, want.AppSet.LoadedAt)
+	}
+	if !got.AppSet.Stale || got.AppSet.Error != want.AppSet.Error {
+		t.Errorf("stale=%v error=%q, want the refusal reported", got.AppSet.Stale, got.AppSet.Error)
+	}
+	if len(got.AppSet.Orphaned) != 1 || got.AppSet.Orphaned[0] != "legacy-api" {
+		t.Errorf("orphaned = %v, want [legacy-api]", got.AppSet.Orphaned)
+	}
+	if got.Applications != 2 {
+		t.Errorf("applications = %d, want 2", got.Applications)
+	}
+}
+
+// A status endpoint that fails when no app-set source is wired is one a monitor
+// cannot tell from a dead controller, so it answers with what it does know.
+func TestStatusWithoutAControllerStillAnswers(t *testing.T) {
+	_, h := testServer(t, &fakeReconciler{views: []application.View{view("edge")}}, nil)
+
+	rr := do(t, h, "GET", "/api/v1/status")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/status = %d, want 200", rr.Code)
+	}
+	got := decode[application.ControllerStatus](t, rr)
+	if got.Applications != 1 || got.AppSet.Mode != "" {
+		t.Errorf("got %+v, want the application count and no app-set mode", got)
+	}
 }

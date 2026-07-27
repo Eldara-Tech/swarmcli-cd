@@ -1258,3 +1258,65 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		}
 	}
 }
+
+// An application that joins the set at runtime brings a credential the map
+// built at startup has never seen, and one that stops declaring registryAuth
+// must stop having it sent. Both go through the setter, and what proves it is
+// the backend the engine is handed.
+func TestSetRegistryAuthTakesEffectOnTheNextReconcile(t *testing.T) {
+	var deployed charts.Backend
+	resolver := regauth.Resolver(func(string) (string, error) { return "auth", nil })
+
+	r := New(nil, Options{
+		Fetcher: &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder: &fakeBuilder{},
+		Swarms:  fakeRegistry{backend: recordingBackend{}},
+		NewEngine: func(b charts.Backend) Engine {
+			deployed = b
+			return &fakeEngine{plans: []*charts.Plan{synced(), synced()}}
+		},
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now: func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+
+	// The joining application: its credential is installed before it is added,
+	// so its very first reconcile already pulls with it.
+	r.SetRegistryAuth("edge", resolver)
+	if err := r.Add(spec("edge", true)); err != nil {
+		t.Fatalf("Add = %v, want nil", err)
+	}
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if rb, ok := deployed.(recordingBackend); !ok || rb.auth == nil {
+		t.Error("the credential installed for a runtime-added application never reached the backend")
+	}
+
+	// It stops declaring one. The credential must go with it, or the controller
+	// keeps sending a secret the application no longer asks for.
+	r.SetRegistryAuth("edge", nil)
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if rb, ok := deployed.(recordingBackend); !ok || rb.auth != nil {
+		t.Error("a cleared credential was still applied to the backend")
+	}
+}
+
+// A name that returns to the set later is a new application, and must not
+// inherit the credential of the one that left.
+func TestRemoveDropsTheCredential(t *testing.T) {
+	r := New([]application.Spec{spec("edge", true)}, Options{
+		Fetcher: &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder: &fakeBuilder{},
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	r.SetRegistryAuth("edge", func(string) (string, error) { return "auth", nil })
+
+	if err := r.Remove("edge"); err != nil {
+		t.Fatalf("Remove = %v, want nil", err)
+	}
+	if r.registryAuth("edge") != nil {
+		t.Error("the departed application's credential survived it")
+	}
+}
