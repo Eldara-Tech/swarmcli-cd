@@ -21,6 +21,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/appset"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/backend"
+	"github.com/Eldara-Tech/swarmcli-cd/config"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
@@ -39,12 +40,18 @@ const (
 	defaultDataDir    = "/var/lib/swarmcli-cd"
 )
 
+// defaultAppSetFile is what the set is called in a directory an external
+// process keeps current, when the deployment does not say. There is no
+// equivalent default for a repository: a file inside somebody else's layout has
+// no name this end can guess.
+const defaultAppSetFile = "applications.yaml"
+
 // shutdownTimeout bounds how long in-flight requests have to finish once a
 // signal has arrived. Swarm sends SIGKILL ten seconds after SIGTERM by default,
 // so anything longer would be cut off mid-drain.
 const shutdownTimeout = 5 * time.Second
 
-const controllerUsage = `Usage: swarmcli-cd controller [options]
+var controllerUsage = `Usage: swarmcli-cd controller [options]
 
 Runs the reconcile loop and serves the HTTP API until it is signalled.
 
@@ -52,6 +59,17 @@ Options:
   --config <path>   Applications file (default ` + defaultConfigPath + `)
   --listen <addr>   API listen address (default ` + defaultListen + `)
   --data <dir>      Repository clones and chart cache (default ` + defaultDataDir + `)
+
+The application set is the mounted --config file unless one of these points it
+somewhere that can change without a redeploy. Which one is set selects the mode;
+setting both, or either alongside an explicit --config, is an error.
+
+  --appset-repo <url>       Pull the set from this repository
+  --appset-revision <ref>   Branch, tag or SHA to track (required with --appset-repo)
+  --appset-dir <dir>        Read the set from a directory something else keeps current
+  --appset-path <file>      The set's path within the repository or the directory
+                            (required with --appset-repo; default ` + defaultAppSetFile + ` with --appset-dir)
+  --appset-interval <dur>   How often the set is re-read (default ` + appset.DefaultInterval.String() + `)
 
 Credentials come from the environment, not from flags, because they arrive as
 Docker secrets and a flag would put them in "docker inspect" output and in argv:
@@ -70,9 +88,15 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	// a misuse belongs on stderr with the same usage text every other command
 	// prints, which is not what its defaults do.
 	fs.SetOutput(io.Discard)
-	configPath := fs.String("config", defaultConfigPath, "")
-	listen := fs.String("listen", defaultListen, "")
-	dataDir := fs.String("data", defaultDataDir, "")
+	var o options
+	fs.StringVar(&o.configPath, "config", defaultConfigPath, "")
+	fs.StringVar(&o.listen, "listen", defaultListen, "")
+	fs.StringVar(&o.dataDir, "data", defaultDataDir, "")
+	fs.StringVar(&o.appSetRepo, "appset-repo", "", "")
+	fs.StringVar(&o.appSetRevision, "appset-revision", "", "")
+	fs.StringVar(&o.appSetDir, "appset-dir", "", "")
+	fs.StringVar(&o.appSetPath, "appset-path", "", "")
+	fs.DurationVar(&o.appSetInterval, "appset-interval", appset.DefaultInterval, "")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -84,6 +108,17 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() > 0 {
 		return usageErr(stderr, fmt.Sprintf("unexpected argument %q", fs.Arg(0)), controllerUsage)
 	}
+	// --config always has a value, so "the operator set it" is a question only
+	// the flag set can answer. It matters because pointing the controller at a
+	// mounted file and at a repository at the same time says two things.
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			o.configSet = true
+		}
+	})
+	if err := o.validate(); err != nil {
+		return usageErr(stderr, err.Error(), controllerUsage)
+	}
 
 	log := slog.New(slog.NewTextHandler(stderr, nil))
 
@@ -92,7 +127,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := serve(ctx, options{configPath: *configPath, listen: *listen, dataDir: *dataDir}, log); err != nil {
+	if err := serve(ctx, o, log); err != nil {
 		return fail(stderr, err)
 	}
 	return 0
@@ -103,32 +138,30 @@ type options struct {
 	configPath string
 	listen     string
 	dataDir    string
+
+	// The app-set selectors. Which of appSetRepo and appSetDir is set chooses
+	// the mode; neither leaves the mounted configPath, which is what every
+	// deployment before this one does.
+	appSetRepo     string
+	appSetRevision string
+	appSetDir      string
+	appSetPath     string
+	appSetInterval time.Duration
+
+	// configSet records that --config was given explicitly rather than
+	// defaulted. See runController.
+	configSet bool
 }
 
 // serve wires the packages together and runs until ctx ends or a component
 // fails. It is the only place in the repository that knows how the whole thing
 // fits together.
 func serve(ctx context.Context, o options, log *slog.Logger) error {
-	// The applications file is read through the app-set source rather than
-	// directly, so that the mounted-Docker-config deployment and a set kept
-	// current by something else are one code path instead of two. A Docker
-	// config is immutable, so in this mode the loop below simply finds it
-	// unchanged for ever; issue #53 is what points the same source at git.
-	src := appset.NewPath(appSetPath(o.configPath))
-
-	// Fatal, as it has always been: a controller whose own applications file
-	// cannot be read has nothing to reconcile and nothing worth reporting. Once
-	// the set comes from a remote this deserves revisiting — a repository that
-	// is briefly unreachable at boot should not become a restart loop — which is
-	// issue #53's, with the flags that make it reachable.
-	cfg, _, err := src.Load(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Before anything else, and before the listener exists. An unconfigured
-	// authorizer that merely rejects every request looks, to an operator,
-	// exactly like a wrong token; refusing to start names the problem instead.
+	// First, and before any I/O: an unconfigured authorizer that merely rejects
+	// every request looks, to an operator, exactly like a wrong token, and
+	// refusing to start names the problem instead. It goes ahead of the app-set
+	// load because that load may now be a clone of a remote repository, and
+	// spending its timeout before refusing for an unrelated reason helps nobody.
 	if err := authz.Get().Ready(); err != nil {
 		return fmt.Errorf("authorizer %q: %w", authz.Active(), err)
 	}
@@ -149,9 +182,50 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		return err
 	}
 
+	// Three directories, not one. Everything under a clone is force-checked-out
+	// and cleaned on every fetch, so a chart cache living there would be deleted
+	// underneath the builder — or show up as repository content. The app set's
+	// clone is separate again: it is the bootstrap tier, and keeping it out of
+	// the applications' root is what makes its cache key unambiguous.
+	repos := filepath.Join(o.dataDir, "repos")
+	chartCache := filepath.Join(o.dataDir, "charts")
+	appSetRoot := filepath.Join(o.dataDir, "appset")
+	dirs := []string{repos, chartCache}
+	mode := o.mode()
+	if mode == appSetModeGit {
+		dirs = append(dirs, appSetRoot)
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("creating %s: %w", dir, err)
+		}
+	}
+
+	src, sourceDesc := appSetSource(o, auth, appSetRoot)
+
+	// Fatal for a file mounted at deploy time: nothing will change under the
+	// controller's feet, so a restart is the operator's notification and this is
+	// what it has always done. Not fatal for a set something else produces — a
+	// repository briefly unreachable at boot, or a git-sync sidecar that has not
+	// finished its first sync, would otherwise become a restart loop, and under
+	// it the API that could say so never comes up. So the controller starts with
+	// no applications, says why on the status endpoint and in the log, and the
+	// loop below retries every interval until the set arrives.
+	cfg, _, err := src.Load(ctx)
+	if err != nil {
+		if mode == appSetModeStatic {
+			return err
+		}
+		log.Error("the app set could not be loaded; starting with none and retrying",
+			"mode", mode, "appSet", sourceDesc, "error", err)
+		cfg = &config.File{}
+	}
+
 	// Per-application image-pull credentials, read from the Docker secrets each
 	// application's registryAuth names. A missing or unparseable one is fatal
-	// here rather than a convergence timeout three minutes into a deploy.
+	// here rather than a convergence timeout three minutes into a deploy. An
+	// application that joins later goes through the loop, which resolves its
+	// credential the same way and fails that application alone.
 	resolvers, err := regauth.Load(cfg.Applications, regauth.DefaultSecretsDir, os.ReadFile)
 	if err != nil {
 		return err
@@ -165,17 +239,6 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		return err
 	}
 
-	// Two directories, not one. Everything under a clone is force-checked-out
-	// and cleaned on every fetch, so a chart cache living there would be
-	// deleted underneath the builder — or show up as repository content.
-	repos := filepath.Join(o.dataDir, "repos")
-	chartCache := filepath.Join(o.dataDir, "charts")
-	for _, dir := range []string{repos, chartCache} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("creating %s: %w", dir, err)
-		}
-	}
-
 	rec := reconcile.New(cfg.Applications, reconcile.Options{
 		Fetcher: git.New(repos, auth),
 		Builder: source.NewBuilder(chartCache, func(format string, a ...any) {
@@ -186,11 +249,16 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		Log:                   log,
 	})
 
-	// The loop that keeps the running set equal to the app set. In this mode it
-	// is watching an immutable Docker config, so it changes nothing — but it is
-	// what serves the controller-status endpoint, and wiring it here rather than
-	// in #53 means the static and sourced deployments are the same program.
-	loop := appset.NewLoop(src, rec, appset.LoopOptions{Mode: appSetModeStatic, Log: log})
+	// The loop that keeps the running set equal to the app set. Watching an
+	// immutable Docker config it changes nothing and still serves the status
+	// endpoint; pointed at a repository it is the whole of app-of-apps. Same
+	// program either way, which is the point of the two modes sharing a loader.
+	loop := appset.NewLoop(src, rec, appset.LoopOptions{
+		Mode:     mode,
+		Source:   sourceDesc,
+		Interval: o.appSetInterval,
+		Log:      log,
+	})
 
 	srv := api.New(rec, api.Options{Log: log, Controller: loop})
 	// api.New deliberately does not do this itself: notify is a seam.List that
@@ -207,25 +275,100 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	log.Info("starting", "applications", len(cfg.Applications), "listen", o.listen, "config", cfg.Path)
+	log.Info("starting",
+		"applications", len(cfg.Applications), "listen", o.listen,
+		"mode", mode, "appSet", sourceDesc)
 	return runUntilStopped(ctx, rec, loop, httpSrv, log)
 }
 
-// appSetModeStatic is what the status endpoint calls the applications file
-// mounted at deploy time — the deployment's own word for it, not the mechanism
-// that happens to read it.
-const appSetModeStatic = "static"
+// The modes the bootstrap can select, as the status endpoint reports them.
+// They are the deployment's own word for where the set lives rather than the
+// mechanism that happens to read it: static and path share a reader and are
+// still two entirely different things to the operator who deployed one of them.
+const (
+	appSetModeStatic = "static"
+	appSetModeGit    = "git"
+	appSetModePath   = "path"
+)
 
-// appSetPath splits the --config path into what the source takes: the directory
-// the file is resolved inside, and the file within it. A bare filename resolves
-// against the working directory, which is what a bare filename means everywhere
-// else.
-func appSetPath(configPath string) appset.PathConfig {
-	dir, file := filepath.Split(configPath)
-	if dir == "" {
-		dir = "."
+// mode reports which source the selectors chose. Every combination that would
+// make this ambiguous has already been refused by validate.
+func (o options) mode() string {
+	switch {
+	case o.appSetRepo != "":
+		return appSetModeGit
+	case o.appSetDir != "":
+		return appSetModePath
+	default:
+		return appSetModeStatic
 	}
-	return appset.PathConfig{Dir: dir, Path: file}
+}
+
+// validate refuses a bootstrap that says two things, or half of one.
+//
+// Errors rather than a precedence rule: the bootstrap is the single anchor
+// nothing in git can repoint (D-f of #47), and a controller that silently
+// ignored half of it would be reconciling a set nobody pointed it at.
+func (o options) validate() error {
+	switch {
+	case o.appSetRepo != "" && o.appSetDir != "":
+		return errors.New("--appset-repo and --appset-dir are alternatives: one app set, one source")
+	case o.configSet && o.appSetRepo != "":
+		return errors.New("--config names a mounted file and --appset-repo a repository, so which one holds the app set is ambiguous")
+	case o.configSet && o.appSetDir != "":
+		return errors.New("--config names a mounted file and --appset-dir a directory, so which one holds the app set is ambiguous")
+	case o.appSetRepo != "" && o.appSetRevision == "":
+		return errors.New("--appset-repo needs --appset-revision: an unpinned app set would follow whatever the default branch happens to point at")
+	case o.appSetRepo != "" && o.appSetPath == "":
+		return errors.New("--appset-repo needs --appset-path: the app set's path within the repository")
+	case o.appSetRevision != "" && o.appSetRepo == "":
+		return errors.New("--appset-revision means nothing without --appset-repo")
+	case o.appSetPath != "" && o.appSetRepo == "" && o.appSetDir == "":
+		return errors.New("--appset-path means nothing without --appset-repo or --appset-dir")
+	case o.appSetInterval <= 0:
+		// Not silently defaulted: an operator writing 0 means something by it,
+		// and "never re-read" is not a thing this controller can do.
+		return errors.New("--appset-interval must be positive")
+	}
+	return nil
+}
+
+// appSetSource builds the loader the bootstrap selected and describes it the
+// way the status endpoint reports it. The description is built once so the
+// startup log line and the endpoint cannot disagree about what is being
+// followed.
+func appSetSource(o options, auth git.Auth, root string) (*appset.Loader, string) {
+	switch o.mode() {
+	case appSetModeGit:
+		// Its own sourcer under its own root, sharing only the type and the
+		// credential with the applications' — the app set is the bootstrap
+		// tier, and its clone is not somewhere an application can reach.
+		src := appset.NewGit(git.New(root, auth), appset.GitConfig{
+			RepoURL:  o.appSetRepo,
+			Revision: o.appSetRevision,
+			Path:     o.appSetPath,
+		})
+		return src, fmt.Sprintf("%s @ %s (%s)", o.appSetRepo, o.appSetRevision, o.appSetPath)
+
+	case appSetModePath:
+		file := o.appSetPath
+		if file == "" {
+			file = defaultAppSetFile
+		}
+		return appset.NewPath(appset.PathConfig{Dir: o.appSetDir, Path: file}),
+			fmt.Sprintf("%s (%s)", o.appSetDir, file)
+
+	default:
+		// The mounted file, read through the same source as everything else so
+		// that a Docker config and a set kept current by something else are one
+		// code path. A bare filename resolves against the working directory,
+		// which is what a bare filename means everywhere else.
+		dir, file := filepath.Split(o.configPath)
+		if dir == "" {
+			dir = "."
+		}
+		return appset.NewPath(appset.PathConfig{Dir: dir, Path: file}), o.configPath
+	}
 }
 
 // runUntilStopped runs the reconciler, the app-set loop and the listener as

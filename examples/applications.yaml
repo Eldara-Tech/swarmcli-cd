@@ -4,10 +4,12 @@
 #
 #   docker config create swarmcli-cd-applications ./applications.yaml
 #
-# Docker configs are immutable, so changing this file means creating a new
-# config and updating the stack — there is no hot reload, which is why
-# applications are read-only in the API. The full field reference is in
-# ../docs/configuration.md.
+# Docker configs are immutable, so in this mode changing the file means creating
+# a new config and updating the stack. To make changing it an ordinary commit
+# instead, keep this file in a git repository and point the controller at it
+# with --appset-repo; see ../examples/appset-repo/ and
+# ../docs/configuration.md#where-the-app-set-lives. The format is identical
+# either way, and the full field reference is in ../docs/configuration.md.
 #
 # apiVersion is "v1" (the only version this build reads; absent means the same),
 # mirroring the chart engine's release file so the two read alike.

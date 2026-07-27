@@ -6,14 +6,45 @@
 #   printf '%s' "$(openssl rand -hex 32)" | docker secret create swarmcli-cd-token -
 #   docker stack deploy -c stack.yml swarmcli-cd
 #
-# Both are immutable in Swarm, so changing either means creating a new one and
-# updating this file — there is no hot reload, which is why applications are
-# read-only in the API.
+# Both a config and a secret are immutable in Swarm, so changing either means
+# creating a new one and updating this file. That is fine for the controller's
+# own bootstrap — the admin token, the listen address, where the app set lives —
+# which is what this file is and which rarely changes.
+#
+# The application set itself does not have to live here. Point the controller at
+# a git repository or at a directory a sidecar keeps current and adding an
+# application becomes a commit rather than a redeploy; see the two commented
+# commands below and docs/configuration.md.
 
 services:
   controller:
     image: eldaratech/swarmcli-cd:latest
+
+    # Mode 1 (default) — the app set is the immutable Docker config mounted
+    # below. Nothing changes without a redeploy, which is what an air-gapped or
+    # tightly-controlled deployment wants.
     command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml"]
+
+    # Mode 2 — the controller pulls the app set itself, with the same
+    # SWARMCLI_CD_GIT_* credential it uses for the applications. A commit to
+    # apps/applications.yaml adds, removes or retunes an application within
+    # --appset-interval, with no redeploy. Drop the `configs:` block below when
+    # using this. Whoever can commit to that repository defines every
+    # application, destination and policy this controller applies with the
+    # docker socket: protect it with branch protection and signed commits.
+    # command: ["controller",
+    #           "--appset-repo", "https://github.com/your-org/apps.git",
+    #           "--appset-revision", "main",
+    #           "--appset-path", "apps/applications.yaml",
+    #           "--appset-interval", "1m"]
+
+    # Mode 3 — something else keeps the app set current on a volume: a git-sync
+    # sidecar, or the Flux source-controller pattern. That writer must publish
+    # atomically (write a temporary file, rename it over the target); a file
+    # rewritten in place can be read half-written, which the controller refuses
+    # and keeps its last-good set for, but a truncation that is still valid YAML
+    # cannot be told from a set you meant to shrink.
+    # command: ["controller", "--appset-dir", "/var/lib/swarmcli-cd/appset"]
 
     healthcheck:
       # The image carries no curl and needs none: the binary probes itself.
@@ -73,6 +104,8 @@ services:
     # ports:
     #   - "8080:8080"
 
+    # Mode 1 only. In git and path mode the app set does not come from a config,
+    # and leaving this mounted would leave a stale copy of it on disk.
     configs:
       - source: swarmcli-cd-applications
         target: /etc/swarmcli-cd/applications.yaml

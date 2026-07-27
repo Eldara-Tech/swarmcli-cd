@@ -130,14 +130,26 @@ reports every compatibility check as `unknown` rather than blocking — fine for
 development, not for anything that deploys. See
 [RELEASING.md](../RELEASING.md).
 
-## Read-only applications, and no hot reload
+## Read-only applications, and the two tiers
 
-In Phase 1 the applications file is the only source of truth, and the API serves
-it read-only. This is not an unfinished CRUD API: the file is delivered as a
-Docker config, Docker configs are immutable, and changing one replaces the
-container. A file-watcher would never fire, because the process that would notice
-the change does not outlive it. The API paths are nouns (`/applications/{app}`)
-so that write operations can be added later without any of them moving.
+The applications file is the only source of truth, and the API serves it
+read-only. This is not an unfinished CRUD API: the way to change what the
+controller runs is to change that file, and the API's job is to show you the
+result. The paths are nouns (`/applications/{app}`) so that write operations can
+be added later without any of them moving.
+
+Where the file lives is a deployment choice, and the two options behave
+differently on purpose. Mounted as a **Docker config** it cannot change under the
+process at all: configs are immutable, changing one replaces the container, and a
+file-watcher would never fire because the process that would notice does not
+outlive the change. Sourced from **git** — or from a directory something else
+keeps current — it is re-read on an interval, validated in full, and swapped in
+only if it is valid, so adding an application is a commit rather than a redeploy.
+
+The controller's own bootstrap stays in the first category either way. That is
+what makes it an anchor: it says which repository is authoritative, and nothing
+in that repository can say otherwise. See
+[configuration § where the app set lives](configuration.md#where-the-app-set-lives).
 
 ## The open-core seams
 

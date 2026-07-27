@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -162,13 +163,19 @@ func discard() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError + 1}))
 }
 
+// testSource is the description a bootstrap would hand in. It is opaque to the
+// loop, which reports it and nothing else.
+const testSource = "/var/lib/appset (applications.yaml)"
+
 // newLoop builds a loop over a path-mode source seeded with initial, and returns
 // it with the fake it drives and the publisher that moves the set.
 func newLoop(t *testing.T, initial string, apps ...application.Spec) (*Loop, *fakeReconciler, func(string)) {
 	t.Helper()
 	m := pathMode(t, initial)
 	rec := newFakeReconciler(apps...)
-	loop := NewLoop(m.loader, rec, LoopOptions{Mode: "path", Log: discard(), Credentials: noCredentials})
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Mode: "path", Source: testSource, Log: discard(), Credentials: noCredentials,
+	})
 	return loop, rec, m.publish
 }
 
@@ -473,6 +480,51 @@ func TestUnresolvableCredentialFailsOnlyItsApplication(t *testing.T) {
 	}
 }
 
+// A controller that has never loaded a set is not stale: there is no last-good
+// set for it to be running. Filing the loudest failure this loop has under the
+// quietest heading is how a controller reconciling nothing gets mistaken for one
+// reconciling something slightly out of date.
+func TestAFirstLoadThatFailsIsNotStale(t *testing.T) {
+	dir := t.TempDir()
+	loop := NewLoop(
+		NewPath(PathConfig{Dir: dir, Path: "applications.yaml"}),
+		newFakeReconciler(),
+		LoopOptions{Mode: "path", Log: discard(), Credentials: noCredentials},
+	)
+
+	if err := loop.Once(context.Background()); err == nil {
+		t.Fatal("Once = nil, want the read to fail")
+	}
+
+	status := loop.Status()
+	if status.AppSet.Stale {
+		t.Error("stale is set, but nothing has ever loaded and nothing is running")
+	}
+	if status.AppSet.Error == "" {
+		t.Error("no error reported for a first load that failed")
+	}
+	if status.Applications != 0 {
+		t.Errorf("applications = %d, want 0", status.Applications)
+	}
+	if !status.AppSet.LoadedAt.IsZero() {
+		t.Error("loadedAt is set, but no load has ever succeeded")
+	}
+
+	// And when the set does turn up — the sidecar finished, the remote came
+	// back — the loop picks it up with no help. That is what makes starting
+	// without one safe rather than merely quiet.
+	if err := os.WriteFile(filepath.Join(dir, "applications.yaml"), []byte(oneApp), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once = %v, want the set to load once it arrives", err)
+	}
+	if status := loop.Status(); status.AppSet.Error != "" || status.Applications != 1 {
+		t.Errorf("status reports error=%q applications=%d, want a clean load of 1",
+			status.AppSet.Error, status.Applications)
+	}
+}
+
 func TestStatusReportsTheSource(t *testing.T) {
 	loop, rec, _ := newLoop(t, twoApps)
 	if err := loop.Once(context.Background()); err != nil {
@@ -482,6 +534,11 @@ func TestStatusReportsTheSource(t *testing.T) {
 	status := loop.Status()
 	if status.AppSet.Mode != "path" {
 		t.Errorf("mode = %q, want the label the caller configured", status.AppSet.Mode)
+	}
+	// Passed in, not derived: the bootstrap is the only thing that knows where
+	// it pointed the controller, and it is the one anchor git cannot repoint.
+	if status.AppSet.Source != testSource {
+		t.Errorf("source = %q, want the description the caller configured", status.AppSet.Source)
 	}
 	if status.AppSet.Revision != "" {
 		t.Errorf("revision = %q, want empty: a path source has no commit", status.AppSet.Revision)
