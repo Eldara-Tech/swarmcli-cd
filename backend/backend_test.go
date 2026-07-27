@@ -725,6 +725,46 @@ func TestRemoveStackTreatsAnAlreadyDeletedResourceAsDone(t *testing.T) {
 	}
 }
 
+// The case the error alone cannot answer. A swarm-scoped network removal is
+// proxied through swarmkit, and its reply for something that had already gone
+// does not reliably arrive as a not-found the client recognises — so the only
+// dependable question is whether anything is still there.
+//
+// This is what CI hit: prune deleted the departed stack and then reported a
+// failure, so the application was recorded as an orphan the swarm no longer had.
+func TestRemoveStackAcceptsAFailureThatLeftNothingBehind(t *testing.T) {
+	api := &fakeAPI{
+		existing:   []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{Name: "s_web"}}}},
+		networks:   []network.Summary{{ID: "net", Name: "s_front"}},
+		removeErr:  map[string]error{"network:net": errors.New("network net not found")},
+		removeGone: map[string]bool{"network:net": true},
+	}
+
+	if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
+		t.Fatalf("RemoveStack = %v, want nil — the stack is gone, whatever the daemon said", err)
+	}
+}
+
+// Release-history configs stay behind on purpose, so the re-check must not read
+// them as "the stack is still here" and turn every removal into a failure.
+func TestRemoveStackIgnoresReleaseRecordsWhenRechecking(t *testing.T) {
+	api := &fakeAPI{
+		networks: []network.Summary{{ID: "net", Name: "s_front"}},
+		configs: []swarm.Config{{ID: "rel", Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{
+				Name:   "swarmcli.release.s.v1",
+				Labels: map[string]string{charts.LabelType: charts.TypeRelease},
+			},
+		}}},
+		removeErr:  map[string]error{"network:net": errors.New("network net not found")},
+		removeGone: map[string]bool{"network:net": true},
+	}
+
+	if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
+		t.Fatalf("RemoveStack = %v, want nil; the release record is not the stack", err)
+	}
+}
+
 // A real failure still fails. The tolerance above is for "it is already gone",
 // not for "the daemon refused".
 func TestRemoveStackStillFailsOnARealError(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -52,9 +53,13 @@ type fakeAPI struct {
 	tasks      []swarm.Task
 	networkErr error
 	// removeErr fails one removal, keyed as the removed slice records it
-	// ("network:net"). It is how a test reproduces a resource that went away
-	// between the list and the delete.
+	// ("network:net"). By default the resource survives the failure, which is a
+	// genuine refusal.
 	removeErr map[string]error
+	// removeGone marks a failed removal whose resource is nevertheless no
+	// longer there — the daemon's reply for something that had already gone,
+	// which does not reliably arrive classified as not-found.
+	removeGone map[string]bool
 
 	// labelFilters records the label filter of every list call, so a test can
 	// assert that a stack-scoped operation was actually scoped.
@@ -608,8 +613,13 @@ func (f *fakeAPI) NetworkCreate(_ context.Context, name string, o network.Create
 }
 
 func (f *fakeAPI) NetworkRemove(_ context.Context, id string) error {
-	f.removed = append(f.removed, "network:"+id)
-	return f.removeErr["network:"+id]
+	key := "network:" + id
+	f.removed = append(f.removed, key)
+	err := f.removeErr[key]
+	if err == nil || f.removeGone[key] {
+		f.networks = slices.DeleteFunc(f.networks, func(n network.Summary) bool { return n.ID == id })
+	}
+	return err
 }
 
 func (f *fakeAPI) ConfigList(_ context.Context, o swarm.ConfigListOptions) ([]swarm.Config, error) {
@@ -638,8 +648,13 @@ func (f *fakeAPI) ConfigUpdate(_ context.Context, _ string, _ swarm.Version, spe
 }
 
 func (f *fakeAPI) ConfigRemove(_ context.Context, id string) error {
-	f.removed = append(f.removed, "config:"+id)
-	return f.removeErr["config:"+id]
+	key := "config:" + id
+	f.removed = append(f.removed, key)
+	err := f.removeErr[key]
+	if err == nil || f.removeGone[key] {
+		f.configs = slices.DeleteFunc(f.configs, func(c swarm.Config) bool { return c.ID == id })
+	}
+	return err
 }
 
 func (f *fakeAPI) SecretList(_ context.Context, o swarm.SecretListOptions) ([]swarm.Secret, error) {
@@ -668,13 +683,23 @@ func (f *fakeAPI) SecretUpdate(_ context.Context, _ string, _ swarm.Version, spe
 }
 
 func (f *fakeAPI) SecretRemove(_ context.Context, id string) error {
-	f.removed = append(f.removed, "secret:"+id)
-	return f.removeErr["secret:"+id]
+	key := "secret:" + id
+	f.removed = append(f.removed, key)
+	err := f.removeErr[key]
+	if err == nil || f.removeGone[key] {
+		f.secrets = slices.DeleteFunc(f.secrets, func(x swarm.Secret) bool { return x.ID == id })
+	}
+	return err
 }
 
 func (f *fakeAPI) ServiceRemove(_ context.Context, id string) error {
-	f.removed = append(f.removed, "service:"+id)
-	return f.removeErr["service:"+id]
+	key := "service:" + id
+	f.removed = append(f.removed, key)
+	err := f.removeErr[key]
+	if err == nil || f.removeGone[key] {
+		f.existing = slices.DeleteFunc(f.existing, func(x swarm.Service) bool { return x.ID == id })
+	}
+	return err
 }
 
 func (f *fakeAPI) VolumeList(_ context.Context, o volume.ListOptions) (volume.ListResponse, error) {
