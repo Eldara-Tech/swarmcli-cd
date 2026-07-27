@@ -7,6 +7,8 @@ RUN apt-get update \
         gnupg \
         lsb-release \
         ccze \
+        python3 \
+        python3-pip \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \
@@ -19,6 +21,7 @@ RUN apt-get update \
         docker-buildx-plugin \
         docker-compose-plugin \
         telnet \
+    && python3 -m pip install --no-cache-dir --break-system-packages mkdocs \
     && rm -rf /var/lib/apt/lists/*
 
 ARG USERNAME=vscode

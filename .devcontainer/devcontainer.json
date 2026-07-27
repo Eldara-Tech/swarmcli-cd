@@ -22,7 +22,8 @@
         "go.vetOnSave": "package"
       },
       "extensions": [
-        "golang.Go"
+        "golang.Go",
+        "ms-python.python"
       ]
     }
   },
