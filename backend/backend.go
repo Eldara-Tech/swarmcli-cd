@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 
@@ -138,6 +139,25 @@ func (b *Backend) DeployStack(name, manifest, resolve string) error {
 // RemoveStack deletes the services, networks, configs and secrets carrying the
 // stack's namespace label — what `docker stack rm` removes, and nothing more.
 //
+// Removal is idempotent, and it is decided by looking rather than by reading
+// the error. A resource that has already gone between the list and the delete
+// has reached the state this was asking for; a failure that leaves nothing
+// behind is not a failure. That is not a rare race — Swarm garbage-collects an
+// overlay network once the last task attached to it goes, which happens while
+// the services removed a few lines above are still shutting down, so the
+// network this listed is routinely gone before it is asked to remove it.
+//
+// Classifying the error is not enough on its own. A swarm-scoped network
+// removal is proxied through swarmkit and its "already gone" reply does not
+// reliably arrive as a not-found the client recognises, so every failed removal
+// is followed by a re-check of what is actually left. The state is the answer;
+// the error is only a hint about where to look.
+//
+// This is what makes the call safely repeatable, which prune's retry depends
+// on: a pass that failed part-way is followed by another that re-lists and
+// re-deletes, and treating the already-deleted half as an error would make that
+// retry fail forever.
+//
 // Volumes survive, as they do there: a stack's data outliving the stack is the
 // whole point of a named volume, and charts has RemoveVolume for the caller
 // that means it.
@@ -158,13 +178,18 @@ func (b *Backend) RemoveStack(name string) error {
 
 	ctx := context.Background()
 
+	// Failures are collected rather than returned at the first: the re-check
+	// below can only say "nothing is left" if everything was attempted, and one
+	// resource that will not go is no reason to abandon the rest of the stack.
+	var errs []error
+
 	services, err := b.api.ServiceList(ctx, swarm.ServiceListOptions{Filters: stackFilter(name)})
 	if err != nil {
 		return fmt.Errorf("listing the stack's services: %w", err)
 	}
 	for _, s := range services {
-		if err := b.api.ServiceRemove(ctx, s.ID); err != nil {
-			return fmt.Errorf("removing service %q: %w", s.Spec.Name, err)
+		if err := b.api.ServiceRemove(ctx, s.ID); err != nil && !errdefs.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("removing service %q: %w", s.Spec.Name, err))
 		}
 	}
 
@@ -187,8 +212,8 @@ func (b *Backend) RemoveStack(name string) error {
 		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
 			continue
 		}
-		if err := b.api.ConfigRemove(ctx, c.ID); err != nil {
-			return fmt.Errorf("removing config %q: %w", c.Spec.Name, err)
+		if err := b.api.ConfigRemove(ctx, c.ID); err != nil && !errdefs.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("removing config %q: %w", c.Spec.Name, err))
 		}
 	}
 
@@ -197,8 +222,8 @@ func (b *Backend) RemoveStack(name string) error {
 		return fmt.Errorf("listing the stack's secrets: %w", err)
 	}
 	for _, s := range secrets {
-		if err := b.api.SecretRemove(ctx, s.ID); err != nil {
-			return fmt.Errorf("removing secret %q: %w", s.Spec.Name, err)
+		if err := b.api.SecretRemove(ctx, s.ID); err != nil && !errdefs.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("removing secret %q: %w", s.Spec.Name, err))
 		}
 	}
 
@@ -207,11 +232,64 @@ func (b *Backend) RemoveStack(name string) error {
 		return fmt.Errorf("listing the stack's networks: %w", err)
 	}
 	for _, n := range networks {
-		if err := b.api.NetworkRemove(ctx, n.ID); err != nil {
-			return fmt.Errorf("removing network %q: %w", n.Name, err)
+		if err := b.api.NetworkRemove(ctx, n.ID); err != nil && !errdefs.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("removing network %q: %w", n.Name, err))
 		}
 	}
-	return nil
+
+	if len(errs) == 0 {
+		return nil
+	}
+	// Something refused. Whether that matters is a question about the swarm,
+	// not about the error: if nothing carrying this namespace is left, every
+	// refusal was a resource that had already gone.
+	left, err := b.stackRemains(ctx, name)
+	if err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	if !left {
+		return nil
+	}
+	return errors.Join(errs...)
+}
+
+// stackRemains reports whether anything the stack owns is still on the swarm.
+//
+// Release-history configs do not count. RemoveStack deliberately leaves them —
+// that is what keeps a release's history readable after it is uninstalled — so
+// counting them would make every removal look like it had failed.
+func (b *Backend) stackRemains(ctx context.Context, name string) (bool, error) {
+	services, err := b.api.ServiceList(ctx, swarm.ServiceListOptions{Filters: stackFilter(name)})
+	if err != nil {
+		return false, fmt.Errorf("re-checking the stack's services: %w", err)
+	}
+	if len(services) > 0 {
+		return true, nil
+	}
+
+	configs, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{Filters: stackFilter(name)})
+	if err != nil {
+		return false, fmt.Errorf("re-checking the stack's configs: %w", err)
+	}
+	for _, c := range configs {
+		if c.Spec.Labels[charts.LabelType] != charts.TypeRelease {
+			return true, nil
+		}
+	}
+
+	secrets, err := b.api.SecretList(ctx, swarm.SecretListOptions{Filters: stackFilter(name)})
+	if err != nil {
+		return false, fmt.Errorf("re-checking the stack's secrets: %w", err)
+	}
+	if len(secrets) > 0 {
+		return true, nil
+	}
+
+	networks, err := b.api.NetworkList(ctx, network.ListOptions{Filters: stackFilter(name)})
+	if err != nil {
+		return false, fmt.Errorf("re-checking the stack's networks: %w", err)
+	}
+	return len(networks) > 0, nil
 }
 
 // RefreshSnapshot is a no-op: this backend holds no cache to invalidate.

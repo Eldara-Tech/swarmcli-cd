@@ -167,4 +167,62 @@ driftDetection: manifest
 	if got.Destination.Swarm != "staging" {
 		t.Errorf("swarm = %q, want staging", got.Destination.Swarm)
 	}
+	if got.SyncPolicy.Prune || got.SyncPolicy.PruneVolumes {
+		t.Errorf("prune defaults should be off, got prune=%v pruneVolumes=%v",
+			got.SyncPolicy.Prune, got.SyncPolicy.PruneVolumes)
+	}
+}
+
+func TestSyncPolicyPruneFromYAML(t *testing.T) {
+	const src = `
+automated: true
+prune: true
+pruneVolumes: true
+`
+	var got SyncPolicy
+	if err := yaml.Unmarshal([]byte(src), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !got.Prune || !got.PruneVolumes {
+		t.Errorf("prune=%v pruneVolumes=%v, want both true", got.Prune, got.PruneVolumes)
+	}
+}
+
+// The prune fields are additive to a wire contract that is already published, so
+// an application that does not mention them must serialise exactly as it did
+// before they existed.
+func TestPruneOffIsAbsentFromJSON(t *testing.T) {
+	data, err := json.Marshal(SyncPolicy{Automated: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{"prune", "pruneVolumes"} {
+		if strings.Contains(string(data), key) {
+			t.Errorf("%q should be omitted when off, got %s", key, data)
+		}
+	}
+}
+
+func TestAppSetStatusPrunedRoundTrip(t *testing.T) {
+	want := AppSetStatus{Mode: "git", Orphaned: []string{"gone"}, Pruned: []string{"deleted"}}
+
+	data, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got AppSetStatus
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("round trip changed the status:\n got %+v\nwant %+v", got, want)
+	}
+
+	// Empty rather than null for a controller that has pruned nothing, which is
+	// every controller running the default.
+	if data, err = json.Marshal(AppSetStatus{Mode: "static"}); err != nil {
+		t.Fatalf("marshal: %v", err)
+	} else if strings.Contains(string(data), "pruned") {
+		t.Errorf("pruned should be omitted when empty, got %s", data)
+	}
 }

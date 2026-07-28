@@ -75,7 +75,8 @@ The controller itself, as distinct from what it reconciles:
     "loadedAt": "2026-07-27T09:12:04Z",
     "error": "apps/applications.yaml@d4e5f6: applications[1]: duplicate application name \"edge\"",
     "stale": true,
-    "orphaned": ["legacy-api"]
+    "orphaned": ["legacy-api"],
+    "pruned": ["old-edge"]
   },
   "applications": 4
 }
@@ -103,7 +104,18 @@ succeeds.
 
 `orphaned` names applications that have left the set. Their stacks are still
 deployed and nobody reconciles them any more: app-of-apps reports the orphan
-rather than removing it. The list lives in memory, so a restart forgets it.
+rather than removing it, unless
+[prune](configuration.md#prune) is enabled. The list lives in memory, so a
+restart forgets it — a gap in the reporting rather than in the cleanup, since a
+controller with prune enabled rediscovers a departed application from the owner
+stamps on its releases and removes it anyway.
+
+`pruned` names applications whose resources this controller has deleted, most
+recent last, and is absent on the default report-only configuration. It exists
+because prune otherwise leaves no trace: the application is gone from the set,
+gone from `orphaned` and gone from the swarm, so "did it actually go" would only
+be answerable from the logs. Like `orphaned` it lives in memory and reports this
+process's own deletions rather than an audit log.
 
 `applications` counts what is actually being reconciled, which is not always what
 the last loaded file declares.

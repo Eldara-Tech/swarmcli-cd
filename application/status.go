@@ -63,7 +63,25 @@ type AppSetStatus struct {
 
 	// Orphaned names applications that left the set. Their loops are stopped and
 	// their stacks are still deployed and no longer reconciled by anyone —
-	// reported rather than removed, which is what pruning them is for. In
-	// memory only: a restart forgets them, because nothing here has a store.
+	// reported rather than removed, unless prune is enabled.
+	//
+	// This list is what the running loop watched leave, so a restart empties it.
+	// That is a gap in the reporting and not in the cleanup: the owner stamps
+	// the releases carry are the durable record, so a controller with prune
+	// enabled still finds and removes an application that departed before it
+	// started. With prune disabled a restart does forget, and the swarm is the
+	// only place left that knows.
 	Orphaned []string `json:"orphaned,omitempty"`
+
+	// Pruned names applications whose resources this controller has deleted,
+	// most recent last. Empty whenever prune is disabled, which is the default.
+	//
+	// It exists because a departed application otherwise leaves no trace at all
+	// once prune has run: it is gone from the app set, gone from Orphaned, and
+	// gone from the swarm. "Did it actually go, or did the controller never
+	// notice" is then only answerable from the logs.
+	//
+	// Like Orphaned, in memory: a restart empties it. What it reports is this
+	// process's own deletions, not an audit log.
+	Pruned []string `json:"pruned,omitempty"`
 }

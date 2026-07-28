@@ -18,12 +18,14 @@ import (
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/api"
+	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/appset"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/backend"
 	"github.com/Eldara-Tech/swarmcli-cd/config"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
+	"github.com/Eldara-Tech/swarmcli-cd/prune"
 	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 	"github.com/Eldara-Tech/swarmcli-cd/secrets"
@@ -71,6 +73,21 @@ setting both, or either alongside an explicit --config, is an error.
                             (required with --appset-repo; default ` + defaultAppSetFile + ` with --appset-dir)
   --appset-interval <dur>   How often the set is re-read (default ` + appset.DefaultInterval.String() + `)
 
+An application that leaves the set stops being reconciled and its stack is left
+running, reported as orphaned. Prune deletes it instead. It is off by default,
+and with it on, removing an application from the set is an outage rather than a
+pause:
+
+  --prune                   Delete the resources of an application that has
+                            left the app set
+  --prune-volumes           Also delete its named volumes, which is the one part
+                            nothing can restore (requires --prune)
+  --controller-id <id>      This controller's identity, stamped on every release
+                            it installs (default ` + application.DefaultControllerID + `). Two controllers
+                            sharing a swarm MUST be given distinct ids, or each
+                            will see the other's applications as departed and,
+                            with --prune, delete them
+
 Credentials come from the environment, not from flags, because they arrive as
 Docker secrets and a flag would put them in "docker inspect" output and in argv:
 
@@ -97,6 +114,9 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.appSetDir, "appset-dir", "", "")
 	fs.StringVar(&o.appSetPath, "appset-path", "", "")
 	fs.DurationVar(&o.appSetInterval, "appset-interval", appset.DefaultInterval, "")
+	fs.BoolVar(&o.prune, "prune", false, "")
+	fs.BoolVar(&o.pruneVolumes, "prune-volumes", false, "")
+	fs.StringVar(&o.controllerID, "controller-id", application.DefaultControllerID, "")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -147,6 +167,18 @@ type options struct {
 	appSetDir      string
 	appSetPath     string
 	appSetInterval time.Duration
+
+	// prune deletes the resources of an application that has left the app set,
+	// and pruneVolumes extends that to its named volumes. Controller-wide
+	// rather than per-application because a departed application's spec is
+	// gone: there is nothing left to carry the setting.
+	prune        bool
+	pruneVolumes bool
+
+	// controllerID is this controller's half of the owner stamp. It bounds what
+	// prune will even consider, so it is what keeps two controllers on one
+	// swarm from deleting each other's applications.
+	controllerID string
 
 	// configSet records that --config was given explicitly rather than
 	// defaulted. See runController.
@@ -246,6 +278,7 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		}),
 		RegistryAuth:          resolvers,
 		ForbiddenSecretMounts: forbidden,
+		ControllerID:          o.controllerID,
 		Log:                   log,
 	})
 
@@ -253,11 +286,21 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// immutable Docker config it changes nothing and still serves the status
 	// endpoint; pointed at a repository it is the whole of app-of-apps. Same
 	// program either way, which is the point of the two modes sharing a loader.
+	// Constructed only when prune is enabled, so the nil the loop checks is the
+	// report-only default rather than a flag read in two places.
+	var pruner appset.Pruner
+	if o.prune {
+		pruner = prune.New(prune.Options{
+			Volumes: o.pruneVolumes, ControllerID: o.controllerID, Log: log,
+		})
+	}
+
 	loop := appset.NewLoop(src, rec, appset.LoopOptions{
 		Mode:     mode,
 		Source:   sourceDesc,
 		Interval: o.appSetInterval,
 		Log:      log,
+		Pruner:   pruner,
 	})
 
 	srv := api.New(rec, api.Options{Log: log, Controller: loop})
@@ -277,7 +320,8 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 
 	log.Info("starting",
 		"applications", len(cfg.Applications), "listen", o.listen,
-		"mode", mode, "appSet", sourceDesc)
+		"mode", mode, "appSet", sourceDesc,
+		"prune", o.prune, "pruneVolumes", o.pruneVolumes, "controllerID", o.controllerID)
 	return runUntilStopped(ctx, rec, loop, httpSrv, log)
 }
 
@@ -329,6 +373,13 @@ func (o options) validate() error {
 		// Not silently defaulted: an operator writing 0 means something by it,
 		// and "never re-read" is not a thing this controller can do.
 		return errors.New("--appset-interval must be positive")
+	case application.ValidateControllerID(o.controllerID) != nil:
+		return fmt.Errorf("--controller-id: %w", application.ValidateControllerID(o.controllerID))
+	case o.pruneVolumes && !o.prune:
+		// Refused rather than resolved either way. Read as "prune with volumes"
+		// it destroys data nobody asked to lose; read as "prune nothing" it
+		// leaves an operator believing cleanup is on when it is not.
+		return errors.New("--prune-volumes means nothing without --prune")
 	}
 	return nil
 }

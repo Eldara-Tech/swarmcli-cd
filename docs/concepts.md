@@ -79,16 +79,29 @@ you and one that only tells you what it would deploy.
 
 ## Ownership
 
-Every release swarmcli-cd installs is stamped with an owner, `cd/<application>`,
-recorded in the release-history config and in the stored record. The stamp is
+Every release swarmcli-cd installs is stamped with an owner,
+`cd/<controller>/<application>`, recorded in the release-history config and in the stored record. The stamp is
 what lets a later reconcile tell a release *this application* installed from one
-it has never seen — the prerequisite for ever pruning safely, because it
-separates "this is obsolete" from "I do not recognise this".
+it has never seen — the prerequisite for pruning safely, because it separates
+"this is obsolete" from "I do not recognise this".
+
+The stamp names the controller as well as the application —
+`cd/<controller>/<application>` — because prune acts on the difference between
+"mine" and "not mine". Without the controller half, a second swarmcli-cd on the
+same swarm would read the first one's applications as departed and delete them.
+Two controllers sharing a swarm must therefore have distinct `--controller-id`
+values; see [configuration § two controllers on one swarm](configuration.md#two-controllers-on-one-swarm).
+
+That stamp lives on the swarm, not in the controller's memory, which is what
+makes [prune](configuration.md#prune) survive a restart: a controller that comes
+up and finds a release stamped for one of its own applications that its app set
+no longer declares knows the application departed, even though it never watched
+it leave. It is also why prune needs no database — the swarm is the record.
 
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by
 swarmcli-cd, **its own `owner:` field is ignored** — the controller substitutes
-`cd/<application>`. Set the application's identity in `applications.yaml`, not in
+its own stamp. Set the application's identity in `applications.yaml`, not in
 the release file. The full ownership model, including the orphan-versus-unmanaged
 distinction, is documented on the engine:
 [swarmcli charts README § ownership](https://github.com/Eldara-Tech/swarmcli/blob/main/charts/README.md#ownership).

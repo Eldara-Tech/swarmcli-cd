@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/appset"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
@@ -147,6 +148,9 @@ func TestAppSetModeFollowsTheSelectors(t *testing.T) {
 func TestAppSetSelectorsAreValidated(t *testing.T) {
 	valid := func(o options) options {
 		o.appSetInterval = appset.DefaultInterval
+		if o.controllerID == "" {
+			o.controllerID = application.DefaultControllerID
+		}
 		return o
 	}
 	for _, tc := range []struct {
@@ -161,7 +165,10 @@ func TestAppSetSelectorsAreValidated(t *testing.T) {
 		{"a repository with no path", valid(options{appSetRepo: "https://example.com/apps.git", appSetRevision: "main"}), "--appset-path"},
 		{"a revision with no repository", valid(options{appSetRevision: "main"}), "--appset-revision"},
 		{"a path with no source", valid(options{appSetPath: "applications.yaml"}), "--appset-path"},
-		{"an interval of zero", options{appSetDir: "/var/lib/appset"}, "--appset-interval"},
+		{"an interval of zero", options{appSetDir: "/var/lib/appset", controllerID: application.DefaultControllerID}, "--appset-interval"},
+		{"a controller id with a slash", valid(options{controllerID: "a/b"}), "--controller-id"},
+		{"a controller id with a colon", valid(options{controllerID: "a:b"}), "--controller-id"},
+		{"volumes without prune", valid(options{pruneVolumes: true}), "--prune-volumes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.o.validate()
@@ -321,6 +328,20 @@ func TestControllerHelpNamesTheAppSetFlags(t *testing.T) {
 	}
 }
 
+// Prune is the one destructive setting, so the help has to say both that it
+// exists and what turning it on costs.
+func TestControllerHelpNamesThePruneFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run = %d, want 0", code)
+	}
+	for _, want := range []string{"--prune", "--prune-volumes", "--controller-id", "outage"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout = %q, want it to mention %q", stdout.String(), want)
+		}
+	}
+}
+
 // testListen binds an ephemeral port on the loopback: the tests need a real
 // listener but must not collide with anything, least of all each other.
 const testListen = "127.0.0.1:0"
@@ -333,6 +354,7 @@ func staticOptions(configPath, dataDir string) options {
 		listen:         testListen,
 		dataDir:        dataDir,
 		appSetInterval: appset.DefaultInterval,
+		controllerID:   application.DefaultControllerID,
 	}
 }
 

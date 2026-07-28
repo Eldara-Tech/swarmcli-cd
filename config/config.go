@@ -157,6 +157,16 @@ func validateApplication(app application.Spec) error {
 	if app.SyncPolicy.HistoryMax < 0 {
 		return fmt.Errorf("%q: syncPolicy historyMax cannot be negative", app.Name)
 	}
+	// Refused rather than ignored. Obeying half of a destructive instruction is
+	// the wrong failure mode in both directions: taken as "prune with volumes"
+	// it deletes data nobody asked to lose, and taken as "prune nothing" it
+	// leaves an operator believing cleanup is on when it is not.
+	if app.SyncPolicy.PruneVolumes && !app.SyncPolicy.Prune {
+		return fmt.Errorf("%q: syncPolicy pruneVolumes means nothing without prune", app.Name)
+	}
+	if app.SyncPolicy.PruneFirst && !app.SyncPolicy.Prune {
+		return fmt.Errorf("%q: syncPolicy pruneFirst means nothing without prune", app.Name)
+	}
 	return nil
 }
 

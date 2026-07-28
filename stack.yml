@@ -46,6 +46,14 @@ services:
     # cannot be told from a set you meant to shrink.
     # command: ["controller", "--appset-dir", "/var/lib/swarmcli-cd/appset"]
 
+    # Prune — add to any of the three. Without it an application removed from
+    # the app set stops being reconciled and its stack is left running, reported
+    # as orphaned. With it the stack is deleted, so removing an entry to park
+    # something is an outage rather than a pause. --prune-volumes extends that
+    # to named volumes, which is the one part no reconcile can put back.
+    #           "--prune"
+    #           "--prune-volumes"
+
     healthcheck:
       # The image carries no curl and needs none: the binary probes itself.
       test: ["CMD", "/swarmcli-cd", "healthcheck"]

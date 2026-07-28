@@ -137,6 +137,7 @@ func TestValidationErrors(t *testing.T) {
 		"unknown drift":      {base("      releaseFile: r.yaml\n    driftDetection: live\n"), "unsupported driftDetection"},
 		"slash regauth":      {base("      releaseFile: r.yaml\n    registryAuth: \"has/slash\"\n"), "invalid registryAuth"},
 		"traversal regauth":  {base("      releaseFile: r.yaml\n    registryAuth: \"..\"\n"), "invalid registryAuth"},
+		"volumes no prune":   {base("      releaseFile: r.yaml\n    syncPolicy: {pruneVolumes: true}\n"), "pruneVolumes means nothing without prune"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Parse([]byte(tc.src), "applications.yaml")
@@ -166,6 +167,22 @@ applications:
 	}
 	if got := f.Applications[0].RegistryAuth; got != "swarmcli-cd-regauth-edge" {
 		t.Errorf("RegistryAuth = %q, want swarmcli-cd-regauth-edge", got)
+	}
+}
+
+func TestPruneWithVolumesAccepted(t *testing.T) {
+	const src = `
+applications:
+  - name: edge
+    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}
+    syncPolicy: {automated: true, prune: true, pruneVolumes: true}
+`
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if p := f.Applications[0].SyncPolicy; !p.Prune || !p.PruneVolumes {
+		t.Errorf("prune=%v pruneVolumes=%v, want both true", p.Prune, p.PruneVolumes)
 	}
 }
 
@@ -227,5 +244,18 @@ func TestLoadMissingFile(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
 	if err == nil || !strings.Contains(err.Error(), "reading applications file") {
 		t.Errorf("Load = %v, want a read error", err)
+	}
+}
+
+func TestPruneFirstNeedsPrune(t *testing.T) {
+	const src = `
+applications:
+  - name: edge
+    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}
+    syncPolicy: {pruneFirst: true}
+`
+	_, err := Parse([]byte(src), "applications.yaml")
+	if err == nil || !strings.Contains(err.Error(), "pruneFirst means nothing without prune") {
+		t.Fatalf("Parse = %v, want pruneFirst refused without prune", err)
 	}
 }

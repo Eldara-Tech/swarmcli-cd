@@ -103,4 +103,9 @@ func renderStatus(out io.Writer, s application.ControllerStatus) {
 	if len(s.AppSet.Orphaned) > 0 {
 		row("Orphaned", strings.Join(s.AppSet.Orphaned, ", "))
 	}
+	// Only when something was actually deleted, like the three above it: on a
+	// controller running the default this line never appears at all.
+	if len(s.AppSet.Pruned) > 0 {
+		row("Pruned", strings.Join(s.AppSet.Pruned, ", "))
+	}
 }

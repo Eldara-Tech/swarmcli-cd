@@ -26,6 +26,17 @@ const (
 	SyncSucceeded EventType = "sync-succeeded"
 	SyncFailed    EventType = "sync-failed"
 	DriftDetected EventType = "drift-detected"
+	// ResourcesPruned reports that the controller deleted the deployed
+	// resources of something git no longer declares — a whole application that
+	// left the app set, or a release an application stopped declaring. Message
+	// names what went.
+	//
+	// It is the loudest thing this controller does, and the only event that
+	// reports something destroyed rather than converged.
+	ResourcesPruned EventType = "resources-pruned"
+	// PruneFailed reports that the deletion did not complete. What it names is
+	// still deployed and still unmanaged; the next reconcile tries again.
+	PruneFailed EventType = "prune-failed"
 )
 
 // Event is one thing that happened to one application.
@@ -85,8 +96,13 @@ func (logNotifier) Notify(ctx context.Context, e Event) {
 	}
 
 	level := slog.LevelInfo
-	if e.Type == SyncFailed {
+	switch e.Type {
+	case SyncFailed, PruneFailed:
 		level = slog.LevelError
+	// Warn, not Info: a stack was deleted. It is the line an operator goes
+	// looking for when something they expected to be running is not.
+	case ResourcesPruned:
+		level = slog.LevelWarn
 	}
 	slog.Default().Log(ctx, level, "reconcile", attrs...)
 }

@@ -90,6 +90,52 @@ type SyncPolicy struct {
 	Wait       bool     `json:"wait,omitempty" yaml:"wait,omitempty"`
 	Timeout    Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
 	HistoryMax int      `json:"historyMax,omitempty" yaml:"historyMax,omitempty"`
+
+	// Prune deletes the resources of a release this application used to declare
+	// and no longer does. Off by default: reporting an orphan is safe and
+	// deleting one is not, so it is a deliberate choice per application.
+	//
+	// It governs only this application's own releases — those carrying its
+	// owner stamp. A release another application or the command line installed
+	// is unmanaged here and is never touched, whatever this says.
+	//
+	// Not to be confused with HistoryMax, which prunes an individual release's
+	// revision history rather than the release itself. Two senses of the word,
+	// one of which is the chart engine's; see the prune package.
+	Prune bool `json:"prune,omitempty" yaml:"prune,omitempty"`
+
+	// PruneVolumes extends Prune to the named volumes of what it deletes, and
+	// means nothing without it — a config declaring one and not the other is
+	// refused rather than half-obeyed.
+	//
+	// Separate from Prune because it is the one irreversible part. Everything
+	// else prune removes can be recreated from git on the next reconcile; the
+	// data in a volume cannot be recreated from anything.
+	PruneVolumes bool `json:"pruneVolumes,omitempty" yaml:"pruneVolumes,omitempty"`
+
+	// PruneFirst deletes before installing, instead of after.
+	//
+	// The default order applies and then prunes, so a failed apply leaves the
+	// old release running rather than nothing at all. The cost is that a
+	// renamed release briefly coexists with the name it replaced: the new name
+	// is an install and the old one an orphan, and between the two steps both
+	// are deployed.
+	//
+	// For a workload where two instances running at once is worse than none —
+	// a blockchain validator that would double-sign and be slashed, a job
+	// runner that must not process a queue twice — that trade is the wrong way
+	// round. This inverts it: the departing release is deleted before its
+	// replacement is installed, so they never overlap, and a failed apply
+	// leaves a gap instead.
+	//
+	// It bounds the overlap this controller creates deliberately; it is not a
+	// distributed lock. Nothing here can prevent two instances during a network
+	// partition or a node recovering with stale state, so a workload that
+	// cannot tolerate that at all needs an external guard — a remote signer
+	// with an anti-slashing record, or a lease.
+	//
+	// Means nothing without Prune, and is refused rather than ignored.
+	PruneFirst bool `json:"pruneFirst,omitempty" yaml:"pruneFirst,omitempty"`
 }
 
 // View is what every API read returns: the declared spec beside what the
