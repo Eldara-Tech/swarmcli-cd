@@ -108,4 +108,11 @@ func renderStatus(out io.Writer, s application.ControllerStatus) {
 	if len(s.AppSet.Pruned) > 0 {
 		row("Pruned", strings.Join(s.AppSet.Pruned, ", "))
 	}
+	// Prune waiting on a first reconcile is normal for a few seconds after
+	// startup and a problem if it persists, and the line reads the same either
+	// way — which is the point. Without it, "prune is enabled and nothing has
+	// been pruned" has no visible explanation at all.
+	if len(s.AppSet.PruneHeldBy) > 0 {
+		row("Prune held", "waiting for "+strings.Join(s.AppSet.PruneHeldBy, ", "))
+	}
 }

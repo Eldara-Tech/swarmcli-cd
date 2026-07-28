@@ -71,7 +71,7 @@ type LoopOptions struct {
 // loop that deletes things, and a test of the loop's guards must be able to
 // assert that it was never called.
 type Pruner interface {
-	Departed(ctx context.Context, desired []string) ([]string, error)
+	Departed(ctx context.Context, desired, declared []string) ([]string, error)
 }
 
 // Loop keeps the running set equal to the app set.
@@ -109,6 +109,9 @@ type Loop struct {
 	// they went. With prune enabled a departure passes through orphaned and out
 	// again within the same pass, so the two lists are disjoint by construction.
 	pruned []string
+	// pruneHeldBy names the applications whose first reconcile the last sweep
+	// waited on. Nil once a sweep has run.
+	pruneHeldBy []string
 }
 
 // NewLoop returns a Loop driving rec from src.
@@ -205,6 +208,23 @@ func (l *Loop) Once(ctx context.Context) error {
 // returns before reaching it, and a pass whose apply failed skips it. The third
 // is the pruner's own refusal to act on a set that declares no applications.
 //
+// The fourth guard is here, and it is about a different mistake: an application
+// that has joined the set but not yet reconciled has not told the controller
+// which releases it declares, and the sweep decides what to delete from exactly
+// that. Renaming an application is the case it exists for (#62). The rename
+// arrives as one departure and one arrival, apply starts the new application's
+// loop and returns, and this runs immediately afterwards while that loop is
+// still fetching git — so the release the departed name still owns is swept
+// before its successor can claim it, and with pruneVolumes the data goes too.
+// A sweep is one config list against a clone and a render, so it wins that race
+// essentially always; it is not a narrow window.
+//
+// So the sweep waits for every application to have planned once. It is over the
+// applications the reconciler currently holds rather than over remembered
+// departures, which is what makes it survive a restart: after one, every
+// application is unreconciled and the wait covers all of them, where a
+// remembered departure would have been forgotten precisely when it was needed.
+//
 // The names go in even when the sweep also returns an error: it reports what it
 // managed to delete alongside what it could not, and a partial success that
 // went unrecorded would leave the status endpoint claiming resources are still
@@ -214,17 +234,76 @@ func (l *Loop) pruneDeparted(ctx context.Context, desired []application.Spec) er
 		return nil
 	}
 
+	// One snapshot for both questions below, so the set the gate clears is the
+	// same set the releases are read from.
+	views := l.rec.Views()
+
+	if held := unreconciled(views); len(held) > 0 {
+		l.recordPruneHeld(held)
+		// Info and every pass, not once: an application that can never plan
+		// holds the sweep indefinitely, and that is a condition an operator has
+		// to be able to find rather than one that scrolled past at startup.
+		l.log.Info("prune held: an application has not reconciled yet, so what it declares is not known",
+			"applications", held)
+		return nil
+	}
+	l.recordPruneHeld(nil)
+
 	names := make([]string, 0, len(desired))
 	for _, spec := range desired {
 		names = append(names, spec.Name)
 	}
 
-	pruned, err := l.pruner.Departed(ctx, names)
+	pruned, err := l.pruner.Departed(ctx, names, declared(views))
 	l.recordPruned(pruned)
 	if err != nil {
 		return fmt.Errorf("pruning departed applications: %w", err)
 	}
 	return nil
+}
+
+// unreconciled names the applications that have not completed a plan, in the
+// reconciler's order.
+//
+// SyncUnknown is the state an application is added with and the only one
+// drift.FromPlan never produces, so it means "has not planned" and nothing
+// else. A failed reconcile is deliberately not enough: it moves ObservedAt but
+// not the sync state, and an application whose first git fetch happened to fail
+// has told the controller no more about what it declares than one that has not
+// run at all. Accepting the attempt would reopen the rename window for exactly
+// as long as a repository is unreachable.
+func unreconciled(views []application.View) []string {
+	var held []string
+	for _, view := range views {
+		if view.Status.Sync.State == application.SyncUnknown {
+			held = append(held, view.Spec.Name)
+		}
+	}
+	return held
+}
+
+// declared names every release the applications still in the set hold,
+// deduplicated and in the reconciler's order. It is what stops the sweep
+// deleting a release whose stamp is stale but whose stack somebody is still
+// reconciling.
+//
+// The gate above is what makes this trustworthy: every application has planned,
+// so every one of them has reported the releases it declares, and an empty list
+// here means the applications really declare nothing rather than that they have
+// not looked yet.
+func declared(views []application.View) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	for _, view := range views {
+		for _, rel := range view.Status.Releases {
+			if _, ok := seen[rel.Name]; ok {
+				continue
+			}
+			seen[rel.Name] = struct{}{}
+			out = append(out, rel.Name)
+		}
+	}
+	return out
 }
 
 // apply drives the reconciler to the desired set.
@@ -366,8 +445,9 @@ func (l *Loop) Status() application.ControllerStatus {
 			Stale:    l.stale,
 			// Cloned: the caller is a handler about to serialise it, and the
 			// list keeps changing underneath.
-			Orphaned: slices.Clone(l.orphaned),
-			Pruned:   slices.Clone(l.pruned),
+			Orphaned:    slices.Clone(l.orphaned),
+			Pruned:      slices.Clone(l.pruned),
+			PruneHeldBy: slices.Clone(l.pruneHeldBy),
 		},
 		// What is being reconciled, which is not always what the file declares:
 		// an application the set added but that could not be started is in the
@@ -428,6 +508,14 @@ func (l *Loop) recordPruned(names []string) {
 			l.pruned = append(l.pruned, name)
 		}
 	}
+}
+
+// recordPruneHeld records which applications the sweep is waiting on, or clears
+// it once one has run.
+func (l *Loop) recordPruneHeld(names []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.pruneHeldBy = names
 }
 
 func without(names []string, name string) []string {

@@ -98,6 +98,15 @@ up and finds a release stamped for one of its own applications that its app set
 no longer declares knows the application departed, even though it never watched
 it leave. It is also why prune needs no database — the swarm is the record.
 
+A stamp records who *installed* a release, and it is only rewritten when
+something deploys that release again — a reconcile that finds nothing to change
+writes no revision and so writes no stamp. So a stamp can name an application
+that no longer exists, which is exactly what renaming one produces. That is why
+prune asks a second question before it deletes anything: not only "whose stamp
+is this" but "is any application still declaring this release". Only a release
+that fails both is left behind; see
+[configuration § renaming an application](configuration.md#renaming-an-application).
+
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by
 swarmcli-cd, **its own `owner:` field is ignored** — the controller substitutes

@@ -49,6 +49,17 @@ const twoApps = `applications:
       releaseFile: releases/core.yaml
 `
 
+// renamedApp is oneApp under a new application name, with the source and the
+// release file untouched — the rename of #62, which is a departure and an
+// arrival that both point at the same deployed release.
+const renamedApp = `applications:
+  - name: edge-eu
+    source:
+      repoURL: https://example.com/infra.git
+      revision: main
+      releaseFile: releases/edge.yaml
+`
+
 // invalidSets are the four ways a commit breaks the set, one per rule the
 // loader is required to enforce before swapping anything in.
 var invalidSets = map[string]string{

@@ -7,6 +7,7 @@ package integration
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -174,10 +175,15 @@ func TestPruneDeletesADepartedApplicationsResources(t *testing.T) {
 // the same fixture so the only difference is the flag.
 func TestPruneVolumesDeletesTheVolumeToo(t *testing.T) {
 	cli := dockerClient(t)
-	const release = "e2e-prune-volumes"
+	const (
+		release       = "e2e-prune-volumes"
+		anchorRelease = "e2e-prune-volumes-anchor"
+	)
 	repo := gitRepo(t, chartFilesWithResources(release, 1))
+	anchorRepo := gitRepo(t, chartFiles(anchorRelease, 1))
 	t.Cleanup(func() {
 		removeStack(t, release)
+		removeStack(t, anchorRelease)
 		removeVolumes(t, cli, release)
 	})
 
@@ -195,9 +201,13 @@ func TestPruneVolumesDeletesTheVolumeToo(t *testing.T) {
       timeout: 3m
   - name: anchor
     source:
-      repoURL: ` + repo + `
+      repoURL: ` + anchorRepo + `
       revision: ` + branch + `
       releaseFile: swarmcli-release.yaml
+    syncPolicy:
+      automated: true
+      wait: true
+      timeout: 3m
 `)
 
 	src := appset.NewPath(appset.PathConfig{Dir: dir, Path: "applications.yaml"})
@@ -210,8 +220,10 @@ func TestPruneVolumesDeletesTheVolumeToo(t *testing.T) {
 	if err := loop.Once(context.Background()); err != nil {
 		t.Fatalf("first pass = %v, want nil", err)
 	}
-	if err := rec.SyncNow(context.Background(), "gone"); err != nil {
-		t.Fatalf("SyncNow = %v, want nil", err)
+	for _, app := range []string{"gone", "anchor"} {
+		if err := rec.SyncNow(context.Background(), app); err != nil {
+			t.Fatalf("SyncNow(%q) = %v, want nil", app, err)
+		}
 	}
 	waitForRunning(t, cli, release, 1)
 	if got := stackVolumeCount(t, cli, release); got != 1 {
@@ -220,18 +232,144 @@ func TestPruneVolumesDeletesTheVolumeToo(t *testing.T) {
 
 	// anchor stays, so the desired set is never empty — an empty one prunes
 	// nothing by design, and this test would otherwise pass for that reason
-	// rather than the one it is about. anchor is not automated, so it never
-	// deploys and never claims the release.
+	// rather than the one it is about. It has its own repository and its own
+	// release, and is reconciled: an anchor sharing this release would be an
+	// application still declaring it, which is now precisely the thing that
+	// stops a sweep (#62), and an anchor that never reconciled would hold the
+	// sweep back instead.
 	publish(`applications:
   - name: anchor
     source:
-      repoURL: ` + repo + `
+      repoURL: ` + anchorRepo + `
       revision: ` + branch + `
       releaseFile: swarmcli-release.yaml
+    syncPolicy:
+      automated: true
+      wait: true
+      timeout: 3m
 `)
 
 	pruneUntilConverged(t, loop, func() bool {
 		return stackVolumeCount(t, cli, release) == 0 &&
 			stackServiceCount(t, cli, release) == 0
 	})
+}
+
+// Issue #62, and the case that made prune destructive rather than merely
+// surprising. Renaming an application — the application, not the release —
+// must hand its stack over rather than delete and reinstall it. Run with
+// volumes opted in, because that is the configuration where getting this wrong
+// destroys the one thing no reconcile can put back.
+//
+// Both halves of the fix are exercised in order: the sweep is held while the
+// renamed application has not reconciled, and once it has, the sweep runs and
+// spares a release that is still stamped for the departed name because an
+// application in the set declares it.
+func TestRenamingAnApplicationKeepsItsStackAndVolume(t *testing.T) {
+	cli := dockerClient(t)
+	const (
+		release       = "e2e-prune-rename"
+		anchorRelease = "e2e-prune-rename-anchor"
+	)
+	repo := gitRepo(t, chartFilesWithResources(release, 1))
+	anchorRepo := gitRepo(t, chartFiles(anchorRelease, 1))
+	t.Cleanup(func() {
+		removeStack(t, release)
+		removeStack(t, anchorRelease)
+		removeVolumes(t, cli, release)
+	})
+
+	dir := t.TempDir()
+	publish := appSetPublisher(t, dir)
+	// The only thing that changes between the two publishes is the application
+	// name; the source and the release file are byte for byte the same, which
+	// is what makes the plan come out unchanged and the stamp go stale.
+	set := func(name string) string {
+		return `applications:
+  - name: ` + name + `
+    source:
+      repoURL: ` + repo + `
+      revision: ` + branch + `
+      releaseFile: swarmcli-release.yaml
+    syncPolicy:
+      automated: true
+      wait: true
+      timeout: 3m
+  - name: anchor
+    source:
+      repoURL: ` + anchorRepo + `
+      revision: ` + branch + `
+      releaseFile: swarmcli-release.yaml
+    syncPolicy:
+      automated: true
+      wait: true
+      timeout: 3m
+`
+	}
+	publish(set("edge"))
+
+	src := appset.NewPath(appset.PathConfig{Dir: dir, Path: "applications.yaml"})
+	rec := reconciler(t)
+	loop := appset.NewLoop(src, rec, appset.LoopOptions{
+		Mode: "path", Log: testLog(),
+		Pruner: prune.New(prune.Options{Volumes: true, ControllerID: controllerID(t), Log: testLog()}),
+	})
+
+	if err := loop.Once(context.Background()); err != nil {
+		t.Fatalf("first pass = %v, want nil", err)
+	}
+	for _, app := range []string{"edge", "anchor"} {
+		if err := rec.SyncNow(context.Background(), app); err != nil {
+			t.Fatalf("SyncNow(%q) = %v, want nil", app, err)
+		}
+	}
+	waitForRunning(t, cli, release, 1)
+
+	// Identity, not count: a stack that was deleted and reinstalled has the
+	// same number of services under the same names, and only the ids say which
+	// of the two happened.
+	before := stackServiceIDs(t, cli, release)
+	if len(before) == 0 {
+		t.Fatal("setup: the stack has no services to keep")
+	}
+	if got := stackVolumeCount(t, cli, release); got != 1 {
+		t.Fatalf("setup: %d volumes, want 1", got)
+	}
+
+	publish(set("edge-eu"))
+
+	if err := loop.Once(context.Background()); err != nil {
+		t.Fatalf("the renaming pass = %v, want nil", err)
+	}
+	if held := loop.Status().AppSet.PruneHeldBy; len(held) != 1 || held[0] != "edge-eu" {
+		t.Errorf("pruneHeldBy = %v, want [edge-eu] on the pass that renamed it", held)
+	}
+
+	if err := rec.SyncNow(context.Background(), "edge-eu"); err != nil {
+		t.Fatalf("SyncNow(edge-eu) = %v, want nil", err)
+	}
+	// More than one, because a sweep that spares a release must keep sparing
+	// it: nothing re-stamps a release whose plan came out unchanged, so every
+	// later pass sees the same stale stamp and must reach the same answer.
+	for pass := range 3 {
+		if err := loop.Once(context.Background()); err != nil {
+			t.Fatalf("sweep pass %d = %v, want nil", pass+1, err)
+		}
+	}
+
+	if got := stackServiceIDs(t, cli, release); !slices.Equal(got, before) {
+		t.Errorf("service ids = %v, want %v; the stack was recreated rather than handed over", got, before)
+	}
+	if got := stackVolumeCount(t, cli, release); got != 1 {
+		t.Errorf("%d volumes after the rename, want the original 1", got)
+	}
+	if got := releaseRecordCount(t, cli, release); got == 0 {
+		t.Error("the release history is gone; the rename uninstalled the release")
+	}
+	if pruned := loop.Status().AppSet.Pruned; len(pruned) != 0 {
+		t.Errorf("pruned = %v, want nothing pruned by a rename", pruned)
+	}
+	if got := runningReplicas(t, cli, anchorRelease); got != 1 {
+		t.Errorf("the anchor has %d running tasks, want 1", got)
+	}
 }

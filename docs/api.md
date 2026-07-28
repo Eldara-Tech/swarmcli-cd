@@ -76,7 +76,8 @@ The controller itself, as distinct from what it reconciles:
     "error": "apps/applications.yaml@d4e5f6: applications[1]: duplicate application name \"edge\"",
     "stale": true,
     "orphaned": ["legacy-api"],
-    "pruned": ["old-edge"]
+    "pruned": ["old-edge"],
+    "pruneHeldBy": ["edge-eu"]
   },
   "applications": 4
 }
@@ -116,6 +117,15 @@ because prune otherwise leaves no trace: the application is gone from the set,
 gone from `orphaned` and gone from the swarm, so "did it actually go" would only
 be answerable from the logs. Like `orphaned` it lives in memory and reports this
 process's own deletions rather than an audit log.
+
+`pruneHeldBy` names the applications the sweep is waiting on, and is absent
+whenever it is waiting on nothing — which, once a controller has settled, is
+always. Prune deletes what no application declares, so it cannot run while an
+application has not yet reconciled and said what it declares; it would read that
+silence as a departure. This is the field that distinguishes "prune is enabled
+and correctly doing nothing" from "prune is broken", and it is what a rename
+looks like for the first pass or two (see
+[configuration § renaming an application](configuration.md#renaming-an-application)).
 
 `applications` counts what is actually being reconciled, which is not always what
 the last loaded file declares.
