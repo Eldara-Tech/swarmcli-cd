@@ -49,7 +49,7 @@ applications:
 	if !strings.Contains(stdout.String(), "OK: ") {
 		t.Errorf("stdout = %q, want an OK verdict", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "(1 applications)") {
+	if !strings.Contains(stdout.String(), "(1 application)") {
 		t.Errorf("stdout = %q, want the application count", stdout.String())
 	}
 	if stderr.Len() != 0 {
@@ -90,5 +90,15 @@ func TestValidateRejectsPositionalArgument(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "unexpected argument") {
 		t.Errorf("stderr = %q, want a usage rejection", stderr.String())
+	}
+}
+
+func TestValidateRejectsUnknownFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"validate", "--nope"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("run(validate) = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "swarmcli-cd validate [options]") {
+		t.Errorf("stderr = %q, want the validate usage", stderr.String())
 	}
 }

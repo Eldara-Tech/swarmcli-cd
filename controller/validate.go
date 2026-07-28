@@ -12,14 +12,20 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/config"
 )
 
-const defaultValidateFile = "applications.yaml"
+const validateUsage = `Usage: swarmcli-cd validate [options]
 
-var validateUsage = `Usage: swarmcli-cd validate [options]
+Validates an applications file and exits without starting the controller. This
+is the check to run in the app set's own CI: it is the same parse and the same
+rules the controller applies before it will swap a new set in.
 
-Validates an applications file and exits without starting the controller.
+It reads the file and nothing else. A file that validates can still fail to
+deploy — whether a releaseFile or chart path exists in its repository, whether
+a destination names a swarm this controller knows, and whether a registryAuth
+secret is mounted are all answered at reconcile time, against things this
+command cannot see.
 
 Options:
-  --file <path>   Applications file path (default ` + defaultValidateFile + `)
+  --file <path>   Applications file path (default ` + defaultAppSetFile + `)
 `
 
 // runValidate checks one applications file and exits with a plain verdict.
@@ -27,7 +33,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	file := fs.String("file", defaultValidateFile, "")
+	file := fs.String("file", defaultAppSetFile, "")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			_, _ = fmt.Fprint(stdout, validateUsage)
@@ -43,6 +49,10 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, err)
 	}
-	_, _ = fmt.Fprintf(stdout, "OK: %s (%d applications)\n", cfg.Path, len(cfg.Applications))
+	noun := "applications"
+	if len(cfg.Applications) == 1 {
+		noun = "application"
+	}
+	_, _ = fmt.Fprintf(stdout, "OK: %s (%d %s)\n", cfg.Path, len(cfg.Applications), noun)
 	return 0
 }

@@ -38,7 +38,7 @@ Commands:
   controller   Run the reconciler and the HTTP API
   app          Inspect and sync applications through a running controller
   status       Show the controller's own state and where its app set comes from
-	validate     Validate an applications file and exit
+  validate     Validate an applications file and exit
   healthcheck  Probe a controller's liveness endpoint
   version      Print the version
   help         Show this help
