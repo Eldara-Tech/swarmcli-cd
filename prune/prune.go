@@ -33,6 +33,18 @@
 // distinction charts.Plan draws between Orphaned and Unmanaged, for the same
 // reason.
 //
+// # The stamp is not enough on its own
+//
+// A stamp records who installed a release, and it is only rewritten when
+// something deploys that release again. Rename an application without changing
+// anything else and the plan comes out identical, so nothing is deployed and
+// nothing is re-stamped: the release keeps the departed name's stamp
+// indefinitely, and reading the stamp alone would delete a stack that a current
+// application is reconciling (#62). So the sweep is given the releases the
+// current applications declare as well, and spares anything in that list. The
+// stamp says who installed it; that list says whether anybody is still
+// responsible for it.
+//
 // # Two controllers on one swarm
 //
 // The stamp names a controller as well as an application, and the sweep only
@@ -217,11 +229,20 @@ func New(o Options) *Pruner {
 // not be read", and the two want opposite things done. See appset.Loop, which
 // only calls this after a load and an apply have both succeeded.
 //
+// declared names the releases the applications still in the set hold, and no
+// release named in it is ever deleted whatever its stamp says. That is what
+// makes renaming an application a handover rather than a teardown (#62): the
+// release keeps the departed application's stamp until something re-stamps it,
+// and under the default sync policy nothing does, because re-stamping means
+// deploying and a manual-policy application is not deployed without being asked.
+// The stamp answers "who installed this"; declared answers "is anybody still
+// responsible for it", and only the second is a safe basis for deleting.
+//
 // Every application is attempted and the failures are collected rather than
 // returned at the first. They are independent, and because the next sweep
 // rediscovers whatever is still stamped on the swarm, a failure costs a
 // reconcile interval rather than an orphan nobody looks at again.
-func (p *Pruner) Departed(ctx context.Context, desired []string) ([]string, error) {
+func (p *Pruner) Departed(ctx context.Context, desired, declared []string) ([]string, error) {
 	// An app set that declares nothing is indistinguishable from one somebody
 	// truncated, and acting on it would delete every managed stack on the
 	// swarm. Refusing costs the ability to empty the set in one commit, which
@@ -245,7 +266,7 @@ func (p *Pruner) Departed(ctx context.Context, desired []string) ([]string, erro
 
 	var pruned []string
 	var errs []error
-	for _, app := range departed(releases, desired, p.controller) {
+	for _, app := range departed(releases, desired, declared, p.controller) {
 		var failed []failure
 		for _, release := range app.releases {
 			if err := p.uninstall(ctx, backend, engine, app.name, release); err != nil {
@@ -343,14 +364,23 @@ type departedApp struct {
 }
 
 // departed groups the releases whose owner stamp names an application that is
-// absent from desired.
+// absent from desired, less any release an application still in the set
+// declares.
+//
+// An application left with nothing after that filtering does not appear at all:
+// there is nothing of its to delete, because every release it used to own now
+// belongs to somebody who is still here.
 //
 // The result is in the order List returned the releases, which is by name, so
 // what gets logged and reported does not reshuffle between sweeps.
-func departed(releases []charts.Release, desired []string, controller string) []departedApp {
+func departed(releases []charts.Release, desired, declared []string, controller string) []departedApp {
 	keep := make(map[string]struct{}, len(desired))
 	for _, name := range desired {
 		keep[name] = struct{}{}
+	}
+	held := make(map[string]struct{}, len(declared))
+	for _, name := range declared {
+		held[name] = struct{}{}
 	}
 
 	var out []departedApp
@@ -361,6 +391,9 @@ func departed(releases []charts.Release, desired []string, controller string) []
 			continue
 		}
 		if _, still := keep[app]; still {
+			continue
+		}
+		if _, taken := held[rel.Name]; taken {
 			continue
 		}
 		if i, seen := at[app]; seen {

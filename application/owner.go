@@ -61,10 +61,18 @@ func OwnerID(controller, app string) string {
 // install.
 //
 // A stamp in the pre-controller-id format ("cd/<app>") is likewise not this
-// controller's. That is deliberate: it reads as unmanaged, so prune leaves it
-// alone, and a release still declared by its application is re-stamped on the
-// next reconcile because ownership plays no part in planning a release the file
-// declares. The migration therefore heals itself and errs towards not deleting.
+// controller's. That is deliberate — it reads as unmanaged, so prune leaves it
+// alone, and the migration errs towards not deleting.
+//
+// It does not heal on its own, though, and it is worth being exact about why.
+// Ownership plays no part in planning a release the file declares, so a
+// reconcile that deploys one re-stamps it; but a release whose chart, values and
+// manifest are unchanged is planned as unchanged and skipped, and skipping is
+// what charts does instead of writing a revision that would say nothing new.
+// So a stale stamp survives until something actually redeploys that release,
+// which under the default sync policy is until an operator asks. What keeps
+// that safe is not the stamp but prune's second signal: a release an
+// application still declares is never swept, whatever it is stamped with (#62).
 func AppFromOwnerID(controller, id string) (string, bool) {
 	if controller == "" {
 		controller = DefaultControllerID

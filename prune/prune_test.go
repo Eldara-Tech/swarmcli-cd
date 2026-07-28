@@ -161,7 +161,7 @@ func TestDepartedApplicationIsPruned(t *testing.T) {
 		owned("web", "kept"),
 	}}
 
-	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"})
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, nil)
 	if err != nil {
 		t.Fatalf("Departed = %v, want nil", err)
 	}
@@ -192,7 +192,7 @@ func TestOnlyProvablyDepartedReleasesArePruned(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e := &fakeEngine{releases: []charts.Release{rel}}
 
-			got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"})
+			got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, nil)
 			if err != nil {
 				t.Fatalf("Departed = %v, want nil", err)
 			}
@@ -206,12 +206,48 @@ func TestOnlyProvablyDepartedReleasesArePruned(t *testing.T) {
 	}
 }
 
+// Issue #62. Renaming an application leaves its release stamped for the name
+// that departed, because a plan that came out identical deploys nothing and so
+// re-stamps nothing. The stamp alone would therefore condemn a stack that an
+// application still in the set is reconciling.
+func TestAReleaseStillDeclaredIsNeverPruned(t *testing.T) {
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, []string{"api"})
+	if err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+	if len(got) != 0 || len(e.calls) != 0 {
+		t.Errorf("pruned %v / uninstalled %v, want nothing: api is still declared", got, e.pruned())
+	}
+}
+
+// Sparing is per release rather than per application, so a departed application
+// that handed one release over still loses the rest.
+func TestOnlyTheStillDeclaredReleaseOfADepartedApplicationSurvives(t *testing.T) {
+	e := &fakeEngine{releases: []charts.Release{
+		owned("api", "gone"),
+		owned("web", "gone"),
+	}}
+
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, []string{"api"})
+	if err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+	if want := []string{"gone"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("pruned applications = %v, want %v", got, want)
+	}
+	if want := []string{"web"}; !reflect.DeepEqual(e.pruned(), want) {
+		t.Errorf("uninstalled releases = %v, want %v; api is still declared", e.pruned(), want)
+	}
+}
+
 // The guard that stops a controller from emptying a swarm because the app set
 // momentarily parsed to nothing.
 func TestEmptyDesiredSetPrunesNothing(t *testing.T) {
 	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
 
-	got, err := testPruner(t, e, false).Departed(t.Context(), nil)
+	got, err := testPruner(t, e, false).Departed(t.Context(), nil, nil)
 	if err != nil {
 		t.Fatalf("Departed = %v, want nil", err)
 	}
@@ -225,7 +261,7 @@ func TestVolumesAreOnlyPurgedWhenAsked(t *testing.T) {
 		e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
 		b := &fakeBackend{volumes: map[string][]string{"api": {"api_data"}}}
 
-		if _, err := prunerWith(t, e, b, volumes).Departed(t.Context(), []string{"kept"}); err != nil {
+		if _, err := prunerWith(t, e, b, volumes).Departed(t.Context(), []string{"kept"}, nil); err != nil {
 			t.Fatalf("Departed = %v, want nil", err)
 		}
 
@@ -251,7 +287,7 @@ func TestAFailedStackRemovalKeepsTheReleaseRecords(t *testing.T) {
 	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
 	b := &fakeBackend{removeErr: map[string]error{"api": errors.New("network still attached")}}
 
-	got, err := prunerWith(t, e, b, false).Departed(t.Context(), []string{"kept"})
+	got, err := prunerWith(t, e, b, false).Departed(t.Context(), []string{"kept"}, nil)
 	if err == nil {
 		t.Fatal("Departed = nil, want the removal failure")
 	}
@@ -276,7 +312,7 @@ func TestAFailedVolumePurgeKeepsTheReleaseRecords(t *testing.T) {
 		volInUse: map[string]int{"api_data": 100},
 	}
 
-	if _, err := prunerWith(t, e, b, true).Departed(t.Context(), []string{"kept"}); err == nil {
+	if _, err := prunerWith(t, e, b, true).Departed(t.Context(), []string{"kept"}, nil); err == nil {
 		t.Fatal("Departed = nil, want the volume failure")
 	}
 	if len(e.calls) != 0 {
@@ -302,7 +338,7 @@ func TestAVolumeStillInUseIsRetried(t *testing.T) {
 		volInUse: map[string]int{"api_data": 3},
 	}
 
-	got, err := prunerWith(t, e, b, true).Departed(t.Context(), []string{"kept"})
+	got, err := prunerWith(t, e, b, true).Departed(t.Context(), []string{"kept"}, nil)
 	if err != nil {
 		t.Fatalf("Departed = %v, want nil once the volume frees", err)
 	}
@@ -324,7 +360,7 @@ func TestOneFailureDoesNotStopTheSweep(t *testing.T) {
 		fail:     map[string]error{"api": boom},
 	}
 
-	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"})
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, nil)
 	if !errors.Is(err, boom) {
 		t.Fatalf("Departed = %v, want it to carry %v", err, boom)
 	}
@@ -346,7 +382,7 @@ func TestPartiallyFailedApplicationIsNotReportedAsPruned(t *testing.T) {
 		fail:     map[string]error{"web": errors.New("nope")},
 	}
 
-	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"})
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, nil)
 	if err == nil {
 		t.Fatal("Departed = nil, want the failure to surface")
 	}
@@ -362,7 +398,7 @@ func TestListFailureIsReportedAndDeletesNothing(t *testing.T) {
 	boom := errors.New("daemon unreachable")
 	e := &fakeEngine{listErr: boom}
 
-	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"})
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, nil)
 	if !errors.Is(err, boom) {
 		t.Fatalf("Departed = %v, want it to carry %v", err, boom)
 	}
@@ -379,7 +415,7 @@ func TestUnresolvableSwarmIsReported(t *testing.T) {
 		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 
-	if _, err := p.Departed(t.Context(), []string{"kept"}); !errors.Is(err, boom) {
+	if _, err := p.Departed(t.Context(), []string{"kept"}, nil); !errors.Is(err, boom) {
 		t.Fatalf("Departed = %v, want it to carry %v", err, boom)
 	}
 }
@@ -400,7 +436,7 @@ func TestLeftoverNetworksAreLogged(t *testing.T) {
 		Log:          slog.New(slog.NewTextHandler(&buf, nil)),
 	})
 
-	if _, err := p.Departed(t.Context(), []string{"kept"}); err != nil {
+	if _, err := p.Departed(t.Context(), []string{"kept"}, nil); err != nil {
 		t.Fatalf("Departed = %v, want nil", err)
 	}
 	if !strings.Contains(buf.String(), "shared-net") {
@@ -417,7 +453,7 @@ func TestReleasesAreGroupedByApplicationInListOrder(t *testing.T) {
 		owned("c-web", "alpha"),
 	}
 
-	got := departed(releases, []string{"kept"}, testController)
+	got := departed(releases, []string{"kept"}, nil, testController)
 	want := []departedApp{
 		{name: "alpha", releases: []string{"a-api", "c-web"}},
 		{name: "beta", releases: []string{"b-api"}},
@@ -456,7 +492,7 @@ func TestAFailureThatFinishedTheJobCountsAsPruned(t *testing.T) {
 		gone:     map[string]bool{"api": true},
 	}
 
-	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"})
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, nil)
 	if err != nil {
 		t.Fatalf("Departed = %v, want nil — the release is gone, whatever the call said", err)
 	}
@@ -473,7 +509,7 @@ func TestAFailureThatLeftTheReleaseIsStillAFailure(t *testing.T) {
 		fail:     map[string]error{"api": errors.New("network still attached")},
 	}
 
-	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"})
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, nil)
 	if err == nil {
 		t.Fatal("Departed = nil, want the failure to survive the re-check")
 	}

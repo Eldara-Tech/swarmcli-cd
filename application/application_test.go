@@ -204,7 +204,12 @@ func TestPruneOffIsAbsentFromJSON(t *testing.T) {
 }
 
 func TestAppSetStatusPrunedRoundTrip(t *testing.T) {
-	want := AppSetStatus{Mode: "git", Orphaned: []string{"gone"}, Pruned: []string{"deleted"}}
+	want := AppSetStatus{
+		Mode:        "git",
+		Orphaned:    []string{"gone"},
+		Pruned:      []string{"deleted"},
+		PruneHeldBy: []string{"joining"},
+	}
 
 	data, err := json.Marshal(want)
 	if err != nil {
@@ -224,5 +229,7 @@ func TestAppSetStatusPrunedRoundTrip(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	} else if strings.Contains(string(data), "pruned") {
 		t.Errorf("pruned should be omitted when empty, got %s", data)
+	} else if strings.Contains(string(data), "pruneHeldBy") {
+		t.Errorf("pruneHeldBy should be omitted when empty, got %s", data)
 	}
 }

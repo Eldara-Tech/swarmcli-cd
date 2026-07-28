@@ -38,9 +38,9 @@ func TestStatus(t *testing.T) {
 	if strings.Contains(stdout, "8b65cf951c7e") {
 		t.Errorf("stdout = %q, want the revision abbreviated", stdout)
 	}
-	// The three lines that only exist when something is wrong must not appear
-	// on a healthy controller, or an operator learns to skip the block.
-	for _, unwanted := range []string{"Stale", "Error", "Orphaned", "Pruned"} {
+	// The lines that only exist when something is wrong must not appear on a
+	// healthy controller, or an operator learns to skip the block.
+	for _, unwanted := range []string{"Stale", "Error", "Orphaned", "Pruned", "Prune held"} {
 		if strings.Contains(stdout, unwanted) {
 			t.Errorf("stdout = %q, want no %s line on a healthy controller", stdout, unwanted)
 		}
@@ -85,6 +85,23 @@ func TestStatusReportsWhatWasPruned(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "Pruned") || !strings.Contains(stdout, "legacy-api, old-edge") {
 		t.Errorf("stdout = %q, want it to report what was pruned", stdout)
+	}
+}
+
+// Prune waiting on an application's first reconcile is the one condition where
+// prune is enabled, correct and doing nothing. Without this line that is
+// indistinguishable from a feature that does not work.
+func TestStatusReportsWhatIsHoldingPrune(t *testing.T) {
+	s := healthyStatus()
+	s.AppSet.PruneHeldBy = []string{"edge-eu"}
+	server := startStatus(t, s)
+
+	code, stdout, stderr := cli(t, server, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "Prune held") || !strings.Contains(stdout, "edge-eu") {
+		t.Errorf("stdout = %q, want it to name what prune is waiting for", stdout)
 	}
 }
 

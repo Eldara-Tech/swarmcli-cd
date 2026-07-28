@@ -84,4 +84,17 @@ type AppSetStatus struct {
 	// Like Orphaned, in memory: a restart empties it. What it reports is this
 	// process's own deletions, not an audit log.
 	Pruned []string `json:"pruned,omitempty"`
+
+	// PruneHeldBy names the applications that have not reconciled yet and are
+	// therefore holding the sweep back. Empty whenever prune is disabled, and
+	// on any controller whose applications have all planned at least once —
+	// which after a settled startup is every controller.
+	//
+	// The sweep deletes what no application declares, so it cannot run while an
+	// application has not said what it declares; it would read that silence as
+	// a departure. Waiting is the safe half of that trade and this is the other
+	// half: an operator who enabled prune and sees nothing being pruned has to
+	// be able to find out which application is holding it, or the safety
+	// measure is indistinguishable from a broken feature.
+	PruneHeldBy []string `json:"pruneHeldBy,omitempty"`
 }

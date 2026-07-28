@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -337,6 +338,23 @@ func stackNetworkCount(t *testing.T, cli *dockerclient.Client, release string) i
 		t.Fatalf("listing networks of %q: %v", release, err)
 	}
 	return len(nets)
+}
+
+// stackServiceIDs identifies the running services rather than counting them.
+// A stack that was deleted and reinstalled has the same count and the same
+// names, and only the ids say which of the two happened.
+func stackServiceIDs(t *testing.T, cli *dockerclient.Client, release string) []string {
+	t.Helper()
+	svcs, err := cli.ServiceList(context.Background(), swarm.ServiceListOptions{Filters: stackFilter(release)})
+	if err != nil {
+		t.Fatalf("listing services of %q: %v", release, err)
+	}
+	ids := make([]string, 0, len(svcs))
+	for _, svc := range svcs {
+		ids = append(ids, svc.ID)
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 func stackVolumeCount(t *testing.T, cli *dockerclient.Client, release string) int {

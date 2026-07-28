@@ -30,6 +30,15 @@ type fakeReconciler struct {
 	mu    sync.Mutex
 	apps  []application.Spec
 	creds map[string]bool // whether a credential is currently installed
+	// unreconciled names applications that have not planned yet, which Views
+	// reports as SyncUnknown. Add puts an application in it and reconciled
+	// takes it out, mirroring the real reconciler: one that joins the set is
+	// unknown until its first plan succeeds, and one the fake was constructed
+	// with has been running all along.
+	unreconciled map[string]bool
+	// releases names what each application declares, as its status reports it
+	// once it has planned. Only the tests about prune set it.
+	releases map[string][]string
 
 	added, replaced, removed []string
 	// ops is every call in the order it arrived, which is the only place the
@@ -41,7 +50,10 @@ type fakeReconciler struct {
 }
 
 func newFakeReconciler(apps ...application.Spec) *fakeReconciler {
-	return &fakeReconciler{apps: apps, creds: map[string]bool{}}
+	return &fakeReconciler{
+		apps: apps, creds: map[string]bool{},
+		unreconciled: map[string]bool{}, releases: map[string][]string{},
+	}
 }
 
 func (f *fakeReconciler) Views() []application.View {
@@ -49,9 +61,41 @@ func (f *fakeReconciler) Views() []application.View {
 	defer f.mu.Unlock()
 	out := make([]application.View, 0, len(f.apps))
 	for _, spec := range f.apps {
-		out = append(out, application.View{Spec: spec})
+		state := application.SyncSynced
+		if f.unreconciled[spec.Name] {
+			state = application.SyncUnknown
+		}
+		status := application.Status{Sync: application.Sync{State: state}}
+		for _, name := range f.releases[spec.Name] {
+			status.Releases = append(status.Releases, application.ReleaseStatus{Name: name})
+		}
+		out = append(out, application.View{Spec: spec, Status: status})
 	}
 	return out
+}
+
+// reconciled marks an application as having completed its first plan, which is
+// what releases the prune gate. holdBack is the reverse, for the state every
+// application is in immediately after a controller restart.
+func (f *fakeReconciler) reconciled(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.unreconciled, name)
+}
+
+// declares records the releases an application reports once it has planned.
+func (f *fakeReconciler) declares(app string, releases ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releases[app] = releases
+}
+
+func (f *fakeReconciler) holdBack(names ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, name := range names {
+		f.unreconciled[name] = true
+	}
 }
 
 func (f *fakeReconciler) Add(spec application.Spec) error {
@@ -63,6 +107,9 @@ func (f *fakeReconciler) Add(spec application.Spec) error {
 	f.added = append(f.added, spec.Name)
 	f.ops = append(f.ops, "add:"+spec.Name)
 	f.apps = append(f.apps, spec)
+	// As the real one does: the entry is seeded SyncUnknown and its loop has to
+	// fetch and render before that changes.
+	f.unreconciled[spec.Name] = true
 	return nil
 }
 
@@ -645,17 +692,30 @@ func TestRunKeepsTickingThroughFailures(t *testing.T) {
 // ---------------------------------------------------------------- prune
 
 type fakePruner struct {
-	mu      sync.Mutex
-	calls   [][]string
-	returns []string
-	err     error
+	mu       sync.Mutex
+	calls    [][]string
+	declared [][]string
+	returns  []string
+	err      error
 }
 
-func (p *fakePruner) Departed(_ context.Context, desired []string) ([]string, error) {
+func (p *fakePruner) Departed(_ context.Context, desired, declared []string) ([]string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls = append(p.calls, slices.Clone(desired))
+	p.declared = append(p.declared, slices.Clone(declared))
 	return p.returns, p.err
+}
+
+// lastDeclared is the release names the sweep was told are still held, which is
+// what stops it deleting a renamed application's stack.
+func (p *fakePruner) lastDeclared() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.declared) == 0 {
+		return nil
+	}
+	return p.declared[len(p.declared)-1]
 }
 
 func (p *fakePruner) called() int {
@@ -797,6 +857,126 @@ func TestRepeatedPruningDoesNotDuplicateTheReport(t *testing.T) {
 
 	if want := []string{"core"}; !slices.Equal(loop.Status().AppSet.Pruned, want) {
 		t.Errorf("pruned = %v, want %v", loop.Status().AppSet.Pruned, want)
+	}
+}
+
+// The fourth guard, and issue #62. A rename is one departure and one arrival
+// naming the same deployed release, and the arrival has not fetched git yet
+// when the sweep would run. Sweeping in that pass deletes the stack the rename
+// was supposed to hand over — and with pruneVolumes, its data.
+func TestARenameIsNotSweptBeforeTheNewNameHasReconciled(t *testing.T) {
+	p := &fakePruner{}
+	loop, rec, publish := newPruningLoop(t, oneApp, p, spec("edge", "releases/edge.yaml"))
+
+	publish(renamedApp)
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if p.called() != 0 {
+		t.Fatalf("swept while edge-eu had not reconciled (%d calls); that deletes the renamed stack", p.called())
+	}
+	if want := []string{"edge-eu"}; !slices.Equal(loop.Status().AppSet.PruneHeldBy, want) {
+		t.Errorf("pruneHeldBy = %v, want %v", loop.Status().AppSet.PruneHeldBy, want)
+	}
+
+	// Once it has planned it reports the release it declares — the same one the
+	// departed name still owns — and that is what the sweep is told to spare.
+	rec.declares("edge-eu", "whoami")
+	rec.reconciled("edge-eu")
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if p.called() != 1 {
+		t.Fatalf("calls = %d, want 1 once the new name had reconciled", p.called())
+	}
+	if want := []string{"edge-eu"}; !slices.Equal(p.lastDesired(), want) {
+		t.Errorf("swept against %v, want %v", p.lastDesired(), want)
+	}
+	if want := []string{"whoami"}; !slices.Equal(p.lastDeclared(), want) {
+		t.Errorf("declared = %v, want %v; the renamed stack is deleted without it", p.lastDeclared(), want)
+	}
+	if got := loop.Status().AppSet.PruneHeldBy; len(got) != 0 {
+		t.Errorf("pruneHeldBy = %v, want empty once a sweep has run", got)
+	}
+}
+
+// The declared list is deduplicated and covers every application, because two
+// applications may legitimately declare the same release name and the sweep
+// only needs to know that somebody holds it.
+func TestTheSweepIsToldEveryReleaseStillHeld(t *testing.T) {
+	p := &fakePruner{}
+	loop, rec, _ := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+	rec.declares("edge", "whoami", "shared")
+	rec.declares("core", "shared", "api")
+
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if want := []string{"whoami", "shared", "api"}; !slices.Equal(p.lastDeclared(), want) {
+		t.Errorf("declared = %v, want %v", p.lastDeclared(), want)
+	}
+}
+
+// A restart is the case a remembered-departure design cannot cover: nothing was
+// watched leaving, so there is nothing to hold back. Holding on the reconciler's
+// own state instead covers it, because after a restart every application is
+// unreconciled.
+func TestNothingIsSweptUntilEveryApplicationHasReconciled(t *testing.T) {
+	p := &fakePruner{}
+	loop, rec, _ := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+	rec.holdBack("edge", "core")
+
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if p.called() != 0 {
+		t.Fatalf("swept on a controller whose applications had none of them planned (%d calls)", p.called())
+	}
+	if want := []string{"edge", "core"}; !slices.Equal(loop.Status().AppSet.PruneHeldBy, want) {
+		t.Errorf("pruneHeldBy = %v, want %v", loop.Status().AppSet.PruneHeldBy, want)
+	}
+
+	// One is not enough: the sweep classifies against the whole set.
+	rec.reconciled("edge")
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if p.called() != 0 {
+		t.Fatalf("swept with core still unplanned (%d calls)", p.called())
+	}
+
+	rec.reconciled("core")
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if p.called() != 1 {
+		t.Errorf("calls = %d, want 1 once both had planned", p.called())
+	}
+}
+
+// The gate is over what the reconciler currently holds, not over what it has
+// ever held, so an application that never plans and then leaves the set stops
+// holding the sweep instead of disabling prune for good.
+func TestAnApplicationLeavingTheSetStopsHoldingPrune(t *testing.T) {
+	p := &fakePruner{}
+	loop, _, publish := newPruningLoop(t, oneApp, p, spec("edge", "releases/edge.yaml"))
+
+	publish(twoApps)
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if p.called() != 0 {
+		t.Fatalf("swept while the newly added core had not reconciled (%d calls)", p.called())
+	}
+
+	publish(oneApp)
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if p.called() != 1 {
+		t.Errorf("calls = %d, want 1 once the unreconciled application had left", p.called())
 	}
 }
 

@@ -375,9 +375,14 @@ inside: it has no way to tell "my own releases from before a restart" from
 "another controller using my id".
 
 Changing the id later is safe but not free: releases stamped with the old one
-stop being recognised, so they read as unmanaged and prune ignores them. An
-application still declared re-stamps itself on its next reconcile. One that was
-removed at the same time has to be cleaned up by hand.
+stop being recognised, so they read as unmanaged and prune ignores them. A
+release is re-stamped by the next reconcile that actually deploys it — not
+merely by the next reconcile, because one that finds nothing to change writes no
+revision and so writes no stamp. An application whose releases are already up to
+date therefore keeps the old stamps until something changes. That is safe (see
+[renaming an application](#renaming-an-application), below) but it does mean the
+old stamps can linger indefinitely. One that was removed at the same time has to
+be cleaned up by hand.
 
 Volumes are a second opt-in because they are the one part nothing can restore.
 Everything else prune deletes is recreated from git the moment the application
@@ -386,6 +391,38 @@ a startup error rather than a guess in either direction.
 
 **With prune on, removing an application from the app set is an outage, not a
 pause.** Deleting the entry to "park" something deletes the deployment.
+
+#### Renaming an application
+
+Renaming an application — changing its `name`, leaving its source and release
+file alone — is a handover. The stack keeps running, keeps its volumes and keeps
+its release history; the new name simply takes over reconciling it.
+
+Two things make that work, and both are worth knowing about because they are
+visible.
+
+The release keeps the *old* name's owner stamp until something redeploys it,
+because a plan that finds nothing to change writes no revision. Prune does not
+go by the stamp alone: it never deletes a release that an application still in
+the set declares. So the stale stamp is harmless, and `swarmcli-cd status` may
+show a release owned by a name that is no longer in the app set.
+
+And the sweep waits. An application that has just joined the set has not fetched
+its repository yet, so it has not yet said which releases it declares — and a
+sweep that ran before it did would read the silence as a departure and delete
+the stack the rename was handing over. Until every application has reconciled at
+least once, nothing is pruned and `status` says what it is waiting for:
+
+```
+Prune held    waiting for edge-eu
+```
+
+That line is normal for a few seconds after a rename or a restart. If it
+persists, an application cannot reconcile at all — a bad repository URL or an
+unreadable chart — and prune stays held for the whole controller until it is
+fixed or removed from the set. Waiting is deliberate: the alternative is
+deleting a running stack on the strength of an application that has not managed
+to speak yet.
 
 A release an application stops declaring is a separate case, and is opted into
 per application rather than controller-wide, because the spec is still there to
