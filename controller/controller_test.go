@@ -47,6 +47,9 @@ func TestRunWithoutArgumentsPrintsUsage(t *testing.T) {
 		if !strings.Contains(stdout.String(), "swarmcli-cd controller") {
 			t.Errorf("run(%v) printed %q, want the usage", args, stdout.String())
 		}
+		if !strings.Contains(stdout.String(), "validate") {
+			t.Errorf("run(%v) printed %q, want it to list validate", args, stdout.String())
+		}
 		if stderr.Len() != 0 {
 			t.Errorf("run(%v) wrote %q to stderr, want nothing", args, stderr.String())
 		}

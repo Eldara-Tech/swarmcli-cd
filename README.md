@@ -65,8 +65,9 @@ development, not for anything that deploys. See [RELEASING.md](RELEASING.md).
 ## Using it
 
 One binary runs the controller and talks to it. The controller reconciles and
-serves the API; every other command is a client of that API, so anything the
-CLI can show, the TUI view and the web UI will show through the same endpoints.
+serves the API; every command that inspects it is a client of that API, so
+anything the CLI can show, the TUI view and the web UI will show through the
+same endpoints.
 
 ```bash
 # In the swarm, on a manager node, with docker.sock mounted:
@@ -83,6 +84,9 @@ swarmcli-cd app diff edge            # what a sync would change
 swarmcli-cd app history edge         # each release's revisions
 swarmcli-cd app sync edge --wait     # reconcile now; non-zero if it failed
 swarmcli-cd status                   # the controller itself: where its app set comes from
+
+# No controller, no swarm — this one reads a file:
+swarmcli-cd validate --file applications.yaml   # non-zero if the set is invalid
 ```
 
 Add `-o json` to any read for the controller's own response, unmodified — that

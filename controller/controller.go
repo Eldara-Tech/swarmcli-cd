@@ -38,6 +38,7 @@ Commands:
   controller   Run the reconciler and the HTTP API
   app          Inspect and sync applications through a running controller
   status       Show the controller's own state and where its app set comes from
+  validate     Validate an applications file and exit
   healthcheck  Probe a controller's liveness endpoint
   version      Print the version
   help         Show this help
@@ -65,6 +66,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return appMain(args[1:], stdout, stderr)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
+	case "validate":
+		return runValidate(args[1:], stdout, stderr)
 	case "healthcheck":
 		return runHealthcheck(args[1:], stdout, stderr)
 	case "version", "--version", "-v":

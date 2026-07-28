@@ -42,10 +42,10 @@ const (
 	defaultDataDir    = "/var/lib/swarmcli-cd"
 )
 
-// defaultAppSetFile is what the set is called in a directory an external
-// process keeps current, when the deployment does not say. There is no
-// equivalent default for a repository: a file inside somebody else's layout has
-// no name this end can guess.
+// defaultAppSetFile is what the set is called when nothing says otherwise: in a
+// directory an external process keeps current, and in a checkout `validate` was
+// pointed at. There is no equivalent default for a repository: a file inside
+// somebody else's layout has no name this end can guess.
 const defaultAppSetFile = "applications.yaml"
 
 // shutdownTimeout bounds how long in-flight requests have to finish once a

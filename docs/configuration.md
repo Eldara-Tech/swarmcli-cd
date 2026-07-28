@@ -315,6 +315,33 @@ deployed.** It is reported as orphaned rather than deleted — pruning a
 deployment because somebody edited a file is not something this controller does
 by accident. [Prune](#prune) turns that into a deletion, deliberately.
 
+### Catching it before the commit
+
+Refusing a bad set is a safety net, not a workflow. The controller only finds
+out once the commit is on the branch, and until somebody fixes it what is
+running is a stale set. `swarmcli-cd validate` is the same parse and the same
+rules, run against a file on disk:
+
+```bash
+swarmcli-cd validate --file applications.yaml
+# OK: applications.yaml (4 applications)
+```
+
+It exits 0 on a valid file, 1 on an invalid one with the reason on stderr, and
+2 on a misuse — so it is a one-line CI job on the app-set repository, run before
+the branch the controller tracks ever moves. The image is the same binary, if
+you would rather not install one:
+
+```bash
+docker run --rm -v "$PWD:/w" eldaratech/swarmcli-cd:latest validate --file /w/applications.yaml
+```
+
+It reads the file and nothing else. A set that validates can still fail to
+deploy: whether a `releaseFile` or chart path exists in its repository, whether
+a `destination` names a swarm this controller knows, and whether a
+`registryAuth` secret is mounted are all answered at reconcile time, against
+things this command cannot see.
+
 ### Prune
 
 By default an application that leaves the app set leaves its stack behind,

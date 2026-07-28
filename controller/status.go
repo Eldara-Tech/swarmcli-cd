@@ -37,9 +37,9 @@ The admin token comes from ` + authz.EnvTokenFile + ` or
 // runStatus reports the controller's own state.
 //
 // It exits 0 whenever the controller answered, including when what it answered
-// is that the app set is stale. Reads report and probes judge: `healthcheck` is
-// the one command whose exit code is a verdict, and a read that failed on a
-// state rather than on an error would be a second, quieter one.
+// is that the app set is stale. Reads report and checks judge: `healthcheck`
+// and `validate` are the commands whose exit code is a verdict, and a read that
+// failed on a state rather than on an error would be a quieter third.
 func runStatus(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
