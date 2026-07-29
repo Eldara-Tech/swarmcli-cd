@@ -164,9 +164,46 @@ docker secret create swarmcli-cd-regauth-edge /tmp/rc/config.json
 
 The credential reaches the swarm only for the pull: it is stored encrypted in
 the raft log and is never injected into a deployed container or returned by
-`docker service inspect`. Nor can a reconciled stack reach it the other way: the
-controller refuses to deploy a stack that mounts one of its own secrets (this
-credential, the admin token, or the git token) as an `external` secret.
+`docker service inspect`. Nor can a reconciled stack reach it the other way — see
+[what a reconciled stack may not reference](#what-a-reconciled-stack-may-not-reference).
+
+#### What a reconciled stack may not reference
+
+Swarm secrets and configs are **cluster-global objects referenced by name**.
+There is no namespace on that reference: a stack declaring one as `external:`
+gets whatever exists under that name, whoever created it. So the controller
+refuses to deploy a stack that reaches for anything of its own, and refuses it
+whole — before any network, config, secret or service is created, so nothing is
+left half-deployed.
+
+Three things are off limits:
+
+| | |
+|---|---|
+| the controller's **secrets** | the admin token, the git token, every `registryAuth` credential |
+| the controller's **configs** | the application set, which names every repository, revision, destination and policy this controller applies |
+| the engine's **release records** | one Docker config per release revision (`com.swarmcli.type=release`), each holding a rendered manifest |
+
+The first two are read from the controller's **own service spec**, not from the
+filesystem. A secret arrives at `/run/secrets/<name>` so a directory listing
+almost answers it — but that yields the mount *target*, and a `stack.yml` written
+in compose's long form can rename it, which would leave the guard comparing the
+wrong name and silently matching nothing. A config has no such path at all: it
+lands wherever `target:` puts it, with nothing tying that back to its name. The
+service spec has both under the names a reference actually resolves by.
+
+The release records cannot come from a set read once at startup, because a new
+one is written on every deploy. They are matched by their label at deploy time.
+
+Nothing here needs configuring, and there is no flag to forget. A controller that
+is **not** running as a Swarm service — a development run — has nothing mounted
+by Swarm and nothing of its own to protect, so this is inert rather than broken.
+If the daemon is reachable but will not answer, the deploy **fails** rather than
+proceeding unguarded, and the next one tries again.
+
+An ordinary `external:` reference to a config or secret an operator created for
+their own stacks is unaffected. Only the controller's own and the engine's own
+are refused.
 
 **Static credentials only.** The controller image ships no docker credential
 helpers, so a `config.json` using `credsStore` or `credHelpers` is refused at

@@ -130,12 +130,12 @@ func TestRejectForbiddenSecretMounts(t *testing.T) {
 			b.forbiddenSecrets = tc.forbidden
 			st := stack("s", cdService{"svc", tc.svc})
 
-			err := b.rejectForbiddenSecretMounts(st)
+			err := b.rejectForbiddenMounts(t.Context(), st)
 			if tc.wantErr && err == nil {
-				t.Fatal("rejectForbiddenSecretMounts = nil, want an error")
+				t.Fatal("rejectForbiddenMounts = nil, want an error")
 			}
 			if !tc.wantErr && err != nil {
-				t.Fatalf("rejectForbiddenSecretMounts = %v, want nil", err)
+				t.Fatalf("rejectForbiddenMounts = %v, want nil", err)
 			}
 		})
 	}
@@ -314,7 +314,7 @@ func TestMissingNetworkIsCreatedWithTheDefaultDriver(t *testing.T) {
 func TestRemoveStackRemovesServicesFirstThenWhatTheyUsed(t *testing.T) {
 	api := &fakeAPI{
 		existing: []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{Name: "s_web"}}}},
-		configs:  []swarm.Config{{ID: "cfg", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+		configs:  []swarm.Config{{ID: "cfg", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_site", "s")}}},
 		secrets:  []swarm.Secret{{ID: "sec", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_key"}}}},
 		networks: []network.Summary{{ID: "net", Name: "s_front"}},
 	}
@@ -656,7 +656,7 @@ func (e *errAPI) NodeList(context.Context, swarm.NodeListOptions) ([]swarm.Node,
 // left alone, because deleting one turns uninstall into "and lose the history".
 func TestRemoveStackNeverDeletesReleaseRecords(t *testing.T) {
 	api := &fakeAPI{configs: []swarm.Config{
-		{ID: "app", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}},
+		{ID: "app", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_site", "s")}},
 		{ID: "rel", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
 			Name: "swarmcli.release.s.v3",
 			Labels: map[string]string{
@@ -706,7 +706,7 @@ func TestRemoveStackTreatsAnAlreadyDeletedResourceAsDone(t *testing.T) {
 		t.Run(missing, func(t *testing.T) {
 			api := &fakeAPI{
 				existing:  []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{Name: "s_web"}}}},
-				configs:   []swarm.Config{{ID: "cfg", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+				configs:   []swarm.Config{{ID: "cfg", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_site", "s")}}},
 				secrets:   []swarm.Secret{{ID: "sec", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_key"}}}},
 				networks:  []network.Summary{{ID: "net", Name: "s_front"}},
 				removeErr: map[string]error{missing: errdefs.ErrNotFound},
@@ -776,5 +776,218 @@ func TestRemoveStackStillFailsOnARealError(t *testing.T) {
 	err := testBackend(t, api, nil).RemoveStack("s")
 	if err == nil || !strings.Contains(err.Error(), "has active endpoints") {
 		t.Fatalf("RemoveStack = %v, want the daemon's refusal surfaced", err)
+	}
+}
+
+// stackScoped is a resource as a real deploy leaves it: carrying the namespace
+// label, which is the whole of "this belongs to that stack" and the only thing
+// RemoveStack has to find it by.
+func stackScoped(name, stack string) swarm.Annotations {
+	return swarm.Annotations{
+		Name:   name,
+		Labels: map[string]string{convert.LabelNamespace: stack},
+	}
+}
+
+// ---------------------------------------- the controller's own state (#63)
+
+// controllerService is this controller as Swarm holds it: mounting its own
+// bootstrap config and its admin token, under the names a reference resolves by.
+//
+// The target rename on the secret is the point. MountedSecretNames would derive
+// "token" from /run/secrets and never match the "swarmcli-cd-token" a tenant
+// stack would actually name, so the filesystem-derived guard has a hole exactly
+// here — and reading the service spec closes it.
+func controllerService() swarm.ServiceSpec {
+	return swarm.ServiceSpec{TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{
+		Configs: []*swarm.ConfigReference{{
+			ConfigName: "swarmcli-cd-applications",
+			File:       &swarm.ConfigReferenceFileTarget{Name: "/etc/swarmcli-cd/applications.yaml"},
+		}},
+		Secrets: []*swarm.SecretReference{{
+			SecretName: "swarmcli-cd-token",
+			File:       &swarm.SecretReferenceFileTarget{Name: "token"},
+		}},
+	}}}
+}
+
+// asController makes the fake answer as though this process is that service's
+// task, which is what SelfMounts reads.
+func asController(api *fakeAPI) *fakeAPI {
+	api.selfServiceID = "controller-svc"
+	api.selfSpec = controllerService()
+	return api
+}
+
+const mountsControllerConfig = `
+services:
+  evil:
+    image: nginx
+    configs: [stolen]
+configs:
+  stolen:
+    external: true
+    name: swarmcli-cd-applications
+`
+
+// The gap #63 was filed for. The app set names every repository, revision,
+// destination and policy this controller applies; a tenant stack mounting it by
+// name is reconnaissance handed over for free.
+func TestDeployStackRefusesMountingTheControllersOwnConfig(t *testing.T) {
+	api := asController(&fakeAPI{
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"},
+		}}},
+	})
+
+	err := testBackend(t, api, nil).DeployStack("s", mountsControllerConfig, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the stack refused for mounting the controller's config")
+	}
+	for _, want := range []string{"evil", "swarmcli-cd-applications", "controller"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	// Refused whole: nothing was created before the reject.
+	if len(api.order) != 0 || len(api.created) != 0 {
+		t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+	}
+}
+
+const mountsAReleaseRecord = `
+services:
+  evil:
+    image: nginx
+    configs: [stolen]
+configs:
+  stolen:
+    external: true
+    name: swarmcli.release.other-app.v3
+`
+
+// The other half, and the one no set captured at startup could cover: release
+// records are created on every deploy and hold the rendered manifest of every
+// release on the swarm.
+func TestDeployStackRefusesMountingAReleaseRecord(t *testing.T) {
+	api := asController(&fakeAPI{
+		configs: []swarm.Config{{ID: "r", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+			Name:   "swarmcli.release.other-app.v3",
+			Labels: map[string]string{charts.LabelType: charts.TypeRelease},
+		}}}},
+	})
+
+	err := testBackend(t, api, nil).DeployStack("s", mountsAReleaseRecord, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the stack refused for mounting a release record")
+	}
+	if !strings.Contains(err.Error(), "release record") {
+		t.Errorf("error %q does not say what was refused", err)
+	}
+}
+
+// The secret half, via the service spec rather than the /run/secrets listing.
+// Nothing is wired into forbiddenSecrets here: a controller whose stack.yml
+// renames the mount target derives the wrong name from the filesystem, and this
+// is what still refuses the stack.
+func TestDeployStackRefusesAControllerSecretRenamedOnTheWayIn(t *testing.T) {
+	api := asController(&fakeAPI{
+		secrets: []swarm.Secret{{ID: "tok", Spec: swarm.SecretSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli-cd-token"},
+		}}},
+	})
+
+	err := testBackend(t, api, nil).DeployStack("s", mountsControllerSecret, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the stack refused for mounting the controller's token")
+	}
+	if !strings.Contains(err.Error(), "swarmcli-cd-token") {
+		t.Errorf("error %q does not name the secret", err)
+	}
+}
+
+// An external reference is the ordinary way to share a config an operator
+// created, and refusing those would make the guard unusable. Only the
+// controller's own and the engine's own are off limits.
+func TestDeployStackAllowsAnOrdinaryExternalConfig(t *testing.T) {
+	api := asController(&fakeAPI{
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
+	})
+
+	if err := testBackend(t, api, nil).DeployStack("s", oneOfEach, ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want nil", err)
+	}
+}
+
+// A stack that declares everything it uses reaches outside itself for nothing,
+// so the guard must cost it no daemon calls at all.
+func TestAStackThatReachesForNothingCostsNoLookup(t *testing.T) {
+	const selfContained = `
+services:
+  web:
+    image: nginx
+`
+	api := asController(&fakeAPI{})
+	if err := testBackend(t, api, nil).DeployStack("s", selfContained, ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want nil", err)
+	}
+	if api.selfInspects != 0 {
+		t.Errorf("asked about this controller %d times, want 0", api.selfInspects)
+	}
+}
+
+// Read once and reused: every With* method copies the backend, and a per-copy
+// cache would re-read this for every application on every deploy.
+func TestTheControllersOwnMountsAreReadOnce(t *testing.T) {
+	api := asController(&fakeAPI{
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
+	})
+	b := testBackend(t, api, nil)
+
+	for range 3 {
+		if err := b.WithRegistryAuth(nil).DeployStack("s", oneOfEach, ResolveNever); err != nil {
+			t.Fatalf("DeployStack = %v, want nil", err)
+		}
+	}
+	if api.selfInspects != 1 {
+		t.Errorf("asked about this controller %d times, want 1", api.selfInspects)
+	}
+}
+
+// A daemon that is reachable and answers with an error fails the deploy rather
+// than letting it through unguarded, and the failure is not cached: a hiccup
+// must not disable deploys for the life of the controller.
+func TestAFailedSelfReadRefusesTheDeployAndIsRetried(t *testing.T) {
+	api := &fakeAPI{
+		selfErr: errors.New("daemon busy"),
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
+	}
+	b := testBackend(t, api, nil)
+
+	if err := b.DeployStack("s", oneOfEach, ResolveNever); err == nil {
+		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
+	}
+	if len(api.created) != 0 {
+		t.Errorf("%d services created despite the failure", len(api.created))
+	}
+
+	api.selfErr = nil
+	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {
+		t.Fatalf("second DeployStack = %v, want the failure not to have been cached", err)
+	}
+}
+
+// A controller that is not a swarm task — a development run — has nothing
+// mounted by Swarm, which is an answer rather than a failure.
+func TestOutsideASwarmThereIsNothingOfOursToProtect(t *testing.T) {
+	api := &fakeAPI{
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
+	}
+	if err := testBackend(t, api, nil).DeployStack("s", oneOfEach, ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 }

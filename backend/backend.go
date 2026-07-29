@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 
@@ -49,6 +50,11 @@ func (b *Backend) WithRegistryAuth(auth regauth.Resolver) charts.Backend {
 // Controller-wide, not per application, but applied through the same
 // optional-interface upgrade as WithRegistryAuth so the reconciler need not
 // depend on this concrete type.
+//
+// It is the startup-derived half only. The backend adds what Swarm reports it
+// has mounted, and the chart engine's release records, at deploy time — see
+// rejectForbiddenMounts. Nothing an operator has to wire up can therefore be the
+// difference between the guard being on and off.
 func (b *Backend) WithForbiddenSecrets(names map[string]struct{}) charts.Backend {
 	c := *b
 	c.forbiddenSecrets = names
@@ -100,28 +106,124 @@ func MountedSecretNames(dir string) (map[string]struct{}, error) {
 	return out, nil
 }
 
-// rejectForbiddenSecretMounts refuses a stack whose any service mounts one of
-// the controller's own secrets. The reference resolves by name against the
-// cluster-wide secret store, so the check is a name comparison; a stack's own
-// secrets are namespace-scoped and cannot collide with an unscoped controller
-// name, so only an `external` reference can ever match.
-func (b *Backend) rejectForbiddenSecretMounts(stack *cdcompose.Stack) error {
-	if len(b.forbiddenSecrets) == 0 {
-		return nil
+// rejectForbiddenMounts refuses a stack that reaches outside itself for one of
+// the controller's own secrets or configs, or for the chart engine's release
+// history.
+//
+// Secrets and configs are cluster-global objects resolved by name, so the check
+// is a name comparison. Only an `external` reference can ever match: a stack's
+// own secrets and configs are namespace-scoped to "<stack>_<name>" by
+// conversion, and cannot collide with an unscoped name. That is also what makes
+// this cheap — externalRefs is usually empty, and a stack that reaches for
+// nothing outside itself costs no lookup at all.
+func (b *Backend) rejectForbiddenMounts(ctx context.Context, stack *cdcompose.Stack) error {
+	// Read at most once per deploy, and only if some service reaches outside the
+	// stack at all. Inside the loop each would be read once per such service,
+	// for an answer that cannot differ between them.
+	var mine selfMounts
+	var history map[string]struct{}
+	load := func() error {
+		if history != nil {
+			return nil
+		}
+		var err error
+		if mine, err = b.mounts(ctx); err != nil {
+			return err
+		}
+		history, err = b.releaseConfigNames(ctx)
+		return err
 	}
+
 	for _, svc := range stack.Services {
-		cs := svc.Spec.TaskTemplate.ContainerSpec
-		if cs == nil {
+		secrets, configs := externalRefs(stack, svc)
+		if len(secrets) == 0 && len(configs) == 0 {
 			continue
 		}
-		for _, ref := range cs.Secrets {
-			if _, forbidden := b.forbiddenSecrets[ref.SecretName]; forbidden {
+		if err := load(); err != nil {
+			return err
+		}
+
+		for _, name := range secrets {
+			_, wired := b.forbiddenSecrets[name]
+			_, mounted := mine.secrets[name]
+			if wired || mounted {
 				return fmt.Errorf("service %q mounts secret %q, which is a credential belonging to the "+
-					"controller; a reconciled stack may not mount the controller's own secrets", svc.Name, ref.SecretName)
+					"controller; a reconciled stack may not mount the controller's own secrets", svc.Name, name)
+			}
+		}
+		for _, name := range configs {
+			if _, forbidden := mine.configs[name]; forbidden {
+				return fmt.Errorf("service %q mounts config %q, which is this controller's own state; "+
+					"a reconciled stack may not mount it, because the application set names every "+
+					"repository, revision and destination this controller applies", svc.Name, name)
+			}
+		}
+
+		for _, name := range configs {
+			if _, forbidden := history[name]; forbidden {
+				return fmt.Errorf("service %q mounts config %q, which is a chart release record; "+
+					"those hold the rendered manifest of every release on this swarm, so a reconciled "+
+					"stack may not mount one", svc.Name, name)
 			}
 		}
 	}
 	return nil
+}
+
+// externalRefs names the secrets and configs one service references that the
+// stack does not itself declare.
+//
+// Those are the only references that can reach another tenant's resources or the
+// controller's: everything a manifest declares is namespace-scoped on the way in,
+// so a reference to a bare name came from an `external:` declaration and resolves
+// against the cluster-wide store.
+func externalRefs(stack *cdcompose.Stack, svc cdcompose.Service) (secrets, configs []string) {
+	cs := svc.Spec.TaskTemplate.ContainerSpec
+	if cs == nil {
+		return nil, nil
+	}
+
+	declaredSecrets := make(map[string]struct{}, len(stack.Secrets))
+	for _, s := range stack.Secrets {
+		declaredSecrets[s.Name] = struct{}{}
+	}
+	for _, ref := range cs.Secrets {
+		if _, own := declaredSecrets[ref.SecretName]; !own {
+			secrets = append(secrets, ref.SecretName)
+		}
+	}
+
+	declaredConfigs := make(map[string]struct{}, len(stack.Configs))
+	for _, c := range stack.Configs {
+		declaredConfigs[c.Name] = struct{}{}
+	}
+	for _, ref := range cs.Configs {
+		if _, own := declaredConfigs[ref.ConfigName]; !own {
+			configs = append(configs, ref.ConfigName)
+		}
+	}
+	return secrets, configs
+}
+
+// releaseConfigNames names the chart engine's release records.
+//
+// Matched by the engine's own exported label rather than by the
+// "swarmcli.release.<release>.v<n>" name it happens to use, because that format
+// is unexported and a rename there would silently stop protecting these. The
+// label is part of the contract this repository already reads elsewhere —
+// RemoveStack skips these configs by the same one.
+func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, error) {
+	list, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{
+		Filters: filters.NewArgs(filters.Arg("label", charts.LabelType+"="+charts.TypeRelease)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing the release records to check a config reference against: %w", err)
+	}
+	out := make(map[string]struct{}, len(list))
+	for _, c := range list {
+		out[c.Spec.Name] = struct{}{}
+	}
+	return out, nil
 }
 
 // DeployStack converges the swarm to a rendered manifest.
@@ -139,9 +241,9 @@ func (b *Backend) DeployStack(name, manifest, resolve string) error {
 	if err != nil {
 		return err
 	}
-	// Before any resource is created: a stack that mounts one of the controller's
-	// own secrets is refused whole, not half-deployed.
-	if err := b.rejectForbiddenSecretMounts(stack); err != nil {
+	// Before any resource is created: a stack that reaches for one of the
+	// controller's own secrets or configs is refused whole, not half-deployed.
+	if err := b.rejectForbiddenMounts(ctx, stack); err != nil {
 		return err
 	}
 	if err := b.applyNetworks(ctx, stack); err != nil {

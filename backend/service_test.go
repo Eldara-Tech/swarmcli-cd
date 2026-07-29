@@ -15,6 +15,7 @@ import (
 
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
@@ -73,6 +74,34 @@ type fakeAPI struct {
 	updatedConfigs []swarm.ConfigSpec
 	updatedSecrets []swarm.SecretSpec
 	removed        []string
+
+	// selfServiceID is what ContainerInspect reports this process's container
+	// belongs to, and selfSpec the service spec ServiceInspectWithRaw then
+	// returns for it — the two reads the mount guard makes about the controller
+	// itself. Unset means "not a swarm task", which is what every test that is
+	// not about that guard wants and what a development run really is.
+	selfServiceID string
+	selfSpec      swarm.ServiceSpec
+	// selfInspects counts the reads about this controller's own container, so a
+	// test can assert both that the answer is cached and that a stack reaching
+	// for nothing outside itself never asks at all.
+	selfInspects int
+	selfErr      error
+}
+
+// ContainerInspect answers for this process's own container. Not-found unless a
+// test says otherwise, so nothing else has to know the guard exists.
+func (f *fakeAPI) ContainerInspect(_ context.Context, _ string) (container.InspectResponse, error) {
+	f.selfInspects++
+	if f.selfErr != nil {
+		return container.InspectResponse{}, f.selfErr
+	}
+	if f.selfServiceID == "" {
+		return container.InspectResponse{}, errdefs.ErrNotFound
+	}
+	return container.InspectResponse{Config: &container.Config{
+		Labels: map[string]string{serviceIDLabel: f.selfServiceID},
+	}}, nil
 }
 
 type updateCall struct {
@@ -109,6 +138,9 @@ func (f *fakeAPI) ServiceUpdate(_ context.Context, id string, v swarm.Version, s
 }
 
 func (f *fakeAPI) ServiceInspectWithRaw(_ context.Context, id string, _ swarm.ServiceInspectOptions) (swarm.Service, []byte, error) {
+	if f.selfServiceID != "" && id == f.selfServiceID {
+		return swarm.Service{ID: id, Spec: f.selfSpec}, nil, nil
+	}
 	f.inspects++
 	if f.inspectErr != nil {
 		return swarm.Service{}, nil, f.inspectErr
@@ -627,9 +659,24 @@ func (f *fakeAPI) NetworkRemove(_ context.Context, id string) error {
 	return err
 }
 
+// ConfigList honours the label filter it is given. A fake that ignored it would
+// hand every caller the whole store, which is how a filtered read gets shipped
+// untested — and one of this package's callers asks specifically for the chart
+// engine's release records.
 func (f *fakeAPI) ConfigList(_ context.Context, o swarm.ConfigListOptions) ([]swarm.Config, error) {
-	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
-	return f.configs, nil
+	label := labelOf(o.Filters)
+	f.labelFilters = append(f.labelFilters, label)
+	if label == "" {
+		return f.configs, nil
+	}
+	key, value, _ := strings.Cut(label, "=")
+	var out []swarm.Config
+	for _, c := range f.configs {
+		if v, ok := c.Spec.Labels[key]; ok && v == value {
+			out = append(out, c)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeAPI) ConfigInspectWithRaw(_ context.Context, name string) (swarm.Config, []byte, error) {
