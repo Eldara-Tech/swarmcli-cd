@@ -142,26 +142,87 @@ func (c *CompatState) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// DriftDetection is how an application's drift is decided. Phase 1 has one
-// mode: manifest, which compares the rendered manifest against what was last
-// applied. Comparing the desired ServiceSpec against the live one is Phase 2.
+// DriftDetection is how an application's drift is decided.
+//
+// manifest compares the rendered manifest against what was last applied, which
+// catches a changed chart version, changed values and a changed template. live
+// additionally compares the running ServiceSpec against the one the repository
+// renders to, which is the only thing that can catch a change made to the swarm
+// afterwards — Swarm has no server-side apply, so `docker service update
+// --replicas 10` produces no conflict signal at all.
 type DriftDetection string
 
 const (
 	DriftUnknown  DriftDetection = ""
 	DriftManifest DriftDetection = "manifest"
+	DriftLive     DriftDetection = "live"
 )
 
 // Valid reports whether d names a mode this build implements. It is what the
 // config loader checks: unlike the wire, applications.yaml gets no leniency.
-func (d DriftDetection) Valid() bool { return d == DriftManifest }
+func (d DriftDetection) Valid() bool { return d == DriftManifest || d == DriftLive }
 
 // MarshalJSON implements json.Marshaler.
 func (d DriftDetection) MarshalJSON() ([]byte, error) { return marshalEnum(d, unknownName) }
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (d *DriftDetection) UnmarshalJSON(data []byte) error {
-	v, err := unmarshalEnum(data, DriftManifest)
+	v, err := unmarshalEnum(data, DriftManifest, DriftLive)
+	if err != nil {
+		return err
+	}
+	*d = v
+	return nil
+}
+
+// DriftState is whether the running services match what the repository renders
+// to, under driftDetection: live. It is a separate axis from SyncState rather
+// than a member of it, because "git moved" and "the swarm moved" need different
+// actions from an operator even though both make an application out of sync.
+//
+// Unknown is not merely "not evaluated". It is also what a release whose live
+// state could not be read reports, and the reconciler will not converge one:
+// the controller does not write on the strength of a read it could not make.
+type DriftState string
+
+const (
+	DriftStateUnknown  DriftState = ""
+	DriftStateNone     DriftState = "none"
+	DriftStateDetected DriftState = "detected"
+)
+
+// MarshalJSON implements json.Marshaler.
+func (d DriftState) MarshalJSON() ([]byte, error) { return marshalEnum(d, unknownName) }
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (d *DriftState) UnmarshalJSON(data []byte) error {
+	v, err := unmarshalEnum(data, DriftStateNone, DriftStateDetected)
+	if err != nil {
+		return err
+	}
+	*d = v
+	return nil
+}
+
+// DriftReason is how one service differs. The three are genuinely different
+// problems: Modified is a service whose spec was changed, Missing is one that is
+// declared and not running at all, and Unexpected is one running under the
+// stack's namespace that the manifest does not declare.
+type DriftReason string
+
+const (
+	DriftReasonUnknown DriftReason = ""
+	DriftModified      DriftReason = "modified"
+	DriftMissing       DriftReason = "missing"
+	DriftUnexpected    DriftReason = "unexpected"
+)
+
+// MarshalJSON implements json.Marshaler.
+func (d DriftReason) MarshalJSON() ([]byte, error) { return marshalEnum(d, unknownName) }
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (d *DriftReason) UnmarshalJSON(data []byte) error {
+	v, err := unmarshalEnum(data, DriftModified, DriftMissing, DriftUnexpected)
 	if err != nil {
 		return err
 	}

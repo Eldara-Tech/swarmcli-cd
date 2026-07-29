@@ -25,9 +25,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types/swarm"
+
 	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/drift"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/health"
@@ -393,6 +396,163 @@ func withForbiddenSecrets(b charts.Backend, names map[string]struct{}) charts.Ba
 	return b
 }
 
+// outOfBandBackend is the optional interface a backend implements to report a
+// mutation that lost its compare-and-swap. *backend.Backend satisfies it.
+type outOfBandBackend interface {
+	WithOutOfBandNotifier(func(service string)) charts.Backend
+}
+
+// withOutOfBandNotifier makes the backend report a write that raced one of ours.
+//
+// Swarm gives the controller exactly one signal that something else is writing
+// to a service — ?version= is mandatory, so a mutation that loses the race is
+// refused — and until now that signal was detected and thrown away: the backend
+// called a no-op default because only this layer knows which application a
+// write belongs to.
+//
+// The write is still retried and still lands, which is right: the desired spec
+// is complete, so re-applying it *is* correcting the drift. What must not happen
+// is the overwrite being silent, and this is what stops it being.
+//
+// Reported once per service per sync rather than once per attempt. The retry
+// loop can fire three times for one conflict, and three identical notifications
+// describe one event.
+func (r *Reconciler) withOutOfBandNotifier(ctx context.Context, b charts.Backend, app string) charts.Backend {
+	ob, ok := b.(outOfBandBackend)
+	if !ok {
+		return b
+	}
+
+	var mu sync.Mutex
+	seen := map[string]struct{}{}
+	return ob.WithOutOfBandNotifier(func(service string) {
+		mu.Lock()
+		_, already := seen[service]
+		seen[service] = struct{}{}
+		mu.Unlock()
+		if already {
+			return
+		}
+		notify.Dispatch(ctx, notify.Event{
+			Application: app,
+			Type:        notify.LiveDriftDetected,
+			At:          r.now(),
+			Message: "service " + service + " was changed by something else while this sync was writing it; " +
+				"the change has been overwritten with what the repository declares",
+		})
+	})
+}
+
+// liveDriftBackend is the optional interface a backend implements to expose the
+// two halves of a live drift comparison. *backend.Backend satisfies it.
+//
+// It exists because charts.Backend carries no way to read a ServiceSpec — its
+// StackServices returns a display projection with a running count and no spec —
+// and no Docker client for the reconciler to convert a manifest with. A backend
+// that cannot answer, such as a Phase 3 remote one reached through the same
+// swarms seam, simply does not implement it and its applications report no live
+// drift rather than failing.
+//
+// Only the read half needs a seam. Correcting drift is DeployStack, which is on
+// charts.Backend already.
+type liveDriftBackend interface {
+	DesiredServices(ctx context.Context, manifest, stack string) (*compose.Stack, error)
+	LiveServices(ctx context.Context, stack string) (map[string]swarm.Service, error)
+}
+
+// liveDrift compares each settled release against what is running, for an
+// application that asked for it.
+//
+// Only releases the plan calls unchanged are compared, and that is the decision
+// that makes the whole mode affordable and safe. A release the plan would
+// install has nothing running to compare; one it would upgrade is about to have
+// its spec overwritten, so a spec-level difference is noise against a manifest
+// the sync axis already reports as out of date. What is left is exactly the
+// case nothing else can see: a release git has not touched whose services no
+// longer match it.
+//
+// A release that cannot be read reports Unknown rather than failing the
+// reconcile — this is a read for a reporting axis, and a daemon hiccup does not
+// make the deploy wrong. It is also not converged: the controller does not
+// write on the strength of a read it could not make.
+func (r *Reconciler) liveDrift(ctx context.Context, spec application.Spec, b charts.Backend, plan *charts.Plan) map[string]*application.ReleaseDrift {
+	if spec.DriftDetection != application.DriftLive {
+		return nil
+	}
+	ldb, ok := b.(liveDriftBackend)
+	if !ok {
+		return nil
+	}
+
+	out := make(map[string]*application.ReleaseDrift, len(plan.Releases))
+	for _, rp := range plan.Releases {
+		if rp.Action != charts.ActionUnchanged {
+			continue
+		}
+		desired, err := ldb.DesiredServices(ctx, rp.Manifest, rp.Name)
+		if err == nil {
+			var live map[string]swarm.Service
+			if live, err = ldb.LiveServices(ctx, rp.Name); err == nil {
+				out[rp.Name] = drift.Live(desired, live)
+				continue
+			}
+		}
+		r.log.Warn("could not compare a release against what is running",
+			"application", spec.Name, "release", rp.Name, "error", err)
+		out[rp.Name] = &application.ReleaseDrift{
+			State:   application.DriftStateUnknown,
+			Message: err.Error(),
+		}
+	}
+	return out
+}
+
+// driftedReleases names the releases matching want, in plan order.
+func driftedReleases(plan *charts.Plan, live map[string]*application.ReleaseDrift, want func(*application.ReleaseDrift) bool) []string {
+	if len(live) == 0 {
+		return nil
+	}
+	var out []string
+	for _, rp := range plan.Releases {
+		if want(live[rp.Name]) {
+			out = append(out, rp.Name)
+		}
+	}
+	return out
+}
+
+// detected is a release whose live comparison found a difference. Unknown is
+// deliberately not one: a comparison that could not be made has found nothing.
+func detected(d *application.ReleaseDrift) bool {
+	return d != nil && d.State == application.DriftStateDetected
+}
+
+// convergeable is a release that redeploying its manifest could actually put
+// right.
+//
+// A modified service is rewritten and a missing one is created, so both are
+// fixable. An *unexpected* service is not: applying deletes nothing — by design,
+// established in Phase 1 and unchanged here — so a redeploy would leave it
+// exactly where it is and the next reconcile would find it again. Treating it as
+// convergeable would redeploy the whole stack on every tick forever, raising a
+// correction event each time, while never removing the one thing it was
+// reacting to.
+//
+// So it is reported and not acted on. The application stays out of sync, which
+// is the truth: the swarm does not match the repository, and putting that right
+// means deleting something this controller has decided it does not delete.
+func convergeable(d *application.ReleaseDrift) bool {
+	if !detected(d) {
+		return false
+	}
+	for _, svc := range d.Services {
+		if svc.Reason == application.DriftModified || svc.Reason == application.DriftMissing {
+			return true
+		}
+	}
+	return false
+}
+
 // loop reconciles one application on its own schedule, reading its current spec
 // each tick so a Replace is picked up without the loop being restarted.
 func (r *Reconciler) loop(ctx context.Context, app string) {
@@ -499,6 +659,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	}
 	backend = withRegistryAuth(backend, r.registryAuth(spec.Name))
 	backend = withForbiddenSecrets(backend, r.forbidden)
+	backend = r.withOutOfBandNotifier(ctx, backend, spec.Name)
 	engine := r.newEngine(backend)
 
 	plan, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{
@@ -514,17 +675,29 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		return fmt.Errorf("planning: %w", err)
 	}
 
-	// Read before recording: record overwrites the state this compares
+	live := r.liveDrift(ctx, spec, backend, plan)
+	// Two lists, because reporting and acting are not the same set: everything
+	// found is reported, and only what a redeploy could actually put right is
+	// acted on.
+	drifted := driftedReleases(plan, live, detected)
+	fixable := driftedReleases(plan, live, convergeable)
+
+	// Read before recording: record overwrites the states this compares
 	// against, so asking afterwards would always find them equal and drift
 	// would never look like a transition.
 	was := r.syncState(spec.Name)
-	r.record(spec.Name, backend, plan, checkout.Revision, nil)
+	wasLive := r.driftState(spec.Name)
+	r.record(spec.Name, backend, plan, checkout.Revision, nil, live)
 
+	// Both notifications come before the gate below, because something found and
+	// not correctable is exactly the case an operator has to be told about: the
+	// controller will not act on it, so nothing else will say so.
+	//
+	// The git one is gated on the plan rather than on the state, because the
+	// state now goes out-of-sync for live drift too. One change must not produce
+	// two notifications saying different things about it.
 	install, upgrade, _ := plan.Counts()
-	if install+upgrade == 0 {
-		return nil
-	}
-	if was != application.SyncOutOfSync {
+	if install+upgrade > 0 && was != application.SyncOutOfSync {
 		// Only on the transition. A manual-policy application sits out of
 		// sync indefinitely by design, and notifying every tick would train
 		// an operator to ignore the one that matters.
@@ -535,14 +708,26 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 			At:          r.now(),
 		})
 	}
+	if len(drifted) > 0 && wasLive != application.DriftStateDetected {
+		notify.Dispatch(ctx, notify.Event{
+			Application: spec.Name,
+			Type:        notify.LiveDriftDetected,
+			Revision:    checkout.Revision,
+			At:          r.now(),
+			Message:     "the running services of " + strings.Join(drifted, ", ") + " no longer match the repository",
+		})
+	}
 
+	if install+upgrade+len(fixable) == 0 {
+		return nil
+	}
 	if !spec.SyncPolicy.Automated && !force {
 		return nil
 	}
 	if err := checkCompat(plan); err != nil {
 		return err
 	}
-	return r.apply(ctx, spec, backend, engine, plan, built, checkout)
+	return r.apply(ctx, spec, backend, engine, plan, built, checkout, fixable)
 }
 
 // checkCompat refuses a plan containing a release this build's chart engine is
@@ -582,7 +767,7 @@ func checkCompat(plan *charts.Plan) error {
 // also surfaces a chart whose render is not deterministic — one that would
 // otherwise sit permanently out of sync, deploying on every single tick — on
 // the first sync rather than never.
-func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout) error {
+func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, drifted []string) error {
 	started := r.now()
 	notify.Dispatch(ctx, notify.Event{
 		Application: spec.Name,
@@ -613,6 +798,13 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	})
 	for _, res := range results {
 		r.log.Info("release applied", "application", spec.Name, "release", res.Name, "action", res.Action, "revision", res.Revision)
+	}
+
+	// After the apply because the two are disjoint — a release the plan would
+	// install or upgrade is never one this compared — and because a failed
+	// apply is the wrong moment to start correcting something else.
+	if applyErr == nil {
+		applyErr = r.converge(ctx, spec, backend, plan, drifted)
 	}
 
 	result := &application.SyncResult{
@@ -666,8 +858,67 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 		r.recordResult(spec.Name, result)
 		return fmt.Errorf("re-planning after apply: %w", err)
 	}
-	r.record(spec.Name, backend, after, checkout.Revision, result)
+	// Re-compared, not carried forward: the correction above is exactly the
+	// thing this needs to confirm, and reporting the pre-apply comparison would
+	// leave an application that has just been put right still reading drifted.
+	r.record(spec.Name, backend, after, checkout.Revision, result, r.liveDrift(ctx, spec, backend, after))
 	return nil
+}
+
+// converge redeploys the releases whose running services no longer match the
+// repository.
+//
+// It cannot go through the engine. Engine.Apply skips a release it planned as
+// unchanged, and a live-drifted release is unchanged by construction — that is
+// what made it comparable in the first place. Forcing its action to Upgrade to
+// get it through would write a new chart revision on every correction, filling
+// the history with identical entries and churning HistoryMax. So this deploys
+// the release's manifest directly, and no revision is recorded: the desired
+// state did not change, the swarm was put back to it. The record is
+// Sync.LastSync and the event below.
+//
+// The resolve mode is the one the apply path uses, which is what keeps a
+// correction a correction. Asking the registry to re-resolve here would let a
+// moving tag change the running image as a side effect of fixing someone's
+// replica count.
+//
+// Failures are collected rather than returned at the first: one release that
+// will not converge is no reason to leave the others drifted, and the caller
+// fails the sync on whatever comes back.
+func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backend charts.Backend, plan *charts.Plan, drifted []string) error {
+	if len(drifted) == 0 {
+		return nil
+	}
+
+	manifests := make(map[string]string, len(plan.Releases))
+	for _, rp := range plan.Releases {
+		manifests[rp.Name] = rp.Manifest
+	}
+
+	var errs []error
+	var converged []string
+	for _, release := range drifted {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := backend.DeployStack(release, manifests[release], ""); err != nil {
+			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
+			continue
+		}
+		converged = append(converged, release)
+		r.log.Warn("redeployed a release whose running services had been changed outside the repository",
+			"application", spec.Name, "release", release)
+	}
+
+	if len(converged) > 0 {
+		notify.Dispatch(ctx, notify.Event{
+			Application: spec.Name,
+			Type:        notify.DriftConverged,
+			At:          r.now(),
+			Message:     "redeployed " + strings.Join(converged, ", "),
+		})
+	}
+	return errors.Join(errs...)
 }
 
 // prune deletes the releases this application used to declare and no longer
@@ -754,7 +1005,11 @@ func (r *Reconciler) currentSpec(app string) application.Spec {
 // record stores the status a plan implies. A nil result leaves whatever the
 // last sync recorded in place. An application removed while its sync was in
 // flight is skipped, so a late write does not resurrect it.
-func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Plan, revision string, result *application.SyncResult) {
+//
+// live is the per-release comparison against what is running, keyed by release
+// name, and is nil for an application not using that mode — which leaves the
+// whole axis absent from the status rather than present and empty.
+func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Plan, revision string, result *application.SyncResult, live map[string]*application.ReleaseDrift) {
 	sync, releases := drift.FromPlan(plan)
 	sync.Revision = revision
 
@@ -789,15 +1044,41 @@ func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Pla
 			Installed:  rel.Action != application.ActionInstall,
 			SyncFailed: syncFailed,
 		})
+
+		// Fold the live comparison into the sync axis. A release whose running
+		// services no longer match the repository is out of sync in the plainest
+		// sense of the word, and saying so is what makes the sync button, the
+		// CLI's exit code and any alerting already watching that field work
+		// without knowing this mode exists. What drifted, and that it was the
+		// swarm rather than git that moved, is the Drift axis beside it.
+		rel.Drift = live[rel.Name]
+		if rel.Drift != nil && rel.Drift.State == application.DriftStateDetected {
+			rel.Sync = application.SyncOutOfSync
+			sync.State = application.SyncOutOfSync
+			sync.Summary.Drifted++
+		}
 	}
 
 	e.status = application.Status{
 		Sync:       sync,
 		Health:     health.Application(releases),
+		Drift:      drift.Application(releases),
 		Releases:   releases,
 		ObservedAt: r.now(),
 	}
 	e.plan = plan
+}
+
+// driftState reports the live-drift state last observed for an application.
+// Unknown covers both "not using this mode" and "removed from the set", neither
+// of which is a transition worth reporting.
+func (r *Reconciler) driftState(app string) application.DriftState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if e, ok := r.apps[app]; ok && e.status.Drift != nil {
+		return e.status.Drift.State
+	}
+	return application.DriftStateUnknown
 }
 
 func (r *Reconciler) recordResult(app string, result *application.SyncResult) {

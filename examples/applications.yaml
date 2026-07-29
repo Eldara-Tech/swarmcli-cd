@@ -76,5 +76,13 @@ applications:
       swarm: ""          # "" or omitted = the swarm the controller runs in (the only one the OSS build can resolve)
     syncPolicy:
       automated: false   # manual: the controller reports drift but waits for `swarmcli-cd app sync hello` to apply it
-    # driftDetection defaults to "manifest" (compare the rendered manifest to
-    # what was last applied); it is the only mode this build implements.
+    # driftDetection defaults to "manifest": compare the rendered manifest to
+    # what was last applied, which catches git moving and nothing else.
+    #
+    #   driftDetection: live
+    #
+    # also compares each settled release's running ServiceSpec against what the
+    # repository renders to, which is the only way a `docker service update` made
+    # behind the controller's back is ever noticed. With automated: true it
+    # redeploys the release to correct it; with a manual policy it reports and
+    # waits for `app sync`. See docs/configuration.md for what is compared.

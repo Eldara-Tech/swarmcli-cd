@@ -70,9 +70,10 @@ func TestParseValid(t *testing.T) {
 	}
 }
 
-// An omitted driftDetection is the mode this build implements rather than an
-// error: there is one mode, so requiring it in every application would be
-// boilerplate that cannot say anything else.
+// An omitted driftDetection is the cheaper mode rather than an error. It stays
+// the default now that there are two: live costs a read of the swarm per
+// release per tick and, with an automated policy, writes — neither of which an
+// operator who wrote nothing asked for.
 func TestDriftDetectionDefaults(t *testing.T) {
 	f, err := Parse([]byte(valid), "applications.yaml")
 	if err != nil {
@@ -80,6 +81,18 @@ func TestDriftDetectionDefaults(t *testing.T) {
 	}
 	if got := f.Applications[0].DriftDetection; got != application.DriftManifest {
 		t.Errorf("driftDetection = %q, want it defaulted to manifest", got)
+	}
+}
+
+func TestDriftDetectionLiveAccepted(t *testing.T) {
+	src := "applications:\n  - name: edge\n    source:\n      repoURL: https://x/y.git\n" +
+		"      revision: main\n      releaseFile: r.yaml\n    driftDetection: live\n"
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if got := f.Applications[0].DriftDetection; got != application.DriftLive {
+		t.Errorf("driftDetection = %q, want live", got)
 	}
 }
 
@@ -134,7 +147,8 @@ func TestValidationErrors(t *testing.T) {
 		"empty values entry": {base("      chart: {release: h, path: ./c, values: [\"\"]}\n"), "values[0] is required"},
 		"negative history":   {base("      releaseFile: r.yaml\n    syncPolicy: {historyMax: -1}\n"), "historyMax cannot be negative"},
 		"negative interval":  {base("      releaseFile: r.yaml\n    syncPolicy: {interval: -5s}\n"), "cannot be negative"},
-		"unknown drift":      {base("      releaseFile: r.yaml\n    driftDetection: live\n"), "unsupported driftDetection"},
+		"unknown drift":      {base("      releaseFile: r.yaml\n    driftDetection: livee\n"), "unsupported driftDetection"},
+		"miscased drift":     {base("      releaseFile: r.yaml\n    driftDetection: Live\n"), "unsupported driftDetection"},
 		"slash regauth":      {base("      releaseFile: r.yaml\n    registryAuth: \"has/slash\"\n"), "invalid registryAuth"},
 		"traversal regauth":  {base("      releaseFile: r.yaml\n    registryAuth: \"..\"\n"), "invalid registryAuth"},
 		"volumes no prune":   {base("      releaseFile: r.yaml\n    syncPolicy: {pruneVolumes: true}\n"), "pruneVolumes means nothing without prune"},

@@ -207,18 +207,51 @@ func appList(ctx context.Context, c *client.Client, out io.Writer, format string
 		_, _ = fmt.Fprintln(out, "No applications.")
 		return nil
 	}
+
+	// The drift column only appears when something answers it. Every
+	// application runs the default manifest mode, and a column of dashes down a
+	// list of twenty would bury the one row that has something to say — the same
+	// reason a release that declared no engine requirement reports no compat
+	// finding rather than "unknown".
+	showDrift := false
+	for _, v := range apps.Applications {
+		if v.Status.Drift != nil {
+			showDrift = true
+			break
+		}
+	}
+
+	headers := []string{"NAME", "SYNC", "HEALTH", "SERVICES", "REVISION"}
+	if showDrift {
+		headers = []string{"NAME", "SYNC", "DRIFT", "HEALTH", "SERVICES", "REVISION"}
+	}
+
 	rows := make([][]string, 0, len(apps.Applications))
 	for _, v := range apps.Applications {
-		rows = append(rows, []string{
-			v.Spec.Name,
-			state(v.Status.Sync.State),
+		row := []string{v.Spec.Name, state(v.Status.Sync.State)}
+		if showDrift {
+			row = append(row, driftColumn(v.Status.Drift))
+		}
+		row = append(row,
 			state(v.Status.Health.State),
 			services(v.Status.Health.Services),
 			short(v.Status.Sync.Revision),
-		})
+		)
+		rows = append(rows, row)
 	}
-	table(out, []string{"NAME", "SYNC", "HEALTH", "SERVICES", "REVISION"}, rows)
+	table(out, headers, rows)
 	return nil
+}
+
+// driftColumn renders the live axis for one row. A dash rather than "unknown"
+// for an application that does not use the mode: it was not asked, which is a
+// different thing from asked and unanswerable, and that second case is the one
+// "unknown" has to keep for itself.
+func driftColumn(d *application.Drift) string {
+	if d == nil {
+		return "-"
+	}
+	return state(d.State)
 }
 
 func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app string) error {
@@ -242,6 +275,9 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 	_, _ = fmt.Fprintf(out, "  Health       %s (%s services)\n", state(view.Status.Health.State), services(view.Status.Health.Services))
 	if msg := view.Status.Health.Message; msg != "" {
 		_, _ = fmt.Fprintf(out, "  Message      %s\n", msg)
+	}
+	if d := view.Status.Drift; d != nil {
+		_, _ = fmt.Fprintf(out, "  Drift        %s%s\n", state(d.State), driftMessage(d.Message))
 	}
 	if last := view.Status.Sync.LastSync; last != nil {
 		_, _ = fmt.Fprintf(out, "  Last sync    %s at %s%s\n",
@@ -282,7 +318,48 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 		_, _ = fmt.Fprintf(out, "\n%s:\n", r.Name)
 		table(out, []string{"SERVICE", "MODE", "REPLICAS", "HEALTH", "UPDATE", "MESSAGE"}, serviceRows)
 	}
+
+	printDrift(out, view.Status.Releases)
 	return nil
+}
+
+// printDrift lists what no longer matches the repository, per release.
+//
+// Separate from the service tables above because it answers a different
+// question: those say whether what is running is working, this says whether it
+// is what git asked for. A release with nothing to report prints nothing.
+func printDrift(out io.Writer, releases []application.ReleaseStatus) {
+	for _, r := range releases {
+		if r.Drift == nil || len(r.Drift.Services) == 0 {
+			continue
+		}
+		rows := make([][]string, 0, len(r.Drift.Services))
+		for _, s := range r.Drift.Services {
+			if len(s.Fields) == 0 {
+				// Missing or unexpected: the service itself is the finding, and
+				// there is no field to name.
+				rows = append(rows, []string{s.Name, state(s.Reason), "", "", ""})
+				continue
+			}
+			for _, f := range s.Fields {
+				rows = append(rows, []string{s.Name, state(s.Reason), f.Field, f.Desired, f.Live})
+			}
+			if s.Truncated > 0 {
+				rows = append(rows, []string{s.Name, state(s.Reason),
+					fmt.Sprintf("(and %d more)", s.Truncated), "", ""})
+			}
+		}
+		_, _ = fmt.Fprintf(out, "\n%s drift:\n", r.Name)
+		table(out, []string{"SERVICE", "REASON", "FIELD", "DESIRED", "LIVE"}, rows)
+	}
+}
+
+// driftMessage suffixes the state with its reason, where there is one.
+func driftMessage(message string) string {
+	if message == "" {
+		return ""
+	}
+	return " — " + message
 }
 
 func appDiff(ctx context.Context, c *client.Client, out io.Writer, format, app string) error {

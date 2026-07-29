@@ -222,10 +222,19 @@ func prepareUpdate(cur swarm.Service, spec swarm.ServiceSpec, resolve string) (s
 		opts.QueryRegistry = true
 	case resolve == ResolveChanged && wanted != deployed:
 		opts.QueryRegistry = true
-	case wanted == deployed:
+	case wanted == deployed && sameImageTag(cur.Spec.TaskTemplate.ContainerSpec.Image, deployed):
 		// Same tag as last time, so keep the digest the daemon resolved it to.
 		// Writing the bare tag back would differ from the live spec and
 		// redeploy every task for no reason.
+		//
+		// The second condition is what makes that reasoning true. Keeping the
+		// live image is only right while it *is* the digest our tag resolved
+		// to, and an out-of-band `docker service update --image` breaks that:
+		// it rewrites ContainerSpec.Image and leaves the stack label alone, so
+		// the label still names our tag and this case still matches. Without
+		// the check, correcting an image someone changed by hand would write
+		// their image straight back — the one kind of drift a converge would
+		// silently fail to undo.
 		spec.TaskTemplate.ContainerSpec.Image = cur.Spec.TaskTemplate.ContainerSpec.Image
 	}
 
@@ -235,6 +244,23 @@ func prepareUpdate(cur swarm.Service, spec swarm.ServiceSpec, resolve string) (s
 	spec.TaskTemplate.ForceUpdate = cur.Spec.TaskTemplate.ForceUpdate
 
 	return spec, opts
+}
+
+// sameImageTag reports whether a live image is still the one the stack label
+// names, ignoring the digest the daemon appends when it resolves a tag.
+//
+// It is the test for "nobody has changed this image behind us". We write the
+// tag to both the spec and the label; the daemon only ever appends to the
+// former, so the two agree for as long as nothing else has written.
+func sameImageTag(live, label string) bool { return imageTag(live) == label }
+
+// imageTag strips a digest suffix. LastIndex rather than Cut so that a
+// reference containing more than one "@" loses only the digest.
+func imageTag(image string) string {
+	if i := strings.LastIndex(image, "@"); i >= 0 {
+		return image[:i]
+	}
+	return image
 }
 
 // isVersionConflict reports the "someone else wrote this first" failure.

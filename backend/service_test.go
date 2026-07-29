@@ -38,6 +38,7 @@ type fakeAPI struct {
 	// updateErrs is consumed one per ServiceUpdate call; a nil entry succeeds.
 	updateErrs []error
 	inspectErr error
+	listErr    error
 
 	created   []swarm.ServiceSpec
 	createOpt []swarm.ServiceCreateOptions
@@ -85,7 +86,11 @@ type updateCall struct {
 // spec fields.
 func (f *fakeAPI) ClientVersion() string { return "1.51" }
 
-func (f *fakeAPI) ServiceList(context.Context, swarm.ServiceListOptions) ([]swarm.Service, error) {
+func (f *fakeAPI) ServiceList(_ context.Context, o swarm.ServiceListOptions) ([]swarm.Service, error) {
+	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return f.existing, nil
 }
 
@@ -725,3 +730,44 @@ func (f *fakeAPI) TaskList(context.Context, swarm.TaskListOptions) ([]swarm.Task
 }
 
 func (f *fakeAPI) Info(context.Context) (system.Info, error) { return system.Info{}, nil }
+
+// The other half of the digest case, and the one that only matters once a
+// controller corrects drift: the live image is not ours.
+//
+// `docker service update --image` rewrites ContainerSpec.Image and leaves the
+// stack label alone, so the label still names the tag we deployed and the
+// "unchanged image" branch still matches. Keeping the live image there would
+// write the operator's image straight back, making the image the one thing a
+// converge could not undo.
+func TestOutOfBandImageIsNotPreserved(t *testing.T) {
+	const tag = "nginx:1.2"
+
+	for _, resolve := range []string{ResolveNever, ResolveChanged} {
+		t.Run(resolve, func(t *testing.T) {
+			// Label says what we deployed; the running image is somebody else's.
+			api := &fakeAPI{existing: []swarm.Service{deployed("s_web", tag, "nginx:9.9@sha256:bbbb", 1)}}
+			st := stack("s", cdService{"web", spec(tag)})
+
+			if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, resolve); err != nil {
+				t.Fatalf("ApplyServices = %v, want nil", err)
+			}
+			if got := api.updated[0].spec.TaskTemplate.ContainerSpec.Image; got != tag {
+				t.Errorf("image = %q, want the manifest's tag %q written back over the out-of-band one", got, tag)
+			}
+		})
+	}
+}
+
+func TestImageTagStripsTheDigest(t *testing.T) {
+	for in, want := range map[string]string{
+		"nginx":                        "nginx",
+		"nginx:1.2":                    "nginx:1.2",
+		"nginx:1.2@sha256:aaaa":        "nginx:1.2",
+		"ghcr.io/team/app@sha256:aaaa": "ghcr.io/team/app",
+		"":                             "",
+	} {
+		if got := imageTag(in); got != want {
+			t.Errorf("imageTag(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

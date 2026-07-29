@@ -1,0 +1,409 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright © 2026 Eldara Tech
+
+package drift
+
+import (
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/swarm"
+
+	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/compose"
+)
+
+// Live compares what a release's manifest declares against what is running.
+//
+// # Why this is an allowlist
+//
+// A ServiceSpec read back from the daemon is not the one that was written.
+// Swarmkit defaults fields the manifest never mentioned, resolves images to
+// digests, and returns empty maps where the caller sent nil. Comparing whole
+// specs therefore reports permanent drift on a service nobody has touched,
+// which is worse than no drift detection at all — it is the failure that makes
+// an operator turn the feature off, and after that it detects nothing.
+//
+// So this compares a named set of fields and nothing else. The boundary is what
+// `docker service update` can change, which is not an arbitrary line: it is the
+// out-of-band mutation surface this exists to observe. A field is added to the
+// list only with a normalisation that a real swarm has been observed to
+// satisfy — see integration-tests/live_drift_test.go, which deploys a stack
+// using every one of them and asserts that an untouched deploy reports nothing.
+//
+// Everything outside the list is documented as not compared rather than
+// silently missed; docs/configuration.md carries that list.
+//
+// # Why not YAML
+//
+// Diffing a reconstructed compose file against the manifest would read better
+// and be wrong: compose → ServiceSpec is lossy and one-way, so the
+// reconstruction manufactures differences that do not exist. Established with a
+// reproduction in swarmcli-cd#1 and restated in CLAUDE.md.
+func Live(desired *compose.Stack, live map[string]swarm.Service) *application.ReleaseDrift {
+	out := &application.ReleaseDrift{State: application.DriftStateNone}
+	if desired == nil {
+		return out
+	}
+
+	declared := make(map[string]struct{}, len(desired.Services))
+	for _, svc := range desired.Services {
+		// The scoped name: what the live spec carries, and the only key the two
+		// sides can be matched on.
+		name := svc.Spec.Name
+		declared[name] = struct{}{}
+
+		cur, ok := live[name]
+		if !ok {
+			out.Services = append(out.Services, application.ServiceDrift{
+				Name:   name,
+				Reason: application.DriftMissing,
+			})
+			continue
+		}
+		if fields, truncated := compareService(svc.Spec, cur.Spec); len(fields) > 0 {
+			out.Services = append(out.Services, application.ServiceDrift{
+				Name:      name,
+				Reason:    application.DriftModified,
+				Fields:    fields,
+				Truncated: truncated,
+			})
+		}
+	}
+
+	// A service carrying the stack's namespace label that the manifest does not
+	// declare. Reported, never removed: applying deletes nothing, so this is
+	// also how a service dropped from a chart's template — which lingers on the
+	// swarm forever today — becomes visible at all.
+	var extra []string
+	for name := range live {
+		if _, ok := declared[name]; !ok {
+			extra = append(extra, name)
+		}
+	}
+	slices.Sort(extra)
+	for _, name := range extra {
+		out.Services = append(out.Services, application.ServiceDrift{
+			Name:   name,
+			Reason: application.DriftUnexpected,
+		})
+	}
+
+	if len(out.Services) > 0 {
+		out.State = application.DriftStateDetected
+	}
+	return out
+}
+
+// maxFields bounds one service's reported differences. A service whose every
+// environment variable was replaced would otherwise put an unbounded list into
+// a status payload that is served on every poll.
+const maxFields = 20
+
+// compareService returns the allowlisted fields that differ, and how many more
+// were found beyond the cap.
+func compareService(want, got swarm.ServiceSpec) ([]application.FieldDrift, int) {
+	var fields []application.FieldDrift
+	add := func(name, desired, live string) {
+		fields = append(fields, application.FieldDrift{Field: name, Desired: desired, Live: live})
+	}
+
+	// Mode first: replicas mean nothing across a mode change, and reporting
+	// both would say the same thing twice.
+	wantMode, gotMode := modeKind(want.Mode), modeKind(got.Mode)
+	if wantMode != gotMode {
+		add("mode", wantMode, gotMode)
+	} else if wantMode == modeReplicated {
+		if w, g := replicas(want.Mode), replicas(got.Mode); w != g {
+			add("replicas", strconv.FormatUint(w, 10), strconv.FormatUint(g, 10))
+		}
+	}
+
+	compareImage(want, got, add)
+	compareResources(want.TaskTemplate.Resources, got.TaskTemplate.Resources, add)
+	compareEnv(containerSpec(want).Env, containerSpec(got).Env, add)
+	compareConstraints(want.TaskTemplate.Placement, got.TaskTemplate.Placement, add)
+	compareLabels(want.Labels, got.Labels, add)
+
+	if len(fields) > maxFields {
+		return fields[:maxFields], len(fields) - maxFields
+	}
+	return fields, 0
+}
+
+const modeReplicated = "replicated"
+
+// modeKind names which of the four service modes is set. Replicated is the
+// default for the same reason compose conversion makes it one: an unset mode is
+// a replicated service.
+func modeKind(m swarm.ServiceMode) string {
+	switch {
+	case m.Global != nil:
+		return "global"
+	case m.ReplicatedJob != nil:
+		return "replicated-job"
+	case m.GlobalJob != nil:
+		return "global-job"
+	default:
+		return modeReplicated
+	}
+}
+
+// replicas is the replica count with the daemon's default applied.
+//
+// Compose leaves Replicas nil when the manifest says nothing
+// (cli/compose/convert.convertDeployMode), and the daemon stores 1 for a nil
+// pointer and always reads one back
+// (moby/daemon/cluster/convert.ServiceSpecToGRPC). Comparing the pointers
+// directly would report drift on every service that did not name a count.
+func replicas(m swarm.ServiceMode) uint64 {
+	if m.Replicated == nil || m.Replicated.Replicas == nil {
+		return 1
+	}
+	return *m.Replicated.Replicas
+}
+
+// compareImage reports an image the manifest did not ask for.
+//
+// The live spec's image is not comparable to the manifest's as written: with
+// image resolution on, the daemon appends the digest it resolved the tag to. So
+// a live image matches when it is either exactly what we asked for — which
+// covers a manifest that pins a digest itself — or that same reference with a
+// digest appended.
+//
+// What this must catch is `docker service update --image`, and note what it
+// does NOT rely on: the stack image label. That update rewrites the spec's
+// image and leaves the label at whatever the last deploy wrote, so comparing
+// the two labels would agree in exactly the case this is looking for.
+func compareImage(want, got swarm.ServiceSpec, add func(name, desired, live string)) {
+	wanted := containerSpec(want).Image
+	running := containerSpec(got).Image
+	if wanted == "" {
+		return
+	}
+	if running == wanted || imageTag(running) == wanted {
+		return
+	}
+	add("image", wanted, running)
+}
+
+// imageTag strips a digest suffix. LastIndex rather than Cut so a reference
+// containing more than one "@" loses only the digest.
+func imageTag(image string) string {
+	if i := strings.LastIndex(image, "@"); i >= 0 {
+		return image[:i]
+	}
+	return image
+}
+
+// compareResources reports changed CPU and memory limits and reservations.
+//
+// Raw spec values rather than a friendly rendering: the field names say the
+// unit, the numbers are exactly what `docker service inspect` shows, and a
+// formatter is one more thing that can be wrong about a number nobody can then
+// check.
+func compareResources(want, got *swarm.ResourceRequirements, add func(name, desired, live string)) {
+	wl, gl := limits(want), limits(got)
+	compareInt64("resources.limits.nanoCPUs", wl.NanoCPUs, gl.NanoCPUs, add)
+	compareInt64("resources.limits.memoryBytes", wl.MemoryBytes, gl.MemoryBytes, add)
+
+	wr, gr := reservations(want), reservations(got)
+	compareInt64("resources.reservations.nanoCPUs", wr.NanoCPUs, gr.NanoCPUs, add)
+	compareInt64("resources.reservations.memoryBytes", wr.MemoryBytes, gr.MemoryBytes, add)
+}
+
+// limits and reservations flatten the pointer chain the manifest leaves nil and
+// the daemon returns as a zero struct. Both readings mean "no limit".
+func limits(r *swarm.ResourceRequirements) swarm.Limit {
+	if r == nil || r.Limits == nil {
+		return swarm.Limit{}
+	}
+	return *r.Limits
+}
+
+func reservations(r *swarm.ResourceRequirements) swarm.Resources {
+	if r == nil || r.Reservations == nil {
+		return swarm.Resources{}
+	}
+	return *r.Reservations
+}
+
+func compareInt64(name string, want, got int64, add func(name, desired, live string)) {
+	if want != got {
+		add(name, strconv.FormatInt(want, 10), strconv.FormatInt(got, 10))
+	}
+}
+
+// Renderings for an environment difference. The value is never one of them: what
+// is running is whatever an operator typed, this is served to anyone with read
+// scope, and an environment variable is exactly where a credential would be.
+const (
+	envSet     = "set"
+	envAbsent  = "absent"
+	envChanged = "changed"
+)
+
+// compareEnv reports environment variables added, removed or changed, by name.
+func compareEnv(want, got []string, add func(name, desired, live string)) {
+	wm, gm := envMap(want), envMap(got)
+	for _, key := range unionKeys(wm, gm) {
+		wv, inWant := wm[key]
+		gv, inGot := gm[key]
+		switch {
+		case inWant && !inGot:
+			add("env["+key+"]", envSet, envAbsent)
+		case !inWant && inGot:
+			add("env["+key+"]", envAbsent, envSet)
+		case wv != gv:
+			add("env["+key+"]", envSet, envChanged)
+		}
+	}
+}
+
+// envMap splits "KEY=value" entries. An entry with no "=" is a variable passed
+// through from the environment, which has a name and no value here.
+func envMap(env []string) map[string]string {
+	out := make(map[string]string, len(env))
+	for _, e := range env {
+		key, value, _ := strings.Cut(e, "=")
+		out[key] = value
+	}
+	return out
+}
+
+// compareConstraints reports the placement constraints as a whole rather than
+// one entry at a time: they are read together, and "want a, b; got a" is
+// clearer than two lines about a single expression.
+//
+// Sorted on both sides because neither the manifest's order nor the daemon's is
+// meaningful, and an order-sensitive comparison would report drift on a
+// reordered chart template.
+func compareConstraints(want, got *swarm.Placement, add func(name, desired, live string)) {
+	w, g := placementConstraints(want), placementConstraints(got)
+	if !slices.Equal(w, g) {
+		add("constraints", strings.Join(w, ", "), strings.Join(g, ", "))
+	}
+}
+
+func placementConstraints(p *swarm.Placement) []string {
+	if p == nil {
+		return nil
+	}
+	out := slices.Clone(p.Constraints)
+	slices.Sort(out)
+	return out
+}
+
+// absent is how a label that is not set renders, so that a difference always
+// has two sides to read.
+const absent = "(absent)"
+
+// compareLabels reports service labels added, removed or changed.
+//
+// Values are shown here, unlike environment variables: a label is declared in
+// the chart and is not where anyone puts a credential.
+//
+// The com.docker.stack.* labels are excluded because they are ours, not the
+// operator's: the namespace label is how a stack is identified at all, and the
+// image label deliberately records the tag we asked for rather than what is
+// running, which compareImage depends on.
+func compareLabels(want, got map[string]string, add func(name, desired, live string)) {
+	wm, gm := ownLabels(want), ownLabels(got)
+	for _, key := range unionKeys(wm, gm) {
+		wv, inWant := wm[key]
+		gv, inGot := gm[key]
+		if inWant == inGot && wv == gv {
+			continue
+		}
+		add("labels["+key+"]", orAbsent(wv, inWant), orAbsent(gv, inGot))
+	}
+}
+
+func ownLabels(labels map[string]string) map[string]string {
+	out := make(map[string]string, len(labels))
+	for k, v := range labels {
+		if k == convert.LabelNamespace || k == convert.LabelImage {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func orAbsent(value string, present bool) string {
+	if !present {
+		return absent
+	}
+	return value
+}
+
+// unionKeys returns every key of both maps, sorted, so that a service's reported
+// differences are in the same order on every tick. An unstable order would make
+// a status poll look like a change.
+func unionKeys(a, b map[string]string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, m := range []map[string]string{a, b} {
+		for k := range m {
+			if _, ok := seen[k]; ok {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, k)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// containerSpec flattens the pointer, so every caller reads a zero spec rather
+// than checking for nil. A service with no container spec runs a different
+// runtime and has none of the fields compared here.
+func containerSpec(s swarm.ServiceSpec) swarm.ContainerSpec {
+	if s.TaskTemplate.ContainerSpec == nil {
+		return swarm.ContainerSpec{}
+	}
+	return *s.TaskTemplate.ContainerSpec
+}
+
+// Application rolls each release's live drift up to one state for the whole
+// application, or nil when no release was compared — which is every application
+// running the default manifest mode.
+//
+// Detected outranks Unknown deliberately, matching how health ranks Degraded
+// over Missing: a difference that was found is something to act on now, whereas
+// one that could not be read is a gap in the reporting. Both are said; only one
+// leads.
+func Application(releases []application.ReleaseStatus) *application.Drift {
+	out := &application.Drift{State: application.DriftStateNone}
+	compared := false
+
+	for _, rel := range releases {
+		if rel.Drift == nil {
+			continue
+		}
+		compared = true
+		switch rel.Drift.State {
+		case application.DriftStateDetected:
+			out.Services += len(rel.Drift.Services)
+			if out.State != application.DriftStateDetected {
+				out.State = application.DriftStateDetected
+				out.Message = fmt.Sprintf("release %q: %d service(s) do not match the repository",
+					rel.Name, len(rel.Drift.Services))
+			}
+		case application.DriftStateUnknown:
+			if out.State == application.DriftStateNone {
+				out.State = application.DriftStateUnknown
+				out.Message = fmt.Sprintf("release %q: %s", rel.Name, rel.Drift.Message)
+			}
+		}
+	}
+
+	if !compared {
+		return nil
+	}
+	return out
+}

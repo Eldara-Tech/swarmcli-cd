@@ -14,9 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types/swarm"
+
 	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
@@ -1567,5 +1570,457 @@ func TestPruneFirstFailureStopsTheApply(t *testing.T) {
 	}
 	if engine.applyCount() != 0 {
 		t.Errorf("applied %d times, want 0 — the old release is still deployed", engine.applyCount())
+	}
+}
+
+// ------------------------------------------------- driftDetection: live
+
+// driftBackend is a stubBackend that also answers the two live-drift reads and
+// records what was redeployed to correct one.
+//
+// desired and live are keyed by release. A release absent from both compares
+// equal, which is the ordinary case and keeps every existing test unaffected.
+type driftBackend struct {
+	stubBackend
+	desired map[string]*compose.Stack
+	live    map[string]map[string]swarm.Service
+	readErr error
+
+	mu sync.Mutex
+	// deployed records each converge as "<release>|<manifest>", so one field
+	// carries both that a correction happened and that it wrote the right thing.
+	deployed  []string
+	deployErr error
+}
+
+func (b *driftBackend) DesiredServices(_ context.Context, _, stack string) (*compose.Stack, error) {
+	if b.readErr != nil {
+		return nil, b.readErr
+	}
+	return b.desired[stack], nil
+}
+
+func (b *driftBackend) LiveServices(_ context.Context, stack string) (map[string]swarm.Service, error) {
+	if b.readErr != nil {
+		return nil, b.readErr
+	}
+	return b.live[stack], nil
+}
+
+func (b *driftBackend) DeployStack(name, manifest, _ string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.deployed = append(b.deployed, name+"|"+manifest)
+	return b.deployErr
+}
+
+func (b *driftBackend) converged() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.deployed)
+}
+
+func serviceSpec(name string, replicas uint64) swarm.ServiceSpec {
+	return swarm.ServiceSpec{
+		Annotations:  swarm.Annotations{Name: name},
+		TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{Image: "busybox:1.36"}},
+		Mode:         swarm.ServiceMode{Replicated: &swarm.ReplicatedService{Replicas: &replicas}},
+	}
+}
+
+// driftedBackend is a backend on which the release "whoami" is running three
+// replicas where the manifest asks for one.
+func driftedBackend() *driftBackend {
+	want := serviceSpec("whoami_app", 1)
+	got := serviceSpec("whoami_app", 3)
+	return &driftBackend{
+		desired: map[string]*compose.Stack{
+			"whoami": {Services: []compose.Service{{Name: "app", Spec: want}}},
+		},
+		live: map[string]map[string]swarm.Service{
+			"whoami": {"whoami_app": {ID: "id", Spec: got}},
+		},
+	}
+}
+
+// matchingBackend is the same stack with nothing changed behind the controller.
+func matchingBackend() *driftBackend {
+	spec := serviceSpec("whoami_app", 1)
+	return &driftBackend{
+		desired: map[string]*compose.Stack{
+			"whoami": {Services: []compose.Service{{Name: "app", Spec: spec}}},
+		},
+		live: map[string]map[string]swarm.Service{
+			"whoami": {"whoami_app": {ID: "id", Spec: spec}},
+		},
+	}
+}
+
+func liveSpec(name string, automated bool) application.Spec {
+	s := spec(name, automated)
+	s.DriftDetection = application.DriftLive
+	return s
+}
+
+// The default mode must be exactly what it was. Every deployment runs it, and a
+// nil axis is what says the question was not asked rather than answered "none".
+func TestManifestModeNeverComparesAgainstTheSwarm(t *testing.T) {
+	backend := driftedBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Drift != nil {
+		t.Errorf("drift = %+v, want nil for a manifest-mode application", view.Status.Drift)
+	}
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q, want synced", view.Status.Sync.State)
+	}
+	if len(backend.converged()) != 0 {
+		t.Errorf("redeployed %v, want nothing", backend.converged())
+	}
+}
+
+// A backend that cannot read service specs — a remote one reached through the
+// same seam — must leave the axis absent rather than fail the application.
+func TestLiveModeDegradesOnABackendWithoutTheSeam(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTest(t, []application.Spec{liveSpec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if view, _ := r.View("edge"); view.Status.Drift != nil {
+		t.Errorf("drift = %+v, want nil when the backend cannot answer", view.Status.Drift)
+	}
+}
+
+func TestLiveModeReportsNothingOnAnUntouchedStack(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: matchingBackend()})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Drift == nil || view.Status.Drift.State != application.DriftStateNone {
+		t.Errorf("drift = %+v, want none", view.Status.Drift)
+	}
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q, want synced", view.Status.Sync.State)
+	}
+}
+
+// The folding decision: drift makes the application out of sync, so the sync
+// button and anything already alerting on that field work without knowing this
+// mode exists. What moved is the axis beside it.
+func TestLiveDriftMakesTheApplicationOutOfSync(t *testing.T) {
+	rec := listen(t)
+	backend := driftedBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", false)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Sync.State != application.SyncOutOfSync {
+		t.Errorf("state = %q, want out-of-sync", view.Status.Sync.State)
+	}
+	if view.Status.Sync.Summary.Drifted != 1 {
+		t.Errorf("summary.drifted = %d, want 1", view.Status.Sync.Summary.Drifted)
+	}
+	// The plan itself still says the release is unchanged. Summary describes the
+	// plan; State describes the verdict.
+	if view.Status.Sync.Summary.Unchanged != 1 {
+		t.Errorf("summary.unchanged = %d, want the plan still reported honestly", view.Status.Sync.Summary.Unchanged)
+	}
+	if view.Status.Drift == nil || view.Status.Drift.State != application.DriftStateDetected {
+		t.Fatalf("drift = %+v, want detected", view.Status.Drift)
+	}
+	if view.Status.Drift.Services != 1 {
+		t.Errorf("drift services = %d, want 1", view.Status.Drift.Services)
+	}
+	if rel := view.Status.Releases[0]; rel.Sync != application.SyncOutOfSync || rel.Drift == nil {
+		t.Errorf("release = %+v, want it out of sync with its own drift detail", rel)
+	}
+
+	// The swarm moving is a different event from git moving: they need different
+	// responses, so a notifier must be able to route on the type.
+	if got := rec.types(); !slices.Contains(got, notify.LiveDriftDetected) {
+		t.Errorf("events = %v, want a live-drift-detected", got)
+	}
+	if slices.Contains(rec.types(), notify.DriftDetected) {
+		t.Error("a live drift also raised the git-drift event; one change must not report as two")
+	}
+
+	// Manual policy: reported, not corrected.
+	if len(backend.converged()) != 0 {
+		t.Errorf("redeployed %v, want a manual application left alone", backend.converged())
+	}
+}
+
+// The notify contract the git-drift event already has: an application sits
+// drifted until someone acts, and an event on every tick trains an operator to
+// ignore the one that matters.
+func TestLiveDriftNotifiesOnlyOnTheTransition(t *testing.T) {
+	rec := listen(t)
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", false)}, engine, nil, fakeRegistry{backend: driftedBackend()})
+
+	for range 3 {
+		if err := r.Sync(context.Background(), "edge"); err != nil {
+			t.Fatalf("Sync = %v, want nil", err)
+		}
+	}
+
+	var n int
+	for _, e := range rec.types() {
+		if e == notify.LiveDriftDetected {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("raised %d live-drift events over three reconciles, want 1", n)
+	}
+}
+
+func TestLiveDriftConvergesAnAutomatedApplication(t *testing.T) {
+	rec := listen(t)
+	backend := driftedBackend()
+	// Drifted on the first plan, matching on the confirming re-plan — which is
+	// what the correction is supposed to produce.
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	// Redeployed through the backend rather than the engine: Engine.Apply skips
+	// a release it planned as unchanged, which every drifted release is.
+	if got := backend.converged(); len(got) != 1 || !strings.HasPrefix(got[0], "whoami|") {
+		t.Errorf("redeployed %v, want the drifted release's manifest", got)
+	}
+	// And no chart revision was written for it. The desired state did not change.
+	if engine.applyCount() != 1 {
+		t.Errorf("engine applied %d times, want the one no-op pass over an unchanged plan", engine.applyCount())
+	}
+	if got := rec.types(); !slices.Contains(got, notify.DriftConverged) {
+		t.Errorf("events = %v, want a drift-converged", got)
+	}
+}
+
+// Manual means "not on a schedule", not "never" — the same rule the manifest
+// mode already follows.
+func TestManualApplicationConvergesOnAnExplicitSync(t *testing.T) {
+	backend := driftedBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", false)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.SyncNow(context.Background(), "edge"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	if len(backend.converged()) != 1 {
+		t.Errorf("redeployed %v, want the explicit sync to correct it", backend.converged())
+	}
+}
+
+// A correction that did not happen is a write that was asked for and refused,
+// so it fails the sync rather than being logged and forgotten.
+func TestFailedConvergeFailsTheSync(t *testing.T) {
+	backend := driftedBackend()
+	backend.deployErr = errors.New("swarm refused")
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	err := r.Sync(context.Background(), "edge")
+	if err == nil {
+		t.Fatal("Sync = nil, want the failed correction surfaced")
+	}
+	if !strings.Contains(err.Error(), "whoami") {
+		t.Errorf("error %q does not name the release", err)
+	}
+	view, _ := r.View("edge")
+	if last := view.Status.Sync.LastSync; last == nil || last.Succeeded {
+		t.Errorf("lastSync = %+v, want a failure recorded", last)
+	}
+}
+
+// The rule that keeps the mode safe: a read that failed says Unknown, and the
+// controller does not rewrite a service on the strength of it.
+func TestUnreadableDriftIsNotConverged(t *testing.T) {
+	backend := driftedBackend()
+	backend.readErr = errors.New("daemon unreachable")
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want the reconcile to survive a failed drift read", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Drift == nil || view.Status.Drift.State != application.DriftStateUnknown {
+		t.Fatalf("drift = %+v, want unknown", view.Status.Drift)
+	}
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q, want the plan's own verdict when drift could not be read", view.Status.Sync.State)
+	}
+	if len(backend.converged()) != 0 {
+		t.Errorf("redeployed %v, want nothing written on the strength of a read that failed", backend.converged())
+	}
+}
+
+// A release the plan would change is not compared: its spec is about to be
+// overwritten, so a spec-level difference is noise against a manifest the sync
+// axis already reports.
+func TestOnlyUnchangedReleasesAreCompared(t *testing.T) {
+	backend := driftedBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{{Releases: []charts.ReleasePlan{
+		{Name: "whoami", Ref: "repo/whoami", Action: charts.ActionUpgrade, ToVersion: "0.1.8", Manifest: "replicas: 1\n"},
+	}}}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", false)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Releases[0].Drift != nil {
+		t.Errorf("drift = %+v, want none for a release the plan would upgrade", view.Status.Releases[0].Drift)
+	}
+	if view.Status.Drift != nil {
+		t.Errorf("application drift = %+v, want nil when nothing was compared", view.Status.Drift)
+	}
+}
+
+// conflictingBackend accepts the out-of-band notifier and fires it, which is
+// what the real backend does when a mutation loses its compare-and-swap.
+type conflictingBackend struct {
+	stubBackend
+	fires  int
+	notify func(string)
+}
+
+func (b *conflictingBackend) WithOutOfBandNotifier(fn func(string)) charts.Backend {
+	c := *b
+	c.notify = fn
+	return &c
+}
+
+func (b *conflictingBackend) DeployStack(string, string, string) error {
+	for range b.fires {
+		b.notify("edge_web")
+	}
+	return nil
+}
+
+// Swarm's one signal that something else is writing was being detected and
+// thrown away: swarms.local builds the backend with an empty Options, so the
+// callback was the no-op default and production never set it.
+func TestOutOfBandWriteIsReported(t *testing.T) {
+	rec := listen(t)
+	// Three fires, as the retry loop produces for one conflict. One event: three
+	// identical notifications describe one thing that happened.
+	backend := &conflictingBackend{fires: 3}
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}}
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	// The engine is a fake, so drive the notifier the way a real apply would.
+	b, err := fakeRegistry{backend: backend}.Backend(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := r.withOutOfBandNotifier(context.Background(), b, "edge")
+	if err := scoped.DeployStack("edge", "", ""); err != nil {
+		t.Fatalf("DeployStack = %v, want nil", err)
+	}
+
+	var n int
+	var message string
+	for _, e := range rec.got {
+		if e.Type == notify.LiveDriftDetected {
+			n++
+			message = e.Message
+		}
+	}
+	if n != 1 {
+		t.Fatalf("raised %d events for one conflict, want 1", n)
+	}
+	if !strings.Contains(message, "edge_web") {
+		t.Errorf("message %q does not name the service", message)
+	}
+}
+
+// A service running under the stack's namespace that the manifest does not
+// declare cannot be corrected by a redeploy — applying deletes nothing — so
+// treating it as convergeable would redeploy the whole stack on every tick
+// forever, raising a correction event each time and never removing the thing it
+// was reacting to.
+//
+// Reported, and left alone. The application stays out of sync, which is true.
+func TestAnUnexpectedServiceIsReportedButNotConverged(t *testing.T) {
+	rec := listen(t)
+	spec := serviceSpec("whoami_app", 1)
+	stray := serviceSpec("whoami_leftover", 1)
+	backend := &driftBackend{
+		desired: map[string]*compose.Stack{
+			"whoami": {Services: []compose.Service{{Name: "app", Spec: spec}}},
+		},
+		live: map[string]map[string]swarm.Service{
+			"whoami": {"whoami_app": {ID: "a", Spec: spec}, "whoami_leftover": {ID: "b", Spec: stray}},
+		},
+	}
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Drift == nil || view.Status.Drift.State != application.DriftStateDetected {
+		t.Fatalf("drift = %+v, want it reported", view.Status.Drift)
+	}
+	if view.Status.Sync.State != application.SyncOutOfSync {
+		t.Errorf("state = %q, want out-of-sync — the swarm really does not match", view.Status.Sync.State)
+	}
+	// The operator is told, because nothing else is going to deal with it.
+	if got := rec.types(); !slices.Contains(got, notify.LiveDriftDetected) {
+		t.Errorf("events = %v, want the operator told about it", got)
+	}
+	// And nothing was written, on this tick or any other.
+	if got := backend.converged(); len(got) != 0 {
+		t.Errorf("redeployed %v, want nothing a redeploy could not fix", got)
+	}
+	if engine.applyCount() != 0 {
+		t.Errorf("engine applied %d times, want the apply cycle skipped entirely", engine.applyCount())
+	}
+}
+
+// The other half: a missing service is convergeable, because a redeploy creates
+// what is not there.
+func TestAMissingServiceIsConverged(t *testing.T) {
+	spec := serviceSpec("whoami_app", 1)
+	backend := &driftBackend{
+		desired: map[string]*compose.Stack{
+			"whoami": {Services: []compose.Service{{Name: "app", Spec: spec}}},
+		},
+		live: map[string]map[string]swarm.Service{"whoami": {}},
+	}
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := backend.converged(); len(got) != 1 {
+		t.Errorf("redeployed %v, want the release with the missing service", got)
 	}
 }
