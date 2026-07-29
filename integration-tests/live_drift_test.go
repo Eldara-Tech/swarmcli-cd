@@ -215,13 +215,18 @@ func hasTag(image, tag string) bool {
 // A service deleted out of band. The health axis only notices when a release has
 // no services left at all, so without this a two-service stack missing one of
 // them reports healthy.
+//
+// Manual, so that the two halves can be asserted separately. An automated
+// application detects and corrects within the same reconcile — and then the
+// confirming re-plan re-compares and reports none, which is the feature working
+// and leaves nothing to assert about what was found.
 func TestLiveDriftDetectsAndRestoresADeletedService(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-live-missing"
 	repo := gitRepo(t, richChartFiles(release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("missing", repo, true))
+	rec := reconciler(t, liveDriftApp("missing", repo, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "missing"); err != nil {
@@ -239,7 +244,7 @@ func TestLiveDriftDetectsAndRestoresADeletedService(t *testing.T) {
 	}
 
 	// Reported as missing rather than as a field difference, and only the
-	// service that went.
+	// service that went — the one still running must not be swept up in it.
 	d := driftOf(t, rec, "missing")
 	if d == nil || d.State != application.DriftStateDetected || len(d.Services) != 1 {
 		t.Fatalf("drift = %+v, want exactly the departed service", d)
@@ -248,7 +253,11 @@ func TestLiveDriftDetectsAndRestoresADeletedService(t *testing.T) {
 		t.Errorf("got %+v, want %s_sidecar missing", d.Services[0], release)
 	}
 
-	// And an automated application puts it back.
+	// And converging recreates it: a redeploy creates what is not there, which
+	// is what makes a missing service convergeable where an unexpected one is not.
+	if err := rec.SyncNow(ctx, "missing"); err != nil {
+		t.Fatalf("SyncNow after the deletion = %v, want nil", err)
+	}
 	waitForRunning(t, cli, release, 2)
 	if d := driftOf(t, rec, "missing"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
