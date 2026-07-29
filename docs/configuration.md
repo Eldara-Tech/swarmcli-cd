@@ -238,6 +238,13 @@ The correction writes no new chart revision. The desired state did not change;
 the swarm was put back to it. `app get` shows the outcome and a
 `drift-converged` event records that it happened.
 
+A correction is a deploy, so `syncPolicy.wait` governs it too: with `wait: true`
+the sync blocks until the corrected release converges or `timeout` expires, and
+a correction that deploys but never settles fails the sync rather than reporting
+success. Releases are corrected in the order the release file lists them, so
+`wait` also gives the same ordering guarantee here that it gives an ordinary
+apply.
+
 A release whose live state could not be read reports `unknown` and is **not**
 corrected: the controller does not rewrite a service on the strength of a read
 it could not make.

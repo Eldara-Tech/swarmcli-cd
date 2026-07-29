@@ -2024,3 +2024,167 @@ func TestAMissingServiceIsConverged(t *testing.T) {
 		t.Errorf("redeployed %v, want the release with the missing service", got)
 	}
 }
+
+// ------------------------------------------- converge honours syncPolicy.wait
+
+// convergingBackend replays a scripted sequence of convergence states, so a test
+// can watch the wait poll rather than merely observe its result. The last entry
+// repeats once the script runs out.
+type convergingBackend struct {
+	*driftBackend
+
+	mu     sync.Mutex
+	script [][]charts.ServiceState
+	calls  int
+}
+
+func (b *convergingBackend) StackServices(string) []charts.ServiceState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.calls++
+	return b.script[min(b.calls-1, len(b.script)-1)]
+}
+
+func (b *convergingBackend) reads() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls
+}
+
+func converging(script ...[]charts.ServiceState) *convergingBackend {
+	return &convergingBackend{driftBackend: driftedBackend(), script: script}
+}
+
+// NewestTaskAge past the stability window: parity alone is not convergence, and
+// a fixture that ignored the window would report converged where a real swarm
+// would still be waiting.
+func convergedStates() []charts.ServiceState {
+	return []charts.ServiceState{{Name: "whoami_app", Running: 1, Desired: 1, NewestTaskAge: time.Hour}}
+}
+
+func progressingStates() []charts.ServiceState {
+	return []charts.ServiceState{{Name: "whoami_app", Running: 0, Desired: 1}}
+}
+
+// Swarm never rolls back a rollback, so a paused rollout needs a human — the
+// engine calls it wedged and waiting it out only delays the report.
+func wedgedStates() []charts.ServiceState {
+	return []charts.ServiceState{{Name: "whoami_app", Running: 1, Desired: 1, UpdateState: "paused"}}
+}
+
+func waitingSpec(name string, automated bool) application.Spec {
+	s := liveSpec(name, automated)
+	s.SyncPolicy.Wait = true
+	return s
+}
+
+// fastPolling shrinks the converge poll so a test does not spend it.
+func fastPolling(t *testing.T) {
+	t.Helper()
+	prev := convergePollInterval
+	convergePollInterval = time.Millisecond
+	t.Cleanup(func() { convergePollInterval = prev })
+}
+
+// A correction is a deploy, so syncPolicy.wait has to mean the same thing for it
+// as for any other. It did not: converging writes through DeployStack rather
+// than Engine.Apply, and the engine is where the wait lives.
+func TestConvergeWaitsForTheCorrectionToSettle(t *testing.T) {
+	fastPolling(t)
+	backend := converging(progressingStates(), progressingStates(), convergedStates())
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{waitingSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	// It polled rather than accepting the first answer, which is the whole point:
+	// the daemon accepts the write long before the rollout has landed.
+	if got := backend.reads(); got < 3 {
+		t.Errorf("read the swarm %d times, want it to have polled until converged", got)
+	}
+	if got := backend.converged(); len(got) != 1 {
+		t.Errorf("redeployed %v, want the drifted release", got)
+	}
+}
+
+// A correction that deploys and then wedges recorded a successful sync. Because
+// health only turns a slow rollout into a broken one on the back of a failed
+// sync, the release then read as progressing indefinitely instead of degraded —
+// the exact failure the wait policy exists to surface.
+func TestConvergeThatWedgesFailsTheSync(t *testing.T) {
+	fastPolling(t)
+	rec := listen(t)
+	backend := converging(wedgedStates())
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{waitingSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	err := r.Sync(context.Background(), "edge")
+	if err == nil {
+		t.Fatal("Sync = nil, want the wedged correction surfaced")
+	}
+	if !strings.Contains(err.Error(), "whoami") {
+		t.Errorf("error %q does not name the release", err)
+	}
+
+	view, _ := r.View("edge")
+	if last := view.Status.Sync.LastSync; last == nil || last.Succeeded {
+		t.Errorf("lastSync = %+v, want a failure recorded", last)
+	}
+	// Deployed but not settled, so it is not announced as corrected.
+	if slices.Contains(rec.types(), notify.DriftConverged) {
+		t.Error("announced a correction that never converged")
+	}
+}
+
+// An application that did not ask to wait must not start: the policy is opt-in,
+// and waiting by default would make every correction as slow as its rollout.
+func TestConvergeDoesNotWaitWithoutThePolicy(t *testing.T) {
+	// Deliberately no fastPolling: if this waited at all it would poll a
+	// backend that never converges, and the test would hang rather than fail.
+	backend := converging(progressingStates())
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := backend.converged(); len(got) != 1 {
+		t.Errorf("redeployed %v, want the correction to have gone ahead unwaited", got)
+	}
+}
+
+// A rollout that never lands must end, or the reconcile loop for this
+// application never ticks again.
+func TestConvergeWaitTimesOut(t *testing.T) {
+	fastPolling(t)
+	backend := converging(progressingStates())
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+
+	// A clock that advances a minute per reading, so the deadline is reached in
+	// a handful of polls rather than in real time.
+	var ticks int
+	clock := func() time.Time {
+		ticks++
+		return time.Unix(0, 0).UTC().Add(time.Duration(ticks) * time.Minute)
+	}
+
+	spec := waitingSpec("edge", true)
+	spec.SyncPolicy.Timeout = application.Duration(3 * time.Minute)
+	r := New([]application.Spec{spec}, Options{
+		Fetcher:   &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{backend: backend},
+		NewEngine: func(charts.Backend) Engine { return engine },
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:       clock,
+	})
+
+	err := r.Sync(context.Background(), "edge")
+	if err == nil {
+		t.Fatal("Sync = nil, want a timeout")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error %q does not report a timeout", err)
+	}
+}

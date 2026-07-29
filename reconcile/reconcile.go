@@ -905,6 +905,12 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
 			continue
 		}
+		if err := r.awaitConverged(ctx, spec, backend, release); err != nil {
+			// Deployed but not settled. Not counted as converged: the write
+			// landed, the correction did not finish, and the sync says so.
+			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
+			continue
+		}
 		converged = append(converged, release)
 		r.log.Warn("redeployed a release whose running services had been changed outside the repository",
 			"application", spec.Name, "release", release)
@@ -919,6 +925,71 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 		})
 	}
 	return errors.Join(errs...)
+}
+
+// convergePollInterval is how often a correction re-reads the swarm while
+// waiting for it to settle. A variable so tests do not have to spend it.
+var convergePollInterval = 2 * time.Second
+
+// defaultConvergeTimeout bounds a wait the application did not bound itself,
+// matching the chart engine's own default for the same policy.
+const defaultConvergeTimeout = 5 * time.Minute
+
+// awaitConverged blocks until a corrected release has settled, when the
+// application's sync policy asks it to.
+//
+// A drift correction is a deploy, so syncPolicy.wait has to mean the same thing
+// for it as for any other. Without this it did not: converging writes through
+// Backend.DeployStack rather than Engine.Apply — because the engine skips a
+// release it planned as unchanged, which every drifted release is — and the
+// engine is where the wait lives (charts.Engine.deployAndRecord). So a
+// correction returned the moment the daemon accepted the write.
+//
+// That mattered for reporting rather than for data. A correction that deploys
+// and then wedges recorded a successful sync, and because health turns a slow
+// rollout into a broken one only on the back of a failed sync
+// (health.serviceHealth), the release then read as progressing indefinitely
+// instead of degraded — the exact failure the wait policy exists to convert into
+// something an operator is told about.
+//
+// It also gives the converge path the ordering the docs already promise, since
+// releases are corrected in plan order: with wait set, a later release is not
+// redeployed until an earlier one it depends on is live.
+//
+// The judgement is the chart engine's own exported rollup, not a second copy.
+// Every rule in it was corrected at least once — the running count by actual
+// rather than desired state, the target over active nodes, a completed one-shot
+// job, the stability window measured from task creation — and a reimplementation
+// would diverge silently in both directions.
+func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, backend charts.Backend, release string) error {
+	if !spec.SyncPolicy.Wait {
+		return nil
+	}
+
+	timeout := time.Duration(spec.SyncPolicy.Timeout)
+	if timeout <= 0 {
+		timeout = defaultConvergeTimeout
+	}
+	deadline := r.now().Add(timeout)
+
+	for {
+		switch c := charts.Rollup(backend.StackServices(release)); c.Phase {
+		case charts.PhaseWedged:
+			// Swarm has given up and will not continue on its own, so waiting
+			// out the deadline would only delay the same answer.
+			return fmt.Errorf("release %q did not converge: %s", release, c.Reason)
+		case charts.PhaseConverged:
+			return nil
+		}
+		if !r.now().Before(deadline) {
+			return fmt.Errorf("timed out after %s waiting for release %q to converge", timeout, release)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(convergePollInterval):
+		}
+	}
 }
 
 // prune deletes the releases this application used to declare and no longer
