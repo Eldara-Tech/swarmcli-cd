@@ -68,6 +68,12 @@ type Backend struct {
 	// token, git token or another application's registry credential. Set
 	// controller-wide by WithForbiddenSecrets; empty disables the check.
 	forbiddenSecrets map[string]struct{}
+	// self is what Swarm reports it has mounted into this controller, read from
+	// its own service spec on the first deploy that needs it. It covers the
+	// controller's configs, which have no /run/secrets equivalent to list, and
+	// corrects its secrets, which that listing names by mount target rather than
+	// by the name a reference uses. Shared by every With* copy.
+	self *selfMountCache
 	// now stamps the swarmcli.created label; overridable in tests.
 	now func() time.Time
 }
@@ -90,7 +96,8 @@ func New(api client.APIClient, o Options) *Backend {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	return &Backend{api: api, log: o.Log, onOutOfBandChange: o.OnOutOfBandChange, now: o.Now}
+	return &Backend{api: api, log: o.Log, onOutOfBandChange: o.OnOutOfBandChange, now: o.Now,
+		self: &selfMountCache{}}
 }
 
 // ApplyServices creates the stack's services that do not exist and updates
