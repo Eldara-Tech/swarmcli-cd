@@ -173,13 +173,20 @@ func (b *Backend) CreateConfig(ctx context.Context, name string, data []byte, la
 	return err
 }
 
-// ListConfigs returns every config's name and labels.
+// ListConfigs returns every config's name, labels and payload.
 //
-// One ConfigList call, not a list followed by an inspect per config. The CE
-// backend inspects each one because the TUI wants CreatedAt, which ConfigList
-// omits — but the engine only reads Name and Labels here, and this runs on
-// every reconcile against a store that grows by one config per release
-// revision.
+// One ConfigList call and nothing else. A config's payload comes back in the
+// list response, not only on inspect, so passing it through means the engine
+// decodes release history straight from this call instead of inspecting each
+// stored revision (Eldara-Tech/swarmcli#510). That matters here more than
+// anywhere: this runs on every reconcile, against a store that grows by one
+// config per release revision, and a controller reconciles on a timer whether
+// or not anything changed.
+//
+// Deliberately unfiltered. The engine reads this for two different questions —
+// which configs hold release history, and which config names exist at all — and
+// the second one is asked about external configs, which carry no swarmcli label
+// to filter on.
 func (b *Backend) ListConfigs(ctx context.Context) ([]charts.ConfigMeta, error) {
 	configs, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{})
 	if err != nil {
@@ -187,7 +194,7 @@ func (b *Backend) ListConfigs(ctx context.Context) ([]charts.ConfigMeta, error) 
 	}
 	out := make([]charts.ConfigMeta, 0, len(configs))
 	for _, c := range configs {
-		out = append(out, charts.ConfigMeta{Name: c.Spec.Name, Labels: c.Spec.Labels})
+		out = append(out, charts.ConfigMeta{Name: c.Spec.Name, Labels: c.Spec.Labels, Data: c.Spec.Data})
 	}
 	return out, nil
 }
