@@ -31,6 +31,8 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/secrets"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
+
+	swarmlog "github.com/Eldara-Tech/swarmcli/utils/log"
 )
 
 // Defaults for the in-swarm deployment: applications.yaml arrives as a Docker
@@ -164,6 +166,14 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	// for slog.Default or the standard log package would otherwise write a
 	// second format onto the same stream.
 	slog.SetDefault(log)
+	// The CE packages this controller imports log through swarmcli's own
+	// zap-based logger, which is a no-op until something initialises it — so
+	// everything they report has been discarded here since the applier was
+	// written. Its own Init would open a rotating file under ~/.local/state,
+	// which in a container nobody would ever read; this hands it the same
+	// handler instead, so one process still means one format on one stream.
+	// See issue #72.
+	swarmlog.InitSlog(log.Handler())
 
 	// Both signals stop the process the same way. Swarm sends SIGTERM on
 	// `service update` and on rollout; SIGINT is what a terminal sends.
