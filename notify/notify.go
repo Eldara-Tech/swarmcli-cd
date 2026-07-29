@@ -47,8 +47,8 @@ const (
 	DriftConverged EventType = "drift-converged"
 	// ResourcesPruned reports that the controller deleted the deployed
 	// resources of something git no longer declares — a whole application that
-	// left the app set, or a release an application stopped declaring. Message
-	// names what went.
+	// left the app set, a release an application stopped declaring, or a service
+	// its chart stopped declaring. Message names what went.
 	//
 	// It is the loudest thing this controller does, and the only event that
 	// reports something destroyed rather than converged.

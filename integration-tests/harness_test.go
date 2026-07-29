@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -564,4 +565,92 @@ func fieldOf(t *testing.T, d *application.ReleaseDrift, service, field string) a
 	}
 	t.Fatalf("no %q difference reported for %q; got %+v", field, service, d.Services)
 	return application.FieldDrift{}
+}
+
+// twoServiceChartFiles is a stack whose second service sits behind a value, so
+// that one commit drops a service from the template — the case in #75 — while
+// changing nothing else about the release.
+//
+// The sidecar owns a named volume, which is what lets a test assert the other
+// half of the decision: the service goes, its volume does not.
+func twoServiceChartFiles(release string, sidecar bool) map[string]string {
+	files := chartFiles(release, 1)
+	files["charts/app/values.yaml"] = "replicas: 1\nsidecar: " + truth(sidecar) + "\n"
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    deploy:\n" +
+		"      replicas: {{ .Values.replicas }}\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"{{- if .Values.sidecar }}\n" +
+		"  sidecar:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    volumes:\n" +
+		"      - scratch:/scratch\n" +
+		"    deploy:\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"volumes:\n" +
+		"  scratch: {}\n" +
+		"{{- end }}\n"
+	return files
+}
+
+func truth(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// sweepingApp is an application that deletes the services its chart has stopped
+// declaring. The drift mode is a parameter because the feature is deliberately
+// independent of it.
+func sweepingApp(name, repoDir string, mode application.DriftDetection) application.Spec {
+	app := releaseApp(name, repoDir, true)
+	app.DriftDetection = mode
+	app.SyncPolicy.PruneServices = true
+	return app
+}
+
+// serviceNamesOf lists a stack's running services by scoped name.
+func serviceNamesOf(t *testing.T, cli *dockerclient.Client, release string) []string {
+	t.Helper()
+	svcs, err := cli.ServiceList(context.Background(), swarm.ServiceListOptions{
+		Filters: filters.NewArgs(filters.Arg("label", "com.docker.stack.namespace="+release)),
+	})
+	if err != nil {
+		t.Fatalf("listing the stack's services: %v", err)
+	}
+	names := make([]string, 0, len(svcs))
+	for _, s := range svcs {
+		names = append(names, s.Spec.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// createServiceByHand deploys a service into a stack's namespace the way an
+// operator with a shell would: carrying the label that says it belongs to the
+// release, and with nothing anywhere saying this controller put it there.
+func createServiceByHand(t *testing.T, cli *dockerclient.Client, release, name string) {
+	t.Helper()
+	spec := swarm.ServiceSpec{
+		Annotations: swarm.Annotations{
+			Name:   name,
+			Labels: map[string]string{"com.docker.stack.namespace": release},
+		},
+		TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{
+			Image:   "busybox:1.36",
+			Command: []string{"sleep", "3600"},
+		}},
+	}
+	if _, err := cli.ServiceCreate(context.Background(), spec, swarm.ServiceCreateOptions{}); err != nil {
+		t.Fatalf("creating service %q by hand: %v", name, err)
+	}
 }

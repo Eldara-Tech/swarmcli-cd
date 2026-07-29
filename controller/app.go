@@ -335,23 +335,38 @@ func printDrift(out io.Writer, releases []application.ReleaseStatus) {
 		}
 		rows := make([][]string, 0, len(r.Drift.Services))
 		for _, s := range r.Drift.Services {
+			reason := driftReason(s)
 			if len(s.Fields) == 0 {
 				// Missing or unexpected: the service itself is the finding, and
 				// there is no field to name.
-				rows = append(rows, []string{s.Name, state(s.Reason), "", "", ""})
+				rows = append(rows, []string{s.Name, reason, "", "", ""})
 				continue
 			}
 			for _, f := range s.Fields {
-				rows = append(rows, []string{s.Name, state(s.Reason), f.Field, f.Desired, f.Live})
+				rows = append(rows, []string{s.Name, reason, f.Field, f.Desired, f.Live})
 			}
 			if s.Truncated > 0 {
-				rows = append(rows, []string{s.Name, state(s.Reason),
+				rows = append(rows, []string{s.Name, reason,
 					fmt.Sprintf("(and %d more)", s.Truncated), "", ""})
 			}
 		}
 		_, _ = fmt.Fprintf(out, "\n%s drift:\n", r.Name)
 		table(out, []string{"SERVICE", "REASON", "FIELD", "DESIRED", "LIVE"}, rows)
 	}
+}
+
+// driftReason renders one finding, marking an unexpected service this
+// application provably installed and no longer declares.
+//
+// The distinction is the whole of what makes deleting one safe, so it belongs in
+// front of an operator before they enable anything: an orphaned service is what
+// a sync will remove once syncPolicy.pruneServices is on, and an unexpected one
+// without the marker is something this controller will never touch.
+func driftReason(s application.ServiceDrift) string {
+	if s.Orphaned {
+		return state(s.Reason) + " (orphaned)"
+	}
+	return state(s.Reason)
 }
 
 // driftMessage suffixes the state with its reason, where there is one.

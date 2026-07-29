@@ -113,6 +113,24 @@ type SyncPolicy struct {
 	// data in a volume cannot be recreated from anything.
 	PruneVolumes bool `json:"pruneVolumes,omitempty" yaml:"pruneVolumes,omitempty"`
 
+	// PruneServices deletes a service that this application's own chart used to
+	// declare and no longer does. Off by default, for the same reason as Prune.
+	//
+	// It is a sibling of Prune rather than an extension of it, and deliberately
+	// does not require it: Prune decides what happens to a whole release the
+	// application stopped declaring, this decides what happens inside a release
+	// it still declares, and an operator may reasonably want the second without
+	// the first. Applying deletes nothing, so without this a service dropped
+	// from a template runs until somebody removes it by hand.
+	//
+	// A service is deleted only when the swarm, git and this controller's own
+	// records all agree: it runs under the release's stack namespace, the
+	// rendered manifest does not declare it, and a revision this controller
+	// stamped for this application did. The namespace label alone is not
+	// evidence — anything can carry it — which is why the third clause exists.
+	// See the prune package.
+	PruneServices bool `json:"pruneServices,omitempty" yaml:"pruneServices,omitempty"`
+
 	// PruneFirst deletes before installing, instead of after.
 	//
 	// The default order applies and then prunes, so a failed apply leaves the
@@ -282,6 +300,17 @@ type ServiceDrift struct {
 	// every field was rewritten would otherwise put an unbounded list into a
 	// status payload served on every poll.
 	Truncated int `json:"truncated,omitempty"`
+	// Orphaned marks an Unexpected service this application provably installed
+	// and no longer declares: a revision carrying its owner stamp declared it,
+	// which the stack's namespace label alone could never establish. Read it as
+	// "this goes on the next sync".
+	//
+	// Only ever set when SyncPolicy.PruneServices is on, because that is the
+	// only case where the proof is worth computing. An unexpected service on an
+	// application that has not enabled it carries no marker and is not a
+	// candidate for anything — the same distinction charts.Plan draws between
+	// an orphaned release and an unmanaged one.
+	Orphaned bool `json:"orphaned,omitempty"`
 }
 
 // FieldDrift is one field that differs, rendered rather than typed: this

@@ -199,7 +199,8 @@ When and how a plan is applied.
 | `historyMax` | engine default | revisions kept per release (one Docker config each); older revisions are pruned |
 | `prune` | `false` | delete the resources of a release this application no longer declares. Only ever its own releases — see [prune](#prune) |
 | `pruneVolumes` | `false` | extend `prune` to the named volumes of what it deletes. Requires `prune`; set alone it is a config error |
-| `pruneFirst` | `false` | delete before installing rather than after, so a replaced release never overlaps its replacement. Requires `prune`; see [ordering](#ordering-and-workloads-that-must-never-run-twice) |
+| `pruneServices` | `false` | delete a service this application's chart used to declare and no longer does. Stands alone — it does not require `prune`; see [prune](#prune) |
+| `pruneFirst` | `false` | delete before installing rather than after, so a replaced release never overlaps its replacement. Requires `prune` or `pruneServices`; see [ordering](#ordering-and-workloads-that-must-never-run-twice) |
 
 (The `swarmcli-cd app sync --wait` *client* command has its own, separate
 `--timeout`, defaulting to 5m — that bounds how long the CLI watches, not the
@@ -282,7 +283,10 @@ change, which is the surface an out-of-band change actually uses:
 Plus two findings about the service rather than a field: a service the manifest
 declares that is **missing** from the swarm, and one running under the stack's
 namespace that the manifest does not declare (**unexpected**). An unexpected
-service is reported and never deleted.
+service is never *converged* — a redeploy would leave it exactly where it is,
+since applying deletes nothing. Removing it is a different switch:
+[`syncPolicy.pruneServices`](#a-service-a-chart-stops-declaring), which deletes
+only what the controller can prove it installed.
 
 Environment **values are never reported** — only whether a variable is `set`,
 `absent` or `changed`. What is running is whatever was set out of band, this is
@@ -515,10 +519,66 @@ applications:
       automated: true
       prune: true          # delete releases this application no longer declares
       pruneVolumes: false  # and their volumes; requires prune
+      pruneServices: true  # delete services its charts no longer declare
 ```
 
 Not to be confused with `historyMax`, which trims a release's revision *history*
 and never touches anything deployed.
+
+#### A service a chart stops declaring
+
+`prune` above is about a whole release. A service **inside** a release that is
+still declared is a different case and has its own switch, because applying
+deletes nothing: edit a chart to drop a service and the next sync deploys what
+is left and never mentions the one that went. It keeps running, and every later
+reconcile honestly reports the release unchanged, because the rendered manifest
+really does match the last applied one.
+
+`pruneServices` deletes it. It does **not** require `prune`: that decides what
+happens to a release this application stopped declaring, this decides what
+happens inside one it still declares, and wanting the second without the first
+is a reasonable position rather than half a config.
+
+A service is deleted only when the swarm, git and this controller's own records
+all agree:
+
+1. it is running under the release's `com.docker.stack.namespace`;
+2. the freshly rendered manifest does not declare it;
+3. a stored revision **stamped by this controller for this application**
+   declared it.
+
+The third clause is what makes the deletion safe, and note what it is not: the
+namespace label. A stack is a name prefix plus that label and nothing more — no
+`/stacks` endpoint, no owner references — and anything can carry it, so a sidecar
+somebody attached by hand reads exactly like a service the controller installed.
+A stored revision does not: this controller wrote it, it names the owner, and it
+never changes afterwards. The label says where a service lives; the record says
+whose it is.
+
+A service failing the third clause is **reported and never deleted**. It shows
+as `unexpected` without the `(orphaned)` marker, which is also how a service
+older than the release's retained history reads — `historyMax` keeps everything
+by default, so that only arises if you set it.
+
+It works in either drift mode. Removing a service from a template is git moving,
+not the swarm moving, so coupling it to `driftDetection: live` would make it a
+no-op under the default. Enabling it costs one service list per deployed release
+per reconcile, and reads a release's history only when that release actually has
+a candidate.
+
+Volumes the pruned service mounted are **left in place** and reported, not
+deleted, even with `pruneVolumes` on. That flag means "when a whole release goes,
+its data goes with it"; a service leaving a template is a far more frequent
+event, and nothing here can prove another stack does not mount the same volume.
+
+`swarmcli-cd app get` marks what a sync will remove, so a manual-policy
+application shows it before anything acts on it:
+
+```
+SERVICE          REASON                  FIELD  DESIRED  LIVE
+web_sidecar      unexpected (orphaned)
+web_stranger     unexpected
+```
 
 #### Ordering, and workloads that must never run twice
 

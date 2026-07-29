@@ -295,6 +295,11 @@ func TestRenamingAnApplicationKeepsItsStackAndVolume(t *testing.T) {
       automated: true
       wait: true
       timeout: 3m
+      # On, so that this also proves the two sweeps do not interact. A rename
+      # changes no manifest, so no service is ever a candidate; if the service
+      # sweep were keyed on anything weaker it would delete the very stack this
+      # test exists to watch being handed over.
+      pruneServices: true
   - name: anchor
     source:
       repoURL: ` + anchorRepo + `
@@ -359,6 +364,9 @@ func TestRenamingAnApplicationKeepsItsStackAndVolume(t *testing.T) {
 
 	if got := stackServiceIDs(t, cli, release); !slices.Equal(got, before) {
 		t.Errorf("service ids = %v, want %v; the stack was recreated rather than handed over", got, before)
+	}
+	if got := len(stackServiceIDs(t, cli, release)); got != len(before) {
+		t.Errorf("%d services after the rename, want the original %d; the service sweep took one", got, len(before))
 	}
 	if got := stackVolumeCount(t, cli, release); got != 1 {
 		t.Errorf("%d volumes after the rename, want the original 1", got)

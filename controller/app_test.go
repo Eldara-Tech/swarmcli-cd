@@ -680,3 +680,26 @@ func TestAppGetOmitsDriftWhenNotUsed(t *testing.T) {
 		t.Errorf("stdout = %q, want no drift line for a manifest-mode application", stdout)
 	}
 }
+
+// An operator has to be able to tell the two apart before enabling anything: an
+// orphaned service is what a sync will delete, an unexpected one without the
+// marker is something this controller will never touch.
+func TestAppGetMarksAnOrphanedServiceAndLeavesOtherUnexpectedOnesPlain(t *testing.T) {
+	v := driftedView()
+	v.Status.Releases[0].Drift.Services = []application.ServiceDrift{
+		{Name: "web_sidecar", Reason: application.DriftUnexpected, Orphaned: true},
+		{Name: "web_stranger", Reason: application.DriftUnexpected},
+	}
+	server := start(t, &stubReconciler{view: v})
+
+	code, stdout, _ := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "unexpected (orphaned)") {
+		t.Errorf("stdout does not mark the orphan:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "web_stranger  unexpected (orphaned)") {
+		t.Errorf("stdout marks a service nobody proved was ours:\n%s", stdout)
+	}
+}

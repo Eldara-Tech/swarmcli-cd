@@ -464,8 +464,8 @@ func TestReleasesAreGroupedByApplicationInListOrder(t *testing.T) {
 }
 
 func TestOwnerRejectsWhatItCannotProve(t *testing.T) {
-	if app, ok := owner(owned("api", "edge"), testController); !ok || app != "edge" {
-		t.Errorf("owner(well-formed) = %q, %v; want edge, true", app, ok)
+	if app, ok := Owner(owned("api", "edge"), testController); !ok || app != "edge" {
+		t.Errorf("Owner(well-formed) = %q, %v; want edge, true", app, ok)
 	}
 	for _, rel := range []charts.Release{
 		stamped("api", ""),
@@ -474,8 +474,8 @@ func TestOwnerRejectsWhatItCannotProve(t *testing.T) {
 		stamped("api", "apply/edge:release/api"),
 		ownedBy("api", "staging", "edge"),
 	} {
-		if app, ok := owner(rel, testController); ok {
-			t.Errorf("owner(%q) = %q, true; want it rejected", rel.Owner, app)
+		if app, ok := Owner(rel, testController); ok {
+			t.Errorf("Owner(%q) = %q, true; want it rejected", rel.Owner, app)
 		}
 	}
 }
@@ -515,5 +515,84 @@ func TestAFailureThatLeftTheReleaseIsStillAFailure(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("pruned = %v, want none", got)
+	}
+}
+
+// ------------------------------------------------------- the service rule
+
+func TestUndeclaredNamesWhatTheManifestDroppedAndNothingElse(t *testing.T) {
+	running := []string{"web_app", "web_sidecar", "web_cache"}
+	declared := []string{"web_app", "web_worker"}
+
+	// web_worker is declared and not running, which is a missing service and
+	// somebody else's problem: a redeploy creates it, and this only ever looks
+	// at what is already there.
+	if got, want := Undeclared(running, declared), []string{"web_cache", "web_sidecar"}; !slices.Equal(got, want) {
+		t.Errorf("Undeclared = %v, want %v", got, want)
+	}
+}
+
+func TestUndeclaredIsSortedWhateverTheSwarmReturned(t *testing.T) {
+	got := Undeclared([]string{"web_z", "web_a", "web_m"}, nil)
+	if want := []string{"web_a", "web_m", "web_z"}; !slices.Equal(got, want) {
+		t.Errorf("Undeclared = %v, want %v — an unstable order makes a status poll look like a change", got, want)
+	}
+}
+
+func TestUndeclaredFindsNothingWhenEverythingRunningIsDeclared(t *testing.T) {
+	if got := Undeclared([]string{"web_app"}, []string{"web_app", "web_worker"}); got != nil {
+		t.Errorf("Undeclared = %v, want nil", got)
+	}
+}
+
+// The empty swarm, which is also the release that has just been installed.
+func TestUndeclaredFindsNothingWhenNothingIsRunning(t *testing.T) {
+	if got := Undeclared(nil, []string{"web_app"}); got != nil {
+		t.Errorf("Undeclared = %v, want nil", got)
+	}
+}
+
+func TestClaimSplitsOnWhatTheRevisionDeclared(t *testing.T) {
+	claimed, rest := Claim([]string{"web_sidecar", "web_stranger"}, []string{"web_app", "web_sidecar"})
+
+	if want := []string{"web_sidecar"}; !slices.Equal(claimed, want) {
+		t.Errorf("claimed = %v, want %v", claimed, want)
+	}
+	// The one no revision of ours declared. It may be another tool's, or ours
+	// from before the retained history; from here those are the same thing.
+	if want := []string{"web_stranger"}; !slices.Equal(rest, want) {
+		t.Errorf("rest = %v, want %v", rest, want)
+	}
+}
+
+// What lets a sweep stop reading history: everything accounted for leaves
+// nothing to carry into an older revision.
+func TestClaimLeavesNothingWhenARevisionDeclaredEveryCandidate(t *testing.T) {
+	claimed, rest := Claim([]string{"web_a", "web_b"}, []string{"web_a", "web_b", "web_c"})
+
+	if want := []string{"web_a", "web_b"}; !slices.Equal(claimed, want) {
+		t.Errorf("claimed = %v, want %v", claimed, want)
+	}
+	if len(rest) != 0 {
+		t.Errorf("rest = %v, want none — the walk should stop here", rest)
+	}
+}
+
+// A revision that declared none of them proves nothing and consumes nothing.
+func TestClaimCarriesEveryCandidatePastAnUnrelatedRevision(t *testing.T) {
+	claimed, rest := Claim([]string{"web_a"}, []string{"web_other"})
+
+	if len(claimed) != 0 {
+		t.Errorf("claimed = %v, want none", claimed)
+	}
+	if want := []string{"web_a"}; !slices.Equal(rest, want) {
+		t.Errorf("rest = %v, want %v", rest, want)
+	}
+}
+
+func TestClaimWithNoCandidatesDoesNothing(t *testing.T) {
+	claimed, rest := Claim(nil, []string{"web_app"})
+	if claimed != nil || rest != nil {
+		t.Errorf("Claim(nil, …) = %v, %v; want nil, nil", claimed, rest)
 	}
 }

@@ -1585,19 +1585,75 @@ type driftBackend struct {
 	desired map[string]*compose.Stack
 	live    map[string]map[string]swarm.Service
 	readErr error
+	// byManifest answers for one specific manifest rather than for whatever a
+	// release currently renders to. The service sweep converts stored revisions,
+	// so a fake that answered the same thing for every manifest could not tell
+	// "the chart used to declare this" from "the chart declares it now".
+	byManifest map[string]*compose.Stack
 
 	mu sync.Mutex
 	// deployed records each converge as "<release>|<manifest>", so one field
 	// carries both that a correction happened and that it wrote the right thing.
 	deployed  []string
 	deployErr error
+	// manifestReads records every manifest converted, in order, which is how a
+	// test sees that the history walk stopped early.
+	manifestReads []string
+	// removedServices records the ids the sweep deleted.
+	removedServices []string
+	removeErr       error
+	// appliedAt reports how many applies had happened, sampled at each removal.
+	// It is what distinguishes the two prune orderings.
+	appliedAt      func() int
+	removedAtApply []int
 }
 
-func (b *driftBackend) DesiredServices(_ context.Context, _, stack string) (*compose.Stack, error) {
+func (b *driftBackend) DesiredServices(_ context.Context, manifest, stack string) (*compose.Stack, error) {
 	if b.readErr != nil {
 		return nil, b.readErr
 	}
+	b.mu.Lock()
+	b.manifestReads = append(b.manifestReads, manifest)
+	b.mu.Unlock()
+	if s, ok := b.byManifest[manifest]; ok {
+		return s, nil
+	}
 	return b.desired[stack], nil
+}
+
+// RemoveService deletes from the fake swarm as well as recording, so that the
+// reconcile after a sweep sees what the sweep did rather than reporting the same
+// orphan for ever.
+func (b *driftBackend) RemoveService(_ context.Context, id string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.removeErr != nil {
+		return b.removeErr
+	}
+	b.removedServices = append(b.removedServices, id)
+	if b.appliedAt != nil {
+		b.removedAtApply = append(b.removedAtApply, b.appliedAt())
+	}
+	for _, stack := range b.live {
+		for name, svc := range stack {
+			if svc.ID == id {
+				delete(stack, name)
+			}
+		}
+	}
+	return nil
+}
+
+func (b *driftBackend) pruned() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.removedServices)
+}
+
+func (b *driftBackend) converted() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.manifestReads)
 }
 
 func (b *driftBackend) LiveServices(_ context.Context, stack string) (map[string]swarm.Service, error) {
@@ -2186,5 +2242,360 @@ func TestConvergeWaitTimesOut(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "timed out") {
 		t.Errorf("error %q does not report a timeout", err)
+	}
+}
+
+// ------------------------------------------ syncPolicy.pruneServices (#75)
+
+// The stack as the swarm holds it: two services running, a chart that has
+// stopped declaring one of them, and a stored revision that declared both.
+//
+// That last part is the whole point. The namespace label says whoami_sidecar
+// belongs to this release and anything could have set it; the revision says this
+// controller installed it, and only that is a basis for deleting.
+func sweepBackend() *driftBackend {
+	app := serviceSpec("whoami_app", 1)
+	sidecar := serviceSpec("whoami_sidecar", 1)
+	return &driftBackend{
+		desired: map[string]*compose.Stack{
+			"whoami": {Services: []compose.Service{{Name: "app", Spec: app}}},
+		},
+		byManifest: map[string]*compose.Stack{
+			"had-a-sidecar": {Services: []compose.Service{
+				{Name: "app", Spec: app},
+				{Name: "sidecar", Spec: sidecar},
+			}},
+		},
+		live: map[string]map[string]swarm.Service{
+			"whoami": {
+				"whoami_app":     {ID: "id-app", Spec: app},
+				"whoami_sidecar": {ID: "id-sidecar", Spec: sidecar},
+			},
+		},
+	}
+}
+
+// revisions of "whoami" stamped for app, newest last, each naming the manifest
+// the backend above will convert for it.
+func sweepHistory(app string, manifests ...string) map[string][]charts.Release {
+	stamp := charts.OwnerRef{
+		ID:   application.OwnerID("", app),
+		Kind: charts.OwnerKindRelease,
+		Name: "whoami",
+	}.String()
+
+	revs := make([]charts.Release, 0, len(manifests))
+	for i, m := range manifests {
+		revs = append(revs, charts.Release{
+			Name: "whoami", Revision: i + 1, Manifest: m, Owner: stamp,
+		})
+	}
+	return map[string][]charts.Release{"whoami": revs}
+}
+
+func sweepingSpec(name string, drift application.DriftDetection) application.Spec {
+	s := spec(name, true)
+	s.SyncPolicy.PruneServices = true
+	s.DriftDetection = drift
+	return s
+}
+
+func orphanedServices(t *testing.T, r *Reconciler, app string) []string {
+	t.Helper()
+	view, _ := r.View(app)
+	var out []string
+	for _, rel := range view.Status.Releases {
+		if rel.Drift == nil {
+			continue
+		}
+		for _, svc := range rel.Drift.Services {
+			if svc.Orphaned {
+				out = append(out, svc.Name)
+			}
+		}
+	}
+	return out
+}
+
+// The case in the issue, in the default drift mode. A service dropped from a
+// template is removed, and the one the chart still declares is untouched.
+//
+// Deliberately manifest mode: the feature is about git moving, not about the
+// swarm moving, and hanging it off driftDetection: live would make it a silent
+// no-op for every application running the default.
+func TestAServiceDroppedFromTheChartIsPrunedInManifestMode(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
+		t.Errorf("removed %v, want %v — only the service the chart stopped declaring", backend.pruned(), want)
+	}
+}
+
+// Manifest mode has no drift axis at all, so without this the controller would
+// delete a service and leave no record of it anywhere but a log line.
+func TestAPrunedServiceIsReportedInManifestModeBeforeItGoes(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	// Manual, so the report can be read at the point where nothing has acted on
+	// it yet — which is also the only moment an operator could object.
+	spec := sweepingSpec("edge", application.DriftManifest)
+	spec.SyncPolicy.Automated = false
+	r := newTestWith(t, []application.Spec{spec}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	if len(backend.pruned()) != 0 {
+		t.Errorf("removed %v on a manual policy, want nothing", backend.pruned())
+	}
+	if want := []string{"whoami_sidecar"}; !slices.Equal(orphanedServices(t, r, "edge"), want) {
+		t.Errorf("orphaned = %v, want %v", orphanedServices(t, r, "edge"), want)
+	}
+	view, _ := r.View("edge")
+	if view.Status.Sync.State != application.SyncOutOfSync {
+		t.Errorf("state = %q, want out-of-sync — a leftover service is the swarm not matching git", view.Status.Sync.State)
+	}
+
+	// And manual means "not on a schedule" rather than "never".
+	if err := r.SyncNow(context.Background(), "edge"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
+		t.Errorf("removed %v after an explicit sync, want %v", backend.pruned(), want)
+	}
+}
+
+// The pre-#75 behaviour, asserted so it cannot regress into a deletion nobody
+// asked for. Live mode, because that is where an unexpected service is reported
+// at all.
+func TestAnUnexpectedServiceSurvivesWhenPruneServicesIsOff(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	if len(backend.pruned()) != 0 {
+		t.Errorf("removed %v with pruneServices off, want nothing", backend.pruned())
+	}
+	// Still reported, and without the marker: no proof is computed for an
+	// application that did not ask for one.
+	if got := orphanedServices(t, r, "edge"); len(got) != 0 {
+		t.Errorf("orphaned = %v, want none", got)
+	}
+	view, _ := r.View("edge")
+	if got := view.Status.Drift; got == nil || got.State != application.DriftStateDetected {
+		t.Errorf("drift = %+v, want detected — it is still unexpected", got)
+	}
+}
+
+// The #62 lesson one scope down. A service under the stack's namespace that no
+// revision of ours ever declared is not ours to delete, whatever the label says.
+func TestAServiceNoRevisionOfOursDeclaredIsNeverPruned(t *testing.T) {
+	backend := sweepBackend()
+	// The history is real and ours, and it never mentioned a sidecar.
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftLive)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	if len(backend.pruned()) != 0 {
+		t.Errorf("removed %v, want nothing — the namespace label is not evidence", backend.pruned())
+	}
+	if got := orphanedServices(t, r, "edge"); len(got) != 0 {
+		t.Errorf("orphaned = %v, want none — it was never proved ours", got)
+	}
+}
+
+// The same, when the revision that declared it belongs to a sibling application.
+// Its stamp names another owner, so it is that application's business.
+func TestAServiceDeclaredOnlyByAnotherApplicationsRevisionIsNeverPruned(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("somebody-else", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftLive)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if len(backend.pruned()) != 0 {
+		t.Errorf("removed %v, want nothing — the stamp names another application", backend.pruned())
+	}
+}
+
+func TestAReleaseWhoseHistoryCannotBeReadPrunesNothing(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, histErr: errors.New("swarm unreachable")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftLive)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil — an unreadable history is not a failed deploy", err)
+	}
+	if len(backend.pruned()) != 0 {
+		t.Errorf("removed %v, want nothing — nothing could be proved", backend.pruned())
+	}
+}
+
+func TestAReleaseWhoseServicesCannotBeReadPrunesNothing(t *testing.T) {
+	backend := sweepBackend()
+	backend.readErr = errors.New("daemon hiccup")
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftLive)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if len(backend.pruned()) != 0 {
+		t.Errorf("removed %v, want nothing — no service is deleted on a read that failed", backend.pruned())
+	}
+}
+
+// The running state is not yet the declared one, so nothing about it is settled
+// enough to delete from.
+func TestNothingIsPrunedWhenTheApplyFailed(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{
+		plans:    []*charts.Plan{synced()},
+		history:  sweepHistory("edge", "had-a-sidecar"),
+		applyErr: errors.New("no such image"),
+	}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftLive)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Fatal("Sync = nil, want the apply failure")
+	}
+	if len(backend.pruned()) != 0 {
+		t.Errorf("removed %v after a failed apply, want nothing", backend.pruned())
+	}
+}
+
+// The pass that drops a service from a template is an upgrade, and that is the
+// case worth putting right at once rather than an interval later.
+func TestAnUpgradedReleaseIsSweptInTheSamePass(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
+		t.Errorf("removed %v, want %v", backend.pruned(), want)
+	}
+}
+
+// A release the plan would install has nothing of ours deployed under that name,
+// so there is nothing that could be proved ours and nothing to read.
+func TestAnInstalledReleaseIsNeverSwept(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{
+		plans: []*charts.Plan{{Releases: []charts.ReleasePlan{
+			{Name: "whoami", Ref: "repo/whoami", Action: charts.ActionInstall, ToVersion: "0.1.8"},
+		}}},
+		history: sweepHistory("edge", "had-a-sidecar"),
+	}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftLive)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if len(backend.pruned()) != 0 {
+		t.Errorf("removed %v, want nothing", backend.pruned())
+	}
+	if len(backend.converted()) != 0 {
+		t.Errorf("converted %v, want nothing read at all", backend.converted())
+	}
+}
+
+// pruneFirst is about not overlapping, and a service renamed within a template
+// overlaps exactly as a renamed release does.
+func TestPruneFirstRemovesTheServiceBeforeTheApply(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	backend.appliedAt = engine.applyCount
+
+	spec := sweepingSpec("edge", application.DriftManifest)
+	spec.SyncPolicy.PruneFirst = true
+	r := newTestWith(t, []application.Spec{spec}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []int{0}; !slices.Equal(backend.removedAtApply, want) {
+		t.Errorf("removed after %v applies, want %v — pruneFirst deletes before deploying", backend.removedAtApply, want)
+	}
+}
+
+// The default order, and the reason for it: a failed apply must leave the old
+// service running rather than already deleted.
+func TestTheDefaultOrderRemovesTheServiceAfterTheApply(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	backend.appliedAt = engine.applyCount
+
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []int{1}; !slices.Equal(backend.removedAtApply, want) {
+		t.Errorf("removed after %v applies, want %v", backend.removedAtApply, want)
+	}
+}
+
+// The walk stops as soon as nothing is unaccounted for, so a release upgraded a
+// thousand times does not convert a thousand manifests to prove one service.
+func TestTheHistoryWalkStopsAtTheNewestRevisionThatDeclaredIt(t *testing.T) {
+	backend := sweepBackend()
+	backend.byManifest["older-with-sidecar"] = backend.byManifest["had-a-sidecar"]
+	engine := &fakeEngine{
+		plans:   []*charts.Plan{synced()},
+		history: sweepHistory("edge", "older-with-sidecar", "had-a-sidecar"),
+	}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if slices.Contains(backend.converted(), "older-with-sidecar") {
+		t.Errorf("converted %v, want the walk to stop at the newest revision that claimed it", backend.converted())
+	}
+}
+
+// A sweep that could not delete does not fail the deploy that did land, but the
+// reconcile still says it did not do everything it set out to.
+func TestAFailedRemovalIsReportedWithoutFailingTheDeploy(t *testing.T) {
+	backend := sweepBackend()
+	backend.removeErr = errors.New("service is updating")
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Fatal("Sync = nil, want the removal failure reported")
+	}
+	view, _ := r.View("edge")
+	if last := view.Status.Sync.LastSync; last == nil || !last.Succeeded {
+		t.Errorf("last sync = %+v, want a success — the deploy landed, only the sweep did not", last)
 	}
 }

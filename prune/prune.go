@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
-// Package prune deletes the resources of an application that has left the app
-// set.
+// Package prune deletes what git no longer declares: the resources of an
+// application that has left the app set, and the rule deciding which services a
+// release still in it has stopped declaring.
+//
+// The two halves sit here together because they answer the same question at
+// different scopes — "is this provably ours, and provably obsolete" — and get it
+// right the same way, by refusing to act on a single forgeable signal. The
+// sweeping of departed applications is below; the service rule is Undeclared and
+// Claim at the foot of the file, kept as pure functions so that the reconciler
+// owns the reads and this owns the policy.
 //
 // App-of-apps (#47, decision D-e) is deliberately report-only: an application
 // dropped from the git app set stops being reconciled and its stack is left
@@ -74,6 +82,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli/charts"
@@ -386,7 +395,7 @@ func departed(releases []charts.Release, desired, declared []string, controller 
 	var out []departedApp
 	at := map[string]int{}
 	for _, rel := range releases {
-		app, ok := owner(rel, controller)
+		app, ok := Owner(rel, controller)
 		if !ok {
 			continue
 		}
@@ -406,8 +415,9 @@ func departed(releases []charts.Release, desired, declared []string, controller 
 	return out
 }
 
-// owner reports which of this controller's applications installed a release,
-// and whether this controller installed it at all.
+// Owner reports which of this controller's applications installed a release, and
+// whether this controller installed it at all. It reads a stored revision the
+// same way, since a revision carries the stamp its release does.
 //
 // Both halves of the stamp have to agree, which is the check charts makes
 // before it will call a release orphaned. An id-only comparison would treat a
@@ -415,7 +425,7 @@ func departed(releases []charts.Release, desired, declared []string, controller 
 // then delete a release nobody installed under that name. A stamp that does not
 // parse is not evidence of anything either, so it counts as unowned — and
 // unowned is never pruned.
-func owner(rel charts.Release, controller string) (string, bool) {
+func Owner(rel charts.Release, controller string) (string, bool) {
 	ref, err := charts.ParseOwner(rel.Owner)
 	if err != nil {
 		return "", false
@@ -424,4 +434,81 @@ func owner(rel charts.Release, controller string) (string, bool) {
 		return "", false
 	}
 	return application.AppFromOwnerID(controller, ref.ID)
+}
+
+// --- the service rule ---
+//
+// A service dropped from a chart's template is never removed by applying:
+// backend.ApplyServices creates and updates and deletes nothing, and neither
+// does charts.Apply. The release is still declared, so it is not orphaned and
+// the sweep above never sees it. These two functions are the rule that finds it.
+//
+// The whole difficulty is that a stack is a name prefix plus a
+// com.docker.stack.namespace label and nothing else — no /stacks endpoint, no
+// owner references, no garbage collection. That label says a service belongs to
+// a release; it does not say this controller put it there, and anything can
+// carry it. Deleting on it alone is the mistake #62 was filed for, one scope
+// down. So Undeclared produces candidates and Claim requires a second signal
+// before any of them is a deletion: a stored revision, stamped by this
+// controller for this application, whose manifest declared that service. The
+// label says where a service lives; the revision record says whose it is, and
+// only the second is a safe basis for deleting.
+
+// Undeclared names the services running under a release's namespace that its
+// rendered manifest does not declare.
+//
+// Both sides are namespace-scoped names — "<release>_<service>" — because that
+// is what a live spec carries and the only key the two sides can be matched on.
+//
+// On its own this is not permission to delete anything; it is the candidate list
+// for the ownership check. Sorted, so what gets logged and reported does not
+// reshuffle between sweeps.
+func Undeclared(running, declared []string) []string {
+	if len(running) == 0 {
+		return nil
+	}
+	keep := make(map[string]struct{}, len(declared))
+	for _, name := range declared {
+		keep[name] = struct{}{}
+	}
+
+	var out []string
+	for _, name := range running {
+		if _, ok := keep[name]; ok {
+			continue
+		}
+		out = append(out, name)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// Claim splits candidates by whether declared names them: what this revision
+// proves the repository once asked for, and what is still unaccounted for.
+//
+// Taking one revision at a time rather than the union of a whole history is what
+// lets a caller walk revisions newest first and stop as soon as nothing is left
+// unaccounted for — so the ordinary case, a service dropped last week, reads one
+// revision rather than every revision ever recorded.
+//
+// A candidate no revision of ours ever claims is not ours to delete. It may be
+// another tool's, or ours from before the retained history; from here those are
+// the same thing, which is that ownership cannot be proved.
+func Claim(candidates, declared []string) (claimed, rest []string) {
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	in := make(map[string]struct{}, len(declared))
+	for _, name := range declared {
+		in[name] = struct{}{}
+	}
+
+	for _, name := range candidates {
+		if _, ok := in[name]; ok {
+			claimed = append(claimed, name)
+			continue
+		}
+		rest = append(rest, name)
+	}
+	return claimed, rest
 }
