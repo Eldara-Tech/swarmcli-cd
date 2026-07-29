@@ -16,6 +16,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
@@ -395,9 +397,42 @@ func removeVolumes(t *testing.T, cli *dockerclient.Client, release string) {
 		return
 	}
 	for _, v := range vols.Volumes {
-		if err := cli.VolumeRemove(context.Background(), v.Name, true); err != nil {
+		if err := removeVolumeWhenReleased(cli, v.Name); err != nil {
 			t.Logf("cleanup: removing volume %q: %v", v.Name, err)
 		}
+	}
+}
+
+// volumeReleaseTimeout bounds the wait for a stack's tasks to let go of its
+// volumes. It has to outlast a stop grace period the task does not co-operate
+// with: the fixture runs `sleep`, which ignores SIGTERM, so Swarm waits the full
+// grace period and then kills it.
+const volumeReleaseTimeout = 30 * time.Second
+
+// removeVolumeWhenReleased deletes a volume once the tasks using it have gone.
+//
+// removeStack returns when the daemon has accepted the service removals, not
+// when the containers have exited, so a cleanup that deletes straight afterwards
+// races them and loses. `force` does not help: it covers a volume with no
+// container attached, not one still in use.
+//
+// Best effort by design — this is teardown, and a developer running these
+// repeatedly against one swarm is who it is for; CI throws the daemon away. What
+// it must not do is give up on the first refusal, because that is the expected
+// answer for the first few seconds every single time.
+func removeVolumeWhenReleased(cli *dockerclient.Client, name string) error {
+	deadline := time.Now().Add(volumeReleaseTimeout)
+	for {
+		err := cli.VolumeRemove(context.Background(), name, true)
+		// Already gone counts as removed: something else may have reaped it, and
+		// undoing something that did not happen has succeeded.
+		if err == nil || errdefs.IsNotFound(err) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("still in use after %s: %w", volumeReleaseTimeout, err)
+		}
+		time.Sleep(time.Second)
 	}
 }
 
