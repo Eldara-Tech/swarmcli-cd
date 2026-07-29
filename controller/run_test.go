@@ -342,6 +342,97 @@ func TestControllerHelpNamesThePruneFlags(t *testing.T) {
 	}
 }
 
+func TestControllerHelpNamesTheLogFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run = %d, want 0", code)
+	}
+	for _, want := range []string{"--log-level", "--log-format"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout = %q, want it to name %s", stdout.String(), want)
+		}
+	}
+}
+
+// A misspelled level must not leave the controller running at the default one:
+// an operator who asked for debug and silently got info would conclude the
+// thing they are chasing does not log at all.
+func TestControllerRejectsAnUnusableLogLevelOrFormat(t *testing.T) {
+	for _, tc := range []struct{ flagName, value string }{
+		{"--log-level", "verbose"},
+		{"--log-format", "logfmt"},
+	} {
+		t.Run(tc.flagName, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{"controller", tc.flagName, tc.value}, &stdout, &stderr); code != 2 {
+				t.Fatalf("run = %d, want 2", code)
+			}
+			if !strings.Contains(stderr.String(), tc.flagName) {
+				t.Errorf("stderr = %q, want it to name %s", stderr.String(), tc.flagName)
+			}
+		})
+	}
+}
+
+func TestNewLoggerWritesTheSelectedFormat(t *testing.T) {
+	for _, tc := range []struct{ format, want string }{
+		{"text", `level=INFO msg=reconcile application=whoami`},
+		{"json", `"msg":"reconcile","application":"whoami"`},
+	} {
+		t.Run(tc.format, func(t *testing.T) {
+			var out bytes.Buffer
+			log, err := newLogger(&out, "info", tc.format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log.Info("reconcile", "application", "whoami")
+			if !strings.Contains(out.String(), tc.want) {
+				t.Errorf("wrote %q, want it to contain %q", out.String(), tc.want)
+			}
+		})
+	}
+}
+
+func TestTheLogLevelFiltersWhatIsWritten(t *testing.T) {
+	var out bytes.Buffer
+	log, err := newLogger(&out, "warn", "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Info("reconcile")
+	log.Warn("drifted")
+	if strings.Contains(out.String(), "reconcile") {
+		t.Errorf("wrote %q, want the info line dropped at warn", out.String())
+	}
+	if !strings.Contains(out.String(), "drifted") {
+		t.Errorf("wrote %q, want the warn line kept", out.String())
+	}
+}
+
+// Issue #70: the process must log in one format. Most components are handed
+// the logger, but notify's log notifier is registered from an init() where
+// none exists yet and reaches for slog.Default instead — which, unset, is the
+// standard log package's own format on the same stream. So runController has
+// to set it, and this is the regression test for that one line.
+func TestTheControllerSetsTheDefaultLogger(t *testing.T) {
+	original := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(original) })
+	// serve stops on the unready authorizer, which is well after the logger has
+	// been built and installed. Nothing here needs it to get further.
+	swapAuthorizer(t, unreadyAuthorizer{})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--log-format", "json"}, &stdout, &stderr); code == 0 {
+		t.Fatal("run = 0, want the unready authorizer to have failed it")
+	}
+
+	stderr.Reset()
+	slog.Default().Info("reconcile", "application", "whoami")
+	if !strings.Contains(stderr.String(), `"msg":"reconcile"`) {
+		t.Errorf("slog.Default wrote %q, want it to go through the controller's handler", stderr.String())
+	}
+}
+
 // testListen binds an ephemeral port on the loopback: the tests need a real
 // listener but must not collide with anything, least of all each other.
 const testListen = "127.0.0.1:0"

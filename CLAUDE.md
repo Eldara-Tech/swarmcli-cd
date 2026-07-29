@@ -45,6 +45,37 @@ golangci-lint run ./...
   `eldara-cruncher <hello@eldara.io>`, matching the other code repos.
 - `gofmt` is the only formatter; import grouping is not linted.
 
+## Logging
+
+Everything goes through **one** `log/slog` handler on stderr, built in
+`runController` from `--log-level` (debug|info|warn|error, default info) and
+`--log-format` (text|json, default text), and installed with
+`slog.SetDefault`. Components take a `Log` option; `SetDefault` is what covers
+the ones that cannot — `notify`'s log notifier registers from an `init()` where
+no logger exists yet, and any dependency reaching for `slog.Default` or the
+standard `log` package lands in the same stream rather than printing a second
+format alongside it. That was issue #70; do not reintroduce a second handler.
+
+Flags, not environment variables: only credentials come from the environment
+here, for the reason `controllerUsage` gives.
+
+`text` is logfmt, which quotes any value containing a space and escapes the
+quotes inside it — so an error built with `%q` arrives with backslashes. That is
+the format working. `--log-format json` is the answer for anything that parses
+rather than reads.
+
+Levels: `Error` is a reconcile or a component failing, `Warn` is something an
+operator must see but that did not stop the loop (a prune held, a resource left
+behind, an application leaving the set), `Info` is lifecycle and events.
+
+The one gap is CE library logs, which use CE's zap-based `swarmlog` and are
+discarded here because nothing initialises it — see issue #72.
+
+The other repos meet the same contract with different libraries, deliberately:
+swarmcli-agent uses slog configured by `AGENT_LOG_*` environment variables (it
+parses no flags), and swarmcli-rbac-proxy uses zap. CE and BE stay on zap with
+lumberjack file rotation, because a TUI cannot log to the terminal it owns.
+
 ## Layout
 
 ```

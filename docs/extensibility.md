@@ -114,7 +114,7 @@ operator can tell from the logs whether the companion actually loaded rather
 than inferring it from behaviour:
 
 ```go
-slog.Info("seams",
+log.Info("seams",
     "swarms", swarms.Active(),
     "authz", authz.Active(),
     "notify", notify.Active(),   // a list: every notifier is live
