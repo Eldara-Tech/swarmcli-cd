@@ -17,6 +17,14 @@ import (
 // config an operator made by hand, and Swarm resolves it against the
 // cluster-wide store with no namespace on the reference at all. That is the
 // whole vulnerability — the name is the only thing being asked for.
+//
+// The target is the compose key rather than a `name:` override, which is both
+// the shortest way to write it and the only one that gets this far: CE's
+// external-reference pre-flight reads the deprecated `external: {name: X}` form
+// and not the current `external: true` with a sibling `name:`, so the latter is
+// refused upstream with a confusing error before the applier sees it
+// (Eldara-Tech/swarmcli#513). Either way the stack does not deploy; only this
+// form proves *this* guard is what stopped it.
 func thiefChartFiles(release, target string) map[string]string {
 	files := chartFiles(release, 1)
 	files["charts/app/templates/stack.yaml"] = "" +
@@ -25,14 +33,13 @@ func thiefChartFiles(release, target string) map[string]string {
 		"  thief:\n" +
 		"    image: busybox:1.36\n" +
 		"    command: [\"sleep\", \"3600\"]\n" +
-		"    configs: [stolen]\n" +
+		"    configs: [\"" + target + "\"]\n" +
 		"    deploy:\n" +
 		"      labels:\n" +
 		"        com.swarmcli.release: {{ .Release.Name }}\n" +
 		"configs:\n" +
-		"  stolen:\n" +
-		"    external: true\n" +
-		"    name: " + target + "\n"
+		"  \"" + target + "\":\n" +
+		"    external: true\n"
 	return files
 }
 
