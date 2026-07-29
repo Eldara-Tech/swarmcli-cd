@@ -18,6 +18,8 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/appset"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
+
+	swarmlog "github.com/Eldara-Tech/swarmcli/utils/log"
 )
 
 func TestControllerHelp(t *testing.T) {
@@ -430,6 +432,35 @@ func TestTheControllerSetsTheDefaultLogger(t *testing.T) {
 	slog.Default().Info("reconcile", "application", "whoami")
 	if !strings.Contains(stderr.String(), `"msg":"reconcile"`) {
 		t.Errorf("slog.Default wrote %q, want it to go through the controller's handler", stderr.String())
+	}
+}
+
+// Issue #72: the CE packages the applier is built on log through swarmcli's
+// own logger, which stays a no-op until something initialises it. Nothing here
+// did, so every diagnostic they wrote — docker.SnapshotWith's included — went
+// nowhere. They belong in the controller's stream, in its format.
+func TestTheControllerRoutesCELogsThroughItsHandler(t *testing.T) {
+	original := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(original) })
+	// swarmlog has no way to restore a previous logger, and leaving it pointed
+	// at a buffer that has gone out of scope would make a later test's CE call
+	// write into it. Discard is the honest reset.
+	t.Cleanup(func() { swarmlog.InitSlog(slog.NewTextHandler(io.Discard, nil)) })
+	swapAuthorizer(t, unreadyAuthorizer{})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--log-format", "json"}, &stdout, &stderr); code == 0 {
+		t.Fatal("run = 0, want the unready authorizer to have failed it")
+	}
+
+	stderr.Reset()
+	swarmlog.L().Warnf("snapshot: cli.Info failed (%s)", "cluster id unavailable")
+	got := stderr.String()
+	if !strings.Contains(got, `"msg":"snapshot: cli.Info failed (cluster id unavailable)"`) {
+		t.Errorf("a CE log line wrote %q, want it in the controller's format", got)
+	}
+	if !strings.Contains(got, `"level":"WARN"`) {
+		t.Errorf("a CE log line wrote %q, want its level carried over", got)
 	}
 }
 

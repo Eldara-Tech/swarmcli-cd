@@ -3,7 +3,7 @@ module github.com/Eldara-Tech/swarmcli-cd
 go 1.26
 
 require (
-	github.com/Eldara-Tech/swarmcli v1.13.0-rc4.0.20260722094010-8b65cf951c7e
+	github.com/Eldara-Tech/swarmcli v1.13.0-rc4.0.20260729064952-252b0d614170
 	github.com/containerd/errdefs v1.0.0
 	github.com/docker/cli v28.5.1+incompatible
 	github.com/docker/docker v28.5.2+incompatible
@@ -15,7 +15,7 @@ require (
 	dario.cat/mergo v1.0.1 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/Masterminds/goutils v1.1.1 // indirect
-	github.com/Masterminds/semver/v3 v3.3.0 // indirect
+	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/Masterminds/sprig/v3 v3.3.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.1.6 // indirect

@@ -606,7 +606,8 @@ line that shows exactly what the controller is following is worth having in
 Everything the controller writes goes to **stderr**, through one handler, in one
 format — the reconcile events, the applier's per-resource lines and the seam
 report at startup alike. `docker service logs swarmcli-cd_controller` is the
-whole of it.
+whole of it — including what the CE libraries the controller is built on write,
+which goes through the same handler rather than a log file of their own.
 
 `text` is [logfmt](https://brandur.org/logfmt), which is what an operator
 reading those logs wants. It quotes any value containing a space and escapes the

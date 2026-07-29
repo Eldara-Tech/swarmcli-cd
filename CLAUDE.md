@@ -68,8 +68,12 @@ Levels: `Error` is a reconcile or a component failing, `Warn` is something an
 operator must see but that did not stop the loop (a prune held, a resource left
 behind, an application leaving the set), `Info` is lifecycle and events.
 
-The one gap is CE library logs, which use CE's zap-based `swarmlog` and are
-discarded here because nothing initialises it — see issue #72.
+The CE packages this repository imports log through CE's own zap-based
+`swarmlog`, which is a no-op until initialised. `runController` hands it the
+same handler via `swarmlog.InitSlog`, so their lines arrive in this format on
+this stream rather than being discarded (issue #72) or opening a rotating file
+in the container. If the controller starts importing a CE package that logs
+more heavily, that is the knob — not a second handler.
 
 The other repos meet the same contract with different libraries, deliberately:
 swarmcli-agent uses slog configured by `AGENT_LOG_*` environment variables (it
