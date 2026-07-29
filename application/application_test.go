@@ -313,3 +313,47 @@ func TestReleaseDriftRoundTrip(t *testing.T) {
 		t.Errorf("round trip changed the release:\n got %+v\nwant %+v", got, want)
 	}
 }
+
+// The one place pruneServices widens the wire: a manifest-mode application that
+// has enabled it does gain a drift axis, carrying the orphans and nothing else.
+//
+// No field comparison was performed and none is implied, which is what keeps
+// `live`'s cost out of the default mode. The invariant above is untouched — it
+// is about an application that has enabled nothing.
+func TestManifestModeWithServicePruneCarriesOrphansAndNoFieldDrift(t *testing.T) {
+	status := Status{
+		Sync: Sync{State: SyncOutOfSync, Summary: SyncSummary{Unchanged: 1}},
+		Releases: []ReleaseStatus{{
+			Name: "api", Action: ActionUnchanged, Sync: SyncOutOfSync,
+			Drift: &ReleaseDrift{
+				State: DriftStateDetected,
+				Services: []ServiceDrift{{
+					Name: "api_sidecar", Reason: DriftUnexpected, Orphaned: true,
+				}},
+			},
+		}},
+	}
+
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	const want = `"drift":{"state":"detected","services":[` +
+		`{"name":"api_sidecar","reason":"unexpected","orphaned":true}]}`
+	if !strings.Contains(string(data), want) {
+		t.Errorf("orphan reporting changed shape:\n got %s\nwant it to contain %s", data, want)
+	}
+}
+
+// An unexpected service nobody proved is this application's carries no marker,
+// so "orphaned" is absent from the payload rather than present and false.
+func TestAnUnprovenUnexpectedServiceCarriesNoOrphanedField(t *testing.T) {
+	data, err := json.Marshal(ServiceDrift{Name: "api_stranger", Reason: DriftUnexpected})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := `{"name":"api_stranger","reason":"unexpected"}`; string(data) != want {
+		t.Errorf("got %s, want %s", data, want)
+	}
+}

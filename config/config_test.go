@@ -269,7 +269,41 @@ applications:
     syncPolicy: {pruneFirst: true}
 `
 	_, err := Parse([]byte(src), "applications.yaml")
-	if err == nil || !strings.Contains(err.Error(), "pruneFirst means nothing without prune") {
+	if err == nil || !strings.Contains(err.Error(), "pruneFirst means nothing without prune or pruneServices") {
 		t.Fatalf("Parse = %v, want pruneFirst refused without prune", err)
+	}
+}
+
+// pruneServices stands alone, unlike pruneVolumes and pruneFirst. It is a
+// sibling of prune rather than an extension of it: prune decides what happens to
+// a whole release the application stopped declaring, pruneServices what happens
+// inside one it still declares, and wanting the second without the first is a
+// coherent position rather than a half-written config.
+func TestPruneServicesNeedsNoOtherFlag(t *testing.T) {
+	const src = `
+applications:
+  - name: edge
+    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}
+    syncPolicy: {automated: true, pruneServices: true}
+`
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if p := f.Applications[0].SyncPolicy; !p.PruneServices || p.Prune {
+		t.Errorf("pruneServices=%v prune=%v, want true and false", p.PruneServices, p.Prune)
+	}
+}
+
+// pruneFirst orders both sweeps, so either gate gives it something to order.
+func TestPruneFirstIsAcceptedWithPruneServicesAlone(t *testing.T) {
+	const src = `
+applications:
+  - name: edge
+    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}
+    syncPolicy: {automated: true, pruneServices: true, pruneFirst: true}
+`
+	if _, err := Parse([]byte(src), "applications.yaml"); err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
 	}
 }

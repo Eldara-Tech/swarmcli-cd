@@ -21,10 +21,12 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/swarm"
 
 	"github.com/Eldara-Tech/swarmcli/charts"
@@ -460,6 +462,91 @@ type liveDriftBackend interface {
 	LiveServices(ctx context.Context, stack string) (map[string]swarm.Service, error)
 }
 
+// serviceRemover is the optional interface a backend implements to delete a
+// single service. *backend.Backend satisfies it.
+//
+// Separate from liveDriftBackend rather than folded into it, so that a backend
+// which can read the swarm but not write to it still reports what a sweep would
+// remove instead of losing the report along with the removal.
+type serviceRemover interface {
+	RemoveService(ctx context.Context, id string) error
+}
+
+// releaseView is what both the live comparison and the service sweep need from
+// one release: the specs the repository renders to, and the services actually
+// running under its namespace.
+type releaseView struct {
+	desired *compose.Stack
+	live    map[string]swarm.Service
+	// err is whatever stopped the release being read. Both features answer it
+	// the same way — report it and change nothing — because neither rewrites
+	// nor deletes a service on the strength of a read it could not make.
+	err error
+}
+
+// departedService is one service a sweep may delete: the scoped name to report
+// it by, the id to delete it by, and the named volumes it was mounting.
+//
+// The id is read before the apply and stays valid across it. An apply only ever
+// writes the services the manifest declares, and this is by definition one it
+// does not.
+type departedService struct {
+	name    string
+	id      string
+	volumes []string
+}
+
+// observe reads what is running for the releases this application's settings ask
+// about, and returns both the live-drift report and the services a sweep would
+// delete.
+//
+// The two come back together because they read the same thing, and enabling both
+// should not cost two reads of it. What they ask for differs in one way: live
+// drift looks only at a settled release, while the sweep looks at an upgraded one
+// too, because the pass that drops a service from a template is an upgrade and
+// that is the case worth putting right at once rather than an interval later.
+//
+// A release the plan would install is read for neither. Nothing of ours is
+// deployed under that name, so there is nothing to compare against and nothing
+// this controller could prove is its own to delete.
+func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b charts.Backend, engine Engine, plan *charts.Plan) (map[string]*application.ReleaseDrift, map[string][]departedService) {
+	live := spec.DriftDetection == application.DriftLive
+	sweep := spec.SyncPolicy.PruneServices
+	if !live && !sweep {
+		return nil, nil
+	}
+	ldb, ok := b.(liveDriftBackend)
+	if !ok {
+		return nil, nil
+	}
+
+	views := make(map[string]releaseView, len(plan.Releases))
+	for _, rp := range plan.Releases {
+		if rp.Action == charts.ActionInstall {
+			continue
+		}
+		if rp.Action != charts.ActionUnchanged && !sweep {
+			continue
+		}
+		var v releaseView
+		if v.desired, v.err = ldb.DesiredServices(ctx, rp.Manifest, rp.Name); v.err == nil {
+			v.live, v.err = ldb.LiveServices(ctx, rp.Name)
+		}
+		if v.err != nil {
+			r.log.Warn("could not read a release's running services",
+				"application", spec.Name, "release", rp.Name, "error", v.err)
+		}
+		views[rp.Name] = v
+	}
+
+	drifts := r.liveDrift(spec, plan, views)
+	if !sweep {
+		return drifts, nil
+	}
+	doomed := r.departed(ctx, spec, ldb, engine, plan, views)
+	return withOrphans(drifts, doomed), doomed
+}
+
 // liveDrift compares each settled release against what is running, for an
 // application that asked for it.
 //
@@ -475,12 +562,8 @@ type liveDriftBackend interface {
 // reconcile — this is a read for a reporting axis, and a daemon hiccup does not
 // make the deploy wrong. It is also not converged: the controller does not
 // write on the strength of a read it could not make.
-func (r *Reconciler) liveDrift(ctx context.Context, spec application.Spec, b charts.Backend, plan *charts.Plan) map[string]*application.ReleaseDrift {
+func (r *Reconciler) liveDrift(spec application.Spec, plan *charts.Plan, views map[string]releaseView) map[string]*application.ReleaseDrift {
 	if spec.DriftDetection != application.DriftLive {
-		return nil
-	}
-	ldb, ok := b.(liveDriftBackend)
-	if !ok {
 		return nil
 	}
 
@@ -489,21 +572,192 @@ func (r *Reconciler) liveDrift(ctx context.Context, spec application.Spec, b cha
 		if rp.Action != charts.ActionUnchanged {
 			continue
 		}
-		desired, err := ldb.DesiredServices(ctx, rp.Manifest, rp.Name)
-		if err == nil {
-			var live map[string]swarm.Service
-			if live, err = ldb.LiveServices(ctx, rp.Name); err == nil {
-				out[rp.Name] = drift.Live(desired, live)
-				continue
-			}
+		v, ok := views[rp.Name]
+		if !ok {
+			continue
 		}
-		r.log.Warn("could not compare a release against what is running",
-			"application", spec.Name, "release", rp.Name, "error", err)
-		out[rp.Name] = &application.ReleaseDrift{
-			State:   application.DriftStateUnknown,
-			Message: err.Error(),
+		if v.err != nil {
+			out[rp.Name] = &application.ReleaseDrift{
+				State:   application.DriftStateUnknown,
+				Message: v.err.Error(),
+			}
+			continue
+		}
+		out[rp.Name] = drift.Live(v.desired, v.live)
+	}
+	return out
+}
+
+// departed names the services running under each release that its manifest no
+// longer declares and that a revision this controller stamped for this
+// application did.
+//
+// That third clause is what makes deleting safe, and note what it is not: the
+// stack's namespace label. The label is the only thing tying a service to a
+// release, and anything can carry it — a sidecar somebody attached by hand reads
+// exactly like a service we installed. A stored revision does not: this
+// controller wrote it, it names the owner, and it never changes afterwards. The
+// same rule as #62 one scope down — the label says where a service lives, the
+// record says whose it is.
+//
+// A release with no candidates costs nothing beyond the read that has already
+// happened. One with candidates reads its history once and walks it newest
+// first, converting a revision's manifest only while something is still
+// unaccounted for, so the ordinary case reads one revision rather than a whole
+// history.
+func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, plan *charts.Plan, views map[string]releaseView) map[string][]departedService {
+	var out map[string][]departedService
+	for _, rp := range plan.Releases {
+		v, ok := views[rp.Name]
+		if !ok || v.err != nil {
+			continue
+		}
+		candidates := prune.Undeclared(runningNames(v.live), declaredNames(v.desired))
+		if len(candidates) == 0 {
+			continue
+		}
+		claimed := r.claimed(ctx, spec, ldb, engine, rp.Name, candidates)
+		if len(claimed) == 0 {
+			continue
+		}
+		if out == nil {
+			out = make(map[string][]departedService, len(plan.Releases))
+		}
+		for _, name := range claimed {
+			out[rp.Name] = append(out[rp.Name], departedService{
+				name:    name,
+				id:      v.live[name].ID,
+				volumes: mountedVolumes(v.live[name]),
+			})
 		}
 	}
+	return out
+}
+
+// claimed walks a release's stored revisions, newest first, and returns the
+// candidates one of this application's own revisions declared.
+//
+// A history that cannot be read prunes nothing. So does a revision that cannot
+// be converted — it is no evidence either way, and an older one may still claim
+// what it could not.
+func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, release string, candidates []string) []string {
+	revisions, err := engine.History(ctx, release)
+	if err != nil {
+		r.log.Warn("could not read a release's history, so none of its services can be pruned",
+			"application", spec.Name, "release", release, "error", err)
+		return nil
+	}
+
+	var claimed []string
+	rest := candidates
+	for i := len(revisions) - 1; i >= 0 && len(rest) > 0; i-- {
+		rev := revisions[i]
+		if app, ok := prune.Owner(rev, r.controller); !ok || app != spec.Name {
+			continue
+		}
+		stack, err := ldb.DesiredServices(ctx, rev.Manifest, release)
+		if err != nil {
+			r.log.Warn("could not read what a stored revision declared",
+				"application", spec.Name, "release", release,
+				"revision", rev.Revision, "error", err)
+			continue
+		}
+		var found []string
+		found, rest = prune.Claim(rest, declaredNames(stack))
+		claimed = append(claimed, found...)
+	}
+	slices.Sort(claimed)
+	return claimed
+}
+
+// withOrphans records what the sweep found on the drift axis, so that a deletion
+// is visible in the status and not only in the log.
+//
+// In live mode the services are already reported as unexpected and this only
+// marks them, which is the difference between "something is running here that
+// the manifest does not declare" and "this goes on the next sync". In manifest
+// mode liveDrift does not run at all, so a report is built carrying the orphans
+// and nothing else: no field comparison was performed and none is implied. That
+// is the one place this feature adds a drift axis where manifest mode had none,
+// and it is deliberate — deleting a service with no record of it anywhere but a
+// log line would be worse.
+func withOrphans(drifts map[string]*application.ReleaseDrift, doomed map[string][]departedService) map[string]*application.ReleaseDrift {
+	if len(doomed) == 0 {
+		return drifts
+	}
+	if drifts == nil {
+		drifts = make(map[string]*application.ReleaseDrift, len(doomed))
+	}
+
+	for release, services := range doomed {
+		rd := drifts[release]
+		if rd == nil {
+			rd = &application.ReleaseDrift{}
+			drifts[release] = rd
+		}
+		for _, svc := range services {
+			if !markOrphaned(rd, svc.name) {
+				rd.Services = append(rd.Services, application.ServiceDrift{
+					Name:     svc.name,
+					Reason:   application.DriftUnexpected,
+					Orphaned: true,
+				})
+			}
+		}
+		rd.State = application.DriftStateDetected
+	}
+	return drifts
+}
+
+// markOrphaned marks an already-reported service and says whether it found one.
+func markOrphaned(rd *application.ReleaseDrift, name string) bool {
+	for i := range rd.Services {
+		if rd.Services[i].Name == name {
+			rd.Services[i].Orphaned = true
+			return true
+		}
+	}
+	return false
+}
+
+// runningNames is the scoped names of what is deployed.
+func runningNames(live map[string]swarm.Service) []string {
+	out := make([]string, 0, len(live))
+	for name := range live {
+		out = append(out, name)
+	}
+	return out
+}
+
+// declaredNames is the scoped names a manifest declares.
+//
+// The scoped name is what the live spec carries and the only key the two sides
+// can be matched on, which is also why drift.Live keys on it.
+func declaredNames(stack *compose.Stack) []string {
+	if stack == nil {
+		return nil
+	}
+	out := make([]string, 0, len(stack.Services))
+	for _, svc := range stack.Services {
+		out = append(out, svc.Spec.Name)
+	}
+	return out
+}
+
+// mountedVolumes names the volumes a service mounts, for reporting when it is
+// pruned. Bind mounts and tmpfs are not named resources and are left out.
+func mountedVolumes(s swarm.Service) []string {
+	cs := s.Spec.TaskTemplate.ContainerSpec
+	if cs == nil {
+		return nil
+	}
+	var out []string
+	for _, m := range cs.Mounts {
+		if m.Type == mount.TypeVolume && m.Source != "" {
+			out = append(out, m.Source)
+		}
+	}
+	slices.Sort(out)
 	return out
 }
 
@@ -538,9 +792,11 @@ func detected(d *application.ReleaseDrift) bool {
 // correction event each time, while never removing the one thing it was
 // reacting to.
 //
-// So it is reported and not acted on. The application stays out of sync, which
-// is the truth: the swarm does not match the repository, and putting that right
-// means deleting something this controller has decided it does not delete.
+// So it is reported and not converged. Putting it right means deleting the
+// service, which is a different verb on a different list: syncPolicy.pruneServices
+// and the sweep in departed, which deletes only what this controller can prove it
+// installed. With that off — the default — the application stays out of sync,
+// which is the truth.
 func convergeable(d *application.ReleaseDrift) bool {
 	if !detected(d) {
 		return false
@@ -675,10 +931,12 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		return fmt.Errorf("planning: %w", err)
 	}
 
-	live := r.liveDrift(ctx, spec, backend, plan)
+	live, doomed := r.observe(ctx, spec, backend, engine, plan)
 	// Two lists, because reporting and acting are not the same set: everything
 	// found is reported, and only what a redeploy could actually put right is
-	// acted on.
+	// acted on. A third thing is acted on and is not a redeploy at all — doomed
+	// names the services this application installed and no longer declares,
+	// which no deploy can remove because applying deletes nothing.
 	drifted := driftedReleases(plan, live, detected)
 	fixable := driftedReleases(plan, live, convergeable)
 
@@ -718,7 +976,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		})
 	}
 
-	if install+upgrade+len(fixable) == 0 {
+	if install+upgrade+len(fixable)+len(doomed) == 0 {
 		return nil
 	}
 	if !spec.SyncPolicy.Automated && !force {
@@ -727,7 +985,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	if err := checkCompat(plan); err != nil {
 		return err
 	}
-	return r.apply(ctx, spec, backend, engine, plan, built, checkout, fixable)
+	return r.apply(ctx, spec, backend, engine, plan, built, checkout, fixable, doomed)
 }
 
 // checkCompat refuses a plan containing a release this build's chart engine is
@@ -767,7 +1025,7 @@ func checkCompat(plan *charts.Plan) error {
 // also surfaces a chart whose render is not deterministic — one that would
 // otherwise sit permanently out of sync, deploying on every single tick — on
 // the first sync rather than never.
-func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, drifted []string) error {
+func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, drifted []string, doomed map[string][]departedService) error {
 	started := r.now()
 	notify.Dispatch(ctx, notify.Event{
 		Application: spec.Name,
@@ -782,7 +1040,14 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	// which is the point — proceeding would create the overlap this ordering
 	// was chosen to avoid.
 	if spec.SyncPolicy.PruneFirst {
-		if err := r.prune(ctx, spec, backend, engine, plan.Orphaned); err != nil {
+		// Both sweeps, because pruneFirst is about not overlapping and a service
+		// renamed within a template overlaps exactly as a renamed release does.
+		// They are independent, so one failing is no reason not to attempt the
+		// other, and either failing stops the apply.
+		if err := errors.Join(
+			r.prune(ctx, spec, backend, engine, plan.Orphaned),
+			r.pruneServices(ctx, spec, backend, doomed),
+		); err != nil {
 			return err
 		}
 	}
@@ -841,7 +1106,10 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	// re-plan below observes the swarm as prune left it rather than reporting
 	// the releases it has just deleted straight back as orphans.
 	if !spec.SyncPolicy.PruneFirst {
-		if err := r.prune(ctx, spec, backend, engine, plan.Orphaned); err != nil {
+		if err := errors.Join(
+			r.prune(ctx, spec, backend, engine, plan.Orphaned),
+			r.pruneServices(ctx, spec, backend, doomed),
+		); err != nil {
 			r.recordResult(spec.Name, result)
 			return err
 		}
@@ -858,10 +1126,14 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 		r.recordResult(spec.Name, result)
 		return fmt.Errorf("re-planning after apply: %w", err)
 	}
-	// Re-compared, not carried forward: the correction above is exactly the
-	// thing this needs to confirm, and reporting the pre-apply comparison would
-	// leave an application that has just been put right still reading drifted.
-	r.record(spec.Name, backend, after, checkout.Revision, result, r.liveDrift(ctx, spec, backend, after))
+	// Re-observed, not carried forward: the correction and the sweep above are
+	// exactly the things this needs to confirm, and reporting the pre-apply
+	// reading would leave an application that has just been put right still
+	// showing drifted services and orphans that are already gone. The second
+	// reading is cheap in the case that matters — a sweep that worked leaves no
+	// candidates, so no history is read at all.
+	afterLive, _ := r.observe(ctx, spec, backend, engine, after)
+	r.record(spec.Name, backend, after, checkout.Revision, result, afterLive)
 	return nil
 }
 
@@ -1036,6 +1308,83 @@ func (r *Reconciler) prune(ctx context.Context, spec application.Spec, backend c
 			Type:        notify.ResourcesPruned,
 			At:          r.now(),
 			Message:     "pruned " + strings.Join(pruned, ", "),
+		})
+	}
+	err := errors.Join(errs...)
+	if err != nil {
+		notify.Dispatch(ctx, notify.Event{
+			Application: spec.Name,
+			Type:        notify.PruneFailed,
+			At:          r.now(),
+			Message:     err.Error(),
+		})
+	}
+	return err
+}
+
+// pruneServices deletes the services this application installed under a release
+// it still declares and whose chart has stopped declaring them.
+//
+// What may be deleted was decided in departed, against the swarm, git and this
+// controller's own revision records together. Nothing is re-derived here: this
+// is the write, and separating it from the proof is what keeps the proof
+// testable without a daemon.
+//
+// A backend that cannot delete a single service reports the orphans and removes
+// nothing, rather than failing the sync over a capability the deployment does
+// not have.
+//
+// The sync is not failed by a sweep that does not work, for the same reason the
+// release sweep is not: the deploy landed, and a service that would not go is a
+// candidate again on the next tick, since nothing about the evidence changed.
+// The error is still returned, because the reconcile did not do everything it
+// set out to.
+func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, backend charts.Backend, doomed map[string][]departedService) error {
+	if !spec.SyncPolicy.PruneServices || len(doomed) == 0 {
+		return nil
+	}
+	remover, ok := backend.(serviceRemover)
+	if !ok {
+		r.log.Warn("this swarm's backend cannot remove a single service, so services the chart no longer declares were left running",
+			"application", spec.Name)
+		return nil
+	}
+
+	var errs []error
+	var removed []string
+	for _, release := range slices.Sorted(maps.Keys(doomed)) {
+		for _, svc := range doomed[release] {
+			if err := remover.RemoveService(ctx, svc.id); err != nil {
+				errs = append(errs, fmt.Errorf("pruning service %q of release %q: %w", svc.name, release, err))
+				continue
+			}
+			removed = append(removed, svc.name)
+			// Warn rather than Info, like every other deletion here: this is the
+			// controller removing somebody's running service, and it is the log
+			// line an operator goes looking for afterwards.
+			r.log.Warn("pruned a service the release no longer declares",
+				"application", spec.Name, "release", release, "service", svc.name)
+
+			// Reported and never deleted. pruneVolumes means "when a whole
+			// release goes, its data goes with it", which is a boundary an
+			// operator can hold in their head; a service leaving a template is a
+			// far more frequent event, and nothing here can prove another stack
+			// does not mount the same volume. Saying so is the difference between
+			// a cleanup an operator can finish and one they believe is complete.
+			if len(svc.volumes) > 0 {
+				r.log.Warn("volumes the pruned service mounted were left in place",
+					"application", spec.Name, "release", release,
+					"service", svc.name, "volumes", svc.volumes)
+			}
+		}
+	}
+
+	if len(removed) > 0 {
+		notify.Dispatch(ctx, notify.Event{
+			Application: spec.Name,
+			Type:        notify.ResourcesPruned,
+			At:          r.now(),
+			Message:     "pruned " + strings.Join(removed, ", "),
 		})
 	}
 	err := errors.Join(errs...)

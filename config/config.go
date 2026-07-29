@@ -165,8 +165,11 @@ func validateApplication(app application.Spec) error {
 	if app.SyncPolicy.PruneVolumes && !app.SyncPolicy.Prune {
 		return fmt.Errorf("%q: syncPolicy pruneVolumes means nothing without prune", app.Name)
 	}
-	if app.SyncPolicy.PruneFirst && !app.SyncPolicy.Prune {
-		return fmt.Errorf("%q: syncPolicy pruneFirst means nothing without prune", app.Name)
+	// pruneFirst orders both prunes — the release sweep and the service sweep —
+	// so either gate gives it something to order. pruneServices needs no gate of
+	// its own: it is a sibling of prune rather than an extension of it.
+	if app.SyncPolicy.PruneFirst && !app.SyncPolicy.Prune && !app.SyncPolicy.PruneServices {
+		return fmt.Errorf("%q: syncPolicy pruneFirst means nothing without prune or pruneServices", app.Name)
 	}
 	return nil
 }
