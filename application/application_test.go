@@ -233,3 +233,83 @@ func TestAppSetStatusPrunedRoundTrip(t *testing.T) {
 		t.Errorf("pruneHeldBy should be omitted when empty, got %s", data)
 	}
 }
+
+// A manifest-mode application must serialise exactly as it did before the live
+// axis existed. That is the whole compatibility promise of adding this feature:
+// the mode every existing deployment runs on is untouched, and a client that
+// has never heard of drift sees nothing new.
+//
+// Pinned as a literal rather than compared against a computed value, because a
+// test that builds its expectation from the same types it is checking would
+// accept any change made to both.
+func TestManifestModeStatusCarriesNoDriftFields(t *testing.T) {
+	status := Status{
+		Sync: Sync{
+			State:   SyncSynced,
+			Summary: SyncSummary{Unchanged: 2},
+		},
+		Health: Health{State: HealthHealthy, Services: ServiceCounts{Healthy: 3, Total: 3}},
+		Releases: []ReleaseStatus{{
+			Name: "api", Chart: "./charts/api", Version: "0.1.0", Revision: 4,
+			Action: ActionUnchanged, Sync: SyncSynced,
+			Health: Health{State: HealthHealthy, Services: ServiceCounts{Healthy: 3, Total: 3}},
+		}},
+	}
+
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	const want = `{"sync":{"state":"synced","summary":{"install":0,"upgrade":0,"unchanged":2}},` +
+		`"health":{"state":"healthy","services":{"healthy":3,"total":3}},` +
+		`"releases":[{"name":"api","chart":"./charts/api","version":"0.1.0","revision":4,` +
+		`"action":"unchanged","sync":"synced",` +
+		`"health":{"state":"healthy","services":{"healthy":3,"total":3}}}],` +
+		`"observedAt":"0001-01-01T00:00:00Z"}`
+	if string(data) != want {
+		t.Errorf("manifest-mode status changed shape:\n got %s\nwant %s", data, want)
+	}
+}
+
+// The live axis is nil, not an Unknown state, for an application that does not
+// use it. "Not asked" and "asked, could not tell" are different, and only the
+// second should ever show a state.
+func TestDriftAxisIsOmittedWhenAbsent(t *testing.T) {
+	data, err := json.Marshal(Status{Sync: Sync{State: SyncSynced}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "drift") {
+		t.Errorf("drift should be omitted for a manifest-mode status, got %s", data)
+	}
+}
+
+func TestReleaseDriftRoundTrip(t *testing.T) {
+	want := ReleaseStatus{
+		Name:   "api",
+		Action: ActionUnchanged,
+		Sync:   SyncOutOfSync,
+		Drift: &ReleaseDrift{
+			State: DriftStateDetected,
+			Services: []ServiceDrift{{
+				Name:      "api_web",
+				Reason:    DriftModified,
+				Fields:    []FieldDrift{{Field: "replicas", Desired: "1", Live: "3"}},
+				Truncated: 2,
+			}},
+		},
+	}
+
+	data, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got ReleaseStatus
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("round trip changed the release:\n got %+v\nwant %+v", got, want)
+	}
+}

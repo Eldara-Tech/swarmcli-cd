@@ -400,3 +400,133 @@ func removeVolumes(t *testing.T, cli *dockerclient.Client, release string) {
 		}
 	}
 }
+
+// liveDriftApp is an application that decides sync against the running
+// ServiceSpec rather than only against the last apply.
+func liveDriftApp(name, repoDir string, automated bool) application.Spec {
+	app := releaseApp(name, repoDir, automated)
+	app.DriftDetection = application.DriftLive
+	return app
+}
+
+// richChartFiles exercises every field the live comparison looks at, on a real
+// daemon.
+//
+// That is the whole point of it. Each of these is somewhere swarmkit defaults,
+// normalises or resolves what was written — nil replicas become 1, the image
+// gains a digest, resources come back as zero structs rather than nil, labels as
+// an empty map, a published port acquires whatever the daemon assigns — and a
+// comparison that got any of them wrong would report drift on an untouched stack
+// for as long as it was deployed. Only a round trip through a real swarm can
+// show that, which is why this fixture is here and not in a unit test.
+//
+// Two services, so that "one of them is missing" is a case that exists.
+func richChartFiles(release string, replicas int) map[string]string {
+	files := chartFiles(release, replicas)
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    environment:\n" +
+		"      LOG_LEVEL: info\n" +
+		"      REGION: eu\n" +
+		"    networks: [internal]\n" +
+		"    volumes:\n" +
+		"      - data:/data\n" +
+		"    ports:\n" +
+		// Fixed rather than dynamic, so the assertion does not depend on
+		// whatever the runner had free. High and uncommon to avoid a clash.
+		"      - \"39117:8080\"\n" +
+		"    deploy:\n" +
+		"      replicas: {{ .Values.replicas }}\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"        tier: web\n" +
+		"      placement:\n" +
+		"        constraints: [node.role == manager]\n" +
+		"      resources:\n" +
+		"        limits:\n" +
+		"          cpus: \"0.5\"\n" +
+		"          memory: 64M\n" +
+		"        reservations:\n" +
+		"          cpus: \"0.1\"\n" +
+		"          memory: 16M\n" +
+		"  sidecar:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    networks: [internal]\n" +
+		"    deploy:\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"networks:\n" +
+		"  internal: {}\n" +
+		"volumes:\n" +
+		"  data: {}\n"
+	return files
+}
+
+// serviceOf finds one of a stack's services by its scoped name.
+func serviceOf(t *testing.T, cli *dockerclient.Client, name string) swarm.Service {
+	t.Helper()
+	svcs, err := cli.ServiceList(context.Background(), swarm.ServiceListOptions{
+		Filters: filters.NewArgs(filters.Arg("name", name)),
+	})
+	if err != nil {
+		t.Fatalf("listing service %q: %v", name, err)
+	}
+	for _, s := range svcs {
+		if s.Spec.Name == name {
+			return s
+		}
+	}
+	t.Fatalf("no service named %q", name)
+	return swarm.Service{}
+}
+
+// updateOutOfBand mutates a running service the way an operator with a shell
+// would, through the daemon and behind the controller's back.
+func updateOutOfBand(t *testing.T, cli *dockerclient.Client, name string, mutate func(*swarm.ServiceSpec)) {
+	t.Helper()
+	svc := serviceOf(t, cli, name)
+	spec := svc.Spec
+	mutate(&spec)
+	if _, err := cli.ServiceUpdate(context.Background(), svc.ID, svc.Version, spec, swarm.ServiceUpdateOptions{}); err != nil {
+		t.Fatalf("updating service %q out of band: %v", name, err)
+	}
+}
+
+// driftOf returns the live-drift axis of an application's only release.
+func driftOf(t *testing.T, rec *reconcile.Reconciler, app string) *application.ReleaseDrift {
+	t.Helper()
+	view, ok := rec.View(app)
+	if !ok {
+		t.Fatalf("no view for %q", app)
+	}
+	if len(view.Status.Releases) != 1 {
+		t.Fatalf("got %d releases, want 1", len(view.Status.Releases))
+	}
+	return view.Status.Releases[0].Drift
+}
+
+// fieldOf returns one reported field difference for a service, or fails naming
+// what was actually found.
+func fieldOf(t *testing.T, d *application.ReleaseDrift, service, field string) application.FieldDrift {
+	t.Helper()
+	if d == nil {
+		t.Fatal("no drift reported at all")
+	}
+	for _, s := range d.Services {
+		if s.Name != service {
+			continue
+		}
+		for _, f := range s.Fields {
+			if f.Field == field {
+				return f
+			}
+		}
+	}
+	t.Fatalf("no %q difference reported for %q; got %+v", field, service, d.Services)
+	return application.FieldDrift{}
+}

@@ -25,7 +25,26 @@ const (
 	SyncStarted   EventType = "sync-started"
 	SyncSucceeded EventType = "sync-succeeded"
 	SyncFailed    EventType = "sync-failed"
+	// DriftDetected reports that the repository moved: a commit changed what
+	// the application declares and the swarm has not caught up.
 	DriftDetected EventType = "drift-detected"
+	// LiveDriftDetected reports that the *swarm* moved: the running services of
+	// a release the repository has not touched no longer match it, which under
+	// driftDetection: live is the only way an out-of-band change is ever seen.
+	//
+	// Deliberately not DriftDetected with a different message. The two need
+	// different responses — one is a commit to review, the other is a change
+	// nobody recorded — and a notifier that routes on the type must be able to
+	// tell them apart without parsing prose.
+	LiveDriftDetected EventType = "live-drift-detected"
+	// DriftConverged reports that the controller corrected one. Message names
+	// the releases it redeployed.
+	//
+	// It exists because the correction is otherwise invisible: no chart
+	// revision is written for it — the desired state did not change — so
+	// without this the only trace of a service being rewritten under an
+	// operator is a status field that has already gone back to none.
+	DriftConverged EventType = "drift-converged"
 	// ResourcesPruned reports that the controller deleted the deployed
 	// resources of something git no longer declares — a whole application that
 	// left the app set, or a release an application stopped declaring. Message
@@ -102,6 +121,11 @@ func (logNotifier) Notify(ctx context.Context, e Event) {
 	// Warn, not Info: a stack was deleted. It is the line an operator goes
 	// looking for when something they expected to be running is not.
 	case ResourcesPruned:
+		level = slog.LevelWarn
+	// Warn for the same reason, from the other direction: somebody changed a
+	// running service outside git, and the controller either has or has not put
+	// it back. Both are lines an operator needs to find afterwards.
+	case LiveDriftDetected, DriftConverged:
 		level = slog.LevelWarn
 	}
 	slog.Default().Log(ctx, level, "reconcile", attrs...)

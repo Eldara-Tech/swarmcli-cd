@@ -214,10 +214,83 @@ if a later release needs an earlier one live first.
 driftDetection: manifest
 ```
 
-How drift is decided. Phase 1 has one mode, `manifest`: the rendered manifest is
-compared against what was last applied. Omitting it defaults to `manifest`.
-Comparing the desired `ServiceSpec` against the live one (`live`) is Phase 2 and
-this build rejects it. See [concepts § drift](concepts.md#drift-sync-and-health).
+How drift is decided. Omitting it defaults to `manifest`.
+
+| Mode | Compares | Catches |
+|---|---|---|
+| `manifest` | the rendered manifest against what was last applied | git moved: a changed chart version, values or template |
+| `live` | the above, **and** each settled release's running `ServiceSpec` against the one the repository renders to | the swarm moved: `docker service update`, a deleted service, a rollback |
+
+`live` costs one service list and one manifest conversion per settled release per
+interval, and it is the mode that lets the controller notice — and correct —
+something nobody committed. See
+[concepts § drift](concepts.md#drift-sync-and-health) for how it reads.
+
+#### What `live` does about it
+
+With `syncPolicy.automated: true`, it **redeploys** the drifted release, putting
+the running services back to what the repository declares. With a manual policy
+it reports and waits, and `swarmcli-cd app sync <app>` corrects it — the same
+rule the rest of the controller follows, where manual means "not on a schedule"
+rather than "never".
+
+The correction writes no new chart revision. The desired state did not change;
+the swarm was put back to it. `app get` shows the outcome and a
+`drift-converged` event records that it happened.
+
+A release whose live state could not be read reports `unknown` and is **not**
+corrected: the controller does not rewrite a service on the strength of a read
+it could not make.
+
+#### Which releases are compared
+
+Only those the plan calls **unchanged**. A release that would be installed has
+nothing running to compare against, and one that would be upgraded is about to
+have its spec overwritten anyway — the sync axis already says to act on it.
+
+#### What is compared
+
+Diffing is at `ServiceSpec` level and never at YAML level: `compose →
+ServiceSpec` is lossy and one-way, so reconstructing compose from a live service
+manufactures differences that do not exist.
+
+The comparison is a **named list of fields**, not the whole spec. A spec read
+back from the daemon is not the one that was written — swarmkit defaults fields
+the manifest never mentioned, resolves images to digests, and returns empty maps
+where nil was sent — so a whole-spec comparison reports permanent drift on
+services nobody has touched. The boundary is what `docker service update` can
+change, which is the surface an out-of-band change actually uses:
+
+| Reported as | Corresponds to |
+|---|---|
+| `mode` | a service recreated in a different mode |
+| `replicas` | `--replicas` |
+| `image` | `--image` |
+| `resources.limits.nanoCPUs`, `resources.limits.memoryBytes` | `--limit-cpu`, `--limit-memory` |
+| `resources.reservations.nanoCPUs`, `resources.reservations.memoryBytes` | `--reserve-cpu`, `--reserve-memory` |
+| `env[NAME]` | `--env-add`, `--env-rm` |
+| `constraints` | `--constraint-add`, `--constraint-rm` |
+| `labels[NAME]` | `--label-add`, `--label-rm` |
+
+Plus two findings about the service rather than a field: a service the manifest
+declares that is **missing** from the swarm, and one running under the stack's
+namespace that the manifest does not declare (**unexpected**). An unexpected
+service is reported and never deleted.
+
+Environment **values are never reported** — only whether a variable is `set`,
+`absent` or `changed`. What is running is whatever was set out of band, this is
+served to anyone with read access, and an environment variable is exactly where
+a credential would be.
+
+**Not compared**, each because it needs a normalisation of its own that has not
+been proved against a real swarm yet: published ports (the daemon assigns
+dynamic ones), attached networks (the daemon stores an id where the manifest
+names a network), mounts, secret and config references, healthchecks, update and
+rollback configs, restart policies, and placement preferences. Networks, configs
+and secrets are not compared as *resources* either — Swarm cannot update a
+network in place, and configs and secrets are immutable with their content
+hashed into the name, so a change to either is already a manifest-level
+difference.
 
 ## Where the app set lives
 

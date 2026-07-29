@@ -151,8 +151,16 @@ type View struct {
 // empty once populated — charts rejects a release file declaring no releases —
 // so its absence unambiguously means "not requested" rather than "none".
 type Status struct {
-	Sync       Sync            `json:"sync"`
-	Health     Health          `json:"health"`
+	Sync   Sync   `json:"sync"`
+	Health Health `json:"health"`
+
+	// Drift is the live-drift rollup, and is nil for an application whose
+	// driftDetection is manifest — the mode that does not ask the question. Nil
+	// rather than an Unknown state so that a manifest-mode payload is exactly
+	// what it was before this axis existed, and so that "not asked" and "asked,
+	// could not tell" stay distinguishable.
+	Drift *Drift `json:"drift,omitempty"`
+
 	Releases   []ReleaseStatus `json:"releases,omitempty"`
 	Error      string          `json:"error,omitempty"` // last reconcile error; not a failed sync
 	ObservedAt time.Time       `json:"observedAt"`
@@ -172,10 +180,22 @@ type Sync struct {
 }
 
 // SyncSummary is the plan that made the state OutOfSync, counted by action.
+//
+// Install, Upgrade and Unchanged describe the plan; Drifted describes the
+// verdict on top of it, and the two are deliberately not exclusive. A release
+// the manifest leaves alone but whose running services were changed by hand is
+// both Unchanged and Drifted — the plan really would do nothing to it, and it
+// really does not match git.
 type SyncSummary struct {
 	Install   int `json:"install"`
 	Upgrade   int `json:"upgrade"`
 	Unchanged int `json:"unchanged"`
+	// Drifted counts releases whose live services differ from the manifest,
+	// under driftDetection: live. Omitted rather than zero when there is none,
+	// unlike its three neighbours: a plan always has counts, whereas this
+	// question is only asked in one mode, and omitting it keeps a manifest-mode
+	// payload exactly what it was before this axis existed.
+	Drifted int `json:"drifted,omitempty"`
 }
 
 // SyncResult records the outcome of the last sync that was actually attempted.
@@ -214,6 +234,68 @@ type ReleaseStatus struct {
 	Health   Health          `json:"health"`
 	Services []ServiceStatus `json:"services,omitempty"`
 	Compat   *Compat         `json:"compat,omitempty"`
+
+	// Drift is what the live comparison found for this release, nil when it was
+	// not made: manifest mode, a release the plan would install or upgrade
+	// (there is nothing settled to compare against), or a backend that cannot
+	// read service specs.
+	Drift *ReleaseDrift `json:"drift,omitempty"`
+}
+
+// Drift is the live-drift rollup for a whole application.
+//
+// It is a separate axis from Sync in the same way Health is: Sync.State says
+// the application does not match git, and this says the reason is that the
+// swarm moved rather than that git did. Those need different actions from an
+// operator — one is a commit to review, the other is a change nobody recorded.
+type Drift struct {
+	State DriftState `json:"state"`
+	// Services counts the services that differ, across every release. It is the
+	// number a list row shows without descending into Releases.
+	Services int `json:"services"`
+	// Message names the worst release, or says why the comparison could not be
+	// made when State is Unknown.
+	Message string `json:"message,omitempty"`
+}
+
+// ReleaseDrift is what the live comparison found for one release.
+type ReleaseDrift struct {
+	State    DriftState     `json:"state"`
+	Services []ServiceDrift `json:"services,omitempty"`
+	// Message is why State is Unknown. A release whose live state could not be
+	// read is not converged, so this is the only record that the question was
+	// asked and went unanswered.
+	Message string `json:"message,omitempty"`
+}
+
+// ServiceDrift is one service that does not match.
+//
+// Name is namespace-scoped — "<release>_<service>", what `docker service ls`
+// shows and what an operator would type. Descoping would be a guess for a
+// service whose own name contains the separator, and there is no unscoped name
+// at all for one the manifest does not declare.
+type ServiceDrift struct {
+	Name   string       `json:"name"`
+	Reason DriftReason  `json:"reason"`
+	Fields []FieldDrift `json:"fields,omitempty"`
+	// Truncated counts the differences beyond those listed. A service whose
+	// every field was rewritten would otherwise put an unbounded list into a
+	// status payload served on every poll.
+	Truncated int `json:"truncated,omitempty"`
+}
+
+// FieldDrift is one field that differs, rendered rather than typed: this
+// package deliberately depends on nothing but the standard library, so a
+// swarm.ServiceSpec value cannot appear here.
+//
+// Environment values are never rendered. What is running is whatever an
+// operator set out of band, this is served to anyone with read scope, and an
+// environment variable is exactly where a credential would be — so an env
+// difference reports "set", "absent" or "differs" and never the value itself.
+type FieldDrift struct {
+	Field   string `json:"field"`
+	Desired string `json:"desired"`
+	Live    string `json:"live"`
 }
 
 // Compat is a chart's declared swarmcliVersion verdict. Planning records it

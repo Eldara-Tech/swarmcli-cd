@@ -55,6 +55,26 @@ func (b *Backend) WithForbiddenSecrets(names map[string]struct{}) charts.Backend
 	return &c
 }
 
+// WithOutOfBandNotifier returns a copy of the backend that reports a lost
+// compare-and-swap to fn.
+//
+// It is what makes Options.OnOutOfBandChange reachable at all from a reconcile:
+// a backend is built once per swarm, by the swarms registry, which knows
+// nothing about applications — and only the caller knows which application's
+// sync a losing write belongs to. Applied through the same optional-interface
+// upgrade as WithRegistryAuth, for the same reason.
+//
+// A nil fn leaves the existing notifier in place rather than removing it, so a
+// caller that does not care cannot accidentally silence one that does.
+func (b *Backend) WithOutOfBandNotifier(fn func(service string)) charts.Backend {
+	if fn == nil {
+		return b
+	}
+	c := *b
+	c.onOutOfBandChange = fn
+	return &c
+}
+
 // MountedSecretNames returns the names of the secrets Swarm has mounted into
 // this controller, by listing dir (each secret is a file at /run/secrets/<name>).
 // That set is exactly what a reconciled stack must not be allowed to mount: the

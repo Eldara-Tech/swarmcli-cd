@@ -590,3 +590,93 @@ func TestHealthcheckFailsWhenNothingIsListening(t *testing.T) {
 		t.Error("stderr is empty, want the reason")
 	}
 }
+
+// driftedView is syncedView with the swarm moved underneath it: the plan still
+// says unchanged, and the running service does not match.
+func driftedView() application.View {
+	v := syncedView()
+	v.Status.Sync.State = application.SyncOutOfSync
+	v.Status.Sync.Summary = application.SyncSummary{Unchanged: 1, Drifted: 1}
+	v.Status.Drift = &application.Drift{
+		State:    application.DriftStateDetected,
+		Services: 2,
+		Message:  `release "web": 2 service(s) do not match the repository`,
+	}
+	v.Status.Releases[0].Sync = application.SyncOutOfSync
+	v.Status.Releases[0].Drift = &application.ReleaseDrift{
+		State: application.DriftStateDetected,
+		Services: []application.ServiceDrift{
+			{
+				Name:   "web_nginx",
+				Reason: application.DriftModified,
+				Fields: []application.FieldDrift{{Field: "replicas", Desired: "2", Live: "7"}},
+			},
+			{Name: "web_sidecar", Reason: application.DriftMissing},
+		},
+	}
+	return v
+}
+
+// The column exists only when something answers it, so the default mode every
+// deployment runs keeps the table it had.
+func TestAppListOmitsTheDriftColumnWhenNothingUsesIt(t *testing.T) {
+	server := start(t, &stubReconciler{view: syncedView()})
+
+	code, stdout, stderr := cli(t, server, "app", "list")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if strings.Contains(stdout, "DRIFT") {
+		t.Errorf("stdout = %q, want no drift column for a manifest-mode application", stdout)
+	}
+}
+
+func TestAppListShowsDrift(t *testing.T) {
+	server := start(t, &stubReconciler{view: driftedView()})
+
+	code, stdout, stderr := cli(t, server, "app", "list")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	for _, want := range []string{"DRIFT", "detected", "out-of-sync"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+}
+
+// An operator seeing "out-of-sync" needs to know which field moved and to what,
+// or the only way to find out is to go and read the swarm by hand — which is
+// what this whole mode exists to save them.
+func TestAppGetShowsWhatDrifted(t *testing.T) {
+	server := start(t, &stubReconciler{view: driftedView()})
+
+	code, stdout, stderr := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	for _, want := range []string{
+		"Drift", "detected",
+		"web drift:", "SERVICE", "REASON", "FIELD", "DESIRED", "LIVE",
+		"web_nginx", "modified", "replicas", "7",
+		// A service the manifest declares and the swarm does not have is its own
+		// finding, with no field to name.
+		"web_sidecar", "missing",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+}
+
+func TestAppGetOmitsDriftWhenNotUsed(t *testing.T) {
+	server := start(t, &stubReconciler{view: syncedView()})
+
+	code, stdout, _ := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(stdout, "Drift") {
+		t.Errorf("stdout = %q, want no drift line for a manifest-mode application", stdout)
+	}
+}

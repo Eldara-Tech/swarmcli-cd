@@ -20,11 +20,13 @@ type enumCase struct {
 
 func enumCases() []enumCase {
 	var (
-		sync   SyncState
-		health HealthState
-		action SyncAction
-		compat CompatState
-		drift  DriftDetection
+		sync        SyncState
+		health      HealthState
+		action      SyncAction
+		compat      CompatState
+		drift       DriftDetection
+		driftState  DriftState
+		driftReason DriftReason
 	)
 	return []enumCase{
 		{"SyncState", &sync, "out-of-sync",
@@ -36,7 +38,11 @@ func enumCases() []enumCase {
 		{"CompatState", &compat, "incompatible",
 			[]json.Marshaler{CompatOK, CompatIncompatible}},
 		{"DriftDetection", &drift, "manifest",
-			[]json.Marshaler{DriftManifest}},
+			[]json.Marshaler{DriftManifest, DriftLive}},
+		{"DriftState", &driftState, "detected",
+			[]json.Marshaler{DriftStateNone, DriftStateDetected}},
+		{"DriftReason", &driftReason, "unexpected",
+			[]json.Marshaler{DriftModified, DriftMissing, DriftUnexpected}},
 	}
 }
 
@@ -108,6 +114,8 @@ func TestEnumZeroValueMarshalsAsUnknown(t *testing.T) {
 		"SyncAction":     ActionUnknown,
 		"CompatState":    CompatUnknown,
 		"DriftDetection": DriftUnknown,
+		"DriftState":     DriftStateUnknown,
+		"DriftReason":    DriftReasonUnknown,
 	} {
 		b, err := json.Marshal(got)
 		if err != nil {
@@ -125,8 +133,12 @@ func TestDriftDetectionValid(t *testing.T) {
 		want bool
 	}{
 		{DriftManifest, true},
+		{DriftLive, true},
 		{DriftUnknown, false},
-		{DriftDetection("live"), false}, // Phase 2, and not implemented by this build
+		// Near-misses, because the loader is the one place a typo has to fail
+		// loudly rather than decode to Unknown and quietly disable the mode.
+		{DriftDetection("Live"), false},
+		{DriftDetection("livee"), false},
 	} {
 		if got := tc.in.Valid(); got != tc.want {
 			t.Errorf("%q.Valid() = %v, want %v", tc.in, got, tc.want)

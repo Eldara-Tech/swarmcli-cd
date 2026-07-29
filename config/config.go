@@ -143,7 +143,8 @@ func validateApplication(app application.Spec) error {
 		return fmt.Errorf("invalid name %q: lowercase letters, digits, dot, dash and underscore only, starting with a letter or digit", app.Name)
 	}
 	if !app.DriftDetection.Valid() {
-		return fmt.Errorf("%q: unsupported driftDetection %q, this build implements %q", app.Name, app.DriftDetection, application.DriftManifest)
+		return fmt.Errorf("%q: unsupported driftDetection %q, this build implements %q and %q",
+			app.Name, app.DriftDetection, application.DriftManifest, application.DriftLive)
 	}
 	if app.RegistryAuth != "" && !secretNameRE.MatchString(app.RegistryAuth) {
 		return fmt.Errorf("%q: invalid registryAuth %q: it names a Docker secret, so letters, digits, dot, dash and underscore only", app.Name, app.RegistryAuth)

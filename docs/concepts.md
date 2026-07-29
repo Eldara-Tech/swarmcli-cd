@@ -48,10 +48,38 @@ having to open the application.
 the controller reconciles, sees the swarm no longer matches git, and records
 `out-of-sync` — but does not apply it. The drift is observed; acting on it waits
 for an explicit `app sync`. On an automated application the same reconcile
-applies the change. In Phase 1 drift is decided at the **manifest** level: the
-rendered manifest is compared against what was last applied. (Comparing the
-desired `ServiceSpec` against the live one — catching a change made directly with
-`docker service update` — is Phase 2.)
+applies the change.
+
+### Two ways to be out of sync
+
+`driftDetection` decides which of them the controller looks for.
+
+**`manifest`** (the default) compares the rendered manifest against what was last
+applied. It catches a changed chart version, changed values and a changed
+template — everything that happens because *git moved*.
+
+It cannot catch anything that happened to the swarm afterwards. Swarm has no
+server-side apply, so `docker service update --replicas 10` produces no conflict
+signal at all: the next reconcile computes the same desired spec, finds it
+unchanged, and does nothing. The hand-scaled service stays hand-scaled until some
+unrelated commit triggers a deploy, and is then silently overwritten.
+
+**`live`** additionally compares the running `ServiceSpec` of each settled
+release against the one the repository renders to. That is the only thing that
+catches *the swarm moving*, and it makes the controller report — and, with an
+automated policy, correct — a change nobody committed.
+
+The two are separate axes in the status for the same reason sync and health are.
+`sync` goes `out-of-sync` either way, so the sync button and anything alerting on
+that field work unchanged; `drift` beside it says the reason was the swarm rather
+than git, which is a different thing for an operator to do something about. A
+commit is something to review; a change nobody recorded is something to ask
+about.
+
+The comparison is at `ServiceSpec` level, never at YAML level, and is a named
+list of fields rather than everything — see
+[configuration § driftDetection](configuration.md#driftdetection-optional) for
+what is compared and what is not.
 
 ## Revision, and last sync
 
