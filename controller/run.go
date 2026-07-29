@@ -42,6 +42,13 @@ const (
 	defaultDataDir    = "/var/lib/swarmcli-cd"
 )
 
+// The log defaults. Text is what an operator reading `docker service logs`
+// wants; json is for whatever ships them somewhere that parses them.
+const (
+	defaultLogLevel  = "info"
+	defaultLogFormat = "text"
+)
+
 // defaultAppSetFile is what the set is called when nothing says otherwise: in a
 // directory an external process keeps current, and in a checkout `validate` was
 // pointed at. There is no equivalent default for a repository: a file inside
@@ -88,6 +95,11 @@ pause:
                             will see the other's applications as departed and,
                             with --prune, delete them
 
+Everything the controller writes goes through one handler on stderr:
+
+  --log-level <level>       debug, info, warn or error (default ` + defaultLogLevel + `)
+  --log-format <format>     text or json (default ` + defaultLogFormat + `)
+
 Credentials come from the environment, not from flags, because they arrive as
 Docker secrets and a flag would put them in "docker inspect" output and in argv:
 
@@ -117,6 +129,8 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&o.prune, "prune", false, "")
 	fs.BoolVar(&o.pruneVolumes, "prune-volumes", false, "")
 	fs.StringVar(&o.controllerID, "controller-id", application.DefaultControllerID, "")
+	fs.StringVar(&o.logLevel, "log-level", defaultLogLevel, "")
+	fs.StringVar(&o.logFormat, "log-format", defaultLogFormat, "")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -140,7 +154,16 @@ func runController(args []string, stdout, stderr io.Writer) int {
 		return usageErr(stderr, err.Error(), controllerUsage)
 	}
 
-	log := slog.New(slog.NewTextHandler(stderr, nil))
+	log, err := newLogger(stderr, o.logLevel, o.logFormat)
+	if err != nil {
+		return usageErr(stderr, err.Error(), controllerUsage)
+	}
+	// One handler for the whole process. Components are given the logger
+	// explicitly, and SetDefault covers what cannot be: notify's log notifier
+	// registers from an init() where no logger exists yet, and anything reaching
+	// for slog.Default or the standard log package would otherwise write a
+	// second format onto the same stream.
+	slog.SetDefault(log)
 
 	// Both signals stop the process the same way. Swarm sends SIGTERM on
 	// `service update` and on rollout; SIGINT is what a terminal sends.
@@ -183,6 +206,40 @@ type options struct {
 	// configSet records that --config was given explicitly rather than
 	// defaulted. See runController.
 	configSet bool
+
+	// logLevel and logFormat configure the process's one handler. Flags rather
+	// than environment variables: only the credentials come from the
+	// environment, and for the reason controllerUsage gives.
+	logLevel  string
+	logFormat string
+}
+
+// newLogger builds the handler everything logs through. An unusable level or
+// format is a usage error rather than a silent fallback, for the reason
+// --appset-interval is: an operator who wrote it meant it.
+func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {
+	var lvl slog.Level
+	switch level {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "info":
+		lvl = slog.LevelInfo
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		return nil, fmt.Errorf("--log-level %q: want debug, info, warn or error", level)
+	}
+
+	opts := &slog.HandlerOptions{Level: lvl}
+	switch format {
+	case "text":
+		return slog.New(slog.NewTextHandler(w, opts)), nil
+	case "json":
+		return slog.New(slog.NewJSONHandler(w, opts)), nil
+	}
+	return nil, fmt.Errorf("--log-format %q: want text or json", format)
 }
 
 // serve wires the packages together and runs until ctx ends or a component

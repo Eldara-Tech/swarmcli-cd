@@ -598,6 +598,28 @@ line that shows exactly what the controller is following is worth having in
 | `--appset-dir` | — | read the app set from a directory something else keeps current. Selects **path** mode |
 | `--appset-path` | `applications.yaml` in path mode | the set's path within the repository or the directory. Required with `--appset-repo` |
 | `--appset-interval` | `3m` | how often the app set is re-read |
+| `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
+| `--log-format` | `text` | `text` or `json` |
+
+### Logs
+
+Everything the controller writes goes to **stderr**, through one handler, in one
+format — the reconcile events, the applier's per-resource lines and the seam
+report at startup alike. `docker service logs swarmcli-cd_controller` is the
+whole of it.
+
+`text` is [logfmt](https://brandur.org/logfmt), which is what an operator
+reading those logs wants. It quotes any value containing a space and escapes the
+quotes inside it, so an error that names things in quotes arrives looking like
+this:
+
+```
+time=2026-07-28T13:42:30.788Z level=ERROR msg="reconcile failed" application=swarm-cronjob failures=2 error="planning: release \"swarm-cronjob\": chart \"swarm-cronjob\" version \"0.1.2\" not found"
+```
+
+That is the format working, not a fault: the backslashes are what keep the value
+one field. `--log-format json` is the option for anything that parses rather
+than reads — a log shipper will unescape it back.
 
 ### Environment
 
