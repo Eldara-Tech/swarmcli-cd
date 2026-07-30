@@ -521,6 +521,10 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"      - /etc/hostname:/etc/host-name:ro\n" +
 		"    configs: [site]\n" +
 		"    secrets: [token]\n" +
+		// Container labels, which are not the service labels under deploy: two
+		// different sets, two different flags, and only these reach the container.
+		"    labels:\n" +
+		"      role: web\n" +
 		"    ports:\n" +
 		// Fixed rather than dynamic, so the assertion does not depend on
 		// whatever the runner had free. High and uncommon to avoid a clash.
@@ -562,6 +566,7 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"        limits:\n" +
 		"          cpus: \"0.5\"\n" +
 		"          memory: 64M\n" +
+		"          pids: 100\n" +
 		"        reservations:\n" +
 		"          cpus: \"0.1\"\n" +
 		"          memory: 16M\n" +
@@ -584,6 +589,11 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		// direction those two can drift in.
 		"    user: \"1000:1000\"\n" +
 		"    hostname: sidecar-host\n" +
+		// `default` is the only isolation a Linux daemon accepts, and it is also
+		// what an empty one reads back as — so this states the value the
+		// normalisation has to produce, from the other side.
+		"    isolation: default\n" +
+		"    stdin_open: true\n" +
 		"    working_dir: /tmp\n" +
 		"    stop_signal: SIGTERM\n" +
 		"    stop_grace_period: 5s\n" +
@@ -619,6 +629,20 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"    deploy:\n" +
 		"      labels:\n" +
 		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		// A replicated job, so the two counts that stand in for `replicas` on one
+		// are exercised against a real swarm rather than only against hand-built
+		// specs. Its task sleeps and so never completes, which is what keeps the
+		// job at one running task for the whole test instead of finishing and
+		// dropping out of the count.
+		"  job:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    networks: [internal]\n" +
+		"    deploy:\n" +
+		"      mode: replicated-job\n" +
+		"      replicas: 1\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
 		"networks:\n" +
 		"  internal: {}\n" +
 		"volumes:\n" +
@@ -631,6 +655,14 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"    file: " + tokenFile + "\n"
 	return files
 }
+
+// richTasks is how many running tasks richChartFiles deploys for a given app
+// replica count: the app's own, plus the sidecar and the job beside it.
+//
+// Named rather than written out at each call site so that adding a service to
+// that fixture stays a one-line change here instead of a sweep through every
+// test that waits on it.
+func richTasks(appReplicas int) int { return appReplicas + 2 }
 
 // serviceOf finds one of a stack's services by its scoped name.
 func serviceOf(t *testing.T, cli *dockerclient.Client, name string) swarm.Service {

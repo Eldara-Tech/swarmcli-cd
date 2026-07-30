@@ -166,15 +166,18 @@ func compareService(want, got swarm.ServiceSpec, nets NetworkNames) ([]applicati
 		fields = append(fields, application.FieldDrift{Field: name, Desired: desired, Live: live})
 	}
 
-	// Mode first: replicas mean nothing across a mode change, and reporting
-	// both would say the same thing twice.
+	// Mode first: the counts beneath it mean nothing across a mode change, and
+	// reporting both would say the same thing twice.
 	wantMode, gotMode := modeKind(want.Mode), modeKind(got.Mode)
-	if wantMode != gotMode {
+	switch {
+	case wantMode != gotMode:
 		add("mode", wantMode, gotMode)
-	} else if wantMode == modeReplicated {
+	case wantMode == modeReplicated:
 		if w, g := replicas(want.Mode), replicas(got.Mode); w != g {
 			add("replicas", strconv.FormatUint(w, 10), strconv.FormatUint(g, 10))
 		}
+	case wantMode == modeReplicatedJob:
+		compareJob(want.Mode.ReplicatedJob, got.Mode.ReplicatedJob, add)
 	}
 
 	compareImage(want, got, add)
@@ -202,7 +205,29 @@ func compareService(want, got swarm.ServiceSpec, nets NetworkNames) ([]applicati
 	return fields, 0
 }
 
-const modeReplicated = "replicated"
+const (
+	modeReplicated    = "replicated"
+	modeReplicatedJob = "replicated-job"
+)
+
+// compareJob reports the two counts that make a replicated job, which are to a
+// job what replicas are to a service.
+//
+// Both sides flatten a nil to zero, because serviceSpecFromGRPC addresses the
+// stored value unconditionally — the same shape RestartPolicy.MaxAttempts has —
+// so the live side is never nil where the manifest left a count unstated.
+//
+// Zero is reported as zero rather than as the one swarmkit would actually run.
+// This reports spec values throughout, and a rendering that guessed the effective
+// count would be one more thing that could be wrong about a number nobody can
+// then check.
+func compareJob(want, got *swarm.ReplicatedJob, add func(name, desired, live string)) {
+	if want == nil || got == nil {
+		return
+	}
+	compareUint64("maxConcurrent", orZeroUint64(want.MaxConcurrent), orZeroUint64(got.MaxConcurrent), add)
+	compareUint64("totalCompletions", orZeroUint64(want.TotalCompletions), orZeroUint64(got.TotalCompletions), add)
+}
 
 // modeKind names which of the four service modes is set. Replicated is the
 // default for the same reason compose conversion makes it one: an unset mode is
@@ -277,10 +302,32 @@ func compareResources(want, got *swarm.ResourceRequirements, add func(name, desi
 	wl, gl := limits(want), limits(got)
 	compareInt64("resources.limits.nanoCPUs", wl.NanoCPUs, gl.NanoCPUs, add)
 	compareInt64("resources.limits.memoryBytes", wl.MemoryBytes, gl.MemoryBytes, add)
+	compareInt64("resources.limits.pids", wl.Pids, gl.Pids, add)
 
 	wr, gr := reservations(want), reservations(got)
 	compareInt64("resources.reservations.nanoCPUs", wr.NanoCPUs, gr.NanoCPUs, add)
 	compareInt64("resources.reservations.memoryBytes", wr.MemoryBytes, gr.MemoryBytes, add)
+	compareStringSet("resources.reservations.genericResources",
+		genericResources(wr), genericResources(gr), add)
+}
+
+// genericResources names each reserved node resource as "kind=value", the form
+// `--generic-resource-add` takes.
+//
+// Sorted rather than positional, like the other sets: the order a service
+// reserves a node's resources in carries no meaning.
+func genericResources(r swarm.Resources) []string {
+	out := make([]string, 0, len(r.GenericResources))
+	for _, g := range r.GenericResources {
+		switch {
+		case g.NamedResourceSpec != nil:
+			out = append(out, g.NamedResourceSpec.Kind+"="+g.NamedResourceSpec.Value)
+		case g.DiscreteResourceSpec != nil:
+			out = append(out, g.DiscreteResourceSpec.Kind+"="+
+				strconv.FormatInt(g.DiscreteResourceSpec.Value, 10))
+		}
+	}
+	return out
 }
 
 // limits and reservations flatten the pointer chain the manifest leaves nil and
@@ -639,6 +686,101 @@ func compareContainer(want, got swarm.ContainerSpec, add func(name, desired, liv
 	compareKeyed("sysctls", want.Sysctls, got.Sysctls, add)
 	compareUlimits(want.Ulimits, got.Ulimits, add)
 	compareDNS(want.DNSConfig, got.DNSConfig, add)
+
+	compareBool("openStdin", want.OpenStdin, got.OpenStdin, add)
+	compareInt64("oomScoreAdj", want.OomScoreAdj, got.OomScoreAdj, add)
+	compareString("isolation", isolationOf(want.Isolation), isolationOf(got.Isolation), add)
+	// The container's own labels, which are not the service's: `--label-add`
+	// writes one set and `--container-label-add` the other, and only the second
+	// reaches the running container. AddStackLabel stamps the namespace onto
+	// both, so the same exclusion applies.
+	compareKeyed("containerLabels", ownLabels(want.Labels), ownLabels(got.Labels), add)
+	comparePrivileges(want.Privileges, got.Privileges, add)
+}
+
+// isolationOf flattens the empty isolation a manifest leaves to the "default" the
+// daemon reads back: isolationToGRPC maps anything that is neither hyperv nor
+// process onto the default enum, and IsolationFromGRPC names it.
+func isolationOf(i container.Isolation) string {
+	if i == "" {
+		return string(container.IsolationDefault)
+	}
+	return string(i)
+}
+
+// comparePrivileges reports the container's security options.
+//
+// Compose sets a Privileges struct on every service it converts — always
+// non-nil, usually holding nothing but a nil credential spec — and
+// containerToGRPC stores one whenever it is given one, so in practice both sides
+// have one. Presence is still checked, for a spec that came from somewhere else.
+//
+// Only the credential spec has a `docker service update` flag; the rest can be
+// reached through the API alone. That is the reason to report them rather than a
+// reason not to: a no-new-privileges flag cleared behind the controller's back is
+// a security change that nothing else here would show.
+func comparePrivileges(want, got *swarm.Privileges, add func(name, desired, live string)) {
+	if want == nil || got == nil {
+		if want != got {
+			add("privileges", presence(want != nil), presence(got != nil))
+		}
+		return
+	}
+	compareString("privileges.credentialSpec",
+		credentialSpecOf(want.CredentialSpec), credentialSpecOf(got.CredentialSpec), add)
+	compareBool("privileges.noNewPrivileges", want.NoNewPrivileges, got.NoNewPrivileges, add)
+	compareString("privileges.seccomp", seccompOf(want.Seccomp), seccompOf(got.Seccomp), add)
+	compareString("privileges.apparmor", apparmorOf(want.AppArmor), apparmorOf(got.AppArmor), add)
+	compareString("privileges.selinux", selinuxOf(want.SELinuxContext), selinuxOf(got.SELinuxContext), add)
+}
+
+// credentialSpecOf names which of the three sources a Windows credential spec
+// comes from, since exactly one of them is ever set.
+func credentialSpecOf(c *swarm.CredentialSpec) string {
+	switch {
+	case c == nil:
+		return ""
+	case c.Config != "":
+		return "config=" + c.Config
+	case c.File != "":
+		return "file=" + c.File
+	case c.Registry != "":
+		return "registry=" + c.Registry
+	default:
+		return ""
+	}
+}
+
+// seccompOf renders the mode, and says whether a custom profile is attached
+// without rendering it: a profile is a JSON document, far too long for a table
+// cell, and its presence is the part an operator acts on.
+func seccompOf(s *swarm.SeccompOpts) string {
+	if s == nil {
+		return ""
+	}
+	if len(s.Profile) > 0 {
+		return string(s.Mode) + " (custom profile)"
+	}
+	return string(s.Mode)
+}
+
+func apparmorOf(a *swarm.AppArmorOpts) string {
+	if a == nil {
+		return ""
+	}
+	return string(a.Mode)
+}
+
+// selinuxOf renders the label a container runs under, in the order the four
+// parts are conventionally written.
+func selinuxOf(s *swarm.SELinuxContext) string {
+	if s == nil {
+		return ""
+	}
+	if s.Disable {
+		return "disabled"
+	}
+	return strings.Join([]string{s.User, s.Role, s.Type, s.Level}, ":")
 }
 
 // compareStringSet reports a list whose order carries no meaning, as a whole and

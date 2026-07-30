@@ -43,7 +43,7 @@ func TestLiveDriftIsNotReportedOnAnUntouchedStack(t *testing.T) {
 	if err := rec.SyncNow(ctx, "clean"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 3) // two app replicas and one sidecar
+	waitForRunning(t, cli, release, richTasks(2)) // two app replicas, the sidecar and the job
 
 	// Twice: the first reconcile follows the deploy that wrote the spec, the
 	// second sees it only as the daemon returns it.
@@ -234,7 +234,7 @@ func TestLiveDriftDetectsAnOutOfBandPublishedPort(t *testing.T) {
 	if err := rec.SyncNow(ctx, "ports"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
 		for i, p := range spec.EndpointSpec.Ports {
@@ -276,7 +276,7 @@ func TestLiveDriftDetectsAnOutOfBandPublishedPort(t *testing.T) {
 	if err := rec.SyncNow(ctx, "ports"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 	if d := driftOf(t, rec, "ports"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
 	}
@@ -302,12 +302,12 @@ func TestLiveDriftDetectsAndRestoresADetachedNetwork(t *testing.T) {
 	if err := rec.SyncNow(ctx, "network"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	updateOutOfBand(t, cli, release+"_sidecar", func(spec *swarm.ServiceSpec) {
 		spec.TaskTemplate.Networks = nil
 	})
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	if err := rec.Sync(ctx, "network"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
@@ -324,7 +324,7 @@ func TestLiveDriftDetectsAndRestoresADetachedNetwork(t *testing.T) {
 	if err := rec.SyncNow(ctx, "network"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	svc := serviceOf(t, cli, release+"_sidecar")
 	if n := len(svc.Spec.TaskTemplate.Networks); n != 1 {
@@ -356,7 +356,7 @@ func TestLiveDriftDetectsAndRestoresTheEndpointMode(t *testing.T) {
 	if err := rec.SyncNow(ctx, "endpoint"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	updateOutOfBand(t, cli, release+"_sidecar", func(spec *swarm.ServiceSpec) {
 		if spec.EndpointSpec == nil {
@@ -377,7 +377,7 @@ func TestLiveDriftDetectsAndRestoresTheEndpointMode(t *testing.T) {
 	if err := rec.SyncNow(ctx, "endpoint"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	// Read the daemon, not the report: what was written back names no mode, so
 	// this asserts the daemon's reading of an empty one.
@@ -415,7 +415,7 @@ func TestLiveDriftReportsAnAttachmentOutsideTheStack(t *testing.T) {
 	if err := rec.SyncNow(ctx, "extra"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	// Attached by name, which the daemon resolves to the id it stores — the whole
 	// reason the comparison has to resolve it back.
@@ -423,7 +423,7 @@ func TestLiveDriftReportsAnAttachmentOutsideTheStack(t *testing.T) {
 		spec.TaskTemplate.Networks = append(spec.TaskTemplate.Networks,
 			swarm.NetworkAttachmentConfig{Target: shared})
 	})
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	if err := rec.Sync(ctx, "extra"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
@@ -442,7 +442,7 @@ func TestLiveDriftReportsAnAttachmentOutsideTheStack(t *testing.T) {
 	if err := rec.SyncNow(ctx, "extra"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	svc := serviceOf(t, cli, release+"_sidecar")
 	if n := len(svc.Spec.TaskTemplate.Networks); n != 1 {
@@ -496,7 +496,7 @@ func TestLiveDriftDetectsAnOutOfBandMountRemoval(t *testing.T) {
 	if err := rec.SyncNow(ctx, "mount"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
 		kept := spec.TaskTemplate.ContainerSpec.Mounts[:0]
@@ -507,7 +507,7 @@ func TestLiveDriftDetectsAnOutOfBandMountRemoval(t *testing.T) {
 		}
 		spec.TaskTemplate.ContainerSpec.Mounts = kept
 	})
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	if err := rec.Sync(ctx, "mount"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
@@ -529,7 +529,7 @@ func TestLiveDriftDetectsAnOutOfBandMountRemoval(t *testing.T) {
 	if err := rec.SyncNow(ctx, "mount"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 	if d := driftOf(t, rec, "mount"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
 	}
@@ -552,12 +552,12 @@ func TestLiveDriftDetectsAnOutOfBandSecretRemoval(t *testing.T) {
 	if err := rec.SyncNow(ctx, "secret"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
 		spec.TaskTemplate.ContainerSpec.Secrets = nil
 	})
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	if err := rec.Sync(ctx, "secret"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
@@ -575,7 +575,7 @@ func TestLiveDriftDetectsAnOutOfBandSecretRemoval(t *testing.T) {
 	if err := rec.SyncNow(ctx, "secret"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	svc := serviceOf(t, cli, release+"_app")
 	if n := len(svc.Spec.TaskTemplate.ContainerSpec.Secrets); n != 1 {
@@ -606,7 +606,7 @@ func TestLiveDriftDetectsAnOutOfBandUpdateConfig(t *testing.T) {
 	if err := rec.SyncNow(ctx, "update"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
 		spec.UpdateConfig.Parallelism = 4
@@ -633,7 +633,7 @@ func TestLiveDriftDetectsAnOutOfBandUpdateConfig(t *testing.T) {
 	if err := rec.SyncNow(ctx, "update"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 	if d := driftOf(t, rec, "update"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
 	}
@@ -657,12 +657,12 @@ func TestLiveDriftDetectsAnOutOfBandHealthcheck(t *testing.T) {
 	if err := rec.SyncNow(ctx, "health"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	updateOutOfBand(t, cli, release+"_sidecar", func(spec *swarm.ServiceSpec) {
 		spec.TaskTemplate.ContainerSpec.Healthcheck.Interval = time.Minute
 	})
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	if err := rec.Sync(ctx, "health"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
@@ -682,7 +682,7 @@ func TestLiveDriftDetectsAnOutOfBandHealthcheck(t *testing.T) {
 	if err := rec.SyncNow(ctx, "health"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 	if d := driftOf(t, rec, "health"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
 	}
@@ -708,7 +708,7 @@ func TestLiveDriftDetectsOutOfBandLiteralFields(t *testing.T) {
 	if err := rec.SyncNow(ctx, "literal"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	updateOutOfBand(t, cli, release+"_sidecar", func(spec *swarm.ServiceSpec) {
 		cs := spec.TaskTemplate.ContainerSpec
@@ -716,7 +716,7 @@ func TestLiveDriftDetectsOutOfBandLiteralFields(t *testing.T) {
 		cs.CapabilityAdd = append(cs.CapabilityAdd, "CAP_SYS_ADMIN")
 		cs.Sysctls["net.core.somaxconn"] = "4096"
 	})
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	if err := rec.Sync(ctx, "literal"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
@@ -750,8 +750,75 @@ func TestLiveDriftDetectsOutOfBandLiteralFields(t *testing.T) {
 	if err := rec.SyncNow(ctx, "literal"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 	if d := driftOf(t, rec, "literal"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
+}
+
+// The last of the comparable surface: a container label, a pids limit, and the
+// concurrency of a replicated job.
+//
+// The job is the one worth deploying rather than only unit-testing. Its two
+// counts stand in for `replicas` on an ordinary service, they are flattened from
+// nil the same way a restart policy's attempt count is, and until this ran there
+// was no evidence a real swarm stores them the way the unit table assumes.
+func TestLiveDriftDetectsOutOfBandJobAndContainerFields(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-surface"
+	repo := gitRepo(t, richChartFiles(t, release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, liveDriftApp("surface", repo, false))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "surface"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, richTasks(1))
+
+	updateOutOfBand(t, cli, release+"_job", func(spec *swarm.ServiceSpec) {
+		four := uint64(4)
+		spec.Mode.ReplicatedJob.MaxConcurrent = &four
+	})
+	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
+		spec.TaskTemplate.ContainerSpec.Labels["role"] = "edge"
+		spec.TaskTemplate.Resources.Limits.Pids = 500
+	})
+
+	if err := rec.Sync(ctx, "surface"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	d := driftOf(t, rec, "surface")
+	if got := fieldOf(t, d, release+"_job", "maxConcurrent"); got.Desired != "1" || got.Live != "4" {
+		t.Errorf("maxConcurrent drift = %+v, want 1 against 4", got)
+	}
+	// The other count is untouched, which says the two are compared apart rather
+	// than as one number.
+	assertNotReported(t, d, "totalCompletions")
+	// And a job is not reported as a replica change: the mode branch is
+	// exclusive, so a job never reaches the replicas comparison at all.
+	assertNotReported(t, d, "replicas")
+
+	if got := fieldOf(t, d, release+"_app", "containerLabels[role]"); got.Desired != "web" || got.Live != "edge" {
+		t.Errorf("container label drift = %+v, want web against edge", got)
+	}
+	if got := fieldOf(t, d, release+"_app", "resources.limits.pids"); got.Desired != "100" || got.Live != "500" {
+		t.Errorf("pids limit drift = %+v, want 100 against 500", got)
+	}
+	// The service labels beside the container labels are a different set, and
+	// nobody touched them.
+	assertNotReported(t, d, "labels[tier]")
+	// Isolation is the fixture's one field whose declared value is also what an
+	// empty one normalises to, so it must be silent from both directions.
+	assertNotReported(t, d, "isolation")
+
+	if err := rec.SyncNow(ctx, "surface"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, richTasks(1))
+	if d := driftOf(t, rec, "surface"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
 	}
 }
@@ -776,7 +843,7 @@ func TestLiveDriftDetectsAndRestoresADeletedService(t *testing.T) {
 	if err := rec.SyncNow(ctx, "missing"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 
 	sidecar := serviceOf(t, cli, release+"_sidecar")
 	if err := cli.ServiceRemove(ctx, sidecar.ID); err != nil {
@@ -802,7 +869,7 @@ func TestLiveDriftDetectsAndRestoresADeletedService(t *testing.T) {
 	if err := rec.SyncNow(ctx, "missing"); err != nil {
 		t.Fatalf("SyncNow after the deletion = %v, want nil", err)
 	}
-	waitForRunning(t, cli, release, 2)
+	waitForRunning(t, cli, release, richTasks(1))
 	if d := driftOf(t, rec, "missing"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
 	}

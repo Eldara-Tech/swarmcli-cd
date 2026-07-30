@@ -53,7 +53,13 @@ func desiredSpec(name, image string) swarm.ServiceSpec {
 			},
 		},
 		TaskTemplate: swarm.TaskSpec{
-			ContainerSpec: &swarm.ContainerSpec{Image: image},
+			ContainerSpec: &swarm.ContainerSpec{
+				Image: image,
+				// Also never absent from a converted spec: convert.Service builds
+				// a Privileges for every service, usually holding nothing but a
+				// nil credential spec.
+				Privileges: &swarm.Privileges{},
+			},
 			// Never absent from a converted spec, so never absent here: a
 			// service naming no networks is attached to the stack's default one.
 			Networks: []swarm.NetworkAttachmentConfig{{Target: defaultNetwork}},
@@ -269,11 +275,18 @@ func TestNormalisedDifferencesAreNotDrift(t *testing.T) {
 			want.TaskTemplate.ContainerSpec.Init = nil
 			live.TaskTemplate.ContainerSpec.Init = nil
 		},
-		"isolation defaulted": func(_, live *swarm.ServiceSpec) {
-			live.TaskTemplate.ContainerSpec.Isolation = "default"
-		},
-		"privileges populated": func(_, live *swarm.ServiceSpec) {
+		// Not "the daemon populated one against a manifest that sent none", which
+		// the previous version of this case asserted and which cannot happen:
+		// convert.Service builds a Privileges for every service. The struct is
+		// stored whenever it is sent and read back the same way, so an empty one
+		// on both sides is what an ordinary service looks like.
+		"privileges round-trip as an empty struct": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Privileges = &swarm.Privileges{}
 			live.TaskTemplate.ContainerSpec.Privileges = &swarm.Privileges{}
+		},
+		"isolation defaulted from empty": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Isolation = ""
+			live.TaskTemplate.ContainerSpec.Isolation = container.IsolationDefault
 		},
 		"runtime defaulted to container": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.Runtime = swarm.RuntimeContainer
@@ -701,6 +714,120 @@ func TestLiveReportsEachComparedField(t *testing.T) {
 			},
 			application.FieldDrift{Field: "logDriver.options[max-size]", Desired: "10m", Live: "50m"},
 		},
+		// The container's labels, not the service's: two different sets, two
+		// different flags, and only these reach the running container.
+		"container label changed": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Labels = map[string]string{"role": "web"}
+				live.TaskTemplate.ContainerSpec.Labels = map[string]string{"role": "edge"}
+			},
+			application.FieldDrift{Field: "containerLabels[role]", Desired: "web", Live: "edge"},
+		},
+		"isolation": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.ContainerSpec.Isolation = container.IsolationProcess
+			},
+			application.FieldDrift{Field: "isolation", Desired: "default", Live: "process"},
+		},
+		"oom score": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.ContainerSpec.OomScoreAdj = 500
+			},
+			application.FieldDrift{Field: "oomScoreAdj", Desired: "0", Live: "500"},
+		},
+		"stdin held open": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.OpenStdin = true
+			},
+			application.FieldDrift{Field: "openStdin", Desired: "true", Live: "false"},
+		},
+		"pids limit": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.Resources = &swarm.ResourceRequirements{Limits: &swarm.Limit{Pids: 100}}
+			},
+			application.FieldDrift{Field: "resources.limits.pids", Desired: "100", Live: "0"},
+		},
+		"generic resource reservation": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.Resources = &swarm.ResourceRequirements{
+					Reservations: &swarm.Resources{GenericResources: []swarm.GenericResource{
+						{DiscreteResourceSpec: &swarm.DiscreteGenericResource{Kind: "SSD", Value: 2}},
+					}},
+				}
+			},
+			application.FieldDrift{
+				Field:   "resources.reservations.genericResources",
+				Desired: "SSD=2",
+				Live:    "",
+			},
+		},
+		"named generic resource": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.Resources = &swarm.ResourceRequirements{
+					Reservations: &swarm.Resources{GenericResources: []swarm.GenericResource{
+						{NamedResourceSpec: &swarm.NamedGenericResource{Kind: "GPU", Value: "uuid-1"}},
+					}},
+				}
+			},
+			application.FieldDrift{
+				Field:   "resources.reservations.genericResources",
+				Desired: "",
+				Live:    "GPU=uuid-1",
+			},
+		},
+		// Only the credential spec has a service flag; the rest are reachable
+		// through the API alone, which is why a change to one is worth seeing.
+		"no-new-privileges cleared behind the controller's back": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Privileges = &swarm.Privileges{NoNewPrivileges: true}
+			},
+			application.FieldDrift{Field: "privileges.noNewPrivileges", Desired: "true", Live: "false"},
+		},
+		"credential spec": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Privileges = &swarm.Privileges{
+					CredentialSpec: &swarm.CredentialSpec{Config: "s_credspec"},
+				}
+			},
+			application.FieldDrift{Field: "privileges.credentialSpec", Desired: "config=s_credspec", Live: ""},
+		},
+		"seccomp profile swapped for unconfined": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Privileges = &swarm.Privileges{
+					Seccomp: &swarm.SeccompOpts{Mode: swarm.SeccompModeCustom, Profile: []byte("{}")},
+				}
+				live.TaskTemplate.ContainerSpec.Privileges = &swarm.Privileges{
+					Seccomp: &swarm.SeccompOpts{Mode: swarm.SeccompModeUnconfined},
+				}
+			},
+			application.FieldDrift{
+				Field:   "privileges.seccomp",
+				Desired: "custom (custom profile)",
+				Live:    "unconfined",
+			},
+		},
+		"apparmor disabled": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.ContainerSpec.Privileges = &swarm.Privileges{
+					AppArmor: &swarm.AppArmorOpts{Mode: swarm.AppArmorModeDisabled},
+				}
+			},
+			application.FieldDrift{Field: "privileges.apparmor", Desired: "", Live: "disabled"},
+		},
+		"selinux label": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.ContainerSpec.Privileges = &swarm.Privileges{
+					SELinuxContext: &swarm.SELinuxContext{
+						User: "system_u", Role: "object_r", Type: "svirt_t", Level: "s0",
+					},
+				}
+			},
+			application.FieldDrift{
+				Field:   "privileges.selinux",
+				Desired: "",
+				Live:    "system_u:object_r:svirt_t:s0",
+			},
+		},
 		"network attached that the manifest does not declare": {
 			func(want, live *swarm.ServiceSpec) {
 				live.TaskTemplate.Networks = append(live.TaskTemplate.Networks,
@@ -746,6 +873,53 @@ func freshPair() (swarm.ServiceSpec, swarm.ServiceSpec) {
 		return s
 	}
 	return build(), build()
+}
+
+// A replicated job counts differently from a service, so the two counts under it
+// need their own case: the mode branch is exclusive, and a job never reaches the
+// replicas comparison at all.
+func TestJobCountsAreCompared(t *testing.T) {
+	job := func(maxConcurrent, total *uint64) swarm.ServiceMode {
+		return swarm.ServiceMode{ReplicatedJob: &swarm.ReplicatedJob{
+			MaxConcurrent: maxConcurrent, TotalCompletions: total,
+		}}
+	}
+
+	t.Run("a count the manifest left unstated", func(t *testing.T) {
+		// serviceSpecFromGRPC addresses the stored value unconditionally, so the
+		// live side is a pointer to zero where the manifest left nil.
+		want, live := freshPair()
+		want.Mode = job(nil, nil)
+		live.Mode = job(uint64p(0), uint64p(0))
+
+		if got := Live(stackOf(want), liveOf(live), swarmNets); got.State != application.DriftStateNone {
+			t.Errorf("got %+v, want none — an unstated count is not a difference", got.Services)
+		}
+	})
+
+	t.Run("concurrency raised by hand", func(t *testing.T) {
+		want, live := freshPair()
+		want.Mode = job(uint64p(1), uint64p(10))
+		live.Mode = job(uint64p(4), uint64p(10))
+
+		fields := Live(stackOf(want), liveOf(live), swarmNets).Services[0].Fields
+		want1 := []application.FieldDrift{{Field: "maxConcurrent", Desired: "1", Live: "4"}}
+		if !reflect.DeepEqual(fields, want1) {
+			t.Errorf("fields = %+v, want %+v", fields, want1)
+		}
+	})
+
+	t.Run("total completions changed", func(t *testing.T) {
+		want, live := freshPair()
+		want.Mode = job(uint64p(1), uint64p(10))
+		live.Mode = job(uint64p(1), uint64p(99))
+
+		fields := Live(stackOf(want), liveOf(live), swarmNets).Services[0].Fields
+		want1 := []application.FieldDrift{{Field: "totalCompletions", Desired: "10", Live: "99"}}
+		if !reflect.DeepEqual(fields, want1) {
+			t.Errorf("fields = %+v, want %+v", fields, want1)
+		}
+	})
 }
 
 // A mode change makes the replica counts incomparable, so saying both would say
