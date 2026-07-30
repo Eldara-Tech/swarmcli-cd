@@ -303,7 +303,10 @@ apply.
 
 A release whose live state could not be read reports `unknown` and is **not**
 corrected: the controller does not rewrite a service on the strength of a read
-it could not make.
+it could not make. The same applies when the manifest it would be compared
+*against* cannot be converted — a config the release mounts having been deleted by
+hand, say. That costs the comparison only: `pruneResources` reads what a release
+declares, which needs nothing it mounts to still exist, so a sweep is unaffected.
 
 #### Which releases are compared
 
