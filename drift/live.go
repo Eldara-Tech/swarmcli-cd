@@ -193,6 +193,8 @@ func compareService(want, got swarm.ServiceSpec, nets NetworkNames) ([]applicati
 	compareUpdateConfig("rollbackConfig", want.RollbackConfig, got.RollbackConfig, add)
 	compareRestartPolicy(want.TaskTemplate.RestartPolicy, got.TaskTemplate.RestartPolicy, add)
 	comparePlacement(want.TaskTemplate.Placement, got.TaskTemplate.Placement, add)
+	compareContainer(containerSpec(want), containerSpec(got), add)
+	compareLogDriver(want.TaskTemplate.LogDriver, got.TaskTemplate.LogDriver, add)
 
 	if len(fields) > maxFields {
 		return fields[:maxFields], len(fields) - maxFields
@@ -315,6 +317,25 @@ func compareString(name, want, got string, add func(name, desired, live string))
 	}
 }
 
+func compareBool(name string, want, got bool, add func(name, desired, live string)) {
+	if want != got {
+		add(name, strconv.FormatBool(want), strconv.FormatBool(got))
+	}
+}
+
+// compareOptionalBool compares a flag that may be unstated, keeping the three
+// readings apart rather than folding nil into false.
+func compareOptionalBool(name string, want, got *bool, add func(name, desired, live string)) {
+	compareString(name, renderOptionalBool(want), renderOptionalBool(got), add)
+}
+
+func renderOptionalBool(v *bool) string {
+	if v == nil {
+		return unsetBool
+	}
+	return strconv.FormatBool(*v)
+}
+
 // compareDuration renders through time.Duration.String, so a difference reads
 // "30s" rather than as the nanoseconds the spec stores.
 func compareDuration(name string, want, got time.Duration, add func(name, desired, live string)) {
@@ -418,15 +439,7 @@ const absent = "(absent)"
 // image label deliberately records the tag we asked for rather than what is
 // running, which compareImage depends on.
 func compareLabels(want, got map[string]string, add func(name, desired, live string)) {
-	wm, gm := ownLabels(want), ownLabels(got)
-	for _, key := range unionKeys(wm, gm) {
-		wv, inWant := wm[key]
-		gv, inGot := gm[key]
-		if inWant == inGot && wv == gv {
-			continue
-		}
-		add("labels["+key+"]", orAbsent(wv, inWant), orAbsent(gv, inGot))
-	}
+	compareKeyed("labels", ownLabels(want), ownLabels(got), add)
 }
 
 func ownLabels(labels map[string]string) map[string]string {
@@ -579,6 +592,112 @@ func compareNetworks(want, got swarm.ServiceSpec, nets NetworkNames, add func(na
 	if declared := declaredNetworkNames(want.TaskTemplate.Networks); !slices.Equal(declared, live) {
 		add("networks", strings.Join(declared, ", "), strings.Join(live, ", "))
 	}
+}
+
+// unsetBool renders an optional flag the manifest never stated. Distinct from
+// "false" on purpose: what a nil means is the daemon's own default, which is
+// configurable, so calling it false would be this package inventing an answer.
+const unsetBool = "(unset)"
+
+// compareContainer reports the container fields a manifest states literally.
+//
+// This is the cheapest group in the allowlist and the reason is worth recording:
+// none of it needs a normalisation. containerToGRPC and containerSpecFromGRPC
+// carry every one of these across untouched — plain strings, string slices, maps
+// and pointers — and swarmkit defaults none of them. What the manifest declared
+// is exactly what reads back.
+//
+// What they do need is order-insensitivity wherever the spec stores a list that
+// is really a set. `--host-add` appends wherever it likes, docker/cli sorts
+// capabilities on the way out but whoever typed them did not, and a chart
+// template that reorders a list has not changed what runs.
+//
+// Two spec fields here that a compose v3.9 manifest cannot declare at all:
+// Groups, which has no `group_add` in that schema, and the DNS options list,
+// which convertDNSConfig never fills. Both are still compared, because
+// `--group-add` and `--dns-option-add` can put them there and the desired side
+// being empty is exactly what makes that visible.
+func compareContainer(want, got swarm.ContainerSpec, add func(name, desired, live string)) {
+	// Command is compose's `entrypoint` and Args is its `command`, which is the
+	// naming Swarm uses and the opposite of what the field names suggest.
+	compareString("command", strings.Join(want.Command, " "), strings.Join(got.Command, " "), add)
+	compareString("args", strings.Join(want.Args, " "), strings.Join(got.Args, " "), add)
+	compareString("user", want.User, got.User, add)
+	compareString("workingDir", want.Dir, got.Dir, add)
+	compareString("hostname", want.Hostname, got.Hostname, add)
+	compareString("stopSignal", want.StopSignal, got.StopSignal, add)
+	compareDuration("stopGracePeriod", orZeroDuration(want.StopGracePeriod), orZeroDuration(got.StopGracePeriod), add)
+	compareBool("readOnly", want.ReadOnly, got.ReadOnly, add)
+	compareBool("tty", want.TTY, got.TTY, add)
+	compareOptionalBool("init", want.Init, got.Init, add)
+
+	compareStringSet("hosts", want.Hosts, got.Hosts, add)
+	compareStringSet("groups", want.Groups, got.Groups, add)
+	compareStringSet("capabilityAdd", want.CapabilityAdd, got.CapabilityAdd, add)
+	compareStringSet("capabilityDrop", want.CapabilityDrop, got.CapabilityDrop, add)
+
+	compareKeyed("sysctls", want.Sysctls, got.Sysctls, add)
+	compareUlimits(want.Ulimits, got.Ulimits, add)
+	compareDNS(want.DNSConfig, got.DNSConfig, add)
+}
+
+// compareStringSet reports a list whose order carries no meaning, as a whole and
+// sorted — the same shape as constraints, and for the same reason: an
+// order-sensitive comparison would report drift on a reordered chart template.
+func compareStringSet(name string, want, got []string, add func(name, desired, live string)) {
+	w, g := slices.Sorted(slices.Values(want)), slices.Sorted(slices.Values(got))
+	if !slices.Equal(w, g) {
+		add(name, strings.Join(w, ", "), strings.Join(g, ", "))
+	}
+}
+
+// compareUlimits reports resource limits by the name they are set under, which
+// is the key `--ulimit-add` and `--ulimit-rm` use.
+func compareUlimits(want, got []*container.Ulimit, add func(name, desired, live string)) {
+	compareKeyed("ulimits", ulimitsByName(want), ulimitsByName(got), add)
+}
+
+func ulimitsByName(ulimits []*container.Ulimit) map[string]string {
+	out := make(map[string]string, len(ulimits))
+	for _, u := range ulimits {
+		if u == nil {
+			continue
+		}
+		out[u.Name] = strconv.FormatInt(u.Soft, 10) + ":" + strconv.FormatInt(u.Hard, 10)
+	}
+	return out
+}
+
+// compareDNS reports the resolver configuration.
+//
+// Presence first, like the declared structs above it: convertDNSConfig returns
+// nil unless the manifest set a nameserver or a search domain, and the daemon
+// returns nil for nil, so one side having none is a real difference.
+func compareDNS(want, got *swarm.DNSConfig, add func(name, desired, live string)) {
+	if want == nil || got == nil {
+		if want != got {
+			add("dns", presence(want != nil), presence(got != nil))
+		}
+		return
+	}
+	compareStringSet("dns.nameservers", want.Nameservers, got.Nameservers, add)
+	compareStringSet("dns.search", want.Search, got.Search, add)
+	compareStringSet("dns.options", want.Options, got.Options, add)
+}
+
+// compareLogDriver reports the service's logging driver and its options.
+//
+// It lives on the task rather than the container spec, which is the only reason
+// it is not in compareContainer beside everything else it behaves like.
+func compareLogDriver(want, got *swarm.Driver, add func(name, desired, live string)) {
+	if want == nil || got == nil {
+		if want != got {
+			add("logDriver", presence(want != nil), presence(got != nil))
+		}
+		return
+	}
+	compareString("logDriver.name", want.Name, got.Name, add)
+	compareKeyed("logDriver.options", want.Options, got.Options, add)
 }
 
 // The structs a manifest may declare or leave out entirely — healthcheck, update
@@ -822,14 +941,17 @@ const runtimeTarget = "(runtime)"
 // manifest's silence. They are out because `docker service update` cannot change
 // one without removing and re-adding the reference, which this already sees.
 func compareSecretRefs(want, got []*swarm.SecretReference, add func(name, desired, live string)) {
-	compareRefs("secrets", secretTargets(want), secretTargets(got), add)
+	compareKeyed("secrets", secretTargets(want), secretTargets(got), add)
 }
 
 func compareConfigRefs(want, got []*swarm.ConfigReference, add func(name, desired, live string)) {
-	compareRefs("configs", configTargets(want), configTargets(got), add)
+	compareKeyed("configs", configTargets(want), configTargets(got), add)
 }
 
-func compareRefs(prefix string, want, got map[string]string, add func(name, desired, live string)) {
+// compareKeyed reports the entries of two string maps that differ, showing both
+// values. It is the shape labels, sysctls, references and log driver options all
+// have: a name an operator chose and a value they can read.
+func compareKeyed(prefix string, want, got map[string]string, add func(name, desired, live string)) {
 	for _, name := range unionKeys(want, got) {
 		wv, inWant := want[name]
 		gv, inGot := got[name]
