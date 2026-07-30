@@ -360,6 +360,10 @@ change, which is the surface an out-of-band change actually uses:
 | `networks` | `--network-add`, `--network-rm` |
 | `mounts[TARGET]` | `--mount-add`, `--mount-rm` |
 | `secrets[NAME]`, `configs[NAME]` | `--secret-add`, `--secret-rm`, `--config-add`, `--config-rm` |
+| `healthcheck`, `healthcheck.*` | `--health-*`, `--no-healthcheck` |
+| `updateConfig.*`, `rollbackConfig.*` | `--update-*`, `--rollback-*` |
+| `restartPolicy.*` | `--restart-*` |
+| `placement.preferences`, `placement.maxReplicas` | `--placement-pref-add`, `--placement-pref-rm`, `--replicas-max-per-node` |
 
 A published port is reported as a whole entry being `set` or `absent` rather than
 as a value that changed, because a port has no stable key: two publishes can share
@@ -406,9 +410,18 @@ Environment **values are never reported** — only whether a variable is `set`,
 served to anyone with read access, and an environment variable is exactly where
 a credential would be.
 
-**Not compared**, each because it needs a normalisation of its own that has not
-been proved against a real swarm yet: healthchecks, update and rollback configs,
-restart policies, and placement preferences. Networks, configs
+The **healthcheck**, **update** and **rollback config** and **restart policy** are
+each a struct a manifest may declare or leave out entirely. One present on exactly
+one side is reported once, as `healthcheck` or `updateConfig` rather than as every
+field inside it. Where both sides have one, the fields the manifest left unstated
+are compared against the daemon's default for them rather than against nothing —
+an update config that names only a parallelism is running with a failure action of
+`pause` and an order of `stop-first`, and neither is a change anybody made.
+
+**Not compared**: everything else in a `ServiceSpec`, which is still a long list —
+`command` and `args`, `user`, `hostname`, `sysctls`, `ulimits`, capabilities,
+extra hosts, DNS config and the logging driver among them. Each is a candidate for
+the same treatment and none has been proved against a real swarm yet. Networks, configs
 and secrets are not compared as *resources* either — Swarm cannot update a
 network in place, and configs and secrets are immutable with their content
 hashed into the name, so a change to either is already a manifest-level

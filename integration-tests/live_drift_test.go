@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
@@ -581,6 +582,108 @@ func TestLiveDriftDetectsAnOutOfBandSecretRemoval(t *testing.T) {
 		t.Errorf("secret references after converging = %d, want the chart's one back", n)
 	}
 	if d := driftOf(t, rec, "secret"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
+}
+
+// An update policy edited by hand, on a service whose manifest declares only part
+// of one.
+//
+// That is what makes it worth deploying. The chart names a parallelism and
+// nothing else, so the running struct also carries a failure action and an order
+// the manifest never mentioned — and the assertion that only the parallelism is
+// reported is the assertion that those two are normalised rather than compared
+// raw. Without it the release would report drift on every tick for ever.
+func TestLiveDriftDetectsAnOutOfBandUpdateConfig(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-update"
+	repo := gitRepo(t, richChartFiles(t, release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, liveDriftApp("update", repo, false))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "update"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
+		spec.UpdateConfig.Parallelism = 4
+	})
+
+	if err := rec.Sync(ctx, "update"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	d := driftOf(t, rec, "update")
+	got := fieldOf(t, d, release+"_app", "updateConfig.parallelism")
+	if got.Desired != "1" || got.Live != "4" {
+		t.Errorf("parallelism drift = %+v, want 1 against 4", got)
+	}
+	// The two the manifest never stated: the daemon names them, and naming them
+	// is not a change anybody made.
+	assertNotReported(t, d, "updateConfig.failureAction")
+	assertNotReported(t, d, "updateConfig.order")
+	// Nor the restart policy or the placement beside it, both also partial.
+	assertNotReported(t, d, "restartPolicy.maxAttempts")
+	assertNotReported(t, d, "restartPolicy.condition")
+	assertNotReported(t, d, "placement.preferences")
+
+	if err := rec.SyncNow(ctx, "update"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+	if d := driftOf(t, rec, "update"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
+}
+
+// A healthcheck edited by hand.
+//
+// The container spec is the one place in this group the daemon stores verbatim,
+// so what this really proves is the other half: that a chart declaring a
+// healthcheck at all still reports nothing when nobody has touched it, which the
+// clean test covers, and that a changed interval is legible here.
+func TestLiveDriftDetectsAnOutOfBandHealthcheck(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-health"
+	repo := gitRepo(t, richChartFiles(t, release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, liveDriftApp("health", repo, false))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "health"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	updateOutOfBand(t, cli, release+"_sidecar", func(spec *swarm.ServiceSpec) {
+		spec.TaskTemplate.ContainerSpec.Healthcheck.Interval = time.Minute
+	})
+	waitForRunning(t, cli, release, 2)
+
+	if err := rec.Sync(ctx, "health"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	d := driftOf(t, rec, "health")
+	got := fieldOf(t, d, release+"_sidecar", "healthcheck.interval")
+	if got.Desired != "5s" || got.Live != "1m0s" {
+		t.Errorf("healthcheck drift = %+v, want 5s against 1m0s", got)
+	}
+	// The rest of the check is untouched and must stay silent, which is what says
+	// the comparison is per field rather than on the struct as a whole.
+	assertNotReported(t, d, "healthcheck.test")
+	assertNotReported(t, d, "healthcheck.retries")
+	assertNotReported(t, d, "healthcheck")
+
+	if err := rec.SyncNow(ctx, "health"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+	if d := driftOf(t, rec, "health"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
 	}
 }

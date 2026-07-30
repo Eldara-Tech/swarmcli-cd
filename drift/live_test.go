@@ -6,8 +6,10 @@ package drift
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/swarm"
 
@@ -144,8 +146,47 @@ func TestNormalisedDifferencesAreNotDrift(t *testing.T) {
 				{Target: networkID(defaultNetwork)},
 			}
 		},
-		"update config defaulted by swarmkit": func(_, live *swarm.ServiceSpec) {
-			live.UpdateConfig = &swarm.UpdateConfig{Parallelism: 1, FailureAction: "pause", Order: "stop-first"}
+		// Not "swarmkit filled one in", which the previous version of this case
+		// asserted and which does not happen: updateConfigToGRPC returns nil for
+		// nil and updateConfigFromGRPC returns nil for nil, so a manifest that
+		// declared no update_config reads one back. The defaulting is one level
+		// down — inside a struct that *was* declared, where the two unstated enums
+		// come back under the names of their defaults.
+		"an update config's unstated fields defaulted": func(want, live *swarm.ServiceSpec) {
+			want.UpdateConfig = &swarm.UpdateConfig{Parallelism: 1}
+			live.UpdateConfig = &swarm.UpdateConfig{
+				Parallelism:   1,
+				FailureAction: swarm.UpdateFailureActionPause,
+				Order:         swarm.UpdateOrderStopFirst,
+			}
+		},
+		"a rollback config's unstated fields defaulted": func(want, live *swarm.ServiceSpec) {
+			want.RollbackConfig = &swarm.UpdateConfig{Parallelism: 2}
+			live.RollbackConfig = &swarm.UpdateConfig{
+				Parallelism:   2,
+				FailureAction: swarm.UpdateFailureActionPause,
+				Order:         swarm.UpdateOrderStopFirst,
+			}
+		},
+		// restartPolicyFromGRPC takes the address of the stored count
+		// unconditionally, so the live side is never nil where the manifest left
+		// it so — and an unstated condition comes back named, like the enums above.
+		"a restart policy's unstated fields defaulted": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.RestartPolicy = &swarm.RestartPolicy{}
+			live.TaskTemplate.RestartPolicy = &swarm.RestartPolicy{
+				Condition:   swarm.RestartPolicyConditionAny,
+				MaxAttempts: uint64p(0),
+			}
+		},
+		// compose builds an empty preference slice for every service; the daemon
+		// returns nil for a spec that placed nothing.
+		"placement preferences returned as nil rather than an empty slice": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.Placement = &swarm.Placement{Preferences: []swarm.PlacementPreference{}}
+			live.TaskTemplate.Placement = &swarm.Placement{}
+		},
+		"a healthcheck absent from both sides": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Healthcheck = nil
+			live.TaskTemplate.ContainerSpec.Healthcheck = nil
 		},
 		// The asymmetry runs the opposite way to the obvious guess: compose builds
 		// a BindOptions for a manifest that named a `bind:` block, and
@@ -440,6 +481,97 @@ func TestLiveReportsEachComparedField(t *testing.T) {
 				}}
 			},
 			application.FieldDrift{Field: "configs[s_credspec]", Desired: "(runtime)", Live: "(absent)"},
+		},
+		"healthcheck removed by hand": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Healthcheck = &container.HealthConfig{
+					Test: []string{"CMD-SHELL", "true"},
+				}
+			},
+			application.FieldDrift{Field: "healthcheck", Desired: "set", Live: "absent"},
+		},
+		"healthcheck interval": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Healthcheck = &container.HealthConfig{Interval: 5 * time.Second}
+				live.TaskTemplate.ContainerSpec.Healthcheck = &container.HealthConfig{Interval: time.Minute}
+			},
+			application.FieldDrift{Field: "healthcheck.interval", Desired: "5s", Live: "1m0s"},
+		},
+		"healthcheck command": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Healthcheck = &container.HealthConfig{
+					Test: []string{"CMD-SHELL", "true"},
+				}
+				live.TaskTemplate.ContainerSpec.Healthcheck = &container.HealthConfig{
+					Test: []string{"NONE"},
+				}
+			},
+			application.FieldDrift{Field: "healthcheck.test", Desired: "CMD-SHELL true", Live: "NONE"},
+		},
+		"update parallelism": {
+			func(want, live *swarm.ServiceSpec) {
+				want.UpdateConfig = &swarm.UpdateConfig{Parallelism: 1}
+				live.UpdateConfig = &swarm.UpdateConfig{Parallelism: 5}
+			},
+			application.FieldDrift{Field: "updateConfig.parallelism", Desired: "1", Live: "5"},
+		},
+		"update order against an unstated default": {
+			func(want, live *swarm.ServiceSpec) {
+				want.UpdateConfig = &swarm.UpdateConfig{}
+				live.UpdateConfig = &swarm.UpdateConfig{Order: swarm.UpdateOrderStartFirst}
+			},
+			application.FieldDrift{Field: "updateConfig.order", Desired: "stop-first", Live: "start-first"},
+		},
+		"update failure ratio": {
+			func(want, live *swarm.ServiceSpec) {
+				want.UpdateConfig = &swarm.UpdateConfig{MaxFailureRatio: 0.3}
+				live.UpdateConfig = &swarm.UpdateConfig{}
+			},
+			application.FieldDrift{Field: "updateConfig.maxFailureRatio", Desired: "0.3", Live: "0"},
+		},
+		// The same struct under its other name, which is what makes one function
+		// with a prefix worth having.
+		"rollback config removed": {
+			func(want, live *swarm.ServiceSpec) {
+				want.RollbackConfig = &swarm.UpdateConfig{Parallelism: 1}
+			},
+			application.FieldDrift{Field: "rollbackConfig", Desired: "set", Live: "absent"},
+		},
+		"restart condition against an unstated default": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.RestartPolicy = &swarm.RestartPolicy{}
+				live.TaskTemplate.RestartPolicy = &swarm.RestartPolicy{
+					Condition: swarm.RestartPolicyConditionOnFailure,
+				}
+			},
+			application.FieldDrift{Field: "restartPolicy.condition", Desired: "any", Live: "on-failure"},
+		},
+		"restart max attempts against a nil the daemon returns as zero": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.RestartPolicy = &swarm.RestartPolicy{MaxAttempts: uint64p(3)}
+				live.TaskTemplate.RestartPolicy = &swarm.RestartPolicy{}
+			},
+			application.FieldDrift{Field: "restartPolicy.maxAttempts", Desired: "3", Live: "0"},
+		},
+		"placement preferences": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.Placement = &swarm.Placement{
+					Preferences: []swarm.PlacementPreference{
+						{Spread: &swarm.SpreadOver{SpreadDescriptor: "node.labels.zone"}},
+					},
+				}
+			},
+			application.FieldDrift{
+				Field:   "placement.preferences",
+				Desired: "node.labels.zone",
+				Live:    "",
+			},
+		},
+		"placement max replicas per node": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.Placement = &swarm.Placement{MaxReplicas: 3}
+			},
+			application.FieldDrift{Field: "placement.maxReplicas", Desired: "3", Live: "0"},
 		},
 		"network attached that the manifest does not declare": {
 			func(want, live *swarm.ServiceSpec) {

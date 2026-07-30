@@ -541,8 +541,23 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"      labels:\n" +
 		"        com.swarmcli.release: {{ .Release.Name }}\n" +
 		"        tier: web\n" +
+		// Every one of these is declared *partially* on purpose, which is the
+		// whole of what makes them worth deploying. A struct the manifest leaves
+		// out entirely round-trips as nothing; the defaulting happens inside one
+		// it declared, where the daemon returns the unstated fields under the
+		// names of their defaults. A fixture that spelled all of them out would
+		// exercise none of that.
+		"      update_config:\n" +
+		"        parallelism: 1\n" +
+		"      restart_policy:\n" +
+		"        condition: any\n" +
 		"      placement:\n" +
 		"        constraints: [node.role == manager]\n" +
+		"        preferences:\n" +
+		"          - spread: node.id\n" +
+		// Above the replica count the clean test deploys, so this bounds nothing
+		// and cannot leave a task unschedulable on a one-node runner.
+		"        max_replicas_per_node: 3\n" +
 		"      resources:\n" +
 		"        limits:\n" +
 		"          cpus: \"0.5\"\n" +
@@ -554,6 +569,16 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"    image: busybox:1.36\n" +
 		"    command: [\"sleep\", \"3600\"]\n" +
 		"    networks: [internal]\n" +
+		// A check that passes the first time it runs, and quickly. A task with a
+		// healthcheck sits in `starting` until it first passes, so one that failed
+		// would not fail this fixture — it would hang waitForRunning and then get
+		// the container killed, which reads as something else entirely.
+		"    healthcheck:\n" +
+		"      test: [\"CMD-SHELL\", \"true\"]\n" +
+		"      interval: 5s\n" +
+		"      timeout: 3s\n" +
+		"      retries: 2\n" +
+		"      start_period: 2s\n" +
 		"    deploy:\n" +
 		"      labels:\n" +
 		"        com.swarmcli.release: {{ .Release.Name }}\n" +
