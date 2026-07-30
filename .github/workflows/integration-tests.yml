@@ -39,7 +39,9 @@ jobs:
     if: needs.changes.outputs.integration == 'true'
     name: Run integration tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Ahead of the go test timeout below, so that a suite which overruns fails
+    # with Go's stack dump naming the test rather than with a killed job.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -66,5 +68,12 @@ jobs:
       - name: Pre-pull the fixture image
         run: docker pull busybox:1.36
 
+      # 25m against a suite that takes about 15 on a healthy runner. Each of these
+      # tests deploys a real stack and waits for it to converge, so the total
+      # grows with every field driftDetection learns to compare — it went from 11
+      # to 15 minutes over swarmcli-cd#76 alone, and overran the previous 15m
+      # budget on the last of those PRs. The headroom is deliberate: a timeout
+      # here reads as a defect in whatever was being tested when the alarm fired,
+      # which costs an investigation before anyone notices it was only the clock.
       - name: Run the integration tests
-        run: go test -tags=integration -count=1 -v -timeout=15m ./integration-tests/...
+        run: go test -tags=integration -count=1 -v -timeout=25m ./integration-tests/...
