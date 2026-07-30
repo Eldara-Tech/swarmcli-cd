@@ -358,6 +358,26 @@ func printDrift(out io.Writer, releases []application.ReleaseStatus) {
 		}
 		_, _ = fmt.Fprintf(out, "\n%s drift:\n", r.Name)
 		table(out, []string{"KIND", "NAME", "REASON", "FIELD", "DESIRED", "LIVE"}, rows)
+		printRollbacks(out, r.Drift.Services)
+	}
+}
+
+// printRollbacks explains the one reason a sync will not put right.
+//
+// It goes under the table rather than in it: the daemon's account of a failed
+// rollout is a sentence, and a REASON cell wide enough for it would wreck every
+// other row. What it has to convey is that this is not waiting to be corrected —
+// the platform rejected the spec the repository asks for, so the next sync will
+// leave it exactly where it is, and the remedy is a commit.
+func printRollbacks(out io.Writer, services []application.ServiceDrift) {
+	for _, s := range services {
+		if s.Reason != application.DriftRolledBack {
+			continue
+		}
+		_, _ = fmt.Fprintf(out, "\n  %s was rolled back by Swarm; a sync will not re-apply it.\n", s.Name)
+		if s.Message != "" {
+			_, _ = fmt.Fprintf(out, "  %s\n", s.Message)
+		}
 	}
 }
 

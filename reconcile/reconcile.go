@@ -1057,9 +1057,25 @@ func detected(d *application.ReleaseDrift) bool {
 // and the sweep in departed, which deletes only what this controller can prove it
 // installed. With that off — the default — the application stays out of sync,
 // which is the truth.
+//
+// A RolledBack service goes further and vetoes the whole release, sibling
+// differences included. Swarm reverted that spec because it would not converge,
+// so re-applying the manifest re-applies the rejected spec — and a deploy is
+// release-granular, with no way to rewrite the service beside it without also
+// rewriting this one. Correcting anyway would push, be rolled back, and find the
+// same drift next interval, for ever — a drift-converged event and a
+// live-drift-detected event apiece, every interval, while nothing converges
+// (swarmcli-cd#90). The release is reported, the daemon's reason is carried on the
+// service, and the remedy is a commit — which arrives as an upgrade rather than as
+// drift, and clears the state with it.
 func convergeable(d *application.ReleaseDrift) bool {
 	if !detected(d) {
 		return false
+	}
+	for _, svc := range d.Services {
+		if svc.Reason == application.DriftRolledBack {
+			return false
+		}
 	}
 	for _, svc := range d.Services {
 		if svc.Reason == application.DriftModified || svc.Reason == application.DriftMissing {

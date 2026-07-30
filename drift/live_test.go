@@ -300,6 +300,104 @@ func TestUnexpectedServiceIsReported(t *testing.T) {
 	}
 }
 
+// rolledBackTo is a live service running an older spec because Swarm reverted the
+// one this controller wrote — the state a real daemon leaves behind after
+// `update_config.failure_action: rollback` fires.
+func rolledBackTo(spec swarm.ServiceSpec, state swarm.UpdateState, message string) swarm.Service {
+	return swarm.Service{
+		ID:           "id-" + spec.Name,
+		Spec:         spec,
+		UpdateStatus: &swarm.UpdateStatus{State: state, Message: message},
+	}
+}
+
+// The difference live drift could not previously see: a spec that stopped matching
+// the repository because *Swarm* put it back, not because anybody changed it.
+//
+// Reported as its own reason so that convergeable can refuse it. Correcting it
+// would re-apply the spec the platform has already rejected, which fails the same
+// way for ever (#90).
+func TestARolledBackServiceIsReportedAsSuch(t *testing.T) {
+	const why = "update paused due to failure or early termination of task 9xk2"
+	for _, state := range []swarm.UpdateState{
+		swarm.UpdateStateRollbackCompleted,
+		swarm.UpdateStateRollbackPaused,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			want := desiredSpec("web", "nginx:1.3")
+			running := desiredSpec("web", "nginx:1.2")
+
+			got := Live(stackOf(want), map[string]swarm.Service{
+				"s_web": rolledBackTo(running, state, why),
+			})
+
+			if len(got.Services) != 1 {
+				t.Fatalf("services = %+v, want one", got.Services)
+			}
+			svc := got.Services[0]
+			if svc.Reason != application.DriftRolledBack {
+				t.Errorf("reason = %q, want %q", svc.Reason, application.DriftRolledBack)
+			}
+			if svc.Message != why {
+				t.Errorf("message = %q, want the daemon's own account %q", svc.Message, why)
+			}
+			// The fields still say what the rejected spec asked for, which is the
+			// next thing an operator wants to know.
+			if len(svc.Fields) == 0 {
+				t.Error("fields = none, want the difference the rejected spec asked for")
+			}
+			if got.State != application.DriftStateDetected {
+				t.Errorf("state = %q, want the release still reported as drifted", got.State)
+			}
+		})
+	}
+}
+
+// Every other update state is somebody's write, not the platform's verdict.
+// `paused` matters most: it is the *default* failure_action, and it leaves the
+// spec Swarm accepted in place — so it is a convergence question, which is
+// syncPolicy.wait's, and a service still differing under it was changed by hand.
+func TestOnlyARollbackStateIsARollback(t *testing.T) {
+	for _, state := range []swarm.UpdateState{
+		swarm.UpdateStateUpdating,
+		swarm.UpdateStatePaused,
+		swarm.UpdateStateCompleted,
+		swarm.UpdateStateRollbackStarted,
+	} {
+		t.Run(string(state), func(t *testing.T) {
+			want := desiredSpec("web", "nginx:1.3")
+			running := desiredSpec("web", "nginx:1.2")
+
+			got := Live(stackOf(want), map[string]swarm.Service{
+				"s_web": rolledBackTo(running, state, "in flight"),
+			})
+
+			if len(got.Services) != 1 || got.Services[0].Reason != application.DriftModified {
+				t.Errorf("services = %+v, want one modified service", got.Services)
+			}
+			if got.Services[0].Message != "" {
+				t.Errorf("message = %q, want none for a reason that is not a rollback", got.Services[0].Message)
+			}
+		})
+	}
+}
+
+// UpdateStatus persists on a service until its next update, so a rollback is not
+// evidence of anything on its own — an operator's own bad `docker service update`,
+// rolled back to the spec the repository asks for, leaves one behind for ever. The
+// specs agreeing is what makes it history rather than a finding.
+func TestARollbackThatRestoredWhatTheRepositoryWantsIsNotDrift(t *testing.T) {
+	spec := desiredSpec("web", "nginx:1.2")
+
+	got := Live(stackOf(spec), map[string]swarm.Service{
+		"s_web": rolledBackTo(spec, swarm.UpdateStateRollbackCompleted, "somebody else's failed update"),
+	})
+
+	if got.State != application.DriftStateNone || len(got.Services) != 0 {
+		t.Errorf("drift = %+v, want none: the running spec is what the repository asks for", got)
+	}
+}
+
 // An unbounded field list would be served on every poll of the detail view.
 func TestFieldsAreCapped(t *testing.T) {
 	want, live := freshPair()

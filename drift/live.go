@@ -65,11 +65,16 @@ func Live(desired *compose.Stack, live map[string]swarm.Service) *application.Re
 			continue
 		}
 		if fields, truncated := compareService(svc.Spec, cur.Spec); len(fields) > 0 {
+			reason, message := application.DriftModified, ""
+			if why, ok := rolledBack(cur); ok {
+				reason, message = application.DriftRolledBack, why
+			}
 			out.Services = append(out.Services, application.ServiceDrift{
 				Name:      name,
-				Reason:    application.DriftModified,
+				Reason:    reason,
 				Fields:    fields,
 				Truncated: truncated,
+				Message:   message,
 			})
 		}
 	}
@@ -96,6 +101,37 @@ func Live(desired *compose.Stack, live map[string]swarm.Service) *application.Re
 		out.State = application.DriftStateDetected
 	}
 	return out
+}
+
+// rolledBack reports whether Swarm reverted this service's spec, and the
+// daemon's own account of why.
+//
+// It is the difference between the two writes live drift cannot otherwise tell
+// apart. A service whose spec no longer matches the repository was either changed
+// by somebody — redeploy it — or reverted by the platform because the spec this
+// controller wrote would not converge, in which case redeploying is the one
+// answer that cannot work: Swarm has already judged it (swarmcli-cd#90).
+//
+// Only the two rollback states count. `paused` is the *default* failure_action
+// and leaves the spec Swarm accepted in place, so it produces no difference here
+// and is a convergence question — which is syncPolicy.wait's. `updating` is a
+// rollout in progress and says nothing about the outcome.
+//
+// Deliberately only consulted when the specs already differ. UpdateStatus
+// persists on a service until its next update, so a rollback somebody's own
+// `docker service update` provoked and that restored what the repository asks for
+// would otherwise be reported for ever, on a release that is exactly where it
+// should be.
+func rolledBack(live swarm.Service) (string, bool) {
+	if live.UpdateStatus == nil {
+		return "", false
+	}
+	switch live.UpdateStatus.State {
+	case swarm.UpdateStateRollbackCompleted, swarm.UpdateStateRollbackPaused:
+		return live.UpdateStatus.Message, true
+	default:
+		return "", false
+	}
 }
 
 // maxFields bounds one service's reported differences. A service whose every

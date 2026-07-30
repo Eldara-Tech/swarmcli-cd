@@ -1826,6 +1826,113 @@ func liveSpec(name string, automated bool) application.Spec {
 	return s
 }
 
+// rolledBackBackend is driftedBackend after Swarm reverted the spec this
+// controller wrote: the release is running one replica where the manifest asks
+// for three, and the service says why.
+//
+// The manifest asking for what the *rollback undid* is the whole point — that is
+// what makes the difference look identical to somebody having scaled the service
+// by hand, which is the write this cannot otherwise be told apart from.
+func rolledBackBackend() *driftBackend {
+	want := serviceSpec("whoami_app", 3)
+	running := serviceSpec("whoami_app", 1)
+	return &driftBackend{
+		desired: map[string]*compose.Stack{
+			"whoami": {Services: []compose.Service{{Name: "app", Spec: want}}},
+		},
+		live: map[string]map[string]swarm.Service{
+			"whoami": {"whoami_app": {
+				ID:   "id",
+				Spec: running,
+				UpdateStatus: &swarm.UpdateStatus{
+					State:   swarm.UpdateStateRollbackCompleted,
+					Message: "update paused due to failure or early termination of task 9xk2",
+				},
+			}},
+		},
+	}
+}
+
+// The flap #90 is about. An automated application would read the rolled-back spec
+// as drift, push the rejected spec again, be rolled back again, and find the same
+// drift next interval — for ever, because a deploy without wait reports success,
+// so the failure backoff never engages.
+//
+// Reported and not corrected. The state clears when a commit changes the plan to
+// an upgrade, which is the only thing that can actually fix it.
+func TestARolledBackReleaseIsReportedAndNotRedeployed(t *testing.T) {
+	backend := rolledBackBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	got := view.Status.Releases[0].Drift
+	if got == nil || got.State != application.DriftStateDetected {
+		t.Fatalf("drift = %+v, want it still reported", got)
+	}
+	if len(got.Services) != 1 || got.Services[0].Reason != application.DriftRolledBack {
+		t.Fatalf("services = %+v, want one rolled-back service", got.Services)
+	}
+	if !strings.Contains(got.Services[0].Message, "update paused") {
+		t.Errorf("message = %q, want the daemon's own account", got.Services[0].Message)
+	}
+	if len(backend.converged()) != 0 {
+		t.Errorf("redeployed %v, want nothing: Swarm has already rejected that spec", backend.converged())
+	}
+}
+
+// A manual sync is not an escape hatch for it either. `force` means "do not wait
+// for the schedule", not "push a spec the platform has judged" — and re-applying
+// an unchanged manifest is the one thing that cannot fix this.
+func TestAManualSyncDoesNotRetryARolledBackRelease(t *testing.T) {
+	backend := rolledBackBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", false)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.SyncNow(context.Background(), "edge"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	if len(backend.converged()) != 0 {
+		t.Errorf("redeployed %v, want nothing", backend.converged())
+	}
+}
+
+// The veto is release-wide, and that is the granularity talking rather than a
+// choice: an apply writes every service the release declares, so there is no way
+// to rewrite the drifting sibling without re-writing the rejected spec beside it.
+func TestARolledBackServiceVetoesItsReleasesCorrection(t *testing.T) {
+	backend := rolledBackBackend()
+	// A second service in the same release, drifting in the ordinary way — the
+	// one a correction would otherwise be right to make.
+	sibling := serviceSpec("whoami_side", 2)
+	backend.desired["whoami"].Services = append(backend.desired["whoami"].Services,
+		compose.Service{Name: "side", Spec: sibling})
+	backend.live["whoami"]["whoami_side"] = swarm.Service{ID: "id-side", Spec: serviceSpec("whoami_side", 5)}
+
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if n := len(view.Status.Releases[0].Drift.Services); n != 2 {
+		t.Errorf("reported %d services, want both the rollback and the sibling", n)
+	}
+	if len(backend.converged()) != 0 {
+		t.Errorf("redeployed %v, want nothing: correcting the sibling re-pushes the rejected spec too",
+			backend.converged())
+	}
+}
+
 // The default mode must be exactly what it was. Every deployment runs it, and a
 // nil axis is what says the question was not asked rather than answered "none".
 func TestManifestModeNeverComparesAgainstTheSwarm(t *testing.T) {

@@ -275,7 +275,7 @@ How drift is decided. Omitting it defaults to `manifest`.
 | Mode | Compares | Catches |
 |---|---|---|
 | `manifest` | the rendered manifest against what was last applied | git moved: a changed chart version, values or template |
-| `live` | the above, **and** each settled release's running `ServiceSpec` against the one the repository renders to | the swarm moved: `docker service update`, a deleted service, a rollback |
+| `live` | the above, **and** each settled release's running `ServiceSpec` against the one the repository renders to | the swarm moved: `docker service update`, a deleted service, a spec Swarm rolled back |
 
 `live` costs one service list and one manifest conversion per settled release per
 interval, and it is the mode that lets the controller notice — and correct —
@@ -307,6 +307,23 @@ it could not make. The same applies when the manifest it would be compared
 *against* cannot be converted — a config the release mounts having been deleted by
 hand, say. That costs the comparison only: `pruneResources` reads what a release
 declares, which needs nothing it mounts to still exist, so a sweep is unaffected.
+
+#### A service Swarm rolled back
+
+One difference is reported and deliberately never corrected. When a service
+declares `update_config.failure_action: rollback` and the spec this controller
+wrote will not converge, Swarm reverts it — so the running spec stops matching the
+repository through no act of anybody's. That reads exactly like a hand edit, and it
+wants the opposite response: re-applying the manifest re-applies the spec the
+platform has already rejected, which fails the same way, for ever.
+
+Such a service reports reason `rolled-back` carrying the daemon's own explanation,
+and it **vetoes the correction of its whole release** — including a sibling service
+drifting in the ordinary way, because an apply writes every service a release
+declares and there is no way to rewrite the sibling without re-writing the rejected
+spec beside it. A manual `app sync` does not override it either; the remedy is a
+commit, which arrives as an upgrade rather than as drift and clears the state with
+it.
 
 #### Which releases are compared
 

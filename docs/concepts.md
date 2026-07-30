@@ -169,6 +169,13 @@ own `failure_action` and the `PreviousSpec` the platform keeps for every service
 The applier uses what the platform gives away for free, which is also why it can
 diff, prune and roll back things `docker stack deploy` cannot.
 
+What the controller does add is knowing that it happened. A rollback leaves the
+service running something the repository does not ask for, which under
+`driftDetection: live` is indistinguishable from somebody editing it by hand — and
+the two want opposite responses. So a service Swarm reverted is reported under its
+own reason and never redeployed, because the platform has already judged that spec.
+See [configuration § a service Swarm rolled back](configuration.md#a-service-swarm-rolled-back).
+
 ## Why the applier is not `docker stack deploy`
 
 The obvious way to apply a compose file is to shell out to `docker stack deploy`.
