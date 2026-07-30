@@ -620,6 +620,17 @@ func sweepingApp(name, repoDir string, mode application.DriftDetection) applicat
 	return app
 }
 
+// configLabels reads one config's labels by name, for asserting that a resource
+// belonging to somebody else was left alone.
+func configLabels(t *testing.T, cli *dockerclient.Client, name string) map[string]string {
+	t.Helper()
+	cfg, _, err := cli.ConfigInspectWithRaw(context.Background(), name)
+	if err != nil {
+		t.Fatalf("inspecting config %q: %v", name, err)
+	}
+	return cfg.Spec.Labels
+}
+
 // serviceNamesOf lists a stack's running services by scoped name.
 func serviceNamesOf(t *testing.T, cli *dockerclient.Client, release string) []string {
 	t.Helper()

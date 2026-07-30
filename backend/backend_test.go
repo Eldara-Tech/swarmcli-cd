@@ -211,12 +211,12 @@ func TestRejectForbiddenSecretMounts(t *testing.T) {
 			b.forbiddenSecrets = tc.forbidden
 			st := stack("s", cdService{"svc", tc.svc})
 
-			err := b.rejectForbiddenMounts(t.Context(), st)
+			err := b.rejectForbiddenResources(t.Context(), st)
 			if tc.wantErr && err == nil {
-				t.Fatal("rejectForbiddenMounts = nil, want an error")
+				t.Fatal("rejectForbiddenResources = nil, want an error")
 			}
 			if !tc.wantErr && err != nil {
-				t.Fatalf("rejectForbiddenMounts = %v, want nil", err)
+				t.Fatalf("rejectForbiddenResources = %v, want nil", err)
 			}
 		})
 	}
@@ -1000,6 +1000,139 @@ func TestDeployStackRefusesAControllerSecretRenamedOnTheWayIn(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "swarmcli-cd-token") {
 		t.Errorf("error %q does not name the secret", err)
+	}
+}
+
+// ------------------------------------ a stack that claims one of our names (#86)
+
+// stealsByDeclaring is a manifest that takes a resource over instead of
+// referencing it: the entry is not `external:`, so it is one of the stack's own
+// as far as conversion and the guard's reference check are concerned, and `name:`
+// points it at something that already exists.
+//
+// The file is any path the controller can read. It never reaches the swarm — a
+// secret that already exists is not created — so what is in it does not matter,
+// which is exactly why this is not hard to write.
+func stealsByDeclaring(t *testing.T, kind, name string, mount bool) string {
+	t.Helper()
+	decoy := filepath.Join(t.TempDir(), "decoy")
+	if err := os.WriteFile(decoy, []byte("not the real thing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc := "services:\n  thief:\n    image: alpine\n"
+	if mount {
+		svc += "    " + kind + ": [x]\n"
+	}
+	return svc + kind + ":\n  x:\n    name: " + name + "\n    file: " + decoy + "\n"
+}
+
+// The controller's own token, taken by declaring it rather than by referencing
+// it. Before #86 this deployed: the reference check saw a name the stack declares
+// and passed it, applySecrets found the secret already there and — unable to read
+// a stored secret's data, so with nothing to compare — updated its labels and
+// moved on, and the service was created holding the real secret's id.
+//
+// So the assertions are about both halves of that. Nothing created, and nothing
+// *updated* either: a refusal that had already relabelled the controller's own
+// secret into this stack's namespace would have handed a later RemoveStack the
+// right to delete it.
+func TestDeployStackRefusesAStackDeclaringAControllerSecret(t *testing.T) {
+	api := asController(&fakeAPI{secrets: []swarm.Secret{{
+		ID:   "real-token",
+		Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-token"}, Data: []byte("REAL")},
+	}}})
+	b := testBackend(t, api, nil).WithForbiddenSecrets(map[string]struct{}{"swarmcli-cd-token": {}}).(*Backend)
+
+	err := b.DeployStack("tenant", stealsByDeclaring(t, "secrets", "swarmcli-cd-token", true), ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the stack refused for declaring the controller's own secret")
+	}
+	for _, want := range []string{"declares", "swarmcli-cd-token", "controller"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if len(api.created) != 0 {
+		t.Errorf("%d services created; one of them holds the controller's token", len(api.created))
+	}
+	if len(api.order) != 0 || len(api.updatedSecrets) != 0 {
+		t.Errorf("the controller's own secret was touched: order=%v updated=%+v", api.order, api.updatedSecrets)
+	}
+}
+
+// Mounting it is not what makes it wrong. applySecrets and applyConfigs run over
+// everything the manifest declares, so a declaration no service references still
+// relabels the controller's resource into this stack's namespace — and that alone
+// is enough for a later RemoveStack to delete it.
+func TestDeployStackRefusesADeclarationNoServiceMounts(t *testing.T) {
+	api := asController(&fakeAPI{secrets: []swarm.Secret{{
+		ID:   "real-token",
+		Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-token"}},
+	}}})
+
+	err := testBackend(t, api, nil).DeployStack("tenant",
+		stealsByDeclaring(t, "secrets", "swarmcli-cd-token", false), ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a declaration of the controller's secret refused even unmounted")
+	}
+	if len(api.updatedSecrets) != 0 {
+		t.Errorf("the controller's own secret was relabelled: %+v", api.updatedSecrets)
+	}
+}
+
+// The config half of the same shape. This one used to be refused by applyConfigs'
+// immutability check rather than by the guard — an error about configs being
+// immutable, for what is actually an attempt to take the application set over,
+// and only after applySecrets had already run.
+func TestDeployStackRefusesAStackDeclaringTheControllersOwnConfig(t *testing.T) {
+	api := asController(&fakeAPI{configs: []swarm.Config{{
+		ID:   "app-set",
+		Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"}, Data: []byte("real")},
+	}}})
+
+	err := testBackend(t, api, nil).DeployStack("tenant",
+		stealsByDeclaring(t, "configs", "swarmcli-cd-applications", true), ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the stack refused for declaring the controller's own config")
+	}
+	if !strings.Contains(err.Error(), "declares") || !strings.Contains(err.Error(), "controller") {
+		t.Errorf("error %q does not say what was refused", err)
+	}
+	if len(api.order) != 0 {
+		t.Errorf("resources were created despite the refusal: %v", api.order)
+	}
+}
+
+// A release record, taken the same way. Not immutability's business at all: the
+// record it names does not exist yet, so nothing would have refused this.
+func TestDeployStackRefusesAStackDeclaringAReleaseRecordName(t *testing.T) {
+	api := asController(&fakeAPI{configs: []swarm.Config{{
+		ID: "rec",
+		Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+			Name:   "swarmcli.release.other-app.v3",
+			Labels: map[string]string{charts.LabelType: charts.TypeRelease},
+		}},
+	}}})
+
+	err := testBackend(t, api, nil).DeployStack("tenant",
+		stealsByDeclaring(t, "configs", "swarmcli.release.other-app.v3", true), ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the stack refused for declaring a release record's name")
+	}
+	if !strings.Contains(err.Error(), "release record") {
+		t.Errorf("error %q does not say what was refused", err)
+	}
+}
+
+// The false-positive check, and the reason the new rule compares names rather
+// than refusing declarations outright: a chart declaring and mounting its own
+// config and secret is ordinary, and #84 exists so that it works. Their names are
+// namespace-scoped, so they are nobody else's.
+func TestAStackDeclaringItsOwnConfigAndSecretIsAllowed(t *testing.T) {
+	api := asController(&fakeAPI{})
+
+	if err := testBackend(t, api, nil).DeployStack("rel", declaresAndMounts(t), ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want a chart's own config and secret to be allowed", err)
 	}
 }
 
