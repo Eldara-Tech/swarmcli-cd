@@ -33,7 +33,7 @@ import (
 func TestLiveDriftIsNotReportedOnAnUntouchedStack(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-live-clean"
-	repo := gitRepo(t, richChartFiles(release, 2))
+	repo := gitRepo(t, richChartFiles(t, release, 2))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
 	rec := reconciler(t, liveDriftApp("clean", repo, true))
@@ -224,7 +224,7 @@ func hasTag(image, tag string) bool {
 func TestLiveDriftDetectsAnOutOfBandPublishedPort(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-live-ports"
-	repo := gitRepo(t, richChartFiles(release, 1))
+	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
 	rec := reconciler(t, liveDriftApp("ports", repo, false))
@@ -292,7 +292,7 @@ func TestLiveDriftDetectsAnOutOfBandPublishedPort(t *testing.T) {
 func TestLiveDriftDetectsAndRestoresADetachedNetwork(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-live-network"
-	repo := gitRepo(t, richChartFiles(release, 1))
+	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
 	rec := reconciler(t, liveDriftApp("network", repo, false))
@@ -346,7 +346,7 @@ func TestLiveDriftDetectsAndRestoresADetachedNetwork(t *testing.T) {
 func TestLiveDriftDetectsAndRestoresTheEndpointMode(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-live-endpoint"
-	repo := gitRepo(t, richChartFiles(release, 1))
+	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
 	rec := reconciler(t, liveDriftApp("endpoint", repo, false))
@@ -401,7 +401,7 @@ func TestLiveDriftReportsAnAttachmentOutsideTheStack(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-live-extra"
 	const shared = "e2e-live-extra-shared"
-	repo := gitRepo(t, richChartFiles(release, 1))
+	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
 	ctx := context.Background()
@@ -452,6 +452,20 @@ func TestLiveDriftReportsAnAttachmentOutsideTheStack(t *testing.T) {
 	}
 }
 
+// assertNotReported fails if any service reports this field. It is how a test
+// says "and nothing else moved", which for a comparison whose whole risk is
+// false positives is half of what each case is for.
+func assertNotReported(t *testing.T, d *application.ReleaseDrift, field string) {
+	t.Helper()
+	for _, svc := range d.Services {
+		for _, f := range svc.Fields {
+			if f.Field == field {
+				t.Errorf("%s reported %+v, want it untouched and unreported", svc.Name, f)
+			}
+		}
+	}
+}
+
 // namesExactly reports whether a rendered network list names these and no others.
 // Order-insensitive deliberately: the rendering sorts, but asserting on that
 // ordering would make the test about ASCII rather than about what is attached.
@@ -461,6 +475,114 @@ func namesExactly(rendered string, want []string) bool {
 	w := slices.Clone(want)
 	slices.Sort(w)
 	return slices.Equal(got, w)
+}
+
+// A mount removed by hand.
+//
+// The target is a real key — a container cannot mount two things at one path — so
+// this reports as one line naming what should be mounted there and what is. The
+// named volume rather than the bind, because it is the one whose source the
+// manifest scopes, so the assertion also says the scoping survives the round trip.
+func TestLiveDriftDetectsAnOutOfBandMountRemoval(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-mount"
+	repo := gitRepo(t, richChartFiles(t, release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, liveDriftApp("mount", repo, false))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "mount"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
+		kept := spec.TaskTemplate.ContainerSpec.Mounts[:0]
+		for _, m := range spec.TaskTemplate.ContainerSpec.Mounts {
+			if m.Target != "/data" {
+				kept = append(kept, m)
+			}
+		}
+		spec.TaskTemplate.ContainerSpec.Mounts = kept
+	})
+	waitForRunning(t, cli, release, 2)
+
+	if err := rec.Sync(ctx, "mount"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	got := fieldOf(t, driftOf(t, rec, "mount"), release+"_app", "mounts[/data]")
+	if got.Desired != "volume:"+release+"_data" {
+		t.Errorf("desired mount = %q, want the scoped volume the chart declares", got.Desired)
+	}
+	if got.Live != "(absent)" {
+		t.Errorf("live mount = %q, want it reported as gone", got.Live)
+	}
+
+	// The read-only bind beside it must not report. It is the mount whose
+	// BindOptions the daemon drops on the way in, so a comparison that looked
+	// inside a mount would find a difference here on every tick.
+	assertNotReported(t, driftOf(t, rec, "mount"), "mounts[/etc/host-name]")
+
+	if err := rec.SyncNow(ctx, "mount"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+	if d := driftOf(t, rec, "mount"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
+}
+
+// A mounted secret removed by hand.
+//
+// Both sides carry an id the daemon resolved, and neither is compared: what is
+// compared is the name and where it lands, which is the pair `--secret-rm`
+// changes. The config beside it is the control — untouched, and so unreported.
+func TestLiveDriftDetectsAnOutOfBandSecretRemoval(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-secret"
+	repo := gitRepo(t, richChartFiles(t, release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, liveDriftApp("secret", repo, false))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "secret"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
+		spec.TaskTemplate.ContainerSpec.Secrets = nil
+	})
+	waitForRunning(t, cli, release, 2)
+
+	if err := rec.Sync(ctx, "secret"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	d := driftOf(t, rec, "secret")
+	got := fieldOf(t, d, release+"_app", "secrets["+release+"_token]")
+	// The reference's file target is the source name when the manifest gives no
+	// explicit one, which is what lands under /run/secrets.
+	if got.Desired != "token" || got.Live != "(absent)" {
+		t.Errorf("secret drift = %+v, want the mount target against nothing", got)
+	}
+	assertNotReported(t, d, "configs["+release+"_site]")
+
+	if err := rec.SyncNow(ctx, "secret"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	svc := serviceOf(t, cli, release+"_app")
+	if n := len(svc.Spec.TaskTemplate.ContainerSpec.Secrets); n != 1 {
+		t.Errorf("secret references after converging = %d, want the chart's one back", n)
+	}
+	if d := driftOf(t, rec, "secret"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
 }
 
 // A service deleted out of band. The health axis only notices when a release has
@@ -474,7 +596,7 @@ func namesExactly(rendered string, want []string) bool {
 func TestLiveDriftDetectsAndRestoresADeletedService(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-live-missing"
-	repo := gitRepo(t, richChartFiles(release, 1))
+	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
 	rec := reconciler(t, liveDriftApp("missing", repo, false))

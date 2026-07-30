@@ -482,7 +482,25 @@ func liveDriftApp(name, repoDir string, automated bool) application.Spec {
 // show that, which is why this fixture is here and not in a unit test.
 //
 // Two services, so that "one of them is missing" is a case that exists.
-func richChartFiles(release string, replicas int) map[string]string {
+//
+// It takes t because a mounted config and secret have to come from somewhere:
+// compose sources them with `file:`, resolved against the controller's own
+// filesystem, which in these tests is the test process — so a path under
+// t.TempDir() is exactly right, and a path hard-coded to somebody's checkout is
+// what must not appear. See chartFilesWithPrunables, which does the same.
+func richChartFiles(t *testing.T, release string, replicas int) map[string]string {
+	t.Helper()
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing fixture file %q: %v", path, err)
+		}
+		return path
+	}
+	siteFile := write("site.conf", "listen 8080\n")
+	tokenFile := write("token", "s3cr3t\n")
+
 	files := chartFiles(release, replicas)
 	files["charts/app/templates/stack.yaml"] = "" +
 		"version: \"3.9\"\n" +
@@ -496,6 +514,13 @@ func richChartFiles(release string, replicas int) map[string]string {
 		"    networks: [internal]\n" +
 		"    volumes:\n" +
 		"      - data:/data\n" +
+		// A read-only bind beside the named volume, so both mount types and the
+		// read-only flag are all round-tripped through a real daemon. An absolute
+		// path that exists on any node, because a swarm bind names a path on
+		// whichever node runs the task.
+		"      - /etc/hostname:/etc/host-name:ro\n" +
+		"    configs: [site]\n" +
+		"    secrets: [token]\n" +
 		"    ports:\n" +
 		// Fixed rather than dynamic, so the assertion does not depend on
 		// whatever the runner had free. High and uncommon to avoid a clash.
@@ -535,7 +560,13 @@ func richChartFiles(release string, replicas int) map[string]string {
 		"networks:\n" +
 		"  internal: {}\n" +
 		"volumes:\n" +
-		"  data: {}\n"
+		"  data: {}\n" +
+		"configs:\n" +
+		"  site:\n" +
+		"    file: " + siteFile + "\n" +
+		"secrets:\n" +
+		"  token:\n" +
+		"    file: " + tokenFile + "\n"
 	return files
 }
 
