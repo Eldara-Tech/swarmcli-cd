@@ -358,6 +358,14 @@ type ServiceDrift struct {
 	// candidate for anything — the same distinction charts.Plan draws between
 	// an orphaned release and an unmanaged one.
 	Orphaned bool `json:"orphaned,omitempty"`
+	// Message is the daemon's own account of why a RolledBack service was
+	// reverted, verbatim from the service's UpdateStatus ("update paused due to
+	// failure or early termination of task …").
+	//
+	// Passed through rather than reworded: it names the task that failed, which
+	// is the thread an operator pulls next, and this controller did not observe
+	// the failure and has nothing to add to it. Empty for every other reason.
+	Message string `json:"message,omitempty"`
 }
 
 // FieldDrift is one field that differs, rendered rather than typed: this

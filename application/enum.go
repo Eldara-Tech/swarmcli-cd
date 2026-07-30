@@ -204,10 +204,15 @@ func (d *DriftState) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// DriftReason is how one service differs. The three are genuinely different
+// DriftReason is how one service differs. The four are genuinely different
 // problems: Modified is a service whose spec was changed, Missing is one that is
-// declared and not running at all, and Unexpected is one running under the
-// stack's namespace that the manifest does not declare.
+// declared and not running at all, Unexpected is one running under the stack's
+// namespace that the manifest does not declare, and RolledBack is one Swarm
+// itself reverted because the spec this controller wrote would not converge.
+//
+// Only two of them are worth redeploying for. An Unexpected service is not there
+// to be rewritten, and a RolledBack one has already had the repository's answer
+// rejected by the platform — see reconcile.convergeable.
 type DriftReason string
 
 const (
@@ -215,6 +220,7 @@ const (
 	DriftModified      DriftReason = "modified"
 	DriftMissing       DriftReason = "missing"
 	DriftUnexpected    DriftReason = "unexpected"
+	DriftRolledBack    DriftReason = "rolled-back"
 )
 
 // MarshalJSON implements json.Marshaler.
@@ -222,7 +228,7 @@ func (d DriftReason) MarshalJSON() ([]byte, error) { return marshalEnum(d, unkno
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (d *DriftReason) UnmarshalJSON(data []byte) error {
-	v, err := unmarshalEnum(data, DriftModified, DriftMissing, DriftUnexpected)
+	v, err := unmarshalEnum(data, DriftModified, DriftMissing, DriftUnexpected, DriftRolledBack)
 	if err != nil {
 		return err
 	}

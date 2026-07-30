@@ -669,6 +669,36 @@ func TestAppGetShowsWhatDrifted(t *testing.T) {
 	}
 }
 
+// A rolled-back service is the one finding a sync will not put right, so the
+// table's REASON cell is not enough on its own: an operator reading "rolled-back"
+// with no further word would reasonably wait for the next sync to fix it, and
+// waiting is exactly wrong. The daemon's own account names the task that failed,
+// which is where they go next.
+func TestAppGetExplainsARollbackWillNotBeReapplied(t *testing.T) {
+	view := driftedView()
+	view.Status.Releases[0].Drift.Services = []application.ServiceDrift{{
+		Name:    "web_nginx",
+		Reason:  application.DriftRolledBack,
+		Fields:  []application.FieldDrift{{Field: "image", Desired: "nginx:1.3", Live: "nginx:1.2"}},
+		Message: "update paused due to failure or early termination of task 9xk2",
+	}}
+	server := start(t, &stubReconciler{view: view})
+
+	code, stdout, stderr := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	for _, want := range []string{
+		"rolled-back", "image", "nginx:1.3",
+		"rolled back by Swarm", "will not re-apply",
+		"early termination of task 9xk2",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+}
+
 func TestAppGetOmitsDriftWhenNotUsed(t *testing.T) {
 	server := start(t, &stubReconciler{view: syncedView()})
 
