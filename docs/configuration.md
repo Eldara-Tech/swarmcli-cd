@@ -631,14 +631,16 @@ inside: it has no way to tell "my own releases from before a restart" from
 "another controller using my id".
 
 Changing the id later is safe but not free: releases stamped with the old one
-stop being recognised, so they read as unmanaged and prune ignores them. A
-release is re-stamped by the next reconcile that actually deploys it — not
-merely by the next reconcile, because one that finds nothing to change writes no
-revision and so writes no stamp. An application whose releases are already up to
-date therefore keeps the old stamps until something changes. That is safe (see
-[renaming an application](#renaming-an-application), below) but it does mean the
-old stamps can linger indefinitely. One that was removed at the same time has to
-be cleaned up by hand.
+stop being recognised, so they read as unmanaged and prune ignores them until
+they are re-stamped. **Every release is redeployed once to correct its stamp**,
+because the owner a release is planned under is part of what decides whether it
+needs deploying — an automated application does that on its next pass, a manual
+one when it is next asked. The redeploy hands Swarm the manifest it is already
+running, so it writes a revision and moves the stamp without restarting tasks.
+Until then the old stamps are stale but safe (see
+[renaming an application](#renaming-an-application), below). A release belonging
+to an application that was removed at the same time is never re-stamped, because
+nothing plans it any more; that one has to be cleaned up by hand.
 
 Volumes are a second opt-in because they are the one part nothing can restore.
 Everything else prune deletes is recreated from git the moment the application
@@ -657,11 +659,16 @@ its release history; the new name simply takes over reconciling it.
 Two things make that work, and both are worth knowing about because they are
 visible.
 
-The release keeps the *old* name's owner stamp until something redeploys it,
-because a plan that finds nothing to change writes no revision. Prune does not
-go by the stamp alone: it never deletes a release that an application still in
-the set declares. So the stale stamp is harmless, and `swarmcli-cd status` may
-show a release owned by a name that is no longer in the app set.
+**The rename redeploys each of the application's releases once.** The stamp is
+part of what a plan compares, so a release still carrying the old name's stamp
+is not "unchanged" — it is deployed again under the new name, which writes one
+revision and moves the stamp. Swarm is handed the manifest it is already
+running, so no task is restarted. Between the rename and that first reconcile
+the stamp is stale, and `swarmcli-cd status` may show a release owned by a name
+that is no longer in the app set; a manual-policy application stays that way
+until it is asked to sync. It is harmless either way, because prune does not go
+by the stamp alone: it never deletes a release that an application still in the
+set declares.
 
 And the sweep waits. An application that has just joined the set has not fetched
 its repository yet, so it has not yet said which releases it declares — and a

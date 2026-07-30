@@ -64,15 +64,15 @@ func OwnerID(controller, app string) string {
 // controller's. That is deliberate — it reads as unmanaged, so prune leaves it
 // alone, and the migration errs towards not deleting.
 //
-// It does not heal on its own, though, and it is worth being exact about why.
-// Ownership plays no part in planning a release the file declares, so a
-// reconcile that deploys one re-stamps it; but a release whose chart, values and
-// manifest are unchanged is planned as unchanged and skipped, and skipping is
-// what charts does instead of writing a revision that would say nothing new.
-// So a stale stamp survives until something actually redeploys that release,
-// which under the default sync policy is until an operator asks. What keeps
-// that safe is not the stamp but prune's second signal: a release an
-// application still declares is never swept, whatever it is stamped with (#62).
+// It does heal, and it is worth being exact about when. Ownership is part of
+// what decides whether a release needs deploying (swarmcli#511), so a stamp in
+// this format contradicts the one this controller would write, and the first
+// reconcile that plans the release redeploys it once and stamps it properly.
+// That is the next pass for an automated application and not until it is asked
+// for a manual one, so the old format outlives the upgrade by an interval at
+// least. What keeps that interval safe is not the stamp but prune's second
+// signal: a release an application still declares is never swept, whatever it
+// is stamped with (#62).
 func AppFromOwnerID(controller, id string) (string, bool) {
 	if controller == "" {
 		controller = DefaultControllerID
