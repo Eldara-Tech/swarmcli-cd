@@ -6,11 +6,16 @@ package backend
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
+
+	"github.com/Eldara-Tech/swarmcli/charts"
 )
 
 const liveManifest = `version: "3.9"
@@ -93,4 +98,160 @@ func keysOf(m map[string]swarm.Service) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// ------------------------------------------- the other three kinds (#80)
+
+// Each lister is a namespace filter and nothing else, so a filter that never
+// arrived is the whole of what could go wrong. Asserted twice: the fake applies
+// the filter, so an unfiltered read returns the sibling stack's resource too,
+// and labelFilters catches a read scoped by the wrong label.
+func TestLiveResourceListersAreScopedToTheStack(t *testing.T) {
+	api := &fakeAPI{
+		networks: []network.Summary{
+			stackNetwork("n1", "s_front", "s"),
+			stackNetwork("n2", "other_front", "other"),
+		},
+		configs: []swarm.Config{
+			{ID: "c1", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_site", "s")}},
+			{ID: "c2", Spec: swarm.ConfigSpec{Annotations: stackScoped("other_site", "other")}},
+		},
+		secrets: []swarm.Secret{
+			{ID: "k1", Spec: swarm.SecretSpec{Annotations: stackScoped("s_key", "s")}},
+			{ID: "k2", Spec: swarm.SecretSpec{Annotations: stackScoped("other_key", "other")}},
+		},
+	}
+	b := testBackend(t, api, nil)
+	ctx := context.Background()
+
+	nets, err := b.LiveNetworks(ctx, "s")
+	if err != nil {
+		t.Fatalf("LiveNetworks = %v, want nil", err)
+	}
+	cfgs, err := b.LiveConfigs(ctx, "s")
+	if err != nil {
+		t.Fatalf("LiveConfigs = %v, want nil", err)
+	}
+	secs, err := b.LiveSecrets(ctx, "s")
+	if err != nil {
+		t.Fatalf("LiveSecrets = %v, want nil", err)
+	}
+
+	for what, got := range map[string]map[string]string{
+		"networks": nets, "configs": cfgs, "secrets": secs,
+	} {
+		if len(got) != 1 {
+			t.Errorf("%s = %v, want only this stack's", what, got)
+		}
+	}
+	// Scoped name to id: the name is the only key a manifest and a live resource
+	// share, and the id is what the removal takes.
+	if nets["s_front"] != "n1" || cfgs["s_site"] != "c1" || secs["s_key"] != "k1" {
+		t.Errorf("nets=%v configs=%v secrets=%v, want scoped name to id", nets, cfgs, secs)
+	}
+	for _, f := range api.labelFilters {
+		if f != convert.LabelNamespace+"=s" {
+			t.Errorf("a list was scoped by %q, want the stack namespace label", f)
+		}
+	}
+}
+
+// A release record is the evidence the sweep proves ownership with. Sweeping one
+// up would delete the history that says what this controller installed — the
+// same guard RemoveStack applies, one scope down.
+func TestLiveConfigsNeverIncludesAReleaseRecord(t *testing.T) {
+	record := swarm.ConfigSpec{Annotations: swarm.Annotations{
+		Name: "swarmcli.release.s.v1",
+		Labels: map[string]string{
+			convert.LabelNamespace: "s",
+			charts.LabelType:       charts.TypeRelease,
+		},
+	}}
+	api := &fakeAPI{configs: []swarm.Config{
+		{ID: "rel", Spec: record},
+		{ID: "c1", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_site", "s")}},
+	}}
+
+	got, err := testBackend(t, api, nil).LiveConfigs(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("LiveConfigs = %v, want nil", err)
+	}
+	if _, ok := got["swarmcli.release.s.v1"]; ok {
+		t.Error("a release record is in range of the sweep; that would delete the ownership evidence")
+	}
+	if len(got) != 1 || got["s_site"] != "c1" {
+		t.Errorf("configs = %v, want the stack's own config alone", got)
+	}
+}
+
+func TestLiveResourceListersReportAFailure(t *testing.T) {
+	b := testBackend(t, &fakeAPI{networkErr: errors.New("swarm unreachable")}, nil)
+	if _, err := b.LiveNetworks(context.Background(), "s"); err == nil ||
+		!strings.Contains(err.Error(), "listing the stack's networks") {
+		t.Errorf("LiveNetworks = %v, want the list error surfaced and named", err)
+	}
+}
+
+// By id, not by name: the caller has already read the resource it means, and
+// resolving a name again here would open a window in which it pointed at
+// something else.
+func TestResourceRemovalsGoByID(t *testing.T) {
+	api := &fakeAPI{
+		networks: []network.Summary{stackNetwork("n1", "s_front", "s")},
+		configs:  []swarm.Config{{ID: "c1", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_site", "s")}}},
+		secrets:  []swarm.Secret{{ID: "k1", Spec: swarm.SecretSpec{Annotations: stackScoped("s_key", "s")}}},
+	}
+	b := testBackend(t, api, nil)
+	ctx := context.Background()
+
+	if err := b.RemoveConfig(ctx, "c1"); err != nil {
+		t.Fatalf("RemoveConfig = %v, want nil", err)
+	}
+	if err := b.RemoveSecret(ctx, "k1"); err != nil {
+		t.Fatalf("RemoveSecret = %v, want nil", err)
+	}
+	if err := b.RemoveNetwork(ctx, "n1"); err != nil {
+		t.Fatalf("RemoveNetwork = %v, want nil", err)
+	}
+
+	want := []string{"config:c1", "secret:k1", "network:n1"}
+	if !slices.Equal(api.removed, want) {
+		t.Errorf("removed %v, want %v — each by id", api.removed, want)
+	}
+}
+
+// Already gone is the outcome the caller wanted. It is also routine for a
+// network: Swarm garbage-collects an overlay once its last task leaves, which
+// happens while the services that used it are still shutting down.
+func TestResourceRemovalsTolerateSomethingAlreadyGone(t *testing.T) {
+	api := &fakeAPI{removeErr: map[string]error{
+		"network:n1": errdefs.ErrNotFound,
+		"config:c1":  errdefs.ErrNotFound,
+		"secret:k1":  errdefs.ErrNotFound,
+	}}
+	b := testBackend(t, api, nil)
+	ctx := context.Background()
+
+	if err := b.RemoveNetwork(ctx, "n1"); err != nil {
+		t.Errorf("RemoveNetwork = %v, want nil for one already gone", err)
+	}
+	if err := b.RemoveConfig(ctx, "c1"); err != nil {
+		t.Errorf("RemoveConfig = %v, want nil for one already gone", err)
+	}
+	if err := b.RemoveSecret(ctx, "k1"); err != nil {
+		t.Errorf("RemoveSecret = %v, want nil for one already gone", err)
+	}
+}
+
+// A refusal is not a not-found. Swarm refuses to remove anything still in use,
+// and that has to reach the caller so it can report it and try again.
+func TestResourceRemovalSurfacesARefusal(t *testing.T) {
+	api := &fakeAPI{removeErr: map[string]error{
+		"config:c1": errors.New("config c1 is in use by service s_web"),
+	}}
+
+	err := testBackend(t, api, nil).RemoveConfig(context.Background(), "c1")
+	if err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Fatalf("RemoveConfig = %v, want the daemon's refusal surfaced", err)
+	}
 }

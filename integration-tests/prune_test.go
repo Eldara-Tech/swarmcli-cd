@@ -299,7 +299,7 @@ func TestRenamingAnApplicationKeepsItsStackAndVolume(t *testing.T) {
       # changes no manifest, so no service is ever a candidate; if the service
       # sweep were keyed on anything weaker it would delete the very stack this
       # test exists to watch being handed over.
-      pruneServices: true
+      pruneResources: true
   - name: anchor
     source:
       repoURL: ` + anchorRepo + `

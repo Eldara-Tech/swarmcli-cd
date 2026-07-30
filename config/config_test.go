@@ -269,39 +269,39 @@ applications:
     syncPolicy: {pruneFirst: true}
 `
 	_, err := Parse([]byte(src), "applications.yaml")
-	if err == nil || !strings.Contains(err.Error(), "pruneFirst means nothing without prune or pruneServices") {
+	if err == nil || !strings.Contains(err.Error(), "pruneFirst means nothing without prune or pruneResources") {
 		t.Fatalf("Parse = %v, want pruneFirst refused without prune", err)
 	}
 }
 
-// pruneServices stands alone, unlike pruneVolumes and pruneFirst. It is a
+// pruneResources stands alone, unlike pruneVolumes and pruneFirst. It is a
 // sibling of prune rather than an extension of it: prune decides what happens to
-// a whole release the application stopped declaring, pruneServices what happens
+// a whole release the application stopped declaring, pruneResources what happens
 // inside one it still declares, and wanting the second without the first is a
 // coherent position rather than a half-written config.
-func TestPruneServicesNeedsNoOtherFlag(t *testing.T) {
+func TestPruneResourcesNeedsNoOtherFlag(t *testing.T) {
 	const src = `
 applications:
   - name: edge
     source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}
-    syncPolicy: {automated: true, pruneServices: true}
+    syncPolicy: {automated: true, pruneResources: true}
 `
 	f, err := Parse([]byte(src), "applications.yaml")
 	if err != nil {
 		t.Fatalf("Parse = %v, want nil", err)
 	}
-	if p := f.Applications[0].SyncPolicy; !p.PruneServices || p.Prune {
-		t.Errorf("pruneServices=%v prune=%v, want true and false", p.PruneServices, p.Prune)
+	if p := f.Applications[0].SyncPolicy; !p.PruneResources || p.Prune {
+		t.Errorf("pruneResources=%v prune=%v, want true and false", p.PruneResources, p.Prune)
 	}
 }
 
 // pruneFirst orders both sweeps, so either gate gives it something to order.
-func TestPruneFirstIsAcceptedWithPruneServicesAlone(t *testing.T) {
+func TestPruneFirstIsAcceptedWithPruneResourcesAlone(t *testing.T) {
 	const src = `
 applications:
   - name: edge
     source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}
-    syncPolicy: {automated: true, pruneServices: true, pruneFirst: true}
+    syncPolicy: {automated: true, pruneResources: true, pruneFirst: true}
 `
 	if _, err := Parse([]byte(src), "applications.yaml"); err != nil {
 		t.Fatalf("Parse = %v, want nil", err)

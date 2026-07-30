@@ -1606,6 +1606,25 @@ type driftBackend struct {
 	// It is what distinguishes the two prune orderings.
 	appliedAt      func() int
 	removedAtApply []int
+
+	// The other three kinds, by release and then scoped name to id — the shape
+	// the resourceLister seam returns.
+	liveNetworks map[string]map[string]string
+	liveConfigs  map[string]map[string]string
+	liveSecrets  map[string]map[string]string
+	// listErr fails the resource listers only, so a test can have a backend that
+	// reads services and not the rest.
+	listErr error
+	// removedResources records what the resource sweep deleted, as "<kind>:<id>",
+	// so one field carries both what went and that the right call was made.
+	removedResources []string
+	// resourceRemoveErr fails a removal by "<kind>:<id>", modelling the daemon
+	// refusing to remove something still in use.
+	resourceRemoveErr map[string]error
+	// resourcesAtApply is removedAtApply for the other three kinds. They are
+	// sampled separately because they are ordered separately: pruneFirst moves
+	// the services and deliberately leaves these where they are.
+	resourcesAtApply []int
 }
 
 func (b *driftBackend) DesiredServices(_ context.Context, manifest, stack string) (*compose.Stack, error) {
@@ -1661,6 +1680,68 @@ func (b *driftBackend) LiveServices(_ context.Context, stack string) (map[string
 		return nil, b.readErr
 	}
 	return b.live[stack], nil
+}
+
+func (b *driftBackend) LiveNetworks(_ context.Context, stack string) (map[string]string, error) {
+	if b.listErr != nil {
+		return nil, b.listErr
+	}
+	return b.liveNetworks[stack], nil
+}
+
+func (b *driftBackend) LiveConfigs(_ context.Context, stack string) (map[string]string, error) {
+	if b.listErr != nil {
+		return nil, b.listErr
+	}
+	return b.liveConfigs[stack], nil
+}
+
+func (b *driftBackend) LiveSecrets(_ context.Context, stack string) (map[string]string, error) {
+	if b.listErr != nil {
+		return nil, b.listErr
+	}
+	return b.liveSecrets[stack], nil
+}
+
+// The three resource removals delete from the fake swarm as RemoveService does,
+// so a reconcile after a sweep sees what the sweep did.
+func (b *driftBackend) RemoveNetwork(_ context.Context, id string) error {
+	return b.removeResource("network", id, b.liveNetworks)
+}
+
+func (b *driftBackend) RemoveConfig(_ context.Context, id string) error {
+	return b.removeResource("config", id, b.liveConfigs)
+}
+
+func (b *driftBackend) RemoveSecret(_ context.Context, id string) error {
+	return b.removeResource("secret", id, b.liveSecrets)
+}
+
+func (b *driftBackend) removeResource(kind, id string, from map[string]map[string]string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	key := kind + ":" + id
+	if err := b.resourceRemoveErr[key]; err != nil {
+		return err
+	}
+	b.removedResources = append(b.removedResources, key)
+	if b.appliedAt != nil {
+		b.resourcesAtApply = append(b.resourcesAtApply, b.appliedAt())
+	}
+	for _, stack := range from {
+		for name, have := range stack {
+			if have == id {
+				delete(stack, name)
+			}
+		}
+	}
+	return nil
+}
+
+func (b *driftBackend) prunedResources() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.removedResources)
 }
 
 func (b *driftBackend) DeployStack(name, manifest, _ string) error {
@@ -2245,7 +2326,7 @@ func TestConvergeWaitTimesOut(t *testing.T) {
 	}
 }
 
-// ------------------------------------------ syncPolicy.pruneServices (#75)
+// ----------------------------------------- syncPolicy.pruneResources (#75, #80)
 
 // The stack as the swarm holds it: two services running, a chart that has
 // stopped declaring one of them, and a stored revision that declared both.
@@ -2295,7 +2376,7 @@ func sweepHistory(app string, manifests ...string) map[string][]charts.Release {
 
 func sweepingSpec(name string, drift application.DriftDetection) application.Spec {
 	s := spec(name, true)
-	s.SyncPolicy.PruneServices = true
+	s.SyncPolicy.PruneResources = true
 	s.DriftDetection = drift
 	return s
 }
@@ -2376,7 +2457,7 @@ func TestAPrunedServiceIsReportedInManifestModeBeforeItGoes(t *testing.T) {
 // The pre-#75 behaviour, asserted so it cannot regress into a deletion nobody
 // asked for. Live mode, because that is where an unexpected service is reported
 // at all.
-func TestAnUnexpectedServiceSurvivesWhenPruneServicesIsOff(t *testing.T) {
+func TestAnUnexpectedServiceSurvivesWhenPruneResourcesIsOff(t *testing.T) {
 	backend := sweepBackend()
 	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
 	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
@@ -2386,7 +2467,7 @@ func TestAnUnexpectedServiceSurvivesWhenPruneServicesIsOff(t *testing.T) {
 	}
 
 	if len(backend.pruned()) != 0 {
-		t.Errorf("removed %v with pruneServices off, want nothing", backend.pruned())
+		t.Errorf("removed %v with pruneResources off, want nothing", backend.pruned())
 	}
 	// Still reported, and without the marker: no proof is computed for an
 	// application that did not ask for one.
@@ -2597,5 +2678,239 @@ func TestAFailedRemovalIsReportedWithoutFailingTheDeploy(t *testing.T) {
 	view, _ := r.View("edge")
 	if last := view.Status.Sync.LastSync; last == nil || !last.Succeeded {
 		t.Errorf("last sync = %+v, want a success — the deploy landed, only the sweep did not", last)
+	}
+}
+
+// -------------------------------------- networks, configs and secrets (#80)
+
+// The same stack one scope wider: the chart has stopped declaring a network, a
+// config and a secret as well as a service, and still declares one of each.
+//
+// The "keep" half is what makes this a test rather than a demonstration. A sweep
+// that deleted everything under the namespace would pass a test that only
+// asserted the departed ones were gone.
+func resourceSweepBackend() *driftBackend {
+	b := sweepBackend()
+	b.desired["whoami"].Networks = []compose.Network{{Name: "whoami_keep"}}
+	b.desired["whoami"].Configs = []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "whoami_cfg-keep"}}}
+	b.desired["whoami"].Secrets = []swarm.SecretSpec{{Annotations: swarm.Annotations{Name: "whoami_sec-keep"}}}
+
+	had := b.byManifest["had-a-sidecar"]
+	had.Networks = []compose.Network{{Name: "whoami_keep"}, {Name: "whoami_gone"}}
+	had.Configs = []swarm.ConfigSpec{
+		{Annotations: swarm.Annotations{Name: "whoami_cfg-keep"}},
+		{Annotations: swarm.Annotations{Name: "whoami_cfg-old"}},
+	}
+	had.Secrets = []swarm.SecretSpec{
+		{Annotations: swarm.Annotations{Name: "whoami_sec-keep"}},
+		{Annotations: swarm.Annotations{Name: "whoami_sec-old"}},
+	}
+
+	b.liveNetworks = map[string]map[string]string{
+		"whoami": {"whoami_keep": "n-keep", "whoami_gone": "n-gone"},
+	}
+	b.liveConfigs = map[string]map[string]string{
+		"whoami": {"whoami_cfg-keep": "c-keep", "whoami_cfg-old": "c-old"},
+	}
+	b.liveSecrets = map[string]map[string]string{
+		"whoami": {"whoami_sec-keep": "k-keep", "whoami_sec-old": "k-old"},
+	}
+	return b
+}
+
+// The issue's case for the other three kinds. Each one the chart stopped
+// declaring goes; each one it still declares stays.
+//
+// The removal order is asserted because it is the order they stop being
+// referenced in — the same order RemoveStack uses, and the reason a config is
+// not attempted after the network it might have been reachable through.
+func TestResourcesDroppedFromTheChartArePruned(t *testing.T) {
+	backend := resourceSweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	want := []string{"config:c-old", "secret:k-old", "network:n-gone"}
+	if got := backend.prunedResources(); !slices.Equal(got, want) {
+		t.Errorf("pruned %v, want %v — configs, then secrets, then networks", got, want)
+	}
+	// The service sweep still works, and both halves came out of one proof.
+	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
+		t.Errorf("pruned services %v, want %v", backend.pruned(), want)
+	}
+	// One revision converted, answering all four kinds. Sweeping four costs what
+	// sweeping one did; a walk per kind would show four reads of it.
+	if got := slices.Collect(func(yield func(string) bool) {
+		for _, m := range backend.converted() {
+			if m == "had-a-sidecar" && !yield(m) {
+				return
+			}
+		}
+	}); len(got) != 1 {
+		t.Errorf("converted the claiming revision %d times, want once for all four kinds", len(got))
+	}
+}
+
+// The #62 lesson, one kind further out. A network carrying the namespace label
+// that no revision of ours ever declared is not ours to delete.
+func TestAResourceNoRevisionOfOursDeclaredIsNeverPruned(t *testing.T) {
+	backend := resourceSweepBackend()
+	// A network somebody else attached to this stack, and a history that is ours
+	// and never mentioned it.
+	backend.liveNetworks["whoami"]["whoami_stranger"] = "n-stranger"
+	backend.byManifest["had-a-sidecar"].Networks = []compose.Network{{Name: "whoami_keep"}}
+	delete(backend.liveNetworks["whoami"], "whoami_gone")
+
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if slices.Contains(backend.prunedResources(), "network:n-stranger") {
+		t.Errorf("pruned %v, want the stranger left alone — the namespace label is not evidence",
+			backend.prunedResources())
+	}
+}
+
+// Swarm scopes all four kinds into one namespace of names, so "whoami_sidecar"
+// can be both a service and a config. The revision declared the service by that
+// name and never a config, so the config is unproved and must survive.
+func TestAConfigIsNotClaimedByASameNamedService(t *testing.T) {
+	backend := resourceSweepBackend()
+	backend.liveConfigs["whoami"]["whoami_sidecar"] = "c-namesake"
+
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if slices.Contains(backend.prunedResources(), "config:c-namesake") {
+		t.Errorf("pruned %v, want the config spared — only the service of that name was declared",
+			backend.prunedResources())
+	}
+	// The service of the same name still goes, so this is not the sweep failing
+	// wholesale.
+	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
+		t.Errorf("pruned services %v, want %v", backend.pruned(), want)
+	}
+}
+
+// Swarm refuses to remove anything still in use, and a config whose service was
+// removed moments ago is still in use while its tasks drain. That is the
+// ordinary case, not a fault: failing the reconcile on it would report an error
+// every interval for something working exactly as intended.
+func TestAResourceStillInUseIsReportedAndTheReconcileSucceeds(t *testing.T) {
+	backend := resourceSweepBackend()
+	backend.resourceRemoveErr = map[string]error{
+		"config:c-old": errors.New("config is in use by service whoami_sidecar"),
+	}
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil — a refusal is what the next interval is for", err)
+	}
+	// The refusal does not stop the rest of the sweep.
+	want := []string{"secret:k-old", "network:n-gone"}
+	if got := backend.prunedResources(); !slices.Equal(got, want) {
+		t.Errorf("pruned %v, want %v — one refusal does not abandon the others", got, want)
+	}
+	view, _ := r.View("edge")
+	if last := view.Status.Sync.LastSync; last == nil || !last.Succeeded {
+		t.Errorf("last sync = %+v, want a success", last)
+	}
+}
+
+// pruneFirst is about a workload not overlapping itself. A network or a config
+// has no such hazard and cannot go before the service holding it has, so the
+// flag moves the services and deliberately leaves these where they are — which
+// under pruneFirst is the better order anyway, the services being gone already.
+func TestPruneFirstMovesTheServicesAndNotTheResources(t *testing.T) {
+	backend := resourceSweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	backend.appliedAt = engine.applyCount
+
+	spec := sweepingSpec("edge", application.DriftManifest)
+	spec.SyncPolicy.PruneFirst = true
+	r := newTestWith(t, []application.Spec{spec}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []int{0}; !slices.Equal(backend.removedAtApply, want) {
+		t.Errorf("services removed after %v applies, want %v — pruneFirst deletes before deploying",
+			backend.removedAtApply, want)
+	}
+	if want := []int{1, 1, 1}; !slices.Equal(backend.resourcesAtApply, want) {
+		t.Errorf("resources removed after %v applies, want %v — always after the apply",
+			backend.resourcesAtApply, want)
+	}
+}
+
+// Deleting with no record of it anywhere but a log line would be worse than not
+// deleting. Manifest mode has no drift axis of its own, so the sweep builds one
+// carrying the orphans and nothing else.
+func TestDepartedResourcesAreReportedOnTheDriftAxis(t *testing.T) {
+	backend := resourceSweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	// A manual policy reports and does not act, which is what makes this the
+	// operator's warning rather than a receipt.
+	spec := sweepingSpec("edge", application.DriftManifest)
+	spec.SyncPolicy.Automated = false
+	r := newTestWith(t, []application.Spec{spec}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := backend.prunedResources(); len(got) != 0 {
+		t.Fatalf("pruned %v on a manual policy, want nothing", got)
+	}
+
+	view, _ := r.View("edge")
+	var got []string
+	for _, rel := range view.Status.Releases {
+		if rel.Drift == nil {
+			continue
+		}
+		for _, res := range rel.Drift.Resources {
+			got = append(got, string(res.Kind)+" "+res.Name)
+		}
+	}
+	slices.Sort(got)
+	want := []string{"config whoami_cfg-old", "network whoami_gone", "secret whoami_sec-old"}
+	if !slices.Equal(got, want) {
+		t.Errorf("reported %v, want %v", got, want)
+	}
+	if d := view.Status.Drift; d == nil || d.Resources != 3 {
+		t.Errorf("drift = %+v, want 3 departed resources counted", d)
+	}
+}
+
+// A backend that can read services but not the other three kinds loses only the
+// half it cannot answer. The same degradation live drift already has.
+func TestABackendThatCannotListResourcesStillSweepsServices(t *testing.T) {
+	backend := resourceSweepBackend()
+	backend.listErr = errors.New("not implemented here")
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := backend.prunedResources(); len(got) != 0 {
+		t.Errorf("pruned %v, want nothing on a read that failed", got)
+	}
+	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
+		t.Errorf("pruned services %v, want %v — the readable half still works", backend.pruned(), want)
 	}
 }

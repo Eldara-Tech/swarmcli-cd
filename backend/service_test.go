@@ -633,11 +633,22 @@ func labelOf(f filters.Args) string {
 func (f *fakeAPI) note(what string) { f.order = append(f.order, what) }
 
 func (f *fakeAPI) NetworkList(_ context.Context, o network.ListOptions) ([]network.Summary, error) {
-	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
+	label := labelOf(o.Filters)
+	f.labelFilters = append(f.labelFilters, label)
 	if f.networkErr != nil {
 		return nil, f.networkErr
 	}
-	return f.networks, nil
+	if label == "" {
+		return f.networks, nil
+	}
+	key, value, _ := strings.Cut(label, "=")
+	var out []network.Summary
+	for _, n := range f.networks {
+		if v, ok := n.Labels[key]; ok && v == value {
+			out = append(out, n)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeAPI) NetworkCreate(_ context.Context, name string, o network.CreateOptions) (network.CreateResponse, error) {
@@ -659,10 +670,12 @@ func (f *fakeAPI) NetworkRemove(_ context.Context, id string) error {
 	return err
 }
 
-// ConfigList honours the label filter it is given. A fake that ignored it would
-// hand every caller the whole store, which is how a filtered read gets shipped
-// untested — and one of this package's callers asks specifically for the chart
-// engine's release records.
+// ConfigList honours the label filter it is given, as NetworkList and SecretList
+// do. A fake that ignored it would hand every caller the whole store, which is
+// how a filtered read gets shipped untested — and the stack-scoped listers in
+// live.go are nothing but a filter, so a fake that returned everything would
+// make them pass whether or not they sent one. labelFilters remains the second
+// check, because it also catches a list scoped by the wrong label.
 func (f *fakeAPI) ConfigList(_ context.Context, o swarm.ConfigListOptions) ([]swarm.Config, error) {
 	label := labelOf(o.Filters)
 	f.labelFilters = append(f.labelFilters, label)
@@ -710,8 +723,19 @@ func (f *fakeAPI) ConfigRemove(_ context.Context, id string) error {
 }
 
 func (f *fakeAPI) SecretList(_ context.Context, o swarm.SecretListOptions) ([]swarm.Secret, error) {
-	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
-	return f.secrets, nil
+	label := labelOf(o.Filters)
+	f.labelFilters = append(f.labelFilters, label)
+	if label == "" {
+		return f.secrets, nil
+	}
+	key, value, _ := strings.Cut(label, "=")
+	var out []swarm.Secret
+	for _, s := range f.secrets {
+		if v, ok := s.Spec.Labels[key]; ok && v == value {
+			out = append(out, s)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeAPI) SecretInspectWithRaw(_ context.Context, name string) (swarm.Secret, []byte, error) {
