@@ -176,6 +176,24 @@ refuses to deploy a stack that reaches for anything of its own, and refuses it
 whole — before any network, config, secret or service is created, so nothing is
 left half-deployed.
 
+Reaching for a name is not the only way to get at it. A manifest can also put
+that name on a resource it declares as **its own**, which is not an `external:`
+reference at all:
+
+```yaml
+secrets:
+  x:
+    name: swarmcli-cd-token     # not this stack's to name
+    file: ./anything
+```
+
+A secret that already exists is not created again, so the stack would simply be
+handed the real one — and its labels rewritten into the stack's namespace, where
+uninstalling that release would delete it. Declared names are therefore checked
+against the same three sets as referenced ones, whether or not any service mounts
+them (swarmcli-cd#86). A chart's own config or secret is unaffected: its name is
+namespace-scoped to `<release>_<name>`, so it is nobody else's.
+
 Three things are off limits:
 
 | | |
@@ -202,8 +220,8 @@ If the daemon is reachable but will not answer, the deploy **fails** rather than
 proceeding unguarded, and the next one tries again.
 
 An ordinary `external:` reference to a config or secret an operator created for
-their own stacks is unaffected. Only the controller's own and the engine's own
-are refused.
+their own stacks is unaffected, and so is a chart declaring and mounting its own.
+Only the controller's own and the engine's own are refused.
 
 **Static credentials only.** The controller image ships no docker credential
 helpers, so a `config.json` using `credsStore` or `credHelpers` is refused at

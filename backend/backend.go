@@ -53,8 +53,8 @@ func (b *Backend) WithRegistryAuth(auth regauth.Resolver) charts.Backend {
 //
 // It is the startup-derived half only. The backend adds what Swarm reports it
 // has mounted, and the chart engine's release records, at deploy time — see
-// rejectForbiddenMounts. Nothing an operator has to wire up can therefore be the
-// difference between the guard being on and off.
+// rejectForbiddenResources. Nothing an operator has to wire up can therefore be
+// the difference between the guard being on and off.
 func (b *Backend) WithForbiddenSecrets(names map[string]struct{}) charts.Backend {
 	c := *b
 	c.forbiddenSecrets = names
@@ -106,20 +106,44 @@ func MountedSecretNames(dir string) (map[string]struct{}, error) {
 	return out, nil
 }
 
-// rejectForbiddenMounts refuses a stack that reaches outside itself for one of
+// What a reconciled stack may not touch, and why — the same three answers
+// whether it reached for the name or claimed it.
+const (
+	whatControllerSecret = "a credential belonging to the controller"
+	whatControllerConfig = "this controller's own state; the application set names every " +
+		"repository, revision and destination this controller applies"
+	whatReleaseRecord = "a chart release record; those hold the rendered manifest of every " +
+		"release on this swarm"
+)
+
+// rejectForbiddenResources refuses a stack that reaches outside itself for one of
 // the controller's own secrets or configs, or for the chart engine's release
-// history.
+// history — and a stack that declares one of those names as its own.
 //
-// Secrets and configs are cluster-global objects resolved by name, so the check
-// is a name comparison. Only an `external` reference can ever match: a stack's
-// own secrets and configs are namespace-scoped to "<stack>_<name>" by
-// conversion, and cannot collide with an unscoped name. That is also what makes
-// this cheap — externalRefs is usually empty, and a stack that reaches for
-// nothing outside itself costs no lookup at all.
-func (b *Backend) rejectForbiddenMounts(ctx context.Context, stack *cdcompose.Stack) error {
-	// Read at most once per deploy, and only if some service reaches outside the
-	// stack at all. Inside the loop each would be read once per such service,
-	// for an answer that cannot differ between them.
+// Secrets and configs are cluster-global objects addressed by name, so both
+// checks are a name comparison. The second one is not redundant, and #86 is the
+// proof: a manifest can put any name it likes on a resource it declares,
+//
+//	secrets:
+//	  x:
+//	    name: swarmcli-cd-token
+//	    file: ./anything-readable
+//
+// and conversion then resolves both the declaration and the reference to that
+// name. So the stack's own set contains it, externalRefs correctly reports the
+// reference as not reaching outside the stack — and applySecrets adopts the
+// controller's real secret, because a stored secret's data cannot be read back
+// and there is nothing to compare. The service is handed the real credential, and
+// the secret is relabelled into the stack's namespace, where a later RemoveStack
+// deletes it. Declaring a name is not the same as owning it.
+//
+// The cost is one pair of reads per deploy, and only for a stack that either
+// reaches outside itself or declares a secret or config at all. A stack that does
+// neither costs no lookup.
+func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose.Stack) error {
+	// Read at most once per deploy, and only if there is something to compare
+	// against them. Inside the loops each would be read once per service, for an
+	// answer that cannot differ between them.
 	var mine selfMounts
 	var history map[string]struct{}
 	load := func() error {
@@ -134,6 +158,7 @@ func (b *Backend) rejectForbiddenMounts(ctx context.Context, stack *cdcompose.St
 		return err
 	}
 
+	// What a service reaches outside the stack for.
 	for _, svc := range stack.Services {
 		secrets, configs := externalRefs(stack, svc)
 		if len(secrets) == 0 && len(configs) == 0 {
@@ -147,36 +172,66 @@ func (b *Backend) rejectForbiddenMounts(ctx context.Context, stack *cdcompose.St
 			_, wired := b.forbiddenSecrets[name]
 			_, mounted := mine.secrets[name]
 			if wired || mounted {
-				return fmt.Errorf("service %q mounts secret %q, which is a credential belonging to the "+
-					"controller; a reconciled stack may not mount the controller's own secrets", svc.Name, name)
+				return mountsForbidden(svc.Name, "secret", name, whatControllerSecret)
 			}
 		}
 		for _, name := range configs {
 			if _, forbidden := mine.configs[name]; forbidden {
-				return fmt.Errorf("service %q mounts config %q, which is this controller's own state; "+
-					"a reconciled stack may not mount it, because the application set names every "+
-					"repository, revision and destination this controller applies", svc.Name, name)
+				return mountsForbidden(svc.Name, "config", name, whatControllerConfig)
+			}
+			if _, forbidden := history[name]; forbidden {
+				return mountsForbidden(svc.Name, "config", name, whatReleaseRecord)
 			}
 		}
+	}
 
-		for _, name := range configs {
-			if _, forbidden := history[name]; forbidden {
-				return fmt.Errorf("service %q mounts config %q, which is a chart release record; "+
-					"those hold the rendered manifest of every release on this swarm, so a reconciled "+
-					"stack may not mount one", svc.Name, name)
+	// What the stack claims as its own. Checked whether or not a service mounts
+	// it: the adoption happens in applySecrets and applyConfigs, which run over
+	// everything the manifest declares, so an unmounted declaration relabels the
+	// controller's resource just the same.
+	if len(stack.Secrets) > 0 || len(stack.Configs) > 0 {
+		if err := load(); err != nil {
+			return err
+		}
+		for _, spec := range stack.Secrets {
+			_, wired := b.forbiddenSecrets[spec.Name]
+			_, mounted := mine.secrets[spec.Name]
+			if wired || mounted {
+				return declaresForbidden("secret", spec.Name, whatControllerSecret)
+			}
+		}
+		for _, spec := range stack.Configs {
+			if _, forbidden := mine.configs[spec.Name]; forbidden {
+				return declaresForbidden("config", spec.Name, whatControllerConfig)
+			}
+			if _, forbidden := history[spec.Name]; forbidden {
+				return declaresForbidden("config", spec.Name, whatReleaseRecord)
 			}
 		}
 	}
 	return nil
 }
 
+func mountsForbidden(service, kind, name, what string) error {
+	return fmt.Errorf("service %q mounts %s %q, which is %s; a reconciled stack may not mount it",
+		service, kind, name, what)
+}
+
+func declaresForbidden(kind, name, what string) error {
+	return fmt.Errorf("this stack declares %s %q, which is %s; a reconciled stack may not declare "+
+		"one of those names as its own, because Swarm addresses a %s by name — the existing one "+
+		"would be handed to this stack's services and relabelled as this stack's", kind, name, what, kind)
+}
+
 // externalRefs names the secrets and configs one service references that the
 // stack does not itself declare.
 //
-// Those are the only references that can reach another tenant's resources or the
-// controller's: everything a manifest declares is namespace-scoped on the way in,
-// so a reference to a bare name came from an `external:` declaration and resolves
-// against the cluster-wide store.
+// Those are the references that resolve against the cluster-wide store rather
+// than against something this deploy creates. A manifest's own declarations are
+// usually namespace-scoped to "<stack>_<name>" on the way in, so a reference to
+// an unscoped name usually came from an `external:` declaration — but "usually"
+// is the whole of #86, and a declaration that named itself something else is why
+// rejectForbiddenResources checks the declared set separately.
 func externalRefs(stack *cdcompose.Stack, svc cdcompose.Service) (secrets, configs []string) {
 	cs := svc.Spec.TaskTemplate.ContainerSpec
 	if cs == nil {
@@ -258,7 +313,7 @@ func (b *Backend) DeployStack(name, manifest, resolve string) error {
 	// reference to something that does not exist, since assuming it does is how
 	// it works — the chart engine pre-flights those before it calls this, and
 	// says so for the same reason.
-	if err := b.rejectForbiddenMounts(ctx, unresolved); err != nil {
+	if err := b.rejectForbiddenResources(ctx, unresolved); err != nil {
 		return err
 	}
 	// The networks, secrets and configs are read from the unresolved pass
