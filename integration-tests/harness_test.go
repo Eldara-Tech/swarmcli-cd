@@ -521,6 +521,10 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"      - /etc/hostname:/etc/host-name:ro\n" +
 		"    configs: [site]\n" +
 		"    secrets: [token]\n" +
+		// Container labels, which are not the service labels under deploy: two
+		// different sets, two different flags, and only these reach the container.
+		"    labels:\n" +
+		"      role: web\n" +
 		"    ports:\n" +
 		// Fixed rather than dynamic, so the assertion does not depend on
 		// whatever the runner had free. High and uncommon to avoid a clash.
@@ -562,6 +566,7 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"        limits:\n" +
 		"          cpus: \"0.5\"\n" +
 		"          memory: 64M\n" +
+		"          pids: 100\n" +
 		"        reservations:\n" +
 		"          cpus: \"0.1\"\n" +
 		"          memory: 16M\n" +
@@ -584,6 +589,11 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		// direction those two can drift in.
 		"    user: \"1000:1000\"\n" +
 		"    hostname: sidecar-host\n" +
+		// `default` is the only isolation a Linux daemon accepts, and it is also
+		// what an empty one reads back as — so this states the value the
+		// normalisation has to produce, from the other side.
+		"    isolation: default\n" +
+		"    stdin_open: true\n" +
 		"    working_dir: /tmp\n" +
 		"    stop_signal: SIGTERM\n" +
 		"    stop_grace_period: 5s\n" +
@@ -630,6 +640,46 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"  token:\n" +
 		"    file: " + tokenFile + "\n"
 	return files
+}
+
+// richTasks is how many running tasks richChartFiles deploys for a given app
+// replica count: the app's own, plus the sidecar beside it.
+//
+// Named rather than written out at each call site so that adding a service to
+// that fixture stays a one-line change here instead of a sweep through every
+// test that waits on it.
+func richTasks(appReplicas int) int { return appReplicas + 1 }
+
+// jobChartFiles is a one-service chart whose service is a replicated job.
+//
+// It is separate from richChartFiles, and that separation is the finding: a job
+// whose task sleeps never completes, so a release containing one never satisfies
+// the convergence wait a deploy performs. Putting a job in the shared fixture
+// made every test using it time out after three minutes. It gets its own chart
+// and its own application, deployed with syncPolicy.wait off.
+func jobChartFiles(release string, concurrency int) map[string]string {
+	files := chartFiles(release, 1)
+	files["charts/app/values.yaml"] = "replicas: " + itoa(concurrency) + "\n"
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    deploy:\n" +
+		"      mode: replicated-job\n" +
+		"      replicas: {{ .Values.replicas }}\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n"
+	return files
+}
+
+// jobApp is a live-drift application that does not wait for convergence, because
+// the release it deploys is a job that never converges by that definition.
+func jobApp(name, repoDir string) application.Spec {
+	app := liveDriftApp(name, repoDir, false)
+	app.SyncPolicy.Wait = false
+	return app
 }
 
 // serviceOf finds one of a stack's services by its scoped name.

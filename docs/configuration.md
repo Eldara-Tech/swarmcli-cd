@@ -373,6 +373,12 @@ change, which is the surface an out-of-band change actually uses:
 | `sysctls[NAME]`, `ulimits[NAME]` | `--sysctl-add`, `--sysctl-rm`, `--ulimit-add`, `--ulimit-rm` |
 | `dns`, `dns.*` | `--dns-add`, `--dns-search-add`, `--dns-option-add` and their `-rm` pairs |
 | `logDriver`, `logDriver.*` | `--log-driver`, `--log-opt` |
+| `containerLabels[NAME]` | `--container-label-add`, `--container-label-rm` |
+| `isolation`, `oomScoreAdj`, `openStdin` | `--isolation`, `--oom-score-adj` |
+| `resources.limits.pids` | `--limit-pids` |
+| `resources.reservations.genericResources` | `--generic-resource-add`, `--generic-resource-rm` |
+| `privileges.*` | `--credential-spec`, and the API for the rest |
+| `maxConcurrent`, `totalCompletions` | `--max-concurrent`, `--replicas` on a job |
 
 A published port is reported as a whole entry being `set` or `absent` rather than
 as a value that changed, because a port has no stable key: two publishes can share
@@ -440,9 +446,28 @@ cannot express them: `groups` has no `group_add`, and `dns.options` is never
 filled by the conversion. A `--group-add` or `--dns-option-add` therefore always
 shows up against an empty desired side, which is exactly the point.
 
-**Not compared**: container labels (`--container-label-add`), generic resources,
-isolation, and the credential spec and other privileges. Each is a candidate for
-the same treatment and none has been proved against a real swarm yet. Networks, configs
+`containerLabels` are the container's own, which are not the service's: two
+different sets, two different flags, and only the container's reach the running
+process. A **replicated job** counts with `maxConcurrent` and `totalCompletions`
+where a service counts with `replicas`, and the mode branch is exclusive, so a job
+is never reported as a replica change. Most of `privileges` has no
+`docker service update` flag and can only be set through the API — which is the
+reason to report it rather than a reason not to, since a no-new-privileges flag
+cleared behind the controller's back is a security change nothing else here shows.
+
+**What is left, and why.** The list above is now the whole of a `ServiceSpec` that
+an out-of-band change can reach. What remains uncompared is uncompared for a
+reason rather than for want of attention:
+
+| | |
+|---|---|
+| `ForceUpdate`, `Runtime`, `Placement.Platforms` | the daemon's own bookkeeping, not desired state |
+| `PluginSpec`, `NetworkAttachmentSpec` | other task runtimes; a service using one has no container spec at all |
+| mount options, network aliases and driver options, a reference's `uid`/`gid`/`mode` | not independently mutable — changing one means replacing the thing that holds it, which *is* reported |
+| `Endpoint` (as distinct from `EndpointSpec`) | runtime state: virtual IPs and the ports Swarm actually allocated |
+| the service's own name | the key the two sides are matched on |
+
+Networks, configs
 and secrets are not compared as *resources* either — Swarm cannot update a
 network in place, and configs and secrets are immutable with their content
 hashed into the name, so a change to either is already a manifest-level
