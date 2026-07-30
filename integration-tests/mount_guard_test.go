@@ -20,14 +20,15 @@ import (
 // cluster-wide store with no namespace on the reference at all. That is the
 // whole vulnerability — the name is the only thing being asked for.
 //
-// The target is the compose key rather than a `name:` override, which is both
-// the shortest way to write it and the only one that gets this far: CE's
-// external-reference pre-flight reads the deprecated `external: {name: X}` form
-// and not the current `external: true` with a sibling `name:`, so the latter is
-// refused upstream with a confusing error before the applier sees it
-// (Eldara-Tech/swarmcli#513). Either way the stack does not deploy; only this
-// form proves *this* guard is what stopped it.
-func thiefChartFiles(release, target string) map[string]string {
+// key is what the service references and what the top-level entry is keyed on.
+// name, when non-empty, is a `name:` beside `external: true`, which is what the
+// resource is then actually called; key becomes a template-local alias that
+// names nothing on the swarm.
+func thiefChartFiles(release, key, name string) map[string]string {
+	nameLine := ""
+	if name != "" {
+		nameLine = "    name: \"" + name + "\"\n"
+	}
 	files := chartFiles(release, 1)
 	files["charts/app/templates/stack.yaml"] = "" +
 		"version: \"3.9\"\n" +
@@ -35,14 +36,47 @@ func thiefChartFiles(release, target string) map[string]string {
 		"  thief:\n" +
 		"    image: busybox:1.36\n" +
 		"    command: [\"sleep\", \"3600\"]\n" +
-		"    configs: [\"" + target + "\"]\n" +
+		"    configs: [\"" + key + "\"]\n" +
 		"    deploy:\n" +
 		"      labels:\n" +
 		"        com.swarmcli.release: {{ .Release.Name }}\n" +
 		"configs:\n" +
-		"  \"" + target + "\":\n" +
-		"    external: true\n"
+		"  \"" + key + "\":\n" +
+		"    external: true\n" +
+		nameLine
 	return files
+}
+
+// externalForms is the two ways a manifest can say which external config it
+// wants, and the guard has to stop both.
+//
+// They are one code path by the time cd sees them — docker/cli's loader
+// normalises a sibling `name:` onto the entry, and a reference resolves to that
+// name rather than to the map key — so what differs is only what a chart author
+// writes. Both are covered because each is load-bearing for a different reason.
+//
+// The `name:` form is the real attack shape, and until recently it could not be
+// tested here at all: CE's external-reference pre-flight read the deprecated
+// `external: {name: X}` form and not the current `external: true` with a
+// sibling `name:`, so a chart using it was refused upstream with a confusing
+// error before the applier ever saw it. Eldara-Tech/swarmcli#513 fixed that, so
+// the pre-flight now resolves the name, finds the record and hands the stack to
+// this applier — which is what makes "the guard stopped it" a claim this test
+// can prove rather than an assumption about which layer refused first. Its
+// compose key is deliberately the name of nothing on the swarm, so a regression
+// that resolved back to the key would fail the pre-flight instead of reaching
+// the guard, and this test would notice.
+//
+// The key form is what every published chart in Eldara-Tech/swarmcli-charts is
+// written as, so it is the one a regression would break in the field.
+//
+// alias is the compose key when it is not the name itself; empty means the key
+// *is* the name.
+var externalForms = []struct {
+	form, thief, alias string
+}{
+	{form: "compose-key", thief: "e2e-guard-thief-key"},
+	{form: "top-level-name", thief: "e2e-guard-thief-name", alias: "innocent-looking-alias"},
 }
 
 // A tenant stack may not mount the chart engine's release records.
@@ -52,6 +86,9 @@ func thiefChartFiles(release, target string) map[string]string {
 // variable names, mounts, placement. They are also the half of #63 that no set
 // captured at startup could cover, because a new one is written on every deploy.
 //
+// Both ways of naming an external config are covered; see externalForms for why
+// each earns its place.
+//
 // This runs against a real swarm because the guard turns on what a real daemon
 // reports: that the release record exists under the name the manifest asks for,
 // that CE's external-reference pre-flight is satisfied by it, and that the
@@ -59,12 +96,9 @@ func thiefChartFiles(release, target string) map[string]string {
 // declining for an unrelated reason.
 func TestAStackMayNotMountAReleaseRecord(t *testing.T) {
 	cli := dockerClient(t)
-	const (
-		victim = "e2e-guard-victim"
-		thief  = "e2e-guard-thief"
-	)
+	const victim = "e2e-guard-victim"
 	victimRepo := gitRepo(t, chartFiles(victim, 1))
-	t.Cleanup(func() { removeStack(t, victim); removeStack(t, thief) })
+	t.Cleanup(func() { removeStack(t, victim) })
 
 	ctx := context.Background()
 	rec := reconciler(t, releaseApp("victim", victimRepo, true))
@@ -77,21 +111,33 @@ func TestAStackMayNotMountAReleaseRecord(t *testing.T) {
 	// rather than searching for it keeps the test honest about what it is
 	// reaching for.
 	record := "swarmcli.release." + victim + ".v1"
-	thiefRepo := gitRepo(t, thiefChartFiles(thief, record))
 
-	rec2 := reconciler(t, releaseApp("thief", thiefRepo, true))
-	err := rec2.SyncNow(ctx, "thief")
-	if err == nil {
-		t.Fatal("SyncNow(thief) = nil, want the deploy refused for mounting a release record")
-	}
-	if !strings.Contains(err.Error(), "release record") {
-		t.Fatalf("SyncNow(thief) = %v, want it refused by the mount guard", err)
-	}
+	// One victim for both forms. Each theft is refused before anything is
+	// created, so a second one costs a reconcile and no deploy.
+	for _, tc := range externalForms {
+		t.Run(tc.form, func(t *testing.T) {
+			key, name := record, ""
+			if tc.alias != "" {
+				key, name = tc.alias, record
+			}
+			t.Cleanup(func() { removeStack(t, tc.thief) })
+			thiefRepo := gitRepo(t, thiefChartFiles(tc.thief, key, name))
 
-	// Refused whole. The guard runs before any resource is created, so a refusal
-	// must not leave a service behind for somebody to wonder about.
-	if names := serviceNamesOf(t, cli, thief); len(names) != 0 {
-		t.Errorf("services = %v, want none created by a refused deploy", names)
+			rec := reconciler(t, releaseApp("thief", thiefRepo, true))
+			err := rec.SyncNow(ctx, "thief")
+			if err == nil {
+				t.Fatal("SyncNow(thief) = nil, want the deploy refused for mounting a release record")
+			}
+			if !strings.Contains(err.Error(), "release record") {
+				t.Fatalf("SyncNow(thief) = %v, want it refused by the mount guard", err)
+			}
+
+			// Refused whole. The guard runs before any resource is created, so a
+			// refusal must not leave a service behind for somebody to wonder about.
+			if names := serviceNamesOf(t, cli, tc.thief); len(names) != 0 {
+				t.Errorf("services = %v, want none created by a refused deploy", names)
+			}
+		})
 	}
 }
 

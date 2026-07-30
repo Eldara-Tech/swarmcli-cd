@@ -43,15 +43,17 @@
 //
 // # The stamp is not enough on its own
 //
-// A stamp records who installed a release, and it is only rewritten when
-// something deploys that release again. Rename an application without changing
-// anything else and the plan comes out identical, so nothing is deployed and
-// nothing is re-stamped: the release keeps the departed name's stamp
-// indefinitely, and reading the stamp alone would delete a stack that a current
-// application is reconciling (#62). So the sweep is given the releases the
-// current applications declare as well, and spares anything in that list. The
-// stamp says who installed it; that list says whether anybody is still
-// responsible for it.
+// A stamp records who installed a release, and it is only rewritten by a
+// reconcile that deploys. Rename an application without changing anything else
+// and the release is now planned under an owner that contradicts its stamp,
+// which the plan does notice (swarmcli#511) — but noticing corrects the stamp
+// no earlier than the next reconcile that gets that far, and a sweep can run
+// first. Until it does, the release still carries the departed name's stamp,
+// and reading the stamp alone would delete a stack that a current application
+// is reconciling (#62). So the sweep is given the releases the current
+// applications declare as well, and spares anything in that list. The stamp
+// says who installed it; that list says whether anybody is still responsible
+// for it.
 //
 // # Two controllers on one swarm
 //
@@ -241,11 +243,12 @@ func New(o Options) *Pruner {
 // declared names the releases the applications still in the set hold, and no
 // release named in it is ever deleted whatever its stamp says. That is what
 // makes renaming an application a handover rather than a teardown (#62): the
-// release keeps the departed application's stamp until something re-stamps it,
-// and under the default sync policy nothing does, because re-stamping means
-// deploying and a manual-policy application is not deployed without being asked.
-// The stamp answers "who installed this"; declared answers "is anybody still
-// responsible for it", and only the second is a safe basis for deleting.
+// release keeps the departed application's stamp until a reconcile deploys it
+// under the new one, which is the next pass for an automated application and
+// not until it is asked for a manual one — either way, later than a sweep that
+// runs in between. The stamp answers "who installed this"; declared answers "is
+// anybody still responsible for it", and only the second is a safe basis for
+// deleting.
 //
 // Every application is attempted and the failures are collected rather than
 // returned at the first. They are independent, and because the next sweep

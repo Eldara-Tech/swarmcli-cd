@@ -126,13 +126,15 @@ up and finds a release stamped for one of its own applications that its app set
 no longer declares knows the application departed, even though it never watched
 it leave. It is also why prune needs no database — the swarm is the record.
 
-A stamp records who *installed* a release, and it is only rewritten when
-something deploys that release again — a reconcile that finds nothing to change
-writes no revision and so writes no stamp. So a stamp can name an application
-that no longer exists, which is exactly what renaming one produces. That is why
-prune asks a second question before it deletes anything: not only "whose stamp
-is this" but "is any application still declaring this release". Only a release
-that fails both is left behind; see
+A stamp records who *installed* a release, and it is only rewritten by a
+reconcile that deploys. A stamp naming an application that no longer exists —
+exactly what renaming one produces — is therefore corrected rather than
+permanent: the owner is part of what the plan compares, so the release is
+redeployed once under the new name. But it is corrected no sooner than the next
+reconcile that gets that far, and a prune sweep can run first. That is why prune
+asks a second question before it deletes anything: not only "whose stamp is
+this" but "is any application still declaring this release". Only a release that
+fails both is left behind; see
 [configuration § renaming an application](configuration.md#renaming-an-application).
 
 The same question is asked one scope down, and for all four kinds a manifest
