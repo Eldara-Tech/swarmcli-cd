@@ -484,6 +484,18 @@ type declaredLister interface {
 	DeclaredResources(ctx context.Context, manifest, stack string) (*compose.Stack, error)
 }
 
+// declaredReader returns the conversion to ask what a manifest declares.
+//
+// A backend that does not implement declaredLister gets the resolving one, which
+// is what both callers used before #87: the same answer, unavailable in the same
+// narrow cases, rather than no sweep at all.
+func declaredReader(ldb liveDriftBackend) func(context.Context, string, string) (*compose.Stack, error) {
+	if dl, ok := ldb.(declaredLister); ok {
+		return dl.DeclaredResources
+	}
+	return ldb.DesiredServices
+}
+
 // resourceLister is the optional interface a backend implements to read the
 // other three kinds a manifest declares, by scoped name. *backend.Backend
 // satisfies it.
@@ -518,8 +530,20 @@ type resourceRemover interface {
 // one release: the specs the repository renders to, and the services actually
 // running under its namespace.
 type releaseView struct {
+	// desired is the resolving conversion of the manifest, for the live-drift
+	// comparison only: that diffs whole ServiceSpecs, so it must never be handed
+	// a reference resolved to a placeholder id. Read only for a release live
+	// drift will actually compare — a settled one — because it is also the
+	// reading that cannot be made before a deploy has created what the manifest
+	// newly declares.
 	desired *compose.Stack
-	live    map[string]swarm.Service
+	// declared is the same manifest converted without resolving what its services
+	// mount, which is the whole of what the sweep needs from it: the scoped names
+	// a stored revision proves are this application's. It works on an upgraded
+	// release too, whose new manifest may mount a config this deploy has not
+	// created yet (#84, #87).
+	declared *compose.Stack
+	live     map[string]swarm.Service
 	// networks, configs and secrets are the other three kinds carrying the
 	// release's namespace label, by scoped name to id. Read only for a sweeping
 	// application whose backend can list them; nil otherwise, which makes them
@@ -527,10 +551,17 @@ type releaseView struct {
 	networks map[string]string
 	configs  map[string]string
 	secrets  map[string]string
-	// err is whatever stopped the release's services being read. Both features
-	// answer it the same way — report it and change nothing — because neither
-	// rewrites nor deletes anything on the strength of a read it could not make.
+	// err is whatever stopped the release's services being read, or its manifest
+	// being read for names. Both features answer it the same way — report it and
+	// change nothing — because neither rewrites nor deletes anything on the
+	// strength of a read it could not make.
 	err error
+	// desiredErr is what stopped the resolving conversion, and is kept apart from
+	// err for the reason resErr is: it costs live drift its comparison and the
+	// sweep nothing. A config a settled release mounts having been deleted by hand
+	// is exactly that — the manifest no longer resolves, while what it declares is
+	// as legible as ever.
+	desiredErr error
 	// resErr is the same for the other three kinds, and is kept apart from err
 	// on purpose: a backend that cannot list them should lose only that half.
 	// Folding the two would make a failure to list configs stop the service
@@ -596,6 +627,17 @@ func (n resourceNames) empty() bool {
 // too, because the pass that drops a service from a template is an upgrade and
 // that is the case worth putting right at once rather than an interval later.
 //
+// That difference decides which conversion each gets, and it is not a detail.
+// This runs *before* the apply, so an upgraded release's manifest is the new one —
+// and converting a service resolves every config and secret it mounts against the
+// daemon, which for a config this upgrade is about to create resolves against
+// nothing. Asking the resolving conversion here would fail on exactly the upgrade
+// that adds a mounted config, costing that release both its drift report and its
+// sweep for the interval (#84, #87). So the sweep, which wants names, gets the
+// conversion that needs nothing to exist; live drift, which diffs whole
+// ServiceSpecs, gets the resolving one and only for the settled releases it
+// actually compares — where everything it mounts is by definition already there.
+//
 // A release the plan would install is read for neither. Nothing of ours is
 // deployed under that name, so there is nothing to compare against and nothing
 // this controller could prove is its own to delete.
@@ -612,6 +654,7 @@ func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b chart
 	// A backend that cannot list the other three kinds still sweeps services.
 	// Losing the half it cannot answer is better than losing both.
 	rl, _ := b.(resourceLister)
+	readDeclared := declaredReader(ldb)
 
 	views := make(map[string]releaseView, len(plan.Releases))
 	for _, rp := range plan.Releases {
@@ -622,8 +665,19 @@ func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b chart
 			continue
 		}
 		var v releaseView
-		if v.desired, v.err = ldb.DesiredServices(ctx, rp.Manifest, rp.Name); v.err == nil {
-			v.live, v.err = ldb.LiveServices(ctx, rp.Name)
+		v.live, v.err = ldb.LiveServices(ctx, rp.Name)
+		if v.err == nil && live && rp.Action == charts.ActionUnchanged {
+			v.desired, v.desiredErr = ldb.DesiredServices(ctx, rp.Manifest, rp.Name)
+		}
+		if v.err == nil && sweep {
+			// The resolving conversion, when there is one, has already answered
+			// this: the two produce the same names, and the ids it also carries
+			// are simply unread here. So a live-drifting sweeper converts once.
+			if v.desired != nil {
+				v.declared = v.desired
+			} else {
+				v.declared, v.err = readDeclared(ctx, rp.Manifest, rp.Name)
+			}
 		}
 		if v.err == nil && sweep && rl != nil {
 			v.networks, v.configs, v.secrets, v.resErr = liveResources(ctx, rl, rp.Name)
@@ -631,6 +685,12 @@ func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b chart
 		if v.err != nil {
 			r.log.Warn("could not read a release's running services",
 				"application", spec.Name, "release", rp.Name, "error", v.err)
+		}
+		if v.desiredErr != nil {
+			// Not the sweep's problem, and said separately from err so that it
+			// does not read as one: what a release declares is still legible.
+			r.log.Warn("could not convert a release's manifest to compare its running services against",
+				"application", spec.Name, "release", rp.Name, "error", v.desiredErr)
 		}
 		if v.resErr != nil {
 			r.log.Warn("could not read a release's networks, configs and secrets, so none of them can be pruned",
@@ -676,10 +736,12 @@ func (r *Reconciler) liveDrift(spec application.Spec, plan *charts.Plan, views m
 		if !ok {
 			continue
 		}
-		if v.err != nil {
+		// Either failure leaves nothing to compare: one is the running services,
+		// the other the manifest they would be compared against.
+		if err := errors.Join(v.err, v.desiredErr); err != nil {
 			out[rp.Name] = &application.ReleaseDrift{
 				State:   application.DriftStateUnknown,
-				Message: v.err.Error(),
+				Message: err.Error(),
 			}
 			continue
 		}
@@ -712,7 +774,7 @@ func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb li
 		if !ok || v.err != nil {
 			continue
 		}
-		declared := declaredNames(v.desired)
+		declared := declaredNames(v.declared)
 		candidates := resourceNames{services: prune.Undeclared(runningNames(v.live), declared.services)}
 		// A read that failed proves nothing either way, so the kinds it covered
 		// are candidates for nothing while the services carry on.
@@ -770,10 +832,7 @@ func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb li
 // conversion, which is what this did before #87 — the same claims, lost in the
 // same narrow case, rather than no sweep at all.
 func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, release string, candidates resourceNames) resourceNames {
-	readDeclared := ldb.DesiredServices
-	if dl, ok := ldb.(declaredLister); ok {
-		readDeclared = dl.DeclaredResources
-	}
+	readDeclared := declaredReader(ldb)
 
 	revisions, err := engine.History(ctx, release)
 	if err != nil {

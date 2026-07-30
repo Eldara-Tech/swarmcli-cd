@@ -2473,6 +2473,75 @@ func TestAStoredRevisionStillClaimsWhatItDeclaredAfterASweep(t *testing.T) {
 	}
 }
 
+// The same defect one call earlier, and the one that made it reachable without any
+// history at all: observe runs *before* the apply, so an upgraded release's
+// manifest is the new one — and the upgrade that first adds a config a service
+// mounts cannot be resolved yet, because this deploy is what creates it.
+//
+// Asking the resolving conversion there cost that release its whole sweep for the
+// interval. The sweep wants names, so it no longer asks for ids.
+func TestAnUpgradeThatAddsAMountedConfigStillSweeps(t *testing.T) {
+	backend := sweepBackend()
+	backend.unresolvableErr = map[string]error{
+		"adds-a-config": errors.New("converting services: service app: config not found: whoami_new"),
+	}
+	engine := &fakeEngine{
+		plans: []*charts.Plan{{Releases: []charts.ReleasePlan{{
+			Name: "whoami", Ref: "repo/whoami", Action: charts.ActionUpgrade,
+			ToVersion: "0.1.9", CurrentManifest: "had-a-sidecar", Manifest: "adds-a-config",
+		}}}},
+		history: sweepHistory("edge", "had-a-sidecar"),
+	}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
+		t.Errorf("removed %v, want %v — the upgrade declares what it declares, "+
+			"whether or not the daemon can resolve what it mounts yet", backend.pruned(), want)
+	}
+}
+
+// A settled release whose mounted config somebody deleted by hand. The comparison
+// is genuinely impossible — there is no spec to diff against — so live drift says
+// so; but what the release *declares* is as legible as ever, so the sweep is
+// unaffected. One reading failing must not cost the other.
+func TestAnUnresolvableSettledReleaseLosesItsComparisonAndNotItsSweep(t *testing.T) {
+	backend := sweepBackend()
+	backend.unresolvableErr = map[string]error{
+		"current": errors.New("converting services: service app: config not found: whoami_gone"),
+	}
+	engine := &fakeEngine{
+		plans: []*charts.Plan{{Releases: []charts.ReleasePlan{{
+			Name: "whoami", Ref: "repo/whoami", Action: charts.ActionUnchanged,
+			ToVersion: "0.1.8", Manifest: "current",
+		}}}},
+		history: sweepHistory("edge", "had-a-sidecar"),
+	}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftLive)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	got := view.Status.Releases[0].Drift
+	if got == nil || got.State != application.DriftStateUnknown {
+		t.Fatalf("drift = %+v, want it reported unknown rather than compared", got)
+	}
+	if !strings.Contains(got.Message, "config not found") {
+		t.Errorf("message = %q, want it to say why nothing could be compared", got.Message)
+	}
+	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
+		t.Errorf("removed %v, want %v — a comparison it cannot make is not a sweep it cannot make",
+			backend.pruned(), want)
+	}
+}
+
 // oldSeamBackend implements liveDriftBackend and nothing else: a backend written
 // against the seam as it stood before #87, or a Phase 3 remote one that answers
 // what it can. It is the fallback path in claimed, which must be the behaviour
