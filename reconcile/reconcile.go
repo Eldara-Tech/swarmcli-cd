@@ -462,6 +462,28 @@ type liveDriftBackend interface {
 	LiveServices(ctx context.Context, stack string) (map[string]swarm.Service, error)
 }
 
+// declaredLister is the optional interface a backend implements to answer what a
+// manifest declares without needing any of it to exist. *backend.Backend
+// satisfies it.
+//
+// DesiredServices cannot answer that question about a *stored* revision.
+// Converting a service resolves every config and secret it mounts to the id Swarm
+// addresses it by, so it asks today's swarm about yesterday's references — and a
+// revision that mounted a config a previous sweep has since deleted no longer
+// converts at all. The sweep then loses that revision's claims and leaves
+// resources behind (#87). Nothing about proving ownership wants an id; the scoped
+// name is the whole of it.
+//
+// Separate from liveDriftBackend rather than added to it, for the reason
+// resourceLister gives: a backend that cannot answer this should lose the sweep's
+// history walk, not its live drift too. And separate from DesiredServices rather
+// than replacing it, because live drift compares whole ServiceSpecs — its field
+// list is an allowlist today, but widening it (#76) must not be the thing that
+// starts diffing against a placeholder id.
+type declaredLister interface {
+	DeclaredResources(ctx context.Context, manifest, stack string) (*compose.Stack, error)
+}
+
 // resourceLister is the optional interface a backend implements to read the
 // other three kinds a manifest declares, by scoped name. *backend.Backend
 // satisfies it.
@@ -741,7 +763,18 @@ func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb li
 // A history that cannot be read prunes nothing. So does a revision that cannot
 // be converted — it is no evidence either way, and an older one may still claim
 // what it could not.
+//
+// Which conversion answers that matters, and is why declaredLister exists: this
+// asks what a revision from the past declared, so it must not depend on any of it
+// still existing. A backend that cannot answer that falls back to the resolving
+// conversion, which is what this did before #87 — the same claims, lost in the
+// same narrow case, rather than no sweep at all.
 func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, release string, candidates resourceNames) resourceNames {
+	readDeclared := ldb.DesiredServices
+	if dl, ok := ldb.(declaredLister); ok {
+		readDeclared = dl.DeclaredResources
+	}
+
 	revisions, err := engine.History(ctx, release)
 	if err != nil {
 		r.log.Warn("could not read a release's history, so none of its resources can be pruned",
@@ -756,7 +789,7 @@ func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liv
 		if app, ok := prune.Owner(rev, r.controller); !ok || app != spec.Name {
 			continue
 		}
-		stack, err := ldb.DesiredServices(ctx, rev.Manifest, release)
+		stack, err := readDeclared(ctx, rev.Manifest, release)
 		if err != nil {
 			r.log.Warn("could not read what a stored revision declared",
 				"application", spec.Name, "release", release,

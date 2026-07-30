@@ -41,6 +41,23 @@ func (b *Backend) DesiredServices(ctx context.Context, manifest, stack string) (
 	return cdcompose.Convert(ctx, manifest, stack, b.api)
 }
 
+// DeclaredResources converts a rendered manifest to the specs it declares,
+// without resolving what its services mount to the ids Swarm addresses them by.
+//
+// It is for the caller that wants names — the sweep proving a resource was
+// declared by one of this application's own stored revisions. That caller is
+// asking about the past, so it must not need any of it to still exist:
+// DesiredServices resolves every mounted config and secret against the daemon,
+// and a revision that mounted one a previous sweep has already deleted does not
+// convert at all (#87).
+//
+// Not a substitute for DesiredServices. What it returns is what ConvertUnresolved
+// returns, so the config and secret references in it carry a placeholder id and
+// nothing may be applied from it.
+func (b *Backend) DeclaredResources(ctx context.Context, manifest, stack string) (*cdcompose.Stack, error) {
+	return cdcompose.ConvertUnresolved(ctx, manifest, stack, b.api)
+}
+
 // LiveServices returns the stack's running services with their full specs, by
 // scoped name.
 //

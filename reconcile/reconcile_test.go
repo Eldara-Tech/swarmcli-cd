@@ -1599,6 +1599,11 @@ type driftBackend struct {
 	// manifestReads records every manifest converted, in order, which is how a
 	// test sees that the history walk stopped early.
 	manifestReads []string
+	// unresolvableErr fails the *resolving* conversion of one manifest, keyed by
+	// it — a stored revision that mounted a config a previous sweep has since
+	// deleted, which is the real daemon's "config not found". DeclaredResources
+	// answers it anyway, because a name needs nothing to exist.
+	unresolvableErr map[string]error
 	// removedServices records the ids the sweep deleted.
 	removedServices []string
 	removeErr       error
@@ -1631,13 +1636,35 @@ func (b *driftBackend) DesiredServices(_ context.Context, manifest, stack string
 	if b.readErr != nil {
 		return nil, b.readErr
 	}
+	if err := b.unresolvableErr[manifest]; err != nil {
+		return nil, err
+	}
+	return b.answer(manifest, stack), nil
+}
+
+// DeclaredResources answers the same manifests as DesiredServices but is not
+// subject to unresolvableErr, which is the asymmetry the real pair has: resolving
+// a reference needs the resource to exist, and reading a name does not.
+//
+// readErr still applies. That one models a backend that cannot read at all, and a
+// fake that answered anyway would make the no-backend degradation untestable.
+func (b *driftBackend) DeclaredResources(_ context.Context, manifest, stack string) (*compose.Stack, error) {
+	if b.readErr != nil {
+		return nil, b.readErr
+	}
+	return b.answer(manifest, stack), nil
+}
+
+// answer is what both conversions have in common: record the read, then hand back
+// this manifest's stack if the test named one and the release's otherwise.
+func (b *driftBackend) answer(manifest, stack string) *compose.Stack {
 	b.mu.Lock()
 	b.manifestReads = append(b.manifestReads, manifest)
 	b.mu.Unlock()
 	if s, ok := b.byManifest[manifest]; ok {
-		return s, nil
+		return s
 	}
-	return b.desired[stack], nil
+	return b.desired[stack]
 }
 
 // RemoveService deletes from the fake swarm as well as recording, so that the
@@ -2416,6 +2443,69 @@ func TestAServiceDroppedFromTheChartIsPrunedInManifestMode(t *testing.T) {
 
 	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
 		t.Errorf("removed %v, want %v — only the service the chart stopped declaring", backend.pruned(), want)
+	}
+}
+
+// A revision proves ownership by what it declared, and that is a question about
+// the past — so it must not depend on any of it still existing (#87).
+//
+// The stored revision here mounted something a previous sweep has already
+// deleted, so the resolving conversion of it fails the way a real daemon fails
+// it: "config not found". Before this the sweep lost that revision's claims and
+// left the service behind, warning about a manifest it could not read; now it
+// reads the names and deletes what the revision proves is this application's.
+func TestAStoredRevisionStillClaimsWhatItDeclaredAfterASweep(t *testing.T) {
+	backend := sweepBackend()
+	backend.unresolvableErr = map[string]error{
+		"had-a-sidecar": errors.New("converting services: service sidecar: config not found: whoami_swept"),
+	}
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
+		t.Errorf("removed %v, want %v — the revision declared it, whether or not what it mounted survives",
+			backend.pruned(), want)
+	}
+}
+
+// oldSeamBackend implements liveDriftBackend and nothing else: a backend written
+// against the seam as it stood before #87, or a Phase 3 remote one that answers
+// what it can. It is the fallback path in claimed, which must be the behaviour
+// that preceded declaredLister rather than no history walk at all.
+type oldSeamBackend struct{ stack *compose.Stack }
+
+func (o oldSeamBackend) DesiredServices(context.Context, string, string) (*compose.Stack, error) {
+	return o.stack, nil
+}
+
+func (oldSeamBackend) LiveServices(context.Context, string) (map[string]swarm.Service, error) {
+	return nil, nil
+}
+
+// A backend that cannot answer the names-only question loses nothing it had. The
+// sweep falls back to the resolving conversion, and a revision that converts
+// still claims what it declared.
+func TestAnOlderBackendStillProvesOwnershipThroughTheResolvingConversion(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: sweepBackend()})
+	ldb := oldSeamBackend{stack: &compose.Stack{Services: []compose.Service{
+		{Name: "sidecar", Spec: serviceSpec("whoami_sidecar", 1)},
+	}}}
+	if _, ok := any(ldb).(declaredLister); ok {
+		t.Fatal("oldSeamBackend implements declaredLister; it is meant to be the backend that does not")
+	}
+
+	got := r.claimed(context.Background(), sweepingSpec("edge", application.DriftManifest), ldb, engine,
+		"whoami", resourceNames{services: []string{"whoami_sidecar"}})
+
+	if want := []string{"whoami_sidecar"}; !slices.Equal(got.services, want) {
+		t.Errorf("claimed %v, want %v through the older seam", got.services, want)
 	}
 }
 
