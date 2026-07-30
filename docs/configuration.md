@@ -278,8 +278,9 @@ How drift is decided. Omitting it defaults to `manifest`.
 | `live` | the above, **and** each settled release's running `ServiceSpec` against the one the repository renders to | the swarm moved: `docker service update`, a deleted service, a spec Swarm rolled back |
 
 `live` costs one service list and one manifest conversion per settled release per
-interval, and it is the mode that lets the controller notice — and correct —
-something nobody committed. See
+interval, plus one network list per application per interval to name the networks
+its services are attached to. It is the mode that lets the controller notice — and
+correct — something nobody committed. See
 [concepts § drift](concepts.md#drift-sync-and-health) for how it reads.
 
 #### What `live` does about it
@@ -354,6 +355,26 @@ change, which is the surface an out-of-band change actually uses:
 | `env[NAME]` | `--env-add`, `--env-rm` |
 | `constraints` | `--constraint-add`, `--constraint-rm` |
 | `labels[NAME]` | `--label-add`, `--label-rm` |
+| `ports[PUBLISHED:TARGET/PROTOCOL/MODE]` | `--publish-add`, `--publish-rm` |
+| `endpointMode` | `--endpoint-mode` |
+| `networks` | `--network-add`, `--network-rm` |
+
+A published port is reported as a whole entry being `set` or `absent` rather than
+as a value that changed, because a port has no stable key: two publishes can share
+a target, a protocol and a mode and differ only in the published port. Moving one
+therefore reads as one entry gone and one arrived — which is what `--publish-rm`
+plus `--publish-add` did. A port the manifest published without naming one reads
+as `dynamic`.
+
+Attached **networks** are the one field that needs a second read: a service's spec
+names them by the id the daemon assigned, where the manifest named a network, so
+comparing them means naming the ids first. That costs one network listing per
+application per interval. If it fails, or the swarm's backend cannot answer it,
+attachments are not compared and everything else still is.
+
+At most 20 differences are listed per service; beyond that the report carries a
+count of how many more there were. A service whose every environment variable was
+replaced would otherwise put an unbounded list into a payload served on every poll.
 
 Plus two findings about the service rather than a field: a service the manifest
 declares that is **missing** from the swarm, and one running under the stack's
@@ -369,10 +390,9 @@ served to anyone with read access, and an environment variable is exactly where
 a credential would be.
 
 **Not compared**, each because it needs a normalisation of its own that has not
-been proved against a real swarm yet: published ports (the daemon assigns
-dynamic ones), attached networks (the daemon stores an id where the manifest
-names a network), mounts, secret and config references, healthchecks, update and
-rollback configs, restart policies, and placement preferences. Networks, configs
+been proved against a real swarm yet: mounts, secret and config references,
+healthchecks, update and rollback configs, restart policies, and placement
+preferences. Networks, configs
 and secrets are not compared as *resources* either — Swarm cannot update a
 network in place, and configs and secrets are immutable with their content
 hashed into the name, so a change to either is already a manifest-level

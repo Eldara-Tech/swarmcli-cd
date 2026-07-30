@@ -477,8 +477,19 @@ func richChartFiles(release string, replicas int) map[string]string {
 		// Fixed rather than dynamic, so the assertion does not depend on
 		// whatever the runner had free. High and uncommon to avoid a clash.
 		"      - \"39117:8080\"\n" +
+		// And one published without naming a port, which is the case the
+		// comparison has to be right about and no unit test can settle: the
+		// daemon allocates one from the ingress range. It does so on the
+		// service's runtime endpoint rather than on its spec, so both sides
+		// should still read zero — and if that is ever wrong, this is the line
+		// that turns the clean test red.
+		"      - \"8081\"\n" +
 		"    deploy:\n" +
 		"      replicas: {{ .Values.replicas }}\n" +
+		// Explicit, so the comparison is exercised against a stated mode as
+		// well as against the sidecar's unstated one, which the daemon returns
+		// as vip.
+		"      endpoint_mode: vip\n" +
 		"      labels:\n" +
 		"        com.swarmcli.release: {{ .Release.Name }}\n" +
 		"        tier: web\n" +

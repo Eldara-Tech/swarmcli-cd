@@ -14,6 +14,29 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/compose"
 )
 
+// defaultNetwork is the attachment a service that names no networks still gets:
+// convert.convertServiceNetworks defaults to {default: {}} and scopes it, so a
+// converted spec always carries at least one.
+const defaultNetwork = "s_default"
+
+// networkID is the id the daemon stores for a network the manifest named. What
+// matters about it is only that it is not the name — the resolution step exists
+// because the two are different strings.
+func networkID(name string) string { return "netid-" + name }
+
+// swarmNets is the reconciler's read of the swarm, as drift.Live receives it.
+//
+// Each network is named under both forms deliberately. A live spec the daemon
+// returned carries the id, which is the case that matters; a spec built by hand
+// in a test and handed straight back carries the name. Naming both means a test
+// about some other field compares its attachments rather than quietly taking the
+// decline path and proving less than it looks like it does.
+var swarmNets = NetworkNames{
+	networkID(defaultNetwork): defaultNetwork,
+	defaultNetwork:            defaultNetwork,
+	networkID("s_extra"):      "s_extra",
+}
+
 // desiredSpec is a service as compose conversion produces it: pointers left nil
 // wherever the manifest said nothing, which is exactly where the daemon fills a
 // default in and where a naive comparison goes wrong.
@@ -26,8 +49,13 @@ func desiredSpec(name, image string) swarm.ServiceSpec {
 				convert.LabelImage:     image,
 			},
 		},
-		TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{Image: image}},
-		Mode:         swarm.ServiceMode{Replicated: &swarm.ReplicatedService{}},
+		TaskTemplate: swarm.TaskSpec{
+			ContainerSpec: &swarm.ContainerSpec{Image: image},
+			// Never absent from a converted spec, so never absent here: a
+			// service naming no networks is attached to the stack's default one.
+			Networks: []swarm.NetworkAttachmentConfig{{Target: defaultNetwork}},
+		},
+		Mode: swarm.ServiceMode{Replicated: &swarm.ReplicatedService{}},
 	}
 }
 
@@ -56,54 +84,75 @@ func uint64p(v uint64) *uint64 { return &v }
 // converge a service nobody touched — on every tick, forever — and the right
 // response from an operator would be to turn the feature off.
 func TestNormalisedDifferencesAreNotDrift(t *testing.T) {
-	for name, mutate := range map[string]func(live *swarm.ServiceSpec){
-		"replicas defaulted from nil to one": func(live *swarm.ServiceSpec) {
+	for name, mutate := range map[string]func(want, live *swarm.ServiceSpec){
+		"replicas defaulted from nil to one": func(_, live *swarm.ServiceSpec) {
 			live.Mode.Replicated.Replicas = uint64p(1)
 		},
-		"image resolved to a digest": func(live *swarm.ServiceSpec) {
+		"image resolved to a digest": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.ContainerSpec.Image = "nginx:1.2@sha256:aaaa"
 		},
-		"force update counter advanced": func(live *swarm.ServiceSpec) {
+		"force update counter advanced": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.ForceUpdate = 3
 		},
-		"labels returned as an empty map rather than nil": func(live *swarm.ServiceSpec) {
+		"labels returned as an empty map rather than nil": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.ContainerSpec.Labels = map[string]string{}
 		},
-		"resources returned as zero structs rather than nil": func(live *swarm.ServiceSpec) {
+		"resources returned as zero structs rather than nil": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.Resources = &swarm.ResourceRequirements{
 				Limits:       &swarm.Limit{},
 				Reservations: &swarm.Resources{},
 			}
 		},
-		"placement returned as a zero struct rather than nil": func(live *swarm.ServiceSpec) {
+		"placement returned as a zero struct rather than nil": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.Placement = &swarm.Placement{}
 		},
-		"endpoint resolution mode defaulted to vip": func(live *swarm.ServiceSpec) {
+		"endpoint resolution mode defaulted to vip": func(_, live *swarm.ServiceSpec) {
 			live.EndpointSpec = &swarm.EndpointSpec{Mode: swarm.ResolutionModeVIP}
 		},
-		"published port assigned by the daemon": func(live *swarm.ServiceSpec) {
+		// Not "the daemon assigned a published port", which is the natural
+		// assumption and does not happen to a *spec*: swarmkit allocates a
+		// dynamic publish into the service's runtime Endpoint and leaves
+		// Spec.Endpoint alone, so a zero stays zero on both sides. What the
+		// round trip does change is the two enums, which is what this pins.
+		"protocol and publish mode defaulted from empty": func(want, live *swarm.ServiceSpec) {
+			want.EndpointSpec = &swarm.EndpointSpec{Ports: []swarm.PortConfig{{
+				TargetPort: 80, PublishedPort: 8080,
+			}}}
 			live.EndpointSpec = &swarm.EndpointSpec{Ports: []swarm.PortConfig{{
-				TargetPort: 80, PublishedPort: 30000, Protocol: "tcp", PublishMode: "ingress",
+				TargetPort: 80, PublishedPort: 8080, Protocol: "tcp", PublishMode: "ingress",
 			}}}
 		},
-		"platforms filled from the image manifest": func(live *swarm.ServiceSpec) {
+		"a dynamic publish stays zero on both sides": func(want, live *swarm.ServiceSpec) {
+			want.EndpointSpec = &swarm.EndpointSpec{Ports: []swarm.PortConfig{{TargetPort: 80}}}
+			live.EndpointSpec = &swarm.EndpointSpec{Ports: []swarm.PortConfig{{
+				TargetPort: 80, Protocol: "tcp", PublishMode: "ingress",
+			}}}
+		},
+		"platforms filled from the image manifest": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.Placement = &swarm.Placement{
 				Platforms: []swarm.Platform{{Architecture: "amd64", OS: "linux"}},
 			}
 		},
-		"network target resolved from a name to an id": func(live *swarm.ServiceSpec) {
-			live.TaskTemplate.Networks = []swarm.NetworkAttachmentConfig{{Target: "abc123netid"}}
+		// The desired side names the network; the live side is the same
+		// attachment after the daemon rewrote its target to the id it stored.
+		// Not "an attachment appeared against none", which the previous version
+		// of this case asserted and which cannot happen: a converted spec always
+		// carries at least the stack's default network.
+		"network target resolved from a name to an id": func(_, live *swarm.ServiceSpec) {
+			live.TaskTemplate.Networks = []swarm.NetworkAttachmentConfig{
+				{Target: networkID(defaultNetwork)},
+			}
 		},
-		"update config defaulted by swarmkit": func(live *swarm.ServiceSpec) {
+		"update config defaulted by swarmkit": func(_, live *swarm.ServiceSpec) {
 			live.UpdateConfig = &swarm.UpdateConfig{Parallelism: 1, FailureAction: "pause", Order: "stop-first"}
 		},
-		"isolation defaulted": func(live *swarm.ServiceSpec) {
+		"isolation defaulted": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.ContainerSpec.Isolation = "default"
 		},
-		"privileges populated": func(live *swarm.ServiceSpec) {
+		"privileges populated": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.ContainerSpec.Privileges = &swarm.Privileges{}
 		},
-		"runtime defaulted to container": func(live *swarm.ServiceSpec) {
+		"runtime defaulted to container": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.Runtime = swarm.RuntimeContainer
 		},
 	} {
@@ -117,9 +166,9 @@ func TestNormalisedDifferencesAreNotDrift(t *testing.T) {
 			mode := *live.Mode.Replicated
 			live.Mode.Replicated = &mode
 
-			mutate(&live)
+			mutate(&want, &live)
 
-			got := Live(stackOf(want), liveOf(live))
+			got := Live(stackOf(want), liveOf(live), swarmNets)
 			if got.State != application.DriftStateNone {
 				t.Errorf("state = %q with %v, want none — this is normalisation, not drift",
 					got.State, got.Services)
@@ -130,7 +179,7 @@ func TestNormalisedDifferencesAreNotDrift(t *testing.T) {
 
 func TestLiveReportsNoDriftOnAnIdenticalStack(t *testing.T) {
 	spec := desiredSpec("web", "nginx:1.2")
-	got := Live(stackOf(spec), liveOf(spec))
+	got := Live(stackOf(spec), liveOf(spec), swarmNets)
 	if got.State != application.DriftStateNone || len(got.Services) != 0 {
 		t.Errorf("got %+v, want none", got)
 	}
@@ -221,12 +270,57 @@ func TestLiveReportsEachComparedField(t *testing.T) {
 			},
 			application.FieldDrift{Field: "labels[tier]", Desired: "web", Live: "(absent)"},
 		},
+		"published port removed": {
+			func(want, live *swarm.ServiceSpec) {
+				want.EndpointSpec = &swarm.EndpointSpec{Ports: []swarm.PortConfig{{
+					TargetPort: 80, PublishedPort: 8080, Protocol: "tcp", PublishMode: "ingress",
+				}}}
+			},
+			application.FieldDrift{Field: "ports[8080:80/tcp/ingress]", Desired: "set", Live: "absent"},
+		},
+		"published port added": {
+			func(want, live *swarm.ServiceSpec) {
+				live.EndpointSpec = &swarm.EndpointSpec{Ports: []swarm.PortConfig{{
+					TargetPort: 443, PublishedPort: 8443, Protocol: "tcp", PublishMode: "host",
+				}}}
+			},
+			application.FieldDrift{Field: "ports[8443:443/tcp/host]", Desired: "absent", Live: "set"},
+		},
+		"a publish the manifest left dynamic": {
+			func(want, live *swarm.ServiceSpec) {
+				want.EndpointSpec = &swarm.EndpointSpec{Ports: []swarm.PortConfig{{TargetPort: 80}}}
+			},
+			application.FieldDrift{Field: "ports[dynamic:80/tcp/ingress]", Desired: "set", Live: "absent"},
+		},
+		"endpoint mode": {
+			func(want, live *swarm.ServiceSpec) {
+				live.EndpointSpec = &swarm.EndpointSpec{Mode: swarm.ResolutionModeDNSRR}
+			},
+			application.FieldDrift{Field: "endpointMode", Desired: "vip", Live: "dnsrr"},
+		},
+		"network detached": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.Networks = nil
+			},
+			application.FieldDrift{Field: "networks", Desired: defaultNetwork, Live: ""},
+		},
+		"network attached that the manifest does not declare": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.Networks = append(live.TaskTemplate.Networks,
+					swarm.NetworkAttachmentConfig{Target: networkID("s_extra")})
+			},
+			application.FieldDrift{
+				Field:   "networks",
+				Desired: defaultNetwork,
+				Live:    defaultNetwork + ", s_extra",
+			},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			want, live := freshPair()
 			tc.mutate(&want, &live)
 
-			got := Live(stackOf(want), liveOf(live))
+			got := Live(stackOf(want), liveOf(live), swarmNets)
 			if got.State != application.DriftStateDetected {
 				t.Fatalf("state = %q, want detected", got.State)
 			}
@@ -264,9 +358,58 @@ func TestModeChangeSuppressesReplicas(t *testing.T) {
 	want.Mode.Replicated.Replicas = uint64p(3)
 	live.Mode = swarm.ServiceMode{Global: &swarm.GlobalService{}}
 
-	fields := Live(stackOf(want), liveOf(live)).Services[0].Fields
+	fields := Live(stackOf(want), liveOf(live), swarmNets).Services[0].Fields
 	if len(fields) != 1 || fields[0].Field != "mode" {
 		t.Errorf("fields = %+v, want only the mode change", fields)
+	}
+}
+
+// Attachments are the one field that cannot be read without naming what the
+// daemon stored, so there are three ways to be unable to compare them — and every
+// one of them must report nothing rather than guess. Guessing here means claiming
+// a detachment nobody performed, on the axis that redeploys unattended.
+func TestNetworksAreNotComparedWhenTheyCannotBeNamed(t *testing.T) {
+	// Each case detaches the service's only network, which is real drift, so a
+	// case that stopped declining would fail loudly rather than silently.
+	for name, tc := range map[string]struct {
+		nets    NetworkNames
+		prepare func(want, live *swarm.ServiceSpec)
+	}{
+		"the backend could not list the swarm's networks": {
+			nil,
+			func(want, live *swarm.ServiceSpec) { live.TaskTemplate.Networks = nil },
+		},
+		"an attachment names a network the listing did not": {
+			swarmNets,
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.Networks = []swarm.NetworkAttachmentConfig{
+					{Target: "netid-created-since-the-listing"},
+				}
+			},
+		},
+		// Below API 1.29 compose writes the deprecated field instead, which would
+		// otherwise leave the desired side empty against a populated live one and
+		// report a detachment on every service of every release, for ever.
+		"the deprecated ServiceSpec.Networks is in use": {
+			swarmNets,
+			func(want, live *swarm.ServiceSpec) {
+				//nolint:staticcheck // ignore SA1019: the deprecated field is the case.
+				want.Networks = want.TaskTemplate.Networks
+				want.TaskTemplate.Networks = nil
+				live.TaskTemplate.Networks = nil
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			want, live := freshPair()
+			tc.prepare(&want, &live)
+
+			got := Live(stackOf(want), liveOf(live), tc.nets)
+			if got.State != application.DriftStateNone {
+				t.Errorf("got %+v, want none: an attachment that cannot be named proves nothing",
+					got.Services)
+			}
+		})
 	}
 }
 
@@ -276,7 +419,7 @@ func TestMissingServiceIsReported(t *testing.T) {
 	web := desiredSpec("web", "nginx:1.2")
 	db := desiredSpec("db", "postgres:16")
 
-	got := Live(stackOf(web, db), liveOf(web))
+	got := Live(stackOf(web, db), liveOf(web), swarmNets)
 	if len(got.Services) != 1 {
 		t.Fatalf("services = %+v, want one", got.Services)
 	}
@@ -291,7 +434,7 @@ func TestUnexpectedServiceIsReported(t *testing.T) {
 	web := desiredSpec("web", "nginx:1.2")
 	stray := desiredSpec("old", "nginx:1.0")
 
-	got := Live(stackOf(web), liveOf(web, stray))
+	got := Live(stackOf(web), liveOf(web, stray), swarmNets)
 	if len(got.Services) != 1 {
 		t.Fatalf("services = %+v, want one", got.Services)
 	}
@@ -329,7 +472,7 @@ func TestARolledBackServiceIsReportedAsSuch(t *testing.T) {
 
 			got := Live(stackOf(want), map[string]swarm.Service{
 				"s_web": rolledBackTo(running, state, why),
-			})
+			}, swarmNets)
 
 			if len(got.Services) != 1 {
 				t.Fatalf("services = %+v, want one", got.Services)
@@ -370,7 +513,7 @@ func TestOnlyARollbackStateIsARollback(t *testing.T) {
 
 			got := Live(stackOf(want), map[string]swarm.Service{
 				"s_web": rolledBackTo(running, state, "in flight"),
-			})
+			}, swarmNets)
 
 			if len(got.Services) != 1 || got.Services[0].Reason != application.DriftModified {
 				t.Errorf("services = %+v, want one modified service", got.Services)
@@ -391,7 +534,7 @@ func TestARollbackThatRestoredWhatTheRepositoryWantsIsNotDrift(t *testing.T) {
 
 	got := Live(stackOf(spec), map[string]swarm.Service{
 		"s_web": rolledBackTo(spec, swarm.UpdateStateRollbackCompleted, "somebody else's failed update"),
-	})
+	}, swarmNets)
 
 	if got.State != application.DriftStateNone || len(got.Services) != 0 {
 		t.Errorf("drift = %+v, want none: the running spec is what the repository asks for", got)
@@ -406,7 +549,7 @@ func TestFieldsAreCapped(t *testing.T) {
 		want.TaskTemplate.ContainerSpec.Env = append(want.TaskTemplate.ContainerSpec.Env, key+"=x")
 	}
 
-	svc := Live(stackOf(want), liveOf(live)).Services[0]
+	svc := Live(stackOf(want), liveOf(live), swarmNets).Services[0]
 	if len(svc.Fields) != maxFields {
 		t.Errorf("reported %d fields, want them capped at %d", len(svc.Fields), maxFields)
 	}
@@ -423,7 +566,7 @@ func TestFieldOrderIsStable(t *testing.T) {
 
 	var first []application.FieldDrift
 	for range 5 {
-		got := Live(stackOf(want), liveOf(live)).Services[0].Fields
+		got := Live(stackOf(want), liveOf(live), swarmNets).Services[0].Fields
 		if first == nil {
 			first = got
 			continue
@@ -446,7 +589,7 @@ func TestStackOwnLabelsAreNotCompared(t *testing.T) {
 	live.Labels[convert.LabelImage] = "nginx:0.1"
 	live.Labels[convert.LabelNamespace] = "somethingelse"
 
-	if got := Live(stackOf(want), liveOf(live)); got.State != application.DriftStateNone {
+	if got := Live(stackOf(want), liveOf(live), swarmNets); got.State != application.DriftStateNone {
 		t.Errorf("got %+v, want the controller's own labels ignored", got.Services)
 	}
 }

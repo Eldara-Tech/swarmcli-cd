@@ -212,6 +212,125 @@ func hasTag(image, tag string) bool {
 	return len(image) > len(tag) && image[:len(tag)] == tag && image[len(tag)] == '@'
 }
 
+// A published port moved by hand.
+//
+// A port has no stable key — two publishes can share a target, a protocol and a
+// mode and differ only in the published port — so a change is reported as one
+// entry gone and one arrived, which is what `--publish-rm` plus `--publish-add`
+// actually did. Manual, so both halves can be asserted separately.
+func TestLiveDriftDetectsAnOutOfBandPublishedPort(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-ports"
+	repo := gitRepo(t, richChartFiles(release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, liveDriftApp("ports", repo, false))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "ports"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
+		for i, p := range spec.EndpointSpec.Ports {
+			if p.TargetPort == 8080 {
+				spec.EndpointSpec.Ports[i].PublishedPort = 39118
+			}
+		}
+	})
+
+	if err := rec.Sync(ctx, "ports"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	d := driftOf(t, rec, "ports")
+	gone := fieldOf(t, d, release+"_app", "ports[39117:8080/tcp/ingress]")
+	if gone.Desired != "set" || gone.Live != "absent" {
+		t.Errorf("the declared publish = %+v, want it reported missing from the swarm", gone)
+	}
+	arrived := fieldOf(t, d, release+"_app", "ports[39118:8080/tcp/ingress]")
+	if arrived.Desired != "absent" || arrived.Live != "set" {
+		t.Errorf("the hand-made publish = %+v, want it reported as unexpected", arrived)
+	}
+
+	// The dynamic publish beside it must not be caught up in this. The daemon
+	// assigned it a host port, and if that assignment reached the spec it would
+	// report here as well — on a port nobody touched.
+	for _, svc := range d.Services {
+		if svc.Name != release+"_app" {
+			t.Errorf("service %q also drifted, want only the one that was changed", svc.Name)
+			continue
+		}
+		for _, f := range svc.Fields {
+			if f.Field != gone.Field && f.Field != arrived.Field {
+				t.Errorf("also reported %+v, want only the port that was moved", f)
+			}
+		}
+	}
+
+	if err := rec.SyncNow(ctx, "ports"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+	if d := driftOf(t, rec, "ports"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
+}
+
+// A network detached by hand — the field that cannot be compared without naming
+// what the daemon stored.
+//
+// The manifest names a network and the spec comes back carrying an id, so this
+// is the test that says the resolution step happens at all: without it the
+// desired and live sides are never equal and an untouched stack reports a
+// detachment for ever, which the clean test above would catch — and with a
+// resolution that silently declined, nothing here would be reported.
+func TestLiveDriftDetectsAndRestoresADetachedNetwork(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-network"
+	repo := gitRepo(t, richChartFiles(release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, liveDriftApp("network", repo, false))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "network"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	updateOutOfBand(t, cli, release+"_sidecar", func(spec *swarm.ServiceSpec) {
+		spec.TaskTemplate.Networks = nil
+	})
+	waitForRunning(t, cli, release, 2)
+
+	if err := rec.Sync(ctx, "network"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	got := fieldOf(t, driftOf(t, rec, "network"), release+"_sidecar", "networks")
+	if got.Desired != release+"_internal" {
+		t.Errorf("desired networks = %q, want the scoped name the chart declares, not an id", got.Desired)
+	}
+	if got.Live != "" {
+		t.Errorf("live networks = %q, want nothing left attached", got.Live)
+	}
+
+	if err := rec.SyncNow(ctx, "network"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	svc := serviceOf(t, cli, release+"_sidecar")
+	if n := len(svc.Spec.TaskTemplate.Networks); n != 1 {
+		t.Errorf("attachments after converging = %d, want the overlay back", n)
+	}
+	if d := driftOf(t, rec, "network"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
+}
+
 // A service deleted out of band. The health axis only notices when a release has
 // no services left at all, so without this a two-service stack missing one of
 // them reports healthy.
