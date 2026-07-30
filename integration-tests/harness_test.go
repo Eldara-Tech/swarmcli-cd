@@ -629,20 +629,6 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"    deploy:\n" +
 		"      labels:\n" +
 		"        com.swarmcli.release: {{ .Release.Name }}\n" +
-		// A replicated job, so the two counts that stand in for `replicas` on one
-		// are exercised against a real swarm rather than only against hand-built
-		// specs. Its task sleeps and so never completes, which is what keeps the
-		// job at one running task for the whole test instead of finishing and
-		// dropping out of the count.
-		"  job:\n" +
-		"    image: busybox:1.36\n" +
-		"    command: [\"sleep\", \"3600\"]\n" +
-		"    networks: [internal]\n" +
-		"    deploy:\n" +
-		"      mode: replicated-job\n" +
-		"      replicas: 1\n" +
-		"      labels:\n" +
-		"        com.swarmcli.release: {{ .Release.Name }}\n" +
 		"networks:\n" +
 		"  internal: {}\n" +
 		"volumes:\n" +
@@ -657,12 +643,44 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 }
 
 // richTasks is how many running tasks richChartFiles deploys for a given app
-// replica count: the app's own, plus the sidecar and the job beside it.
+// replica count: the app's own, plus the sidecar beside it.
 //
 // Named rather than written out at each call site so that adding a service to
 // that fixture stays a one-line change here instead of a sweep through every
 // test that waits on it.
-func richTasks(appReplicas int) int { return appReplicas + 2 }
+func richTasks(appReplicas int) int { return appReplicas + 1 }
+
+// jobChartFiles is a one-service chart whose service is a replicated job.
+//
+// It is separate from richChartFiles, and that separation is the finding: a job
+// whose task sleeps never completes, so a release containing one never satisfies
+// the convergence wait a deploy performs. Putting a job in the shared fixture
+// made every test using it time out after three minutes. It gets its own chart
+// and its own application, deployed with syncPolicy.wait off.
+func jobChartFiles(release string, concurrency int) map[string]string {
+	files := chartFiles(release, 1)
+	files["charts/app/values.yaml"] = "replicas: " + itoa(concurrency) + "\n"
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    deploy:\n" +
+		"      mode: replicated-job\n" +
+		"      replicas: {{ .Values.replicas }}\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n"
+	return files
+}
+
+// jobApp is a live-drift application that does not wait for convergence, because
+// the release it deploys is a job that never converges by that definition.
+func jobApp(name, repoDir string) application.Spec {
+	app := liveDriftApp(name, repoDir, false)
+	app.SyncPolicy.Wait = false
+	return app
+}
 
 // serviceOf finds one of a stack's services by its scoped name.
 func serviceOf(t *testing.T, cli *dockerclient.Client, name string) swarm.Service {

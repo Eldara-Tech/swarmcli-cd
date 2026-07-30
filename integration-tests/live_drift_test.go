@@ -756,14 +756,8 @@ func TestLiveDriftDetectsOutOfBandLiteralFields(t *testing.T) {
 	}
 }
 
-// The last of the comparable surface: a container label, a pids limit, and the
-// concurrency of a replicated job.
-//
-// The job is the one worth deploying rather than only unit-testing. Its two
-// counts stand in for `replicas` on an ordinary service, they are flattened from
-// nil the same way a restart policy's attempt count is, and until this ran there
-// was no evidence a real swarm stores them the way the unit table assumes.
-func TestLiveDriftDetectsOutOfBandJobAndContainerFields(t *testing.T) {
+// The last of the container-level surface: a container label and a pids limit.
+func TestLiveDriftDetectsOutOfBandContainerFields(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-live-surface"
 	repo := gitRepo(t, richChartFiles(t, release, 1))
@@ -777,10 +771,6 @@ func TestLiveDriftDetectsOutOfBandJobAndContainerFields(t *testing.T) {
 	}
 	waitForRunning(t, cli, release, richTasks(1))
 
-	updateOutOfBand(t, cli, release+"_job", func(spec *swarm.ServiceSpec) {
-		four := uint64(4)
-		spec.Mode.ReplicatedJob.MaxConcurrent = &four
-	})
 	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
 		spec.TaskTemplate.ContainerSpec.Labels["role"] = "edge"
 		spec.TaskTemplate.Resources.Limits.Pids = 500
@@ -791,16 +781,6 @@ func TestLiveDriftDetectsOutOfBandJobAndContainerFields(t *testing.T) {
 	}
 
 	d := driftOf(t, rec, "surface")
-	if got := fieldOf(t, d, release+"_job", "maxConcurrent"); got.Desired != "1" || got.Live != "4" {
-		t.Errorf("maxConcurrent drift = %+v, want 1 against 4", got)
-	}
-	// The other count is untouched, which says the two are compared apart rather
-	// than as one number.
-	assertNotReported(t, d, "totalCompletions")
-	// And a job is not reported as a replica change: the mode branch is
-	// exclusive, so a job never reaches the replicas comparison at all.
-	assertNotReported(t, d, "replicas")
-
 	if got := fieldOf(t, d, release+"_app", "containerLabels[role]"); got.Desired != "web" || got.Live != "edge" {
 		t.Errorf("container label drift = %+v, want web against edge", got)
 	}
@@ -821,6 +801,51 @@ func TestLiveDriftDetectsOutOfBandJobAndContainerFields(t *testing.T) {
 	if d := driftOf(t, rec, "surface"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
 	}
+}
+
+// A replicated job's concurrency, changed by hand.
+//
+// The job gets its own chart and its own application rather than a place in
+// richChartFiles, and the reason is worth recording: a job whose task sleeps
+// never completes, so a release containing one never satisfies the convergence
+// wait a deploy performs. Putting one in the shared fixture made every test using
+// it time out after three minutes. So this deploys with syncPolicy.wait off and
+// waits on the task itself.
+//
+// Compared apart from `replicas`, which a job does not have: the mode branch is
+// exclusive, so a job never reaches that comparison at all.
+func TestLiveDriftDetectsAnOutOfBandJobConcurrency(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-job"
+	repo := gitRepo(t, jobChartFiles(release, 1))
+	t.Cleanup(func() { removeStack(t, release) })
+
+	rec := reconciler(t, jobApp("job", repo))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "job"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 1)
+
+	updateOutOfBand(t, cli, release+"_app", func(spec *swarm.ServiceSpec) {
+		four := uint64(4)
+		spec.Mode.ReplicatedJob.MaxConcurrent = &four
+	})
+
+	if err := rec.Sync(ctx, "job"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	d := driftOf(t, rec, "job")
+	if got := fieldOf(t, d, release+"_app", "maxConcurrent"); got.Desired != "1" || got.Live != "4" {
+		t.Errorf("maxConcurrent drift = %+v, want 1 against 4", got)
+	}
+	// The other count is untouched, which says the two are compared apart rather
+	// than as one number — and a job is never reported as a replica change.
+	assertNotReported(t, d, "totalCompletions")
+	assertNotReported(t, d, "replicas")
+	assertNotReported(t, d, "mode")
 }
 
 // A service deleted out of band. The health axis only notices when a release has
