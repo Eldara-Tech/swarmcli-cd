@@ -43,7 +43,15 @@ import (
 // and be wrong: compose → ServiceSpec is lossy and one-way, so the
 // reconstruction manufactures differences that do not exist. Established with a
 // reproduction in swarmcli-cd#1 and restated in CLAUDE.md.
-func Live(desired *compose.Stack, live map[string]swarm.Service) *application.ReleaseDrift {
+//
+// # Naming what the daemon stores as an id
+//
+// One compared field cannot be read without help. A service's attached networks
+// are stored by id where the manifest named a network, so nets carries the
+// swarm's networks by id and the comparison names them before comparing. Nil is
+// allowed and means the backend could not answer: attachments are then not
+// compared, which loses one field rather than the whole report.
+func Live(desired *compose.Stack, live map[string]swarm.Service, nets NetworkNames) *application.ReleaseDrift {
 	out := &application.ReleaseDrift{State: application.DriftStateNone}
 	if desired == nil {
 		return out
@@ -64,7 +72,7 @@ func Live(desired *compose.Stack, live map[string]swarm.Service) *application.Re
 			})
 			continue
 		}
-		if fields, truncated := compareService(svc.Spec, cur.Spec); len(fields) > 0 {
+		if fields, truncated := compareService(svc.Spec, cur.Spec, nets); len(fields) > 0 {
 			reason, message := application.DriftModified, ""
 			if why, ok := rolledBack(cur); ok {
 				reason, message = application.DriftRolledBack, why
@@ -139,9 +147,17 @@ func rolledBack(live swarm.Service) (string, bool) {
 // a status payload that is served on every poll.
 const maxFields = 20
 
+// NetworkNames maps a network's id to its name.
+//
+// Nil means the backend could not list the swarm's networks, in which case
+// attached networks are not compared. That is the degradation the sweep's
+// resourceLister already takes: lose the one field that needed the read, not the
+// whole comparison.
+type NetworkNames map[string]string
+
 // compareService returns the allowlisted fields that differ, and how many more
 // were found beyond the cap.
-func compareService(want, got swarm.ServiceSpec) ([]application.FieldDrift, int) {
+func compareService(want, got swarm.ServiceSpec, nets NetworkNames) ([]application.FieldDrift, int) {
 	var fields []application.FieldDrift
 	add := func(name, desired, live string) {
 		fields = append(fields, application.FieldDrift{Field: name, Desired: desired, Live: live})
@@ -163,6 +179,9 @@ func compareService(want, got swarm.ServiceSpec) ([]application.FieldDrift, int)
 	compareEnv(containerSpec(want).Env, containerSpec(got).Env, add)
 	compareConstraints(want.TaskTemplate.Placement, got.TaskTemplate.Placement, add)
 	compareLabels(want.Labels, got.Labels, add)
+	comparePorts(want.EndpointSpec, got.EndpointSpec, add)
+	compareEndpointMode(want.EndpointSpec, got.EndpointSpec, add)
+	compareNetworks(want, got, nets, add)
 
 	if len(fields) > maxFields {
 		return fields[:maxFields], len(fields) - maxFields
@@ -273,13 +292,20 @@ func compareInt64(name string, want, got int64, add func(name, desired, live str
 	}
 }
 
-// Renderings for an environment difference. The value is never one of them: what
-// is running is whatever an operator typed, this is served to anyone with read
-// scope, and an environment variable is exactly where a credential would be.
+// Renderings for a difference in something that is either there or not.
+//
+// Environment variables are the reason the first two exist and the reason a
+// value is never one of them: what is running is whatever an operator typed,
+// this is served to anyone with read scope, and an environment variable is
+// exactly where a credential would be. They are not env-specific, though —
+// anything compared as a set renders this way, because a set entry has no key to
+// hang a value on. Note the other rendering of "not there", `absent` below, which
+// is what a *keyed* value shows; the two have been spelled differently since the
+// first version of this file.
 const (
-	envSet     = "set"
-	envAbsent  = "absent"
-	envChanged = "changed"
+	valueSet    = "set"
+	valueAbsent = "absent"
+	envChanged  = "changed"
 )
 
 // compareEnv reports environment variables added, removed or changed, by name.
@@ -290,11 +316,11 @@ func compareEnv(want, got []string, add func(name, desired, live string)) {
 		gv, inGot := gm[key]
 		switch {
 		case inWant && !inGot:
-			add("env["+key+"]", envSet, envAbsent)
+			add("env["+key+"]", valueSet, valueAbsent)
 		case !inWant && inGot:
-			add("env["+key+"]", envAbsent, envSet)
+			add("env["+key+"]", valueAbsent, valueSet)
 		case wv != gv:
-			add("env["+key+"]", envSet, envChanged)
+			add("env["+key+"]", valueSet, envChanged)
 		}
 	}
 }
@@ -376,13 +402,182 @@ func orAbsent(value string, present bool) string {
 	return value
 }
 
+// portDynamic renders a published port the manifest left the daemon to pick.
+const portDynamic = "dynamic"
+
+// comparePorts reports published ports added and removed.
+//
+// Reported as a set, unlike every other collection here, because a port has no
+// stable key to hang a value on: "8080:80" and "8081:80" differ only in the
+// published side, so keying on the target would collide, and keying on the
+// published port would make a changed one look like a different port entirely. A
+// change therefore reads as one entry gone and one arrived — which is exactly
+// what `--publish-rm` plus `--publish-add` did.
+//
+// What the daemon does *not* do here is worth writing down, because the opposite
+// is the natural assumption and it is what makes this comparison safe at all: it
+// never writes the port it assigned back into the spec. Swarmkit allocates a
+// dynamic publish into the service's runtime Endpoint
+// (manager/allocator.serviceAllocatePorts) and leaves Spec.Endpoint untouched, so
+// a manifest that published without naming a port reads back as zero on both
+// sides rather than meeting an assigned 30000-something.
+func comparePorts(want, got *swarm.EndpointSpec, add func(name, desired, live string)) {
+	comparePresence("ports", portSet(want), portSet(got), add)
+}
+
+// portSet is one endpoint's ports in canonical form.
+//
+// Both enum defaults are applied, because an empty protocol or publish mode is
+// stored as the zero enum and read back as its name: "tcp" and "ingress"
+// (daemon/cluster/convert.ServiceSpecToGRPC, then swarmPortConfigToAPIPortConfig).
+// Comparing the raw strings would report drift on every port that named neither.
+func portSet(e *swarm.EndpointSpec) map[string]struct{} {
+	if e == nil {
+		return nil
+	}
+	out := make(map[string]struct{}, len(e.Ports))
+	for _, p := range e.Ports {
+		out[portKey(p)] = struct{}{}
+	}
+	return out
+}
+
+func portKey(p swarm.PortConfig) string {
+	published := portDynamic
+	if p.PublishedPort != 0 {
+		published = strconv.FormatUint(uint64(p.PublishedPort), 10)
+	}
+	protocol := string(p.Protocol)
+	if protocol == "" {
+		protocol = string(swarm.PortConfigProtocolTCP)
+	}
+	mode := string(p.PublishMode)
+	if mode == "" {
+		mode = string(swarm.PortConfigPublishModeIngress)
+	}
+	return published + ":" + strconv.FormatUint(uint64(p.TargetPort), 10) + "/" + protocol + "/" + mode
+}
+
+// comparePresence reports the entries of one set the other does not have.
+func comparePresence(prefix string, want, got map[string]struct{}, add func(name, desired, live string)) {
+	for _, key := range unionKeys(want, got) {
+		_, inWant := want[key]
+		_, inGot := got[key]
+		if inWant == inGot {
+			continue
+		}
+		add(prefix+"["+key+"]", presence(inWant), presence(inGot))
+	}
+}
+
+func presence(in bool) string {
+	if in {
+		return valueSet
+	}
+	return valueAbsent
+}
+
+// compareEndpointMode reports a changed service discovery mode.
+//
+// Empty means vip on both sides. Compose passes the manifest's endpoint_mode
+// through as written (cli/compose/convert.convertEndpointSpec), so a manifest
+// that named none leaves it empty; the daemon stores the zero enum for that and
+// reads "vip" back. Comparing the raw values would report drift on every service
+// that did not name one.
+func compareEndpointMode(want, got *swarm.EndpointSpec, add func(name, desired, live string)) {
+	if w, g := resolutionMode(want), resolutionMode(got); w != g {
+		add("endpointMode", w, g)
+	}
+}
+
+func resolutionMode(e *swarm.EndpointSpec) string {
+	if e == nil || e.Mode == "" {
+		return string(swarm.ResolutionModeVIP)
+	}
+	return string(e.Mode)
+}
+
+// compareNetworks reports the networks a service is attached to, as a whole set
+// rather than one at a time: attachments are read together, like constraints, and
+// "want a, b; got a" is clearer than two lines about one detachment.
+//
+// The live side has to be named before it can be compared at all. The manifest
+// names a network and the daemon stores an id, rewriting each Target in place as
+// it creates or updates the service (daemon/cluster.populateNetworkID) — so this
+// is a resolution step before it is a comparison.
+//
+// Three ways to decline, each reporting nothing rather than guessing:
+//
+//   - No map at all: the backend could not list the swarm's networks.
+//   - An id the map does not name — a network created since the listing, or one
+//     this controller cannot see. Silence about one service's attachments beats a
+//     report that names an id.
+//   - Either side carrying the deprecated ServiceSpec.Networks. Compose writes
+//     that field instead of TaskTemplate.Networks below API 1.29
+//     (cli/compose/convert.Service), which would leave the desired side empty
+//     against a populated live one and report drift on every service of every
+//     release, for ever.
+//
+// One thing that is safe and reads as though it should not be: a service that
+// publishes a port is attached to the ingress network, but swarmkit records that
+// on the runtime Endpoint's virtual IPs and on the task, never on the spec — so
+// the spec's list stays what was written.
+func compareNetworks(want, got swarm.ServiceSpec, nets NetworkNames, add func(name, desired, live string)) {
+	//nolint:staticcheck // ignore SA1019: reading the deprecated field is the point.
+	if nets == nil || len(want.Networks) > 0 || len(got.Networks) > 0 {
+		return
+	}
+	live, ok := resolvedNetworkNames(got.TaskTemplate.Networks, nets)
+	if !ok {
+		return
+	}
+	if declared := declaredNetworkNames(want.TaskTemplate.Networks); !slices.Equal(declared, live) {
+		add("networks", strings.Join(declared, ", "), strings.Join(live, ", "))
+	}
+}
+
+// declaredNetworkNames is the desired side's attachments, whose targets are
+// already names: convert scopes the name the manifest used, or takes the explicit
+// `name:`, and never asks a daemon for anything.
+//
+// Sorted, like constraints, because neither side's order is meaningful and an
+// order-sensitive comparison would report drift on a reordered chart template.
+func declaredNetworkNames(attachments []swarm.NetworkAttachmentConfig) []string {
+	out := make([]string, 0, len(attachments))
+	for _, a := range attachments {
+		out = append(out, a.Target)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// resolvedNetworkNames names the live side's attachments, and says whether every
+// one of them could be named. One that could not makes the whole set unusable:
+// a comparison missing an attachment reports a detachment that did not happen.
+func resolvedNetworkNames(attachments []swarm.NetworkAttachmentConfig, nets NetworkNames) ([]string, bool) {
+	out := make([]string, 0, len(attachments))
+	for _, a := range attachments {
+		name, ok := nets[a.Target]
+		if !ok {
+			return nil, false
+		}
+		out = append(out, name)
+	}
+	slices.Sort(out)
+	return out, true
+}
+
 // unionKeys returns every key of both maps, sorted, so that a service's reported
 // differences are in the same order on every tick. An unstable order would make
 // a status poll look like a change.
-func unionKeys(a, b map[string]string) []string {
+//
+// Generic in the value, so that the sets comparePresence works over — where the
+// key is the whole of the entry and there is no value — use the same ordering as
+// the keyed maps beside them.
+func unionKeys[V any](a, b map[string]V) []string {
 	seen := make(map[string]struct{}, len(a)+len(b))
 	out := make([]string, 0, len(a)+len(b))
-	for _, m := range []map[string]string{a, b} {
+	for _, m := range []map[string]V{a, b} {
 		for k := range m {
 			if _, ok := seen[k]; ok {
 				continue

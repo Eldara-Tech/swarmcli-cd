@@ -462,6 +462,23 @@ type liveDriftBackend interface {
 	LiveServices(ctx context.Context, stack string) (map[string]swarm.Service, error)
 }
 
+// networkNamer is the optional interface a backend implements to name the
+// networks a service is attached to. *backend.Backend satisfies it.
+//
+// A spec names them by id, because the daemon rewrites each target to one as it
+// writes the service, so without this the attachments cannot be compared at all.
+// Separate from liveDriftBackend for the reason resourceLister is: a backend that
+// can read services but not list networks should lose that one field and keep
+// every other comparison.
+//
+// Not stack-scoped, unlike resourceLister's three. A service may be attached to
+// an external network or a predefined one, neither of which carries the stack's
+// namespace label, and an attachment that could not be named is exactly the one
+// worth reporting.
+type networkNamer interface {
+	LiveNetworkNames(ctx context.Context) (map[string]string, error)
+}
+
 // declaredLister is the optional interface a backend implements to answer what a
 // manifest declares without needing any of it to exist. *backend.Backend
 // satisfies it.
@@ -655,6 +672,8 @@ func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b chart
 	// Losing the half it cannot answer is better than losing both.
 	rl, _ := b.(resourceLister)
 	readDeclared := declaredReader(ldb)
+	// Per swarm rather than per release, so one read answers every release below.
+	nets := r.networkNames(ctx, spec, ldb, live)
 
 	views := make(map[string]releaseView, len(plan.Releases))
 	for _, rp := range plan.Releases {
@@ -699,7 +718,7 @@ func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b chart
 		views[rp.Name] = v
 	}
 
-	drifts := r.liveDrift(spec, plan, views)
+	drifts := r.liveDrift(spec, plan, views, nets)
 	if !sweep {
 		return drifts, nil
 	}
@@ -722,7 +741,7 @@ func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b chart
 // reconcile — this is a read for a reporting axis, and a daemon hiccup does not
 // make the deploy wrong. It is also not converged: the controller does not
 // write on the strength of a read it could not make.
-func (r *Reconciler) liveDrift(spec application.Spec, plan *charts.Plan, views map[string]releaseView) map[string]*application.ReleaseDrift {
+func (r *Reconciler) liveDrift(spec application.Spec, plan *charts.Plan, views map[string]releaseView, nets drift.NetworkNames) map[string]*application.ReleaseDrift {
 	if spec.DriftDetection != application.DriftLive {
 		return nil
 	}
@@ -745,9 +764,35 @@ func (r *Reconciler) liveDrift(spec application.Spec, plan *charts.Plan, views m
 			}
 			continue
 		}
-		out[rp.Name] = drift.Live(v.desired, v.live)
+		out[rp.Name] = drift.Live(v.desired, v.live, nets)
 	}
 	return out
+}
+
+// networkNames reads the swarm's networks by id, for the one compared field that
+// a spec stores as one.
+//
+// Read once per reconcile rather than per release, because it is a property of
+// the swarm and not of a stack, and only in live mode because nothing else looks
+// at it. A backend that does not implement the seam, or a listing that fails,
+// yields nil and the attachment comparison is skipped: this is a read for a
+// reporting axis, and losing one field is not a reason to fail a reconcile or to
+// call an otherwise readable release unknown.
+func (r *Reconciler) networkNames(ctx context.Context, spec application.Spec, ldb liveDriftBackend, live bool) drift.NetworkNames {
+	if !live {
+		return nil
+	}
+	nn, ok := ldb.(networkNamer)
+	if !ok {
+		return nil
+	}
+	names, err := nn.LiveNetworkNames(ctx)
+	if err != nil {
+		r.log.Warn("could not name the swarm's networks, so no release's attached networks can be compared",
+			"application", spec.Name, "error", err)
+		return nil
+	}
+	return names
 }
 
 // departed names the services running under each release that its manifest no

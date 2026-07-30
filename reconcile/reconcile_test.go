@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -1612,6 +1613,12 @@ type driftBackend struct {
 	appliedAt      func() int
 	removedAtApply []int
 
+	// The swarm's networks by id, as the networkNamer seam returns them, and the
+	// failure of that listing. Nil names with no error is a swarm with no
+	// networks, which is not the same as a backend that could not look.
+	networkNames map[string]string
+	namesErr     error
+
 	// The other three kinds, by release and then scoped name to id — the shape
 	// the resourceLister seam returns.
 	liveNetworks map[string]map[string]string
@@ -1709,6 +1716,13 @@ func (b *driftBackend) LiveServices(_ context.Context, stack string) (map[string
 	return b.live[stack], nil
 }
 
+func (b *driftBackend) LiveNetworkNames(context.Context) (map[string]string, error) {
+	if b.namesErr != nil {
+		return nil, b.namesErr
+	}
+	return b.networkNames, nil
+}
+
 func (b *driftBackend) LiveNetworks(_ context.Context, stack string) (map[string]string, error) {
 	if b.listErr != nil {
 		return nil, b.listErr
@@ -1792,6 +1806,8 @@ func serviceSpec(name string, replicas uint64) swarm.ServiceSpec {
 	}
 }
 
+func uint64p(v uint64) *uint64 { return &v }
+
 // driftedBackend is a backend on which the release "whoami" is running three
 // replicas where the manifest asks for one.
 func driftedBackend() *driftBackend {
@@ -1824,6 +1840,129 @@ func liveSpec(name string, automated bool) application.Spec {
 	s := spec(name, automated)
 	s.DriftDetection = application.DriftLive
 	return s
+}
+
+// attachedTo is the "whoami" release with its service attached to one network in
+// the manifest, and to whatever the daemon reports live.
+//
+// The two sides are deliberately written in different currencies, because that is
+// the whole problem the seam solves: the manifest names a network and the daemon
+// stores an id, so a comparison that skipped the naming step would report a
+// detachment on every service ever deployed.
+func attachedTo(liveIDs ...string) *driftBackend {
+	want := serviceSpec("whoami_app", 1)
+	want.TaskTemplate.Networks = []swarm.NetworkAttachmentConfig{{Target: "whoami_internal"}}
+
+	got := serviceSpec("whoami_app", 1)
+	for _, id := range liveIDs {
+		got.TaskTemplate.Networks = append(got.TaskTemplate.Networks,
+			swarm.NetworkAttachmentConfig{Target: id})
+	}
+
+	return &driftBackend{
+		desired: map[string]*compose.Stack{
+			"whoami": {Services: []compose.Service{{Name: "app", Spec: want}}},
+		},
+		live: map[string]map[string]swarm.Service{
+			"whoami": {"whoami_app": {ID: "id", Spec: got}},
+		},
+		networkNames: map[string]string{"net-internal": "whoami_internal"},
+	}
+}
+
+// The attachment comparison end to end: the id the daemon stored is named back
+// to what the manifest declared, and the two agree.
+func TestAnAttachmentIsNamedBeforeItIsCompared(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil,
+		fakeRegistry{backend: attachedTo("net-internal")})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	view, _ := r.View("edge")
+	if view.Status.Drift == nil || view.Status.Drift.State != application.DriftStateNone {
+		t.Errorf("drift = %+v, want none — the id names the network the manifest declared", view.Status.Drift)
+	}
+}
+
+func TestADetachedNetworkIsReported(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", false)}, engine, nil,
+		fakeRegistry{backend: attachedTo()})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	rel := releaseDriftOf(t, r, "edge")
+	if len(rel.Services) != 1 {
+		t.Fatalf("services = %+v, want the one detached service", rel.Services)
+	}
+	got := rel.Services[0].Fields
+	want := []application.FieldDrift{{Field: "networks", Desired: "whoami_internal", Live: ""}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("fields = %+v, want %+v", got, want)
+	}
+}
+
+// A listing this controller could not make proves nothing about the attachments,
+// so they are not compared — and that must cost the attachments only. Losing the
+// release's other fields, or calling it unknown, would turn one unreadable list
+// into a blind spot over everything.
+func TestANamingFailureCostsTheAttachmentsAndNothingElse(t *testing.T) {
+	backend := attachedTo()
+	backend.namesErr = errors.New("swarm unreachable")
+	// A difference the comparison can still see without naming anything.
+	live := backend.live["whoami"]["whoami_app"]
+	live.Spec.Mode.Replicated.Replicas = uint64p(4)
+	backend.live["whoami"]["whoami_app"] = live
+
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", false)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	rel := releaseDriftOf(t, r, "edge")
+	if rel.State != application.DriftStateDetected {
+		t.Fatalf("state = %q, want detected: the replica difference is still legible", rel.State)
+	}
+	want := []application.FieldDrift{{Field: "replicas", Desired: "1", Live: "4"}}
+	if got := rel.Services[0].Fields; !reflect.DeepEqual(got, want) {
+		t.Errorf("fields = %+v, want %+v — the detachment is not reported on a listing that failed", got, want)
+	}
+}
+
+// A backend that does not implement the seam at all, which is the Phase 3 remote
+// one: the same degradation, decided one step earlier.
+func TestABackendThatCannotNameNetworksComparesEverythingElse(t *testing.T) {
+	ldb := oldSeamBackend{}
+	if _, ok := any(ldb).(networkNamer); ok {
+		t.Fatal("oldSeamBackend implements networkNamer; it is meant to be the backend that does not")
+	}
+
+	r := newTest(t, []application.Spec{liveSpec("edge", false)}, &fakeEngine{plans: []*charts.Plan{synced()}}, nil)
+	if got := r.networkNames(context.Background(), liveSpec("edge", false), ldb, true); got != nil {
+		t.Errorf("names = %v, want nil so that attachments are simply not compared", got)
+	}
+}
+
+// releaseDriftOf returns the drift detail of an application's only release.
+func releaseDriftOf(t *testing.T, r *Reconciler, app string) *application.ReleaseDrift {
+	t.Helper()
+	view, ok := r.View(app)
+	if !ok {
+		t.Fatalf("no view for %q", app)
+	}
+	if len(view.Status.Releases) != 1 {
+		t.Fatalf("got %d releases, want 1", len(view.Status.Releases))
+	}
+	if view.Status.Releases[0].Drift == nil {
+		t.Fatal("no drift detail on the release")
+	}
+	return view.Status.Releases[0].Drift
 }
 
 // rolledBackBackend is driftedBackend after Swarm reverted the spec this

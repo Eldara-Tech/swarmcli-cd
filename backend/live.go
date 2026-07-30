@@ -67,6 +67,37 @@ func (b *Backend) LiveServices(ctx context.Context, stack string) (map[string]sw
 	return b.stackServices(ctx, stack)
 }
 
+// LiveNetworkNames returns every network on the swarm, by id.
+//
+// It belongs to the live comparison rather than to the sweep, which is why it
+// sits here beside LiveServices and not below with LiveNetworks and the other
+// two scoped listers: it is deliberately *not* stack-scoped, and putting it in
+// that group would contradict the one thing that group has in common.
+//
+// A spec names the networks its service is attached to by id — the daemon
+// rewrites each Target to one as it creates or updates the service
+// (daemon/cluster.populateNetworkID) — while a manifest names a network. So
+// comparing attachments is a resolution step before it is a comparison, and a
+// stack-scoped listing cannot perform it: a service may be attached to an
+// external network or to one of the swarm's predefined ones, and neither carries
+// this stack's namespace label. An id that could not be named would have to be
+// treated as opaque, which is precisely the attachment worth reporting.
+//
+// Id to name, the opposite direction from LiveNetworks, because these are
+// opposite jobs: the sweep matches on a name and deletes by id, and this reads an
+// id and reports a name.
+func (b *Backend) LiveNetworkNames(ctx context.Context) (map[string]string, error) {
+	nets, err := b.api.NetworkList(ctx, network.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing the swarm's networks: %w", err)
+	}
+	out := make(map[string]string, len(nets))
+	for _, n := range nets {
+		out[n.ID] = n.Name
+	}
+	return out, nil
+}
+
 // RemoveService deletes one service by id.
 //
 // By id and not by name, because the caller has already read the service it

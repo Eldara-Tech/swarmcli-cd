@@ -6,6 +6,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -98,6 +99,42 @@ func keysOf(m map[string]swarm.Service) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// The one read here that must NOT be scoped, and the assertion is the filter
+// itself: a service can be attached to an external network or a predefined one,
+// neither of which carries the stack's namespace label, so a scoped listing would
+// leave exactly those attachments unnameable — and an attachment that cannot be
+// named is the one worth reporting.
+func TestLiveNetworkNamesAreReadAcrossTheWholeSwarm(t *testing.T) {
+	api := &fakeAPI{networks: []network.Summary{
+		stackNetwork("n1", "s_front", "s"),
+		stackNetwork("n2", "other_front", "other"),
+		{ID: "n3", Name: "shared"}, // external: no namespace label at all
+	}}
+
+	got, err := testBackend(t, api, nil).LiveNetworkNames(context.Background())
+	if err != nil {
+		t.Fatalf("LiveNetworkNames = %v, want nil", err)
+	}
+
+	want := map[string]string{"n1": "s_front", "n2": "other_front", "n3": "shared"}
+	if !maps.Equal(got, want) {
+		t.Errorf("got %v, want %v — id to name, the opposite direction from LiveNetworks", got, want)
+	}
+	for _, f := range api.labelFilters {
+		if f != "" {
+			t.Errorf("listed with filter %q, want the whole swarm's networks", f)
+		}
+	}
+}
+
+func TestLiveNetworkNamesReportsAListFailure(t *testing.T) {
+	api := &fakeAPI{networkErr: errors.New("swarm unreachable")}
+	_, err := testBackend(t, api, nil).LiveNetworkNames(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "listing the swarm's networks") {
+		t.Errorf("LiveNetworkNames = %v, want the list error surfaced and named", err)
+	}
 }
 
 // ------------------------------------------- the other three kinds (#80)
