@@ -366,9 +366,12 @@ func TestCreateConfigStampsTheCreationTime(t *testing.T) {
 
 // One list call, not a list plus an inspect per config. This runs on every
 // reconcile against a store that grows by one config per release revision.
+//
+// The payload has to ride along, or the engine inspects each release config to
+// decode it and the saving is undone one revision at a time.
 func TestListConfigsDoesNotInspectEachOne(t *testing.T) {
 	api := &fakeAPI{configs: []swarm.Config{
-		{Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "a", Labels: map[string]string{"k": "v"}}}},
+		{Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "a", Labels: map[string]string{"k": "v"}}, Data: []byte("payload-a")}},
 		{Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "b"}}},
 	}}
 
@@ -379,8 +382,11 @@ func TestListConfigsDoesNotInspectEachOne(t *testing.T) {
 	if len(got) != 2 || got[0].Name != "a" || got[0].Labels["k"] != "v" {
 		t.Errorf("configs = %+v, want name and labels carried through", got)
 	}
+	if string(got[0].Data) != "payload-a" {
+		t.Errorf("Data = %q, want the payload the list response carried", got[0].Data)
+	}
 	if api.inspects != 0 {
-		t.Errorf("inspected %d configs; the engine reads only name and labels", api.inspects)
+		t.Errorf("inspected %d configs; the list response already holds all of it", api.inspects)
 	}
 }
 
