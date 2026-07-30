@@ -149,6 +149,70 @@ func Convert(ctx context.Context, manifest, stack string, api client.APIClient) 
 	}, nil
 }
 
+// unresolvedID is the id ConvertUnresolved reports for every reference it is
+// asked about. Not a plausible-looking one on purpose: a spec that reached a
+// swarm carrying this would be rejected outright, which is the failure worth
+// having if one of those specs is ever applied by mistake.
+const unresolvedID = "unresolved"
+
+// ConvertUnresolved converts a manifest as though every config and secret it
+// references already existed.
+//
+// It exists to break a circle. A stack that reaches for one of the controller's
+// own secrets or configs has to be refused whole, before anything is created
+// (swarmcli-cd#63) — and what a service mounts is only legible from its
+// converted spec. But converting a service resolves each reference to the id
+// Swarm addresses it by, so the conversion that gets applied cannot run until
+// the resources exist, and a chart's own config does not exist until this
+// controller creates it (swarmcli-cd#84). One conversion cannot be both.
+//
+// So this one answers the lookup instead of making it. Every name it produces is
+// the name Convert produces, because a reference's name comes from the manifest
+// and the namespace — namespace.Scope(source), or the top-level entry's own
+// name: — and nothing in that asks the daemon. Only the id does.
+//
+// **The result must not be applied.** Its references carry unresolvedID rather
+// than the id of anything on the swarm; it is for reading names from, and
+// Convert is what a deploy applies.
+func ConvertUnresolved(ctx context.Context, manifest, stack string, api client.APIClient) (*Stack, error) {
+	return Convert(ctx, manifest, stack, assumeResolved{api})
+}
+
+// assumeResolved is a client that reports every config and secret asked for as
+// existing. It wraps the real one rather than replacing it because conversion
+// also reads the negotiated API version, which gates a few spec fields: a
+// conversion done against a made-up version would differ from the real one in
+// more than the ids.
+//
+// The two overridden methods are the whole of what conversion asks a daemon —
+// docker/cli's ParseSecrets and ParseConfigs list by name filter to turn each
+// reference's name into an id — so a docker/cli bump that starts calling
+// somewhere new surfaces here as a real call against the real client rather than
+// as a silent wrong answer.
+type assumeResolved struct{ client.APIClient }
+
+func (assumeResolved) ConfigList(_ context.Context, o swarm.ConfigListOptions) ([]swarm.Config, error) {
+	names := o.Filters.Get("name")
+	out := make([]swarm.Config, 0, len(names))
+	for _, name := range names {
+		out = append(out, swarm.Config{ID: unresolvedID, Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: name},
+		}})
+	}
+	return out, nil
+}
+
+func (assumeResolved) SecretList(_ context.Context, o swarm.SecretListOptions) ([]swarm.Secret, error) {
+	names := o.Filters.Get("name")
+	out := make([]swarm.Secret, 0, len(names))
+	for _, name := range names {
+		out = append(out, swarm.Secret{ID: unresolvedID, Spec: swarm.SecretSpec{
+			Annotations: swarm.Annotations{Name: name},
+		}})
+	}
+	return out, nil
+}
+
 // declaredNetworks is the set of networks the services reference, which is what
 // decides which of the manifest's networks are actually created. A service that
 // names none joins "default", exactly as `docker stack deploy` has it.

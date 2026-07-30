@@ -701,10 +701,17 @@ func (f *fakeAPI) ConfigInspectWithRaw(_ context.Context, name string) (swarm.Co
 	return swarm.Config{}, nil, errdefs.ErrNotFound
 }
 
+// ConfigCreate stores what it created, so a later read finds it — as a daemon
+// would. A fake that only recorded the call could not model "create the config,
+// then resolve against it the service that mounts it", which is the whole of
+// #84: the conversion that resolves a reference runs after the create that
+// satisfies it, and a fake forgetting its own writes makes that untestable.
 func (f *fakeAPI) ConfigCreate(_ context.Context, spec swarm.ConfigSpec) (swarm.ConfigCreateResponse, error) {
 	f.createdConfigs = append(f.createdConfigs, spec)
 	f.note("config:" + spec.Name)
-	return swarm.ConfigCreateResponse{ID: "cfg-" + spec.Name}, nil
+	id := "cfg-" + spec.Name
+	f.configs = append(f.configs, swarm.Config{ID: id, Spec: spec})
+	return swarm.ConfigCreateResponse{ID: id}, nil
 }
 
 func (f *fakeAPI) ConfigUpdate(_ context.Context, _ string, _ swarm.Version, spec swarm.ConfigSpec) error {
@@ -747,10 +754,13 @@ func (f *fakeAPI) SecretInspectWithRaw(_ context.Context, name string) (swarm.Se
 	return swarm.Secret{}, nil, errdefs.ErrNotFound
 }
 
+// SecretCreate remembers its write for the reason ConfigCreate does.
 func (f *fakeAPI) SecretCreate(_ context.Context, spec swarm.SecretSpec) (swarm.SecretCreateResponse, error) {
 	f.createdSecrets = append(f.createdSecrets, spec)
 	f.note("secret:" + spec.Name)
-	return swarm.SecretCreateResponse{ID: "sec-" + spec.Name}, nil
+	id := "sec-" + spec.Name
+	f.secrets = append(f.secrets, swarm.Secret{ID: id, Spec: spec})
+	return swarm.SecretCreateResponse{ID: id}, nil
 }
 
 func (f *fakeAPI) SecretUpdate(_ context.Context, _ string, _ swarm.Version, spec swarm.SecretSpec) error {

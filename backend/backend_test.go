@@ -70,6 +70,87 @@ func TestDeployStackCreatesReferencesBeforeServices(t *testing.T) {
 	}
 }
 
+// declaresAndMounts is the shape #84 was filed for: a chart that brings its own
+// config and secret and mounts them. Both sources are files, because that is the
+// only way compose carries content, and the loader resolves them against this
+// process's filesystem.
+func declaresAndMounts(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	return `
+services:
+  app:
+    image: busybox
+    configs: [site]
+    secrets: [apikey]
+configs:
+  site:
+    file: ` + write("site.conf", "listen 80;\n") + `
+secrets:
+  apikey:
+    file: ` + write("api.key", "s3cr3t\n") + `
+`
+}
+
+// A chart may mount what it declares. Converting a service resolves each config
+// and secret it mounts to the id Swarm addresses it by, so the conversion that
+// is applied cannot run until they exist — which is the ordering #84 got wrong.
+//
+// The id asserted at the end is the point of the whole arrangement: it is the
+// one the daemon reported for the config this deploy created, so the spec that
+// reached the swarm came from the authoritative conversion and not from the
+// reference-free one the guard reads.
+func TestDeployStackCreatesAConfigAndSecretItThenMounts(t *testing.T) {
+	api := &fakeAPI{}
+
+	if err := testBackend(t, api, nil).DeployStack("rel", declaresAndMounts(t), ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want a chart to be able to mount what it declares", err)
+	}
+
+	want := []string{"network:rel_default", "secret:rel_apikey", "config:rel_site"}
+	if !reflect.DeepEqual(api.order, want) {
+		t.Errorf("mutation order = %v, want %v", api.order, want)
+	}
+	if len(api.created) != 1 {
+		t.Fatalf("created %d services, want 1", len(api.created))
+	}
+	cs := api.created[0].TaskTemplate.ContainerSpec
+	if len(cs.Configs) != 1 || cs.Configs[0].ConfigName != "rel_site" || cs.Configs[0].ConfigID != "cfg-rel_site" {
+		t.Errorf("configs = %+v, want the id the daemon reported for the config just created", cs.Configs)
+	}
+	if len(cs.Secrets) != 1 || cs.Secrets[0].SecretName != "rel_apikey" || cs.Secrets[0].SecretID != "sec-rel_apikey" {
+		t.Errorf("secrets = %+v, want the id the daemon reported for the secret just created", cs.Secrets)
+	}
+}
+
+// A manifest that cannot be converted at all creates nothing. The stack is
+// refused whole for every conversion failure and not only for a forbidden mount,
+// which is what the reference-free first pass buys: it fails here, before the
+// first create, rather than after the configs and secrets are on the swarm.
+func TestAnUnconvertibleManifestCreatesNothing(t *testing.T) {
+	api := &fakeAPI{}
+
+	err := testBackend(t, api, nil).DeployStack("s", `
+services:
+  web:
+    image: nginx
+    secrets: [absent]
+`, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a manifest referencing an undeclared secret to be refused")
+	}
+	if len(api.order) != 0 || len(api.created) != 0 {
+		t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+	}
+}
+
 // A stack referencing one of the controller's own secrets as external is refused
 // whole, before any resource is created — the exfiltration path that would
 // otherwise read the controller's admin token, git token or a registry
