@@ -671,17 +671,11 @@ func createServiceByHand(t *testing.T, cli *dockerclient.Client, release, name s
 // `file:`, resolved against the controller's filesystem — which in these tests
 // is the test process, so an absolute path under t.TempDir() is exactly right.
 //
-// **No service mounts the configs or secrets, and that is not an oversight.**
-// DeployStack converts the whole manifest before it creates anything
-// (backend/backend.go), and converting a service that references a config
-// resolves that reference against the daemon — so a chart declaring its own
-// config and mounting it cannot be installed at all: the conversion fails with
-// "config not found" before applyConfigs would have created it. `docker stack
-// deploy` avoids this by creating configs first and converting services after.
-// That is a separate defect from the one this fixture is for, and until it is
-// fixed a mounted config cannot appear in any fixture. Declared-but-unmounted
-// configs and secrets are still created, still carry the namespace label, and
-// are still exactly what the sweep has to find.
+// `app` mounts the `keep` config deliberately: a chart mounting a config it
+// declares itself is what swarmcli-cd#84 made impossible, so this is that fix
+// under a real daemon as well as a config the sweep must not touch. `drop` and
+// the secret stay unmounted, because the sweep is meant to remove those two and
+// Swarm refuses to remove a config or secret a service is using.
 //
 // The drop of the `drop` network is what needs the real swarm: the sidecar is
 // attached to it, so it cannot be removed until that service's tasks have
@@ -708,6 +702,7 @@ func chartFilesWithPrunables(t *testing.T, release, dir string, extras bool) map
 		"    image: busybox:1.36\n" +
 		"    command: [\"sleep\", \"3600\"]\n" +
 		"    networks: [keep]\n" +
+		"    configs: [keep]\n" +
 		"    deploy:\n" +
 		"      replicas: {{ .Values.replicas }}\n" +
 		"      labels:\n" +

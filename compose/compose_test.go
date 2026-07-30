@@ -306,6 +306,112 @@ configs:
 	}
 }
 
+// declaresAndMounts is the chart shape swarmcli-cd#84 was filed for: it brings
+// its own config and secret and mounts them. Files, because that is the only way
+// compose carries content, resolved against this process's filesystem.
+func declaresAndMounts(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	return `
+services:
+  app:
+    image: busybox
+    configs: [site]
+    secrets: [apikey]
+configs:
+  site:
+    file: ` + write("site.conf", "listen 80;\n") + `
+secrets:
+  apikey:
+    file: ` + write("api.key", "s3cr3t\n") + `
+`
+}
+
+// The conversion that is applied cannot also be the one that decides whether to
+// apply it: it resolves each reference against the daemon, and a chart's own
+// config does not exist until this controller creates it. So Convert refuses
+// this manifest, and ConvertUnresolved is what the mount guard reads instead.
+func TestConvertUnresolvedNeedsNothingToExistYet(t *testing.T) {
+	manifest := declaresAndMounts(t)
+
+	_, err := Convert(context.Background(), manifest, "rel", fakeAPI{})
+	if err == nil {
+		t.Fatal("Convert = nil, want a reference to a resource that does not exist yet to fail")
+	}
+	if !strings.Contains(err.Error(), "secret not found: rel_apikey") {
+		t.Errorf("error %q is not the unresolvable reference", err)
+	}
+
+	got, err := ConvertUnresolved(context.Background(), manifest, "rel", fakeAPI{})
+	if err != nil {
+		t.Fatalf("ConvertUnresolved = %v, want nil", err)
+	}
+
+	// The names are the ones a deploy will create and mount; only the ids are
+	// made up, and nothing reads those.
+	if len(got.Configs) != 1 || got.Configs[0].Name != "rel_site" {
+		t.Errorf("configs = %+v, want one scoped rel_site to create", got.Configs)
+	}
+	if len(got.Secrets) != 1 || got.Secrets[0].Name != "rel_apikey" {
+		t.Errorf("secrets = %+v, want one scoped rel_apikey to create", got.Secrets)
+	}
+	cs := got.Services[0].Spec.TaskTemplate.ContainerSpec
+	if len(cs.Configs) != 1 || cs.Configs[0].ConfigName != "rel_site" || cs.Configs[0].ConfigID != unresolvedID {
+		t.Errorf("mounted configs = %+v, want rel_site with an unresolved id", cs.Configs)
+	}
+	if len(cs.Secrets) != 1 || cs.Secrets[0].SecretName != "rel_apikey" || cs.Secrets[0].SecretID != unresolvedID {
+		t.Errorf("mounted secrets = %+v, want rel_apikey with an unresolved id", cs.Secrets)
+	}
+}
+
+// What the guard's soundness rests on: the two conversions of one manifest agree
+// on everything except the ids. If they could disagree on a name, a stack refused
+// by the first could still be deployed by the second.
+func TestConvertUnresolvedDiffersOnlyByTheIds(t *testing.T) {
+	manifest := declaresAndMounts(t)
+	api := fakeAPI{
+		configs: []swarm.Config{{ID: "cfg-id", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "rel_site"}}}},
+		secrets: []swarm.Secret{{ID: "sec-id", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "rel_apikey"}}}},
+	}
+
+	resolved := convertOK(t, manifest, "rel", api)
+	unresolved, err := ConvertUnresolved(context.Background(), manifest, "rel", api)
+	if err != nil {
+		t.Fatalf("ConvertUnresolved = %v, want nil", err)
+	}
+	if resolved.Services[0].Spec.TaskTemplate.ContainerSpec.Configs[0].ConfigID != "cfg-id" {
+		t.Fatal("the real conversion did not resolve the reference; the comparison below would prove nothing")
+	}
+
+	forgetIDs(resolved)
+	forgetIDs(unresolved)
+	if !reflect.DeepEqual(resolved, unresolved) {
+		t.Errorf("the conversions differ in more than the ids.\n--- resolved ---\n%s\n--- unresolved ---\n%s",
+			describe(resolved), describe(unresolved))
+	}
+}
+
+// Assuming a resource exists must not extend to assuming the manifest declared
+// it. A reference to nothing is a chart-authoring error, and the answer to it is
+// the loader's, not the daemon's — so it survives the substitution.
+func TestConvertUnresolvedStillNeedsTheReferenceDeclared(t *testing.T) {
+	_, err := ConvertUnresolved(context.Background(),
+		"services:\n  web:\n    image: nginx\n    secrets: [absent]\n", "s", fakeAPI{})
+	if err == nil {
+		t.Fatal("ConvertUnresolved = nil, want a reference the manifest never declared to be refused")
+	}
+	if !strings.Contains(err.Error(), "undefined secret") {
+		t.Errorf("error %q does not say what is wrong with the manifest", err)
+	}
+}
+
 // A manifest that is not valid compose must fail here, while nothing has been
 // deployed, rather than partway through an apply.
 func TestInvalidManifestFails(t *testing.T) {
@@ -361,6 +467,20 @@ func networkNames(s *Stack) []string {
 		out = append(out, nw.Name)
 	}
 	return out
+}
+
+// forgetIDs blanks the one thing a conversion can only learn from a daemon, so
+// that two conversions of the same manifest can be compared for everything else.
+func forgetIDs(s *Stack) {
+	for _, svc := range s.Services {
+		cs := svc.Spec.TaskTemplate.ContainerSpec
+		for _, ref := range cs.Configs {
+			ref.ConfigID = ""
+		}
+		for _, ref := range cs.Secrets {
+			ref.SecretID = ""
+		}
+	}
 }
 
 func mustRead(t *testing.T, path string) string {

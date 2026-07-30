@@ -233,26 +233,50 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 // Volumes are absent from that list on purpose — Swarm creates a named volume
 // on the node that first needs it, so there is nothing to pre-create.
 //
+// The manifest is converted twice, and the first conversion is thrown away. It
+// is what makes that order compatible with refusing a stack whole:
+// converting a service resolves every config and secret it mounts to the id
+// Swarm addresses it by, so the conversion that is applied cannot run until
+// those exist — while the guard has to read what a service mounts before
+// anything has been created (swarmcli-cd#84 for the first, #63 for the second).
+// cdcompose.ConvertUnresolved answers that first read without needing anything
+// to exist, and produces the same names for the guard to compare; the second
+// conversion is the one whose specs are applied.
+//
 // Nothing is deleted. Phase 1 is explicitly no prune.
 func (b *Backend) DeployStack(name, manifest, resolve string) error {
 	ctx := context.Background()
 
-	stack, err := cdcompose.Convert(ctx, manifest, name, b.api)
+	unresolved, err := cdcompose.ConvertUnresolved(ctx, manifest, name, b.api)
 	if err != nil {
 		return err
 	}
 	// Before any resource is created: a stack that reaches for one of the
 	// controller's own secrets or configs is refused whole, not half-deployed.
-	if err := b.rejectForbiddenMounts(ctx, stack); err != nil {
+	// So is a manifest that will not convert at all, because the pass above is
+	// that same conversion. The one thing it cannot catch is an `external:`
+	// reference to something that does not exist, since assuming it does is how
+	// it works — the chart engine pre-flights those before it calls this, and
+	// says so for the same reason.
+	if err := b.rejectForbiddenMounts(ctx, unresolved); err != nil {
 		return err
 	}
-	if err := b.applyNetworks(ctx, stack); err != nil {
+	// The networks, secrets and configs are read from the unresolved pass
+	// because the daemon plays no part in deriving them: they are the same specs
+	// the conversion below would produce, and creating them is what lets that
+	// conversion run at all.
+	if err := b.applyNetworks(ctx, unresolved); err != nil {
 		return err
 	}
-	if err := b.applySecrets(ctx, stack.Secrets); err != nil {
+	if err := b.applySecrets(ctx, unresolved.Secrets); err != nil {
 		return err
 	}
-	if err := b.applyConfigs(ctx, stack.Configs); err != nil {
+	if err := b.applyConfigs(ctx, unresolved.Configs); err != nil {
+		return err
+	}
+
+	stack, err := cdcompose.Convert(ctx, manifest, name, b.api)
+	if err != nil {
 		return err
 	}
 	return b.ApplyServices(ctx, stack, resolve)
