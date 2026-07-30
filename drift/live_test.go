@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/swarm"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
@@ -145,6 +146,63 @@ func TestNormalisedDifferencesAreNotDrift(t *testing.T) {
 		},
 		"update config defaulted by swarmkit": func(_, live *swarm.ServiceSpec) {
 			live.UpdateConfig = &swarm.UpdateConfig{Parallelism: 1, FailureAction: "pause", Order: "stop-first"}
+		},
+		// The asymmetry runs the opposite way to the obvious guess: compose builds
+		// a BindOptions for a manifest that named a `bind:` block, and
+		// containerToGRPC drops the whole struct when its propagation is empty,
+		// so the desired side has one and the live side does not.
+		"a bind mount's options dropped on the round trip": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+				Type: mount.TypeBind, Source: "/etc/hostname", Target: "/etc/host-name",
+				BindOptions: &mount.BindOptions{},
+			}}
+			live.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+				Type: mount.TypeBind, Source: "/etc/hostname", Target: "/etc/host-name",
+			}}
+		},
+		// Consistency has no field in swarmapi.Mount at all, so whatever compose
+		// parsed is simply gone by the time the spec is read back.
+		"mount consistency dropped entirely": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+				Type: mount.TypeVolume, Source: "s_data", Target: "/data", Consistency: "cached",
+			}}
+			live.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+				Type: mount.TypeVolume, Source: "s_data", Target: "/data",
+			}}
+		},
+		"a named volume's options are the daemon's business": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+				Type: mount.TypeVolume, Source: "s_data", Target: "/data",
+				VolumeOptions: &mount.VolumeOptions{},
+			}}
+			live.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+				Type: mount.TypeVolume, Source: "s_data", Target: "/data",
+				VolumeOptions: &mount.VolumeOptions{Labels: map[string]string{"com.docker.stack.namespace": "s"}},
+			}}
+		},
+		"mount type defaulted to bind": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{Source: "/src", Target: "/dst"}}
+			live.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+				Type: mount.TypeBind, Source: "/src", Target: "/dst",
+			}}
+		},
+		// The reference's id is resolved on both sides and is not compared: a
+		// config recreated with identical content is a new id under the same name,
+		// and its name is where a content change would show.
+		"a reference resolved to a different id": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Secrets = []*swarm.SecretReference{{
+				SecretID: "old", SecretName: "s_token",
+				File: &swarm.SecretReferenceFileTarget{Name: "token", UID: "0", GID: "0", Mode: 0o444},
+			}}
+			live.TaskTemplate.ContainerSpec.Secrets = []*swarm.SecretReference{{
+				SecretID: "new", SecretName: "s_token",
+				File: &swarm.SecretReferenceFileTarget{Name: "token", UID: "0", GID: "0", Mode: 0o444},
+			}}
+		},
+		"references returned as empty slices rather than nil": func(_, live *swarm.ServiceSpec) {
+			live.TaskTemplate.ContainerSpec.Secrets = []*swarm.SecretReference{}
+			live.TaskTemplate.ContainerSpec.Configs = []*swarm.ConfigReference{}
+			live.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{}
 		},
 		"isolation defaulted": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.ContainerSpec.Isolation = "default"
@@ -303,6 +361,85 @@ func TestLiveReportsEachComparedField(t *testing.T) {
 				live.TaskTemplate.Networks = nil
 			},
 			application.FieldDrift{Field: "networks", Desired: defaultNetwork, Live: ""},
+		},
+		"mount removed": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+					Type: mount.TypeVolume, Source: "s_data", Target: "/data",
+				}}
+			},
+			application.FieldDrift{Field: "mounts[/data]", Desired: "volume:s_data", Live: "(absent)"},
+		},
+		"mount source changed": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+					Type: mount.TypeVolume, Source: "s_data", Target: "/data",
+				}}
+				live.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+					Type: mount.TypeVolume, Source: "somebody_elses", Target: "/data",
+				}}
+			},
+			application.FieldDrift{Field: "mounts[/data]", Desired: "volume:s_data", Live: "volume:somebody_elses"},
+		},
+		"mount made writable by hand": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+					Type: mount.TypeBind, Source: "/etc/hostname", Target: "/etc/host-name", ReadOnly: true,
+				}}
+				live.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+					Type: mount.TypeBind, Source: "/etc/hostname", Target: "/etc/host-name",
+				}}
+			},
+			application.FieldDrift{
+				Field:   "mounts[/etc/host-name]",
+				Desired: "bind:/etc/hostname (read-only)",
+				Live:    "bind:/etc/hostname",
+			},
+		},
+		"anonymous volume": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{{
+					Type: mount.TypeVolume, Target: "/scratch",
+				}}
+			},
+			application.FieldDrift{Field: "mounts[/scratch]", Desired: "volume:(anonymous)", Live: "(absent)"},
+		},
+		"secret removed": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Secrets = []*swarm.SecretReference{{
+					SecretID: "id", SecretName: "s_token",
+					File: &swarm.SecretReferenceFileTarget{Name: "token"},
+				}}
+			},
+			application.FieldDrift{Field: "secrets[s_token]", Desired: "token", Live: "(absent)"},
+		},
+		"config remounted somewhere else": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Configs = []*swarm.ConfigReference{{
+					ConfigID: "id", ConfigName: "s_site",
+					File: &swarm.ConfigReferenceFileTarget{Name: "/etc/site.conf"},
+				}}
+				live.TaskTemplate.ContainerSpec.Configs = []*swarm.ConfigReference{{
+					ConfigID: "id", ConfigName: "s_site",
+					File: &swarm.ConfigReferenceFileTarget{Name: "/etc/elsewhere.conf"},
+				}}
+			},
+			application.FieldDrift{
+				Field:   "configs[s_site]",
+				Desired: "/etc/site.conf",
+				Live:    "/etc/elsewhere.conf",
+			},
+		},
+		// A credential spec is consumed by the runtime and mounted nowhere, so it
+		// has no file target to render — and unlike a secret, the daemon keeps it.
+		"runtime config reference removed": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Configs = []*swarm.ConfigReference{{
+					ConfigID: "id", ConfigName: "s_credspec",
+					Runtime: &swarm.ConfigReferenceRuntimeTarget{},
+				}}
+			},
+			application.FieldDrift{Field: "configs[s_credspec]", Desired: "(runtime)", Live: "(absent)"},
 		},
 		"network attached that the manifest does not declare": {
 			func(want, live *swarm.ServiceSpec) {

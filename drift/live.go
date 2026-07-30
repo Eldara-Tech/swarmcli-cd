@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/swarm"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
@@ -182,6 +183,9 @@ func compareService(want, got swarm.ServiceSpec, nets NetworkNames) ([]applicati
 	comparePorts(want.EndpointSpec, got.EndpointSpec, add)
 	compareEndpointMode(want.EndpointSpec, got.EndpointSpec, add)
 	compareNetworks(want, got, nets, add)
+	compareMounts(containerSpec(want).Mounts, containerSpec(got).Mounts, add)
+	compareSecretRefs(containerSpec(want).Secrets, containerSpec(got).Secrets, add)
+	compareConfigRefs(containerSpec(want).Configs, containerSpec(got).Configs, add)
 
 	if len(fields) > maxFields {
 		return fields[:maxFields], len(fields) - maxFields
@@ -534,6 +538,148 @@ func compareNetworks(want, got swarm.ServiceSpec, nets NetworkNames, add func(na
 	if declared := declaredNetworkNames(want.TaskTemplate.Networks); !slices.Equal(declared, live) {
 		add("networks", strings.Join(declared, ", "), strings.Join(live, ", "))
 	}
+}
+
+// Renderings for a mount whose source Swarm supplies rather than the manifest,
+// and for one that cannot be written to.
+const (
+	anonymousSource = "(anonymous)"
+	readOnlySuffix  = " (read-only)"
+)
+
+// compareMounts reports mounts added, removed and changed, keyed by the path they
+// mount at.
+//
+// The target is a real key, unlike a published port's: a container cannot mount
+// two things at one path. So a mount whose source changed reads as one line
+// rather than as one gone and one arrived.
+//
+// Only the identity is compared — type, source, target and read-only — never the
+// options inside, and the first of the three reasons is decisive. They do not
+// round-trip: containerToGRPC drops a mount's whole BindOptions when its
+// propagation is empty, and Consistency has no field in swarmapi.Mount at all, so
+// comparing either would report drift on a stack nobody has touched. Nor is one
+// independently mutable — changing a propagation means replacing the mount, which
+// this catches through its identity. And a chart that changes one has changed its
+// manifest, which the sync axis already reports as an upgrade.
+func compareMounts(want, got []mount.Mount, add func(name, desired, live string)) {
+	wm, gm := mountsByTarget(want), mountsByTarget(got)
+	for _, target := range unionKeys(wm, gm) {
+		wv, inWant := wm[target]
+		gv, inGot := gm[target]
+		if inWant == inGot && wv == gv {
+			continue
+		}
+		add("mounts["+target+"]", orAbsent(wv, inWant), orAbsent(gv, inGot))
+	}
+}
+
+// mountsByTarget renders each mount as what it mounts and how, keyed by where.
+//
+// An empty type is a bind, which is the zero of swarmkit's enum and so what the
+// daemon reads back for a mount that named none.
+func mountsByTarget(mounts []mount.Mount) map[string]string {
+	out := make(map[string]string, len(mounts))
+	for _, m := range mounts {
+		kind := string(m.Type)
+		if kind == "" {
+			kind = string(mount.TypeBind)
+		}
+		source := m.Source
+		if source == "" {
+			// An anonymous volume: Swarm names one per task, and the manifest
+			// named nothing for it to be compared against.
+			source = anonymousSource
+		}
+		rendered := kind + ":" + source
+		if m.ReadOnly {
+			rendered += readOnlySuffix
+		}
+		out[m.Target] = rendered
+	}
+	return out
+}
+
+// runtimeTarget renders a reference the container runtime consumes rather than
+// mounts, which for Swarm means a Windows credential spec.
+const runtimeTarget = "(runtime)"
+
+// compareSecretRefs and compareConfigRefs report references added, removed and
+// remounted, keyed by the name of the secret or config.
+//
+// Keyed by name and valued by where it lands, because that pair is what
+// `--secret-add` and `--secret-rm` change. The value is a list because the same
+// secret may legally be mounted at two paths, and two entries under one key would
+// otherwise silently lose one of them.
+//
+// The ids are not compared, although both sides carry a real one. A config's
+// content is hashed into its name, so a change to the content is a different name
+// and already a manifest-level difference; comparing ids would add nothing and
+// would report drift on a resource recreated with identical content.
+//
+// File.{UID,GID,Mode} are not compared either — and for once that is not because
+// they fail to round-trip. convertFileObject fills all three in before the spec
+// exists ("0", "0", 0444), so they are never the daemon's default meeting the
+// manifest's silence. They are out because `docker service update` cannot change
+// one without removing and re-adding the reference, which this already sees.
+func compareSecretRefs(want, got []*swarm.SecretReference, add func(name, desired, live string)) {
+	compareRefs("secrets", secretTargets(want), secretTargets(got), add)
+}
+
+func compareConfigRefs(want, got []*swarm.ConfigReference, add func(name, desired, live string)) {
+	compareRefs("configs", configTargets(want), configTargets(got), add)
+}
+
+func compareRefs(prefix string, want, got map[string]string, add func(name, desired, live string)) {
+	for _, name := range unionKeys(want, got) {
+		wv, inWant := want[name]
+		gv, inGot := got[name]
+		if inWant == inGot && wv == gv {
+			continue
+		}
+		add(prefix+"["+name+"]", orAbsent(wv, inWant), orAbsent(gv, inGot))
+	}
+}
+
+func secretTargets(refs []*swarm.SecretReference) map[string]string {
+	byName := make(map[string][]string, len(refs))
+	for _, r := range refs {
+		// A secret with no file target is not something Swarm keeps: the daemon
+		// drops one on the way back (secretReferencesFromGRPC), so comparing it
+		// would report a difference against something that cannot exist.
+		if r == nil || r.File == nil {
+			continue
+		}
+		byName[r.SecretName] = append(byName[r.SecretName], r.File.Name)
+	}
+	return joinTargets(byName)
+}
+
+func configTargets(refs []*swarm.ConfigReference) map[string]string {
+	byName := make(map[string][]string, len(refs))
+	for _, r := range refs {
+		if r == nil {
+			continue
+		}
+		switch {
+		case r.Runtime != nil:
+			byName[r.ConfigName] = append(byName[r.ConfigName], runtimeTarget)
+		case r.File != nil:
+			byName[r.ConfigName] = append(byName[r.ConfigName], r.File.Name)
+		}
+	}
+	return joinTargets(byName)
+}
+
+// joinTargets renders one name's targets as a single value, sorted so that a
+// reference mounted twice reads the same on every tick.
+func joinTargets(byName map[string][]string) map[string]string {
+	out := make(map[string]string, len(byName))
+	for name, targets := range byName {
+		slices.Sort(targets)
+		out[name] = strings.Join(targets, ", ")
+	}
+	return out
 }
 
 // declaredNetworkNames is the desired side's attachments, whose targets are

@@ -358,6 +358,8 @@ change, which is the surface an out-of-band change actually uses:
 | `ports[PUBLISHED:TARGET/PROTOCOL/MODE]` | `--publish-add`, `--publish-rm` |
 | `endpointMode` | `--endpoint-mode` |
 | `networks` | `--network-add`, `--network-rm` |
+| `mounts[TARGET]` | `--mount-add`, `--mount-rm` |
+| `secrets[NAME]`, `configs[NAME]` | `--secret-add`, `--secret-rm`, `--config-add`, `--config-rm` |
 
 A published port is reported as a whole entry being `set` or `absent` rather than
 as a value that changed, because a port has no stable key: two publishes can share
@@ -371,6 +373,21 @@ names them by the id the daemon assigned, where the manifest named a network, so
 comparing them means naming the ids first. That costs one network listing per
 application per interval. If it fails, or the swarm's backend cannot answer it,
 attachments are not compared and everything else still is.
+
+A **mount** is compared by what it mounts and where — its type, source, target and
+read-only flag — and never by the options inside it. `BindOptions`, `VolumeOptions`
+and `TmpfsOptions` are not comparable: the daemon drops a bind's whole options
+struct when its propagation is unset, and `consistency` has no field in Swarm at
+all, so a comparison would report a difference on a stack nobody has touched. None
+of them can be changed without replacing the mount, which *is* reported.
+
+A **secret or config reference** is compared by name and by where it lands. The
+ids are not compared even though both sides carry a real one: a config's content is
+hashed into its name, so a change to the content is already a manifest-level
+difference, and comparing ids would report drift on a resource recreated with
+identical content. `uid`, `gid` and `mode` are not compared either, because
+`docker service update` cannot change one without removing and re-adding the
+reference.
 
 At most 20 differences are listed per service; beyond that the report carries a
 count of how many more there were. A service whose every environment variable was
@@ -390,9 +407,8 @@ served to anyone with read access, and an environment variable is exactly where
 a credential would be.
 
 **Not compared**, each because it needs a normalisation of its own that has not
-been proved against a real swarm yet: mounts, secret and config references,
-healthchecks, update and rollback configs, restart policies, and placement
-preferences. Networks, configs
+been proved against a real swarm yet: healthchecks, update and rollback configs,
+restart policies, and placement preferences. Networks, configs
 and secrets are not compared as *resources* either — Swarm cannot update a
 network in place, and configs and secrets are immutable with their content
 hashed into the name, so a change to either is already a manifest-level
