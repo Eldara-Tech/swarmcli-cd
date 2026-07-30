@@ -567,8 +567,45 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"          memory: 16M\n" +
 		"  sidecar:\n" +
 		"    image: busybox:1.36\n" +
-		"    command: [\"sleep\", \"3600\"]\n" +
+		// Split across entrypoint and command deliberately: Swarm's Command is
+		// compose's entrypoint and its Args is compose's command, so this is the
+		// only arrangement that puts something in both.
+		"    entrypoint: [\"/bin/sleep\"]\n" +
+		"    command: [\"3600\"]\n" +
 		"    networks: [internal]\n" +
+		// The literal-field group. None of these needs a normalisation — the
+		// round trip carries them across untouched — so what this fixture is for
+		// is proving exactly that, on a real daemon, in one deploy.
+		//
+		// group_add and oom_score_adj are absent because the compose v3.9 schema
+		// has neither, so a chart cannot declare them at all. They are still
+		// compared: `--group-add` and `--dns-option-add` can put something there
+		// against a desired side that is always empty, which is the only
+		// direction those two can drift in.
+		"    user: \"1000:1000\"\n" +
+		"    hostname: sidecar-host\n" +
+		"    working_dir: /tmp\n" +
+		"    stop_signal: SIGTERM\n" +
+		"    stop_grace_period: 5s\n" +
+		"    read_only: true\n" +
+		"    init: true\n" +
+		"    tty: true\n" +
+		"    cap_add: [NET_ADMIN]\n" +
+		"    cap_drop: [MKNOD]\n" +
+		"    extra_hosts:\n" +
+		"      - \"somewhere:10.11.12.13\"\n" +
+		"    sysctls:\n" +
+		"      net.core.somaxconn: \"1024\"\n" +
+		"    ulimits:\n" +
+		"      nofile:\n" +
+		"        soft: 1024\n" +
+		"        hard: 2048\n" +
+		"    dns:\n" +
+		"      - 1.1.1.1\n" +
+		"    logging:\n" +
+		"      driver: json-file\n" +
+		"      options:\n" +
+		"        max-size: 10m\n" +
 		// A check that passes the first time it runs, and quickly. A task with a
 		// healthcheck sits in `starting` until it first passes, so one that failed
 		// would not fail this fixture — it would hang waitForRunning and then get

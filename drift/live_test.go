@@ -80,6 +80,10 @@ func liveOf(specs ...swarm.ServiceSpec) map[string]swarm.Service {
 
 func uint64p(v uint64) *uint64 { return &v }
 
+func boolp(v bool) *bool { return &v }
+
+func durationp(v time.Duration) *time.Duration { return &v }
+
 // The test the whole allowlist exists for.
 //
 // Every entry here is a way the daemon legitimately returns something other
@@ -244,6 +248,26 @@ func TestNormalisedDifferencesAreNotDrift(t *testing.T) {
 			live.TaskTemplate.ContainerSpec.Secrets = []*swarm.SecretReference{}
 			live.TaskTemplate.ContainerSpec.Configs = []*swarm.ConfigReference{}
 			live.TaskTemplate.ContainerSpec.Mounts = []mount.Mount{}
+		},
+		// docker/cli sorts capabilities on the way out and the daemon stores what
+		// it is given, so an operator's order is theirs alone. A chart template
+		// that reorders one has changed nothing about what runs.
+		"capabilities in a different order": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.CapabilityAdd = []string{"CAP_NET_ADMIN", "CAP_SYS_TIME"}
+			live.TaskTemplate.ContainerSpec.CapabilityAdd = []string{"CAP_SYS_TIME", "CAP_NET_ADMIN"}
+		},
+		"extra hosts in a different order": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Hosts = []string{"10.0.0.1 a", "10.0.0.2 b"}
+			live.TaskTemplate.ContainerSpec.Hosts = []string{"10.0.0.2 b", "10.0.0.1 a"}
+		},
+		// ulimitsFromGRPC builds its slice with make(..., len(u)), so a service
+		// with none reads back an empty non-nil slice against the manifest's nil.
+		"ulimits returned as an empty slice rather than nil": func(_, live *swarm.ServiceSpec) {
+			live.TaskTemplate.ContainerSpec.Ulimits = []*container.Ulimit{}
+		},
+		"an unstated init flag on both sides": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Init = nil
+			live.TaskTemplate.ContainerSpec.Init = nil
 		},
 		"isolation defaulted": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.ContainerSpec.Isolation = "default"
@@ -572,6 +596,110 @@ func TestLiveReportsEachComparedField(t *testing.T) {
 				want.TaskTemplate.Placement = &swarm.Placement{MaxReplicas: 3}
 			},
 			application.FieldDrift{Field: "placement.maxReplicas", Desired: "3", Live: "0"},
+		},
+		// Swarm's Command is compose's `entrypoint`, and its Args is compose's
+		// `command` — the opposite of what the field names suggest, which is why
+		// both are reported under the names an operator would recognise.
+		"entrypoint replaced": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Command = []string{"/bin/sleep"}
+				live.TaskTemplate.ContainerSpec.Command = []string{"/bin/sh", "-c"}
+			},
+			application.FieldDrift{Field: "command", Desired: "/bin/sleep", Live: "/bin/sh -c"},
+		},
+		"arguments replaced": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Args = []string{"3600"}
+				live.TaskTemplate.ContainerSpec.Args = []string{"while true; do :; done"}
+			},
+			application.FieldDrift{Field: "args", Desired: "3600", Live: "while true; do :; done"},
+		},
+		"user": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.User = "1000:1000"
+			},
+			application.FieldDrift{Field: "user", Desired: "1000:1000", Live: ""},
+		},
+		"read-only root filesystem cleared": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.ReadOnly = true
+			},
+			application.FieldDrift{Field: "readOnly", Desired: "true", Live: "false"},
+		},
+		// Three readings, not two: a nil is the daemon's own default, which is
+		// configurable, so folding it into false would be inventing an answer.
+		"init flag set where the manifest stated none": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.ContainerSpec.Init = boolp(true)
+			},
+			application.FieldDrift{Field: "init", Desired: "(unset)", Live: "true"},
+		},
+		"stop grace period": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.StopGracePeriod = durationp(5 * time.Second)
+			},
+			application.FieldDrift{Field: "stopGracePeriod", Desired: "5s", Live: "0s"},
+		},
+		"capability added by hand": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.ContainerSpec.CapabilityAdd = []string{"CAP_SYS_ADMIN"}
+			},
+			application.FieldDrift{Field: "capabilityAdd", Desired: "", Live: "CAP_SYS_ADMIN"},
+		},
+		// A v3.9 manifest has no `group_add`, so the desired side is always empty
+		// here — which is exactly what makes a hand-added group visible.
+		"supplementary group added by hand": {
+			func(want, live *swarm.ServiceSpec) {
+				live.TaskTemplate.ContainerSpec.Groups = []string{"docker"}
+			},
+			application.FieldDrift{Field: "groups", Desired: "", Live: "docker"},
+		},
+		"sysctl changed": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Sysctls = map[string]string{"net.core.somaxconn": "1024"}
+				live.TaskTemplate.ContainerSpec.Sysctls = map[string]string{"net.core.somaxconn": "4096"}
+			},
+			application.FieldDrift{Field: "sysctls[net.core.somaxconn]", Desired: "1024", Live: "4096"},
+		},
+		"ulimit raised by hand": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Ulimits = []*container.Ulimit{
+					{Name: "nofile", Soft: 1024, Hard: 2048},
+				}
+				live.TaskTemplate.ContainerSpec.Ulimits = []*container.Ulimit{
+					{Name: "nofile", Soft: 8192, Hard: 8192},
+				}
+			},
+			application.FieldDrift{Field: "ulimits[nofile]", Desired: "1024:2048", Live: "8192:8192"},
+		},
+		"dns removed entirely": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.DNSConfig = &swarm.DNSConfig{Nameservers: []string{"1.1.1.1"}}
+			},
+			application.FieldDrift{Field: "dns", Desired: "set", Live: "absent"},
+		},
+		// convertDNSConfig never fills the options list, so the desired side is
+		// always empty — and a --dns-option-add is therefore always visible.
+		"dns option added by hand": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.DNSConfig = &swarm.DNSConfig{Nameservers: []string{"1.1.1.1"}}
+				live.TaskTemplate.ContainerSpec.DNSConfig = &swarm.DNSConfig{
+					Nameservers: []string{"1.1.1.1"},
+					Options:     []string{"ndots:2"},
+				}
+			},
+			application.FieldDrift{Field: "dns.options", Desired: "", Live: "ndots:2"},
+		},
+		"log driver option": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.LogDriver = &swarm.Driver{
+					Name: "json-file", Options: map[string]string{"max-size": "10m"},
+				}
+				live.TaskTemplate.LogDriver = &swarm.Driver{
+					Name: "json-file", Options: map[string]string{"max-size": "50m"},
+				}
+			},
+			application.FieldDrift{Field: "logDriver.options[max-size]", Desired: "10m", Live: "50m"},
 		},
 		"network attached that the manifest does not declare": {
 			func(want, live *swarm.ServiceSpec) {

@@ -688,6 +688,74 @@ func TestLiveDriftDetectsAnOutOfBandHealthcheck(t *testing.T) {
 	}
 }
 
+// The literal fields, changed by hand across all three of their shapes: a scalar,
+// a set and a keyed map.
+//
+// What this really proves is the clean test beside it. None of this group needs a
+// normalisation — the round trip carries every one of these across untouched —
+// and the way that claim fails is not here but there, on a stack nobody has
+// touched. So the fixture declares the whole group and this only has to show the
+// three shapes are legible and correctable.
+func TestLiveDriftDetectsOutOfBandLiteralFields(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-literal"
+	repo := gitRepo(t, richChartFiles(t, release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, liveDriftApp("literal", repo, false))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "literal"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	updateOutOfBand(t, cli, release+"_sidecar", func(spec *swarm.ServiceSpec) {
+		cs := spec.TaskTemplate.ContainerSpec
+		cs.User = "0:0"
+		cs.CapabilityAdd = append(cs.CapabilityAdd, "CAP_SYS_ADMIN")
+		cs.Sysctls["net.core.somaxconn"] = "4096"
+	})
+	waitForRunning(t, cli, release, 2)
+
+	if err := rec.Sync(ctx, "literal"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	d := driftOf(t, rec, "literal")
+	if got := fieldOf(t, d, release+"_sidecar", "user"); got.Desired != "1000:1000" || got.Live != "0:0" {
+		t.Errorf("user drift = %+v, want the chart's user against the hand-set one", got)
+	}
+	// Sorted on both sides, so the report reads the same however it was typed.
+	if got := fieldOf(t, d, release+"_sidecar", "capabilityAdd"); got.Desired != "CAP_NET_ADMIN" ||
+		got.Live != "CAP_NET_ADMIN, CAP_SYS_ADMIN" {
+		t.Errorf("capabilityAdd drift = %+v, want the added capability beside the declared one", got)
+	}
+	if got := fieldOf(t, d, release+"_sidecar", "sysctls[net.core.somaxconn]"); got.Desired != "1024" ||
+		got.Live != "4096" {
+		t.Errorf("sysctl drift = %+v, want 1024 against 4096", got)
+	}
+
+	// Everything else the fixture declares is untouched and must stay silent —
+	// which for a group this wide is the assertion that matters.
+	for _, quiet := range []string{
+		"command", "args", "workingDir", "hostname", "stopSignal", "stopGracePeriod",
+		"readOnly", "tty", "init", "hosts", "groups", "capabilityDrop",
+		"ulimits[nofile]", "dns", "dns.nameservers", "logDriver", "logDriver.name",
+		"logDriver.options[max-size]",
+	} {
+		assertNotReported(t, d, quiet)
+	}
+
+	if err := rec.SyncNow(ctx, "literal"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+	if d := driftOf(t, rec, "literal"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
+}
+
 // A service deleted out of band. The health axis only notices when a release has
 // no services left at all, so without this a two-service stack missing one of
 // them reports healthy.

@@ -364,6 +364,15 @@ change, which is the surface an out-of-band change actually uses:
 | `updateConfig.*`, `rollbackConfig.*` | `--update-*`, `--rollback-*` |
 | `restartPolicy.*` | `--restart-*` |
 | `placement.preferences`, `placement.maxReplicas` | `--placement-pref-add`, `--placement-pref-rm`, `--replicas-max-per-node` |
+| `command`, `args` | `--entrypoint`, `--args` |
+| `user`, `workingDir`, `hostname` | `--user`, `--workdir`, `--hostname` |
+| `stopSignal`, `stopGracePeriod` | `--stop-signal`, `--stop-grace-period` |
+| `readOnly`, `tty`, `init` | `--read-only`, `--tty`, `--init` |
+| `hosts`, `groups` | `--host-add`, `--host-rm`, `--group-add`, `--group-rm` |
+| `capabilityAdd`, `capabilityDrop` | `--cap-add`, `--cap-drop` |
+| `sysctls[NAME]`, `ulimits[NAME]` | `--sysctl-add`, `--sysctl-rm`, `--ulimit-add`, `--ulimit-rm` |
+| `dns`, `dns.*` | `--dns-add`, `--dns-search-add`, `--dns-option-add` and their `-rm` pairs |
+| `logDriver`, `logDriver.*` | `--log-driver`, `--log-opt` |
 
 A published port is reported as a whole entry being `set` or `absent` rather than
 as a value that changed, because a port has no stable key: two publishes can share
@@ -418,9 +427,21 @@ are compared against the daemon's default for them rather than against nothing �
 an update config that names only a parallelism is running with a failure action of
 `pause` and an order of `stop-first`, and neither is a change anybody made.
 
-**Not compared**: everything else in a `ServiceSpec`, which is still a long list —
-`command` and `args`, `user`, `hostname`, `sysctls`, `ulimits`, capabilities,
-extra hosts, DNS config and the logging driver among them. Each is a candidate for
+`command` is compose's `entrypoint` and `args` is its `command` — the naming Swarm
+uses, which is the opposite of what those field names suggest. `hosts`, `groups`
+and the two capability lists are compared as **sets**: their order carries no
+meaning, `--host-add` appends wherever it likes, and a chart template that
+reorders one has not changed what runs. `init` reports `(unset)` where a manifest
+stated nothing, kept apart from `false` because an unstated value means the
+daemon's own default, which is configurable.
+
+Two of these can only ever drift in one direction, because the compose v3.9 schema
+cannot express them: `groups` has no `group_add`, and `dns.options` is never
+filled by the conversion. A `--group-add` or `--dns-option-add` therefore always
+shows up against an empty desired side, which is exactly the point.
+
+**Not compared**: container labels (`--container-label-add`), generic resources,
+isolation, and the credential spec and other privileges. Each is a candidate for
 the same treatment and none has been proved against a real swarm yet. Networks, configs
 and secrets are not compared as *resources* either — Swarm cannot update a
 network in place, and configs and secrets are immutable with their content
