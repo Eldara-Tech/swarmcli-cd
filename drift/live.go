@@ -8,8 +8,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/swarm"
 
@@ -186,6 +188,11 @@ func compareService(want, got swarm.ServiceSpec, nets NetworkNames) ([]applicati
 	compareMounts(containerSpec(want).Mounts, containerSpec(got).Mounts, add)
 	compareSecretRefs(containerSpec(want).Secrets, containerSpec(got).Secrets, add)
 	compareConfigRefs(containerSpec(want).Configs, containerSpec(got).Configs, add)
+	compareHealthcheck(containerSpec(want).Healthcheck, containerSpec(got).Healthcheck, add)
+	compareUpdateConfig("updateConfig", want.UpdateConfig, got.UpdateConfig, add)
+	compareUpdateConfig("rollbackConfig", want.RollbackConfig, got.RollbackConfig, add)
+	compareRestartPolicy(want.TaskTemplate.RestartPolicy, got.TaskTemplate.RestartPolicy, add)
+	comparePlacement(want.TaskTemplate.Placement, got.TaskTemplate.Placement, add)
 
 	if len(fields) > maxFields {
 		return fields[:maxFields], len(fields) - maxFields
@@ -294,6 +301,40 @@ func compareInt64(name string, want, got int64, add func(name, desired, live str
 	if want != got {
 		add(name, strconv.FormatInt(want, 10), strconv.FormatInt(got, 10))
 	}
+}
+
+func compareUint64(name string, want, got uint64, add func(name, desired, live string)) {
+	if want != got {
+		add(name, strconv.FormatUint(want, 10), strconv.FormatUint(got, 10))
+	}
+}
+
+func compareString(name, want, got string, add func(name, desired, live string)) {
+	if want != got {
+		add(name, want, got)
+	}
+}
+
+// compareDuration renders through time.Duration.String, so a difference reads
+// "30s" rather than as the nanoseconds the spec stores.
+func compareDuration(name string, want, got time.Duration, add func(name, desired, live string)) {
+	if want != got {
+		add(name, want.String(), got.String())
+	}
+}
+
+// compareFloat32 is for the one non-integral number in the compared set, an
+// update config's failure ratio. Formatted at 32-bit precision, which is the
+// width the field actually has: widening it to a float64 would render 0.3 as
+// 0.30000001192092896.
+func compareFloat32(name string, want, got float32, add func(name, desired, live string)) {
+	if want != got {
+		add(name, formatFloat32(want), formatFloat32(got))
+	}
+}
+
+func formatFloat32(v float32) string {
+	return strconv.FormatFloat(float64(v), 'g', -1, 32)
 }
 
 // Renderings for a difference in something that is either there or not.
@@ -538,6 +579,164 @@ func compareNetworks(want, got swarm.ServiceSpec, nets NetworkNames, add func(na
 	if declared := declaredNetworkNames(want.TaskTemplate.Networks); !slices.Equal(declared, live) {
 		add("networks", strings.Join(declared, ", "), strings.Join(live, ", "))
 	}
+}
+
+// The structs a manifest may declare or leave out entirely — healthcheck, update
+// and rollback config, restart policy.
+//
+// All three round-trip nil as nil: updateConfigToGRPC and restartPolicyToGRPC
+// return nil for nil, containerSpecFromGRPC sets a healthcheck only where the
+// stored spec had one, and swarmkit fills none of them in. So one present on
+// exactly one side is a real difference and is reported as such, once, rather
+// than as every field inside it.
+//
+// The defaulting the issue expected is real but happens one level down: *inside*
+// a struct the manifest declared, where an unstated enum is stored as the zero
+// value and read back under its name. A manifest that set only an update
+// parallelism meets a live struct that also names a failure action and an order,
+// and a raw comparison would report drift on it for ever. Each of those is
+// flattened below, at the field rather than the struct.
+
+// compareHealthcheck reports a changed container healthcheck.
+//
+// Test is joined rather than compared element by element, because
+// ["CMD-SHELL", "curl -f localhost"] is one command: a per-element report would
+// say "healthcheck.test[1]" about something nobody thinks of as a list.
+func compareHealthcheck(want, got *container.HealthConfig, add func(name, desired, live string)) {
+	if want == nil || got == nil {
+		if want != got {
+			add("healthcheck", presence(want != nil), presence(got != nil))
+		}
+		return
+	}
+	compareString("healthcheck.test", strings.Join(want.Test, " "), strings.Join(got.Test, " "), add)
+	compareDuration("healthcheck.interval", want.Interval, got.Interval, add)
+	compareDuration("healthcheck.timeout", want.Timeout, got.Timeout, add)
+	compareDuration("healthcheck.startPeriod", want.StartPeriod, got.StartPeriod, add)
+	compareDuration("healthcheck.startInterval", want.StartInterval, got.StartInterval, add)
+	compareInt64("healthcheck.retries", int64(want.Retries), int64(got.Retries), add)
+}
+
+// compareUpdateConfig reports a changed update or rollback policy. One function
+// and two callers, because the two are the same struct governing opposite
+// directions, and a second copy would be a second place to fix a rule.
+func compareUpdateConfig(prefix string, want, got *swarm.UpdateConfig, add func(name, desired, live string)) {
+	if want == nil || got == nil {
+		if want != got {
+			add(prefix, presence(want != nil), presence(got != nil))
+		}
+		return
+	}
+	compareUint64(prefix+".parallelism", want.Parallelism, got.Parallelism, add)
+	compareDuration(prefix+".delay", want.Delay, got.Delay, add)
+	compareString(prefix+".failureAction", failureAction(want), failureAction(got), add)
+	compareString(prefix+".order", updateOrder(want), updateOrder(got), add)
+	compareDuration(prefix+".monitor", want.Monitor, got.Monitor, add)
+	compareFloat32(prefix+".maxFailureRatio", want.MaxFailureRatio, got.MaxFailureRatio, add)
+}
+
+// failureAction and updateOrder apply the daemon's two enum defaults. An unset
+// value is stored as the same enum as the named default and read back under that
+// name (daemon/cluster/convert.updateConfigToGRPC), so the manifest's silence and
+// the daemon's answer have to be spelled the same way before they are compared.
+func failureAction(c *swarm.UpdateConfig) string {
+	if c.FailureAction == "" {
+		return swarm.UpdateFailureActionPause
+	}
+	return c.FailureAction
+}
+
+func updateOrder(c *swarm.UpdateConfig) string {
+	if c.Order == "" {
+		return swarm.UpdateOrderStopFirst
+	}
+	return c.Order
+}
+
+// compareRestartPolicy reports a changed restart policy.
+//
+// Two defaults here, and the second is easy to miss. An unset condition is stored
+// as the same enum as "any" and read back named — the pattern above. But
+// restartPolicyFromGRPC also takes the address of the stored attempt count
+// *unconditionally*, so the live side's MaxAttempts is never nil where the
+// manifest left it so. Flattening both pointers to their zero is the only
+// comparison that does not report drift on a policy which named a condition and
+// nothing else.
+func compareRestartPolicy(want, got *swarm.RestartPolicy, add func(name, desired, live string)) {
+	if want == nil || got == nil {
+		if want != got {
+			add("restartPolicy", presence(want != nil), presence(got != nil))
+		}
+		return
+	}
+	compareString("restartPolicy.condition", restartCondition(want), restartCondition(got), add)
+	compareDuration("restartPolicy.delay", orZeroDuration(want.Delay), orZeroDuration(got.Delay), add)
+	compareDuration("restartPolicy.window", orZeroDuration(want.Window), orZeroDuration(got.Window), add)
+	compareUint64("restartPolicy.maxAttempts", orZeroUint64(want.MaxAttempts), orZeroUint64(got.MaxAttempts), add)
+}
+
+func restartCondition(p *swarm.RestartPolicy) string {
+	if p.Condition == "" {
+		return string(swarm.RestartPolicyConditionAny)
+	}
+	return string(p.Condition)
+}
+
+// comparePlacement reports the placement rules beside the constraints: the
+// spread preferences and the per-node replica cap.
+//
+// Preferences are compared **in order** and never sorted, which is the one place
+// this file must not copy compareConstraints. Swarmkit applies them in sequence —
+// the first spreads, the next breaks its ties — so a reordered list is a different
+// scheduling rule rather than the same one written differently.
+//
+// A nil Placement flattens to nothing on either side, which both sides need:
+// compose always builds one, with an empty preference slice, and the daemon
+// returns nil for a spec that placed nothing.
+func comparePlacement(want, got *swarm.Placement, add func(name, desired, live string)) {
+	if w, g := spreadPreferences(want), spreadPreferences(got); !slices.Equal(w, g) {
+		add("placement.preferences", strings.Join(w, ", "), strings.Join(g, ", "))
+	}
+	compareUint64("placement.maxReplicas", maxReplicas(want), maxReplicas(got), add)
+}
+
+// spreadPreferences names each preference by what it spreads over. A preference
+// that is not a spread is skipped rather than rendered blank: swarmkit has only
+// the one kind today, and placementFromGRPC drops anything else on the way back,
+// so a blank would be a difference against something unreadable.
+func spreadPreferences(p *swarm.Placement) []string {
+	if p == nil {
+		return nil
+	}
+	out := make([]string, 0, len(p.Preferences))
+	for _, pref := range p.Preferences {
+		if pref.Spread == nil {
+			continue
+		}
+		out = append(out, pref.Spread.SpreadDescriptor)
+	}
+	return out
+}
+
+func maxReplicas(p *swarm.Placement) uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.MaxReplicas
+}
+
+func orZeroDuration(d *time.Duration) time.Duration {
+	if d == nil {
+		return 0
+	}
+	return *d
+}
+
+func orZeroUint64(v *uint64) uint64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 // Renderings for a mount whose source Swarm supplies rather than the manifest,
