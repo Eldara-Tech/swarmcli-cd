@@ -436,29 +436,36 @@ func Owner(rel charts.Release, controller string) (string, bool) {
 	return application.AppFromOwnerID(controller, ref.ID)
 }
 
-// --- the service rule ---
+// --- the resource rule ---
 //
-// A service dropped from a chart's template is never removed by applying:
-// backend.ApplyServices creates and updates and deletes nothing, and neither
-// does charts.Apply. The release is still declared, so it is not orphaned and
-// the sweep above never sees it. These two functions are the rule that finds it.
+// A service, network, config or secret dropped from a chart's template is never
+// removed by applying: backend.ApplyServices and its siblings create and update
+// and delete nothing, and neither does charts.Apply. The release is still
+// declared, so it is not orphaned and the sweep above never sees it. These two
+// functions are the rule that finds it.
 //
 // The whole difficulty is that a stack is a name prefix plus a
 // com.docker.stack.namespace label and nothing else — no /stacks endpoint, no
-// owner references, no garbage collection. That label says a service belongs to
+// owner references, no garbage collection. That label says a resource belongs to
 // a release; it does not say this controller put it there, and anything can
 // carry it. Deleting on it alone is the mistake #62 was filed for, one scope
 // down. So Undeclared produces candidates and Claim requires a second signal
 // before any of them is a deletion: a stored revision, stamped by this
-// controller for this application, whose manifest declared that service. The
-// label says where a service lives; the revision record says whose it is, and
+// controller for this application, whose manifest declared that resource. The
+// label says where a resource lives; the revision record says whose it is, and
 // only the second is a safe basis for deleting.
-
-// Undeclared names the services running under a release's namespace that its
-// rendered manifest does not declare.
 //
-// Both sides are namespace-scoped names — "<release>_<service>" — because that
-// is what a live spec carries and the only key the two sides can be matched on.
+// Both take plain name lists and neither knows what kind it is looking at, which
+// is deliberate: one rule and one ownership model for all four kinds, applied
+// once per kind. Applying it per kind rather than over a merged list is what
+// keeps a config from being claimed by a same-named service — the four share one
+// namespace of scoped names, so a name is only ever evidence about its own kind.
+
+// Undeclared names the resources of one kind carrying a release's namespace that
+// its rendered manifest does not declare.
+//
+// Both sides are namespace-scoped names — "<release>_<name>" — because that is
+// what a live resource carries and the only key the two sides can be matched on.
 //
 // On its own this is not permission to delete anything; it is the candidate list
 // for the ownership check. Sorted, so what gets logged and reported does not
@@ -488,8 +495,10 @@ func Undeclared(running, declared []string) []string {
 //
 // Taking one revision at a time rather than the union of a whole history is what
 // lets a caller walk revisions newest first and stop as soon as nothing is left
-// unaccounted for — so the ordinary case, a service dropped last week, reads one
-// revision rather than every revision ever recorded.
+// unaccounted for — so the ordinary case, a resource dropped last week, reads one
+// revision rather than every revision ever recorded. A caller sweeping several
+// kinds converts each revision once and calls this per kind, so the walk costs
+// what one kind costs.
 //
 // A candidate no revision of ours ever claims is not ours to delete. It may be
 // another tool's, or ours from before the retained history; from here those are

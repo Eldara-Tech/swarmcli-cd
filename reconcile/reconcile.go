@@ -462,14 +462,34 @@ type liveDriftBackend interface {
 	LiveServices(ctx context.Context, stack string) (map[string]swarm.Service, error)
 }
 
-// serviceRemover is the optional interface a backend implements to delete a
-// single service. *backend.Backend satisfies it.
+// resourceLister is the optional interface a backend implements to read the
+// other three kinds a manifest declares, by scoped name. *backend.Backend
+// satisfies it.
 //
-// Separate from liveDriftBackend rather than folded into it, so that a backend
+// Separate from liveDriftBackend because live drift compares services and
+// nothing else: a backend that can answer one and not the other should lose
+// only the half it cannot answer. A backend implementing neither prunes
+// nothing, which is the degradation live drift already has.
+//
+// Name to id is all the sweep needs — it matches on the scoped name, the only
+// key a manifest and a live resource share, and deletes by id.
+type resourceLister interface {
+	LiveNetworks(ctx context.Context, stack string) (map[string]string, error)
+	LiveConfigs(ctx context.Context, stack string) (map[string]string, error)
+	LiveSecrets(ctx context.Context, stack string) (map[string]string, error)
+}
+
+// resourceRemover is the optional interface a backend implements to delete a
+// single resource of each kind. *backend.Backend satisfies it.
+//
+// Separate from the readers rather than folded into them, so that a backend
 // which can read the swarm but not write to it still reports what a sweep would
 // remove instead of losing the report along with the removal.
-type serviceRemover interface {
+type resourceRemover interface {
 	RemoveService(ctx context.Context, id string) error
+	RemoveNetwork(ctx context.Context, id string) error
+	RemoveConfig(ctx context.Context, id string) error
+	RemoveSecret(ctx context.Context, id string) error
 }
 
 // releaseView is what both the live comparison and the service sweep need from
@@ -478,10 +498,22 @@ type serviceRemover interface {
 type releaseView struct {
 	desired *compose.Stack
 	live    map[string]swarm.Service
-	// err is whatever stopped the release being read. Both features answer it
-	// the same way — report it and change nothing — because neither rewrites
-	// nor deletes a service on the strength of a read it could not make.
+	// networks, configs and secrets are the other three kinds carrying the
+	// release's namespace label, by scoped name to id. Read only for a sweeping
+	// application whose backend can list them; nil otherwise, which makes them
+	// candidates for nothing.
+	networks map[string]string
+	configs  map[string]string
+	secrets  map[string]string
+	// err is whatever stopped the release's services being read. Both features
+	// answer it the same way — report it and change nothing — because neither
+	// rewrites nor deletes anything on the strength of a read it could not make.
 	err error
+	// resErr is the same for the other three kinds, and is kept apart from err
+	// on purpose: a backend that cannot list them should lose only that half.
+	// Folding the two would make a failure to list configs stop the service
+	// sweep as well, which is a strictly worse answer to the same problem.
+	resErr error
 }
 
 // departedService is one service a sweep may delete: the scoped name to report
@@ -494,6 +526,42 @@ type departedService struct {
 	name    string
 	id      string
 	volumes []string
+}
+
+// departedResource is one network, config or secret a sweep may delete.
+//
+// No volumes field: a volume is only ever reachable through the service that
+// mounts it, and #75 settled that those are reported and never deleted.
+type departedResource struct {
+	kind application.ResourceKind
+	name string
+	id   string
+}
+
+// doomedSet is everything one release has that a sweep may delete.
+//
+// The two halves travel together because they are proved together, and are kept
+// apart because they are written at different moments: pruneFirst orders the
+// services, and the other three kinds always go after the apply.
+type doomedSet struct {
+	services  []departedService
+	resources []departedResource
+}
+
+// resourceNames is one release's scoped names, by kind.
+//
+// Kinds are kept apart rather than merged into one list because the four share a
+// single namespace of scoped names — a config and a service can both be
+// "rel_app" — so a name is only ever evidence about its own kind.
+type resourceNames struct {
+	services []string
+	networks []string
+	configs  []string
+	secrets  []string
+}
+
+func (n resourceNames) empty() bool {
+	return len(n.services) == 0 && len(n.networks) == 0 && len(n.configs) == 0 && len(n.secrets) == 0
 }
 
 // observe reads what is running for the releases this application's settings ask
@@ -509,9 +577,9 @@ type departedService struct {
 // A release the plan would install is read for neither. Nothing of ours is
 // deployed under that name, so there is nothing to compare against and nothing
 // this controller could prove is its own to delete.
-func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b charts.Backend, engine Engine, plan *charts.Plan) (map[string]*application.ReleaseDrift, map[string][]departedService) {
+func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b charts.Backend, engine Engine, plan *charts.Plan) (map[string]*application.ReleaseDrift, map[string]doomedSet) {
 	live := spec.DriftDetection == application.DriftLive
-	sweep := spec.SyncPolicy.PruneServices
+	sweep := spec.SyncPolicy.PruneResources
 	if !live && !sweep {
 		return nil, nil
 	}
@@ -519,6 +587,9 @@ func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b chart
 	if !ok {
 		return nil, nil
 	}
+	// A backend that cannot list the other three kinds still sweeps services.
+	// Losing the half it cannot answer is better than losing both.
+	rl, _ := b.(resourceLister)
 
 	views := make(map[string]releaseView, len(plan.Releases))
 	for _, rp := range plan.Releases {
@@ -532,9 +603,16 @@ func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b chart
 		if v.desired, v.err = ldb.DesiredServices(ctx, rp.Manifest, rp.Name); v.err == nil {
 			v.live, v.err = ldb.LiveServices(ctx, rp.Name)
 		}
+		if v.err == nil && sweep && rl != nil {
+			v.networks, v.configs, v.secrets, v.resErr = liveResources(ctx, rl, rp.Name)
+		}
 		if v.err != nil {
 			r.log.Warn("could not read a release's running services",
 				"application", spec.Name, "release", rp.Name, "error", v.err)
+		}
+		if v.resErr != nil {
+			r.log.Warn("could not read a release's networks, configs and secrets, so none of them can be pruned",
+				"application", spec.Name, "release", rp.Name, "error", v.resErr)
 		}
 		views[rp.Name] = v
 	}
@@ -605,31 +683,54 @@ func (r *Reconciler) liveDrift(spec application.Spec, plan *charts.Plan, views m
 // first, converting a revision's manifest only while something is still
 // unaccounted for, so the ordinary case reads one revision rather than a whole
 // history.
-func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, plan *charts.Plan, views map[string]releaseView) map[string][]departedService {
-	var out map[string][]departedService
+func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, plan *charts.Plan, views map[string]releaseView) map[string]doomedSet {
+	var out map[string]doomedSet
 	for _, rp := range plan.Releases {
 		v, ok := views[rp.Name]
 		if !ok || v.err != nil {
 			continue
 		}
-		candidates := prune.Undeclared(runningNames(v.live), declaredNames(v.desired))
-		if len(candidates) == 0 {
+		declared := declaredNames(v.desired)
+		candidates := resourceNames{services: prune.Undeclared(runningNames(v.live), declared.services)}
+		// A read that failed proves nothing either way, so the kinds it covered
+		// are candidates for nothing while the services carry on.
+		if v.resErr == nil {
+			candidates.networks = prune.Undeclared(names(v.networks), declared.networks)
+			candidates.configs = prune.Undeclared(names(v.configs), declared.configs)
+			candidates.secrets = prune.Undeclared(names(v.secrets), declared.secrets)
+		}
+		if candidates.empty() {
 			continue
 		}
 		claimed := r.claimed(ctx, spec, ldb, engine, rp.Name, candidates)
-		if len(claimed) == 0 {
+		if claimed.empty() {
 			continue
 		}
-		if out == nil {
-			out = make(map[string][]departedService, len(plan.Releases))
-		}
-		for _, name := range claimed {
-			out[rp.Name] = append(out[rp.Name], departedService{
+
+		var set doomedSet
+		for _, name := range claimed.services {
+			set.services = append(set.services, departedService{
 				name:    name,
 				id:      v.live[name].ID,
 				volumes: mountedVolumes(v.live[name]),
 			})
 		}
+		// Configs, then secrets, then networks: the order RemoveStack removes
+		// them in, which is the order they stop being referenced in.
+		for _, name := range claimed.configs {
+			set.resources = append(set.resources, departedResource{application.ResourceConfig, name, v.configs[name]})
+		}
+		for _, name := range claimed.secrets {
+			set.resources = append(set.resources, departedResource{application.ResourceSecret, name, v.secrets[name]})
+		}
+		for _, name := range claimed.networks {
+			set.resources = append(set.resources, departedResource{application.ResourceNetwork, name, v.networks[name]})
+		}
+
+		if out == nil {
+			out = make(map[string]doomedSet, len(plan.Releases))
+		}
+		out[rp.Name] = set
 	}
 	return out
 }
@@ -640,17 +741,17 @@ func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb li
 // A history that cannot be read prunes nothing. So does a revision that cannot
 // be converted — it is no evidence either way, and an older one may still claim
 // what it could not.
-func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, release string, candidates []string) []string {
+func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, release string, candidates resourceNames) resourceNames {
 	revisions, err := engine.History(ctx, release)
 	if err != nil {
-		r.log.Warn("could not read a release's history, so none of its services can be pruned",
+		r.log.Warn("could not read a release's history, so none of its resources can be pruned",
 			"application", spec.Name, "release", release, "error", err)
-		return nil
+		return resourceNames{}
 	}
 
-	var claimed []string
+	var claimed resourceNames
 	rest := candidates
-	for i := len(revisions) - 1; i >= 0 && len(rest) > 0; i-- {
+	for i := len(revisions) - 1; i >= 0 && !rest.empty(); i-- {
 		rev := revisions[i]
 		if app, ok := prune.Owner(rev, r.controller); !ok || app != spec.Name {
 			continue
@@ -662,11 +763,23 @@ func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liv
 				"revision", rev.Revision, "error", err)
 			continue
 		}
-		var found []string
-		found, rest = prune.Claim(rest, declaredNames(stack))
-		claimed = append(claimed, found...)
+		// One conversion answers all four kinds, so sweeping four costs what
+		// sweeping one did.
+		declared := declaredNames(stack)
+		var found resourceNames
+		found.services, rest.services = prune.Claim(rest.services, declared.services)
+		found.networks, rest.networks = prune.Claim(rest.networks, declared.networks)
+		found.configs, rest.configs = prune.Claim(rest.configs, declared.configs)
+		found.secrets, rest.secrets = prune.Claim(rest.secrets, declared.secrets)
+		claimed.services = append(claimed.services, found.services...)
+		claimed.networks = append(claimed.networks, found.networks...)
+		claimed.configs = append(claimed.configs, found.configs...)
+		claimed.secrets = append(claimed.secrets, found.secrets...)
 	}
-	slices.Sort(claimed)
+	slices.Sort(claimed.services)
+	slices.Sort(claimed.networks)
+	slices.Sort(claimed.configs)
+	slices.Sort(claimed.secrets)
 	return claimed
 }
 
@@ -681,7 +794,7 @@ func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liv
 // is the one place this feature adds a drift axis where manifest mode had none,
 // and it is deliberate — deleting a service with no record of it anywhere but a
 // log line would be worse.
-func withOrphans(drifts map[string]*application.ReleaseDrift, doomed map[string][]departedService) map[string]*application.ReleaseDrift {
+func withOrphans(drifts map[string]*application.ReleaseDrift, doomed map[string]doomedSet) map[string]*application.ReleaseDrift {
 	if len(doomed) == 0 {
 		return drifts
 	}
@@ -689,13 +802,13 @@ func withOrphans(drifts map[string]*application.ReleaseDrift, doomed map[string]
 		drifts = make(map[string]*application.ReleaseDrift, len(doomed))
 	}
 
-	for release, services := range doomed {
+	for release, set := range doomed {
 		rd := drifts[release]
 		if rd == nil {
 			rd = &application.ReleaseDrift{}
 			drifts[release] = rd
 		}
-		for _, svc := range services {
+		for _, svc := range set.services {
 			if !markOrphaned(rd, svc.name) {
 				rd.Services = append(rd.Services, application.ServiceDrift{
 					Name:     svc.name,
@@ -703,6 +816,12 @@ func withOrphans(drifts map[string]*application.ReleaseDrift, doomed map[string]
 					Orphaned: true,
 				})
 			}
+		}
+		// Appended rather than marked: nothing else reports these kinds, so
+		// there is never an existing entry to find. drift.Live compares
+		// services and only services.
+		for _, res := range set.resources {
+			rd.Resources = append(rd.Resources, application.ResourceDrift{Kind: res.kind, Name: res.name})
 		}
 		rd.State = application.DriftStateDetected
 	}
@@ -729,19 +848,68 @@ func runningNames(live map[string]swarm.Service) []string {
 	return out
 }
 
-// declaredNames is the scoped names a manifest declares.
-//
-// The scoped name is what the live spec carries and the only key the two sides
-// can be matched on, which is also why drift.Live keys on it.
-func declaredNames(stack *compose.Stack) []string {
-	if stack == nil {
-		return nil
-	}
-	out := make([]string, 0, len(stack.Services))
-	for _, svc := range stack.Services {
-		out = append(out, svc.Spec.Name)
+// names is the keys of a scoped-name-to-id map.
+func names(live map[string]string) []string {
+	out := make([]string, 0, len(live))
+	for name := range live {
+		out = append(out, name)
 	}
 	return out
+}
+
+// declaredNames is the scoped names a manifest declares, by kind.
+//
+// The scoped name is what the live resource carries and the only key the two
+// sides can be matched on, which is also why drift.Live keys on it. Every name
+// here is already scoped: docker/cli's convert prefixes the namespace, and a
+// manifest that set an explicit `name:` gets that name on both sides.
+//
+// External declarations are absent from all four lists, because convert drops
+// them: an external resource is not ours to create and so is not ours to delete.
+// That it is missing from the declared side is not a hazard — an external
+// resource carries no namespace label either, so it is never a candidate, and no
+// revision's manifest can claim one.
+func declaredNames(stack *compose.Stack) resourceNames {
+	if stack == nil {
+		return resourceNames{}
+	}
+	out := resourceNames{
+		services: make([]string, 0, len(stack.Services)),
+		networks: make([]string, 0, len(stack.Networks)),
+		configs:  make([]string, 0, len(stack.Configs)),
+		secrets:  make([]string, 0, len(stack.Secrets)),
+	}
+	for _, svc := range stack.Services {
+		out.services = append(out.services, svc.Spec.Name)
+	}
+	for _, nw := range stack.Networks {
+		out.networks = append(out.networks, nw.Name)
+	}
+	for _, cfg := range stack.Configs {
+		out.configs = append(out.configs, cfg.Name)
+	}
+	for _, sec := range stack.Secrets {
+		out.secrets = append(out.secrets, sec.Name)
+	}
+	return out
+}
+
+// liveResources reads the other three kinds carrying a release's namespace.
+//
+// All three or none: a partial read cannot be told apart from a release that
+// genuinely has none of that kind, and the difference decides whether something
+// gets deleted.
+func liveResources(ctx context.Context, rl resourceLister, release string) (networks, configs, secrets map[string]string, err error) {
+	if networks, err = rl.LiveNetworks(ctx, release); err != nil {
+		return nil, nil, nil, err
+	}
+	if configs, err = rl.LiveConfigs(ctx, release); err != nil {
+		return nil, nil, nil, err
+	}
+	if secrets, err = rl.LiveSecrets(ctx, release); err != nil {
+		return nil, nil, nil, err
+	}
+	return networks, configs, secrets, nil
 }
 
 // mountedVolumes names the volumes a service mounts, for reporting when it is
@@ -793,7 +961,7 @@ func detected(d *application.ReleaseDrift) bool {
 // reacting to.
 //
 // So it is reported and not converged. Putting it right means deleting the
-// service, which is a different verb on a different list: syncPolicy.pruneServices
+// service, which is a different verb on a different list: syncPolicy.pruneResources
 // and the sweep in departed, which deletes only what this controller can prove it
 // installed. With that off — the default — the application stays out of sync,
 // which is the truth.
@@ -1025,7 +1193,7 @@ func checkCompat(plan *charts.Plan) error {
 // also surfaces a chart whose render is not deterministic — one that would
 // otherwise sit permanently out of sync, deploying on every single tick — on
 // the first sync rather than never.
-func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, drifted []string, doomed map[string][]departedService) error {
+func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, drifted []string, doomed map[string]doomedSet) error {
 	started := r.now()
 	notify.Dispatch(ctx, notify.Event{
 		Application: spec.Name,
@@ -1114,6 +1282,16 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 			return err
 		}
 	}
+
+	// Always here, under both orderings, and never before the apply.
+	//
+	// pruneFirst exists because two instances of a workload at once is worse
+	// than none; a network or a config has no such hazard, and none of the three
+	// can be removed before the service holding it has gone anyway. Running them
+	// after the apply means that under pruneFirst the departing services are
+	// already gone by the time their configs are attempted, which is the best
+	// order available rather than a compromise.
+	r.pruneResources(ctx, spec, backend, doomed)
 
 	after, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{
 		Owner:    application.OwnerID(r.controller, spec.Name),
@@ -1339,13 +1517,13 @@ func (r *Reconciler) prune(ctx context.Context, spec application.Spec, backend c
 // candidate again on the next tick, since nothing about the evidence changed.
 // The error is still returned, because the reconcile did not do everything it
 // set out to.
-func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, backend charts.Backend, doomed map[string][]departedService) error {
-	if !spec.SyncPolicy.PruneServices || len(doomed) == 0 {
+func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, backend charts.Backend, doomed map[string]doomedSet) error {
+	if !spec.SyncPolicy.PruneResources || len(doomed) == 0 {
 		return nil
 	}
-	remover, ok := backend.(serviceRemover)
+	remover, ok := backend.(resourceRemover)
 	if !ok {
-		r.log.Warn("this swarm's backend cannot remove a single service, so services the chart no longer declares were left running",
+		r.log.Warn("this swarm's backend cannot remove a single resource, so what the chart no longer declares was left in place",
 			"application", spec.Name)
 		return nil
 	}
@@ -1353,7 +1531,7 @@ func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, b
 	var errs []error
 	var removed []string
 	for _, release := range slices.Sorted(maps.Keys(doomed)) {
-		for _, svc := range doomed[release] {
+		for _, svc := range doomed[release].services {
 			if err := remover.RemoveService(ctx, svc.id); err != nil {
 				errs = append(errs, fmt.Errorf("pruning service %q of release %q: %w", svc.name, release, err))
 				continue
@@ -1397,6 +1575,82 @@ func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, b
 		})
 	}
 	return err
+}
+
+// pruneResources deletes the networks, configs and secrets this application
+// installed under a release it still declares and whose chart has stopped
+// declaring them.
+//
+// The same rule as pruneServices, proved in the same walk, written separately
+// because it is written at a different moment — see the call site.
+//
+// It returns nothing, and that is the decision rather than an oversight. Swarm
+// refuses to remove a config, secret or network that is still in use, and a
+// resource whose service was removed moments ago is still in use while its tasks
+// drain. That refusal is the ordinary case, not a fault: failing the reconcile
+// on it would report an error on every interval for something that is working
+// exactly as intended. So a failure is warned and raised as an event, and the
+// next interval tries again — which costs nothing, because the evidence is an
+// immutable revision record that is still there.
+//
+// This is also why there is no retry loop here, unlike prune.purgeVolumes. That
+// one has to settle within the pass because the uninstall around it is about to
+// delete the very records that prove ownership; here nothing is being deleted
+// that a later sweep would need.
+func (r *Reconciler) pruneResources(ctx context.Context, spec application.Spec, backend charts.Backend, doomed map[string]doomedSet) {
+	if !spec.SyncPolicy.PruneResources || len(doomed) == 0 {
+		return
+	}
+	remover, ok := backend.(resourceRemover)
+	if !ok {
+		return // pruneServices has already said so.
+	}
+
+	var errs []error
+	var removed []string
+	for _, release := range slices.Sorted(maps.Keys(doomed)) {
+		for _, res := range doomed[release].resources {
+			var err error
+			switch res.kind {
+			case application.ResourceConfig:
+				err = remover.RemoveConfig(ctx, res.id)
+			case application.ResourceSecret:
+				err = remover.RemoveSecret(ctx, res.id)
+			case application.ResourceNetwork:
+				err = remover.RemoveNetwork(ctx, res.id)
+			}
+			if err != nil {
+				// Warn, not error: still in use is the expected answer while the
+				// services that referenced it are shutting down.
+				r.log.Warn("could not prune a resource the release no longer declares; it will be tried again",
+					"application", spec.Name, "release", release,
+					"kind", string(res.kind), "resource", res.name, "error", err)
+				errs = append(errs, fmt.Errorf("pruning %s %q of release %q: %w", res.kind, res.name, release, err))
+				continue
+			}
+			removed = append(removed, string(res.kind)+" "+res.name)
+			r.log.Warn("pruned a resource the release no longer declares",
+				"application", spec.Name, "release", release,
+				"kind", string(res.kind), "resource", res.name)
+		}
+	}
+
+	if len(removed) > 0 {
+		notify.Dispatch(ctx, notify.Event{
+			Application: spec.Name,
+			Type:        notify.ResourcesPruned,
+			At:          r.now(),
+			Message:     "pruned " + strings.Join(removed, ", "),
+		})
+	}
+	if err := errors.Join(errs...); err != nil {
+		notify.Dispatch(ctx, notify.Event{
+			Application: spec.Name,
+			Type:        notify.PruneFailed,
+			At:          r.now(),
+			Message:     err.Error(),
+		})
+	}
 }
 
 // syncState reports what was last observed for an application, or unknown if it

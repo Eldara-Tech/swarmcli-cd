@@ -288,14 +288,16 @@ func removeStack(t *testing.T, release string) {
 // beside the service: an overlay network the stack owns and a named volume it
 // must not touch.
 //
-// Configs and secrets are deliberately absent. Compose sources them with
-// `file:`, which the loader resolves against the controller's own filesystem —
-// a rendered chart has no directory to resolve against, so a fixture cannot
-// declare one without hard-coding a checkout path. That RemoveStack deletes
-// them by namespace filter is settled by its unit tests
-// (backend.TestRemoveStackRemovesServicesFirstThenWhatTheyUsed); what this
-// fixture is for is the two behaviours only a real swarm can show — a network
-// that can only be removed once its tasks are gone, and a volume that survives.
+// Configs and secrets are absent here because this fixture does not need them —
+// see chartFilesWithPrunables for one that declares both. Compose sources them
+// with `file:`, which the loader resolves against the controller's own
+// filesystem; that reads like a fixture cannot have one, but in these tests the
+// controller *is* the test process, so an absolute path under t.TempDir() works.
+// What must not appear is a path hard-coded to somebody's checkout.
+//
+// What this fixture is for is the two behaviours only a real swarm can show — a
+// network that can only be removed once its tasks are gone, and a volume that
+// survives.
 func chartFilesWithResources(release string, replicas int) map[string]string {
 	files := chartFiles(release, replicas)
 	files["charts/app/templates/stack.yaml"] = "" +
@@ -614,7 +616,7 @@ func truth(b bool) string {
 func sweepingApp(name, repoDir string, mode application.DriftDetection) application.Spec {
 	app := releaseApp(name, repoDir, true)
 	app.DriftDetection = mode
-	app.SyncPolicy.PruneServices = true
+	app.SyncPolicy.PruneResources = true
 	return app
 }
 
@@ -653,4 +655,181 @@ func createServiceByHand(t *testing.T, cli *dockerclient.Client, release, name s
 	if _, err := cli.ServiceCreate(context.Background(), spec, swarm.ServiceCreateOptions{}); err != nil {
 		t.Fatalf("creating service %q by hand: %v", name, err)
 	}
+}
+
+// ------------------------------------------ what a chart stops declaring (#80)
+
+// chartFilesWithPrunables is a stack that declares all four kinds and puts half
+// of each behind a value, so that one commit drops a service, a network, a
+// config and a secret while changing nothing else about the release.
+//
+// The half that stays is the point. A sweep that deleted everything under the
+// namespace would satisfy a fixture that only dropped things, so `keep` is
+// declared in both renders and asserted to survive.
+//
+// dir is a directory the test owns. Compose sources a config or secret with
+// `file:`, resolved against the controller's filesystem — which in these tests
+// is the test process, so an absolute path under t.TempDir() is exactly right.
+//
+// **No service mounts the configs or secrets, and that is not an oversight.**
+// DeployStack converts the whole manifest before it creates anything
+// (backend/backend.go), and converting a service that references a config
+// resolves that reference against the daemon — so a chart declaring its own
+// config and mounting it cannot be installed at all: the conversion fails with
+// "config not found" before applyConfigs would have created it. `docker stack
+// deploy` avoids this by creating configs first and converting services after.
+// That is a separate defect from the one this fixture is for, and until it is
+// fixed a mounted config cannot appear in any fixture. Declared-but-unmounted
+// configs and secrets are still created, still carry the namespace label, and
+// are still exactly what the sweep has to find.
+//
+// The drop of the `drop` network is what needs the real swarm: the sidecar is
+// attached to it, so it cannot be removed until that service's tasks have
+// drained.
+func chartFilesWithPrunables(t *testing.T, release, dir string, extras bool) map[string]string {
+	t.Helper()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing fixture file %q: %v", path, err)
+		}
+		return path
+	}
+	keepFile := write("keep.conf", "keep\n")
+	dropFile := write("drop.conf", "drop\n")
+	secretFile := write("drop.secret", "s3cr3t\n")
+
+	files := chartFiles(release, 1)
+	files["charts/app/values.yaml"] = "replicas: 1\nextras: " + truth(extras) + "\n"
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    networks: [keep]\n" +
+		"    deploy:\n" +
+		"      replicas: {{ .Values.replicas }}\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"{{- if .Values.extras }}\n" +
+		"  sidecar:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    networks: [drop]\n" +
+		"    deploy:\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"{{- end }}\n" +
+		"networks:\n" +
+		"  keep: {}\n" +
+		"{{- if .Values.extras }}\n" +
+		"  drop: {}\n" +
+		"{{- end }}\n" +
+		"configs:\n" +
+		"  keep:\n" +
+		"    file: " + keepFile + "\n" +
+		"{{- if .Values.extras }}\n" +
+		"  drop:\n" +
+		"    file: " + dropFile + "\n" +
+		"{{- end }}\n" +
+		"{{- if .Values.extras }}\n" +
+		"secrets:\n" +
+		"  drop:\n" +
+		"    file: " + secretFile + "\n" +
+		"{{- end }}\n"
+	return files
+}
+
+// stackConfigNames lists a stack's configs by scoped name, excluding the release
+// records — those carry no namespace label, so this is belt and braces over the
+// filter and a check that they never come into range.
+func stackConfigNames(t *testing.T, cli *dockerclient.Client, release string) []string {
+	t.Helper()
+	configs, err := cli.ConfigList(context.Background(), swarm.ConfigListOptions{Filters: stackFilter(release)})
+	if err != nil {
+		t.Fatalf("listing configs of %q: %v", release, err)
+	}
+	names := make([]string, 0, len(configs))
+	for _, c := range configs {
+		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
+			continue
+		}
+		names = append(names, c.Spec.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// stackSecretNames lists a stack's secrets by scoped name.
+func stackSecretNames(t *testing.T, cli *dockerclient.Client, release string) []string {
+	t.Helper()
+	secrets, err := cli.SecretList(context.Background(), swarm.SecretListOptions{Filters: stackFilter(release)})
+	if err != nil {
+		t.Fatalf("listing secrets of %q: %v", release, err)
+	}
+	names := make([]string, 0, len(secrets))
+	for _, s := range secrets {
+		names = append(names, s.Spec.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// stackNetworkNames lists a stack's networks by name.
+func stackNetworkNames(t *testing.T, cli *dockerclient.Client, release string) []string {
+	t.Helper()
+	nets, err := cli.NetworkList(context.Background(), network.ListOptions{Filters: stackFilter(release)})
+	if err != nil {
+		t.Fatalf("listing networks of %q: %v", release, err)
+	}
+	names := make([]string, 0, len(nets))
+	for _, n := range nets {
+		names = append(names, n.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// syncUntilConverged reconciles until done, or fails saying it never did.
+//
+// A single Sync is not enough for a resource sweep and that is by design: Swarm
+// refuses to remove a config, secret or network that is still in use, and one
+// whose service was removed moments ago is in use until its tasks have gone. The
+// controller warns and tries again on the next interval, so a test has to do
+// what the controller does. The fixture runs `sleep`, which ignores SIGTERM, so
+// the drain takes the full stop-grace period.
+func syncUntilConverged(t *testing.T, rec *reconcile.Reconciler, app string, done func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(120 * time.Second)
+	for pass := 1; ; pass++ {
+		if err := rec.Sync(context.Background(), app); err != nil {
+			t.Logf("sync pass %d: %v", pass, err)
+		}
+		if done() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the sweep never converged after %d passes", pass)
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// createConfigByHand stores a config in a stack's namespace the way an operator
+// with a shell would: carrying the label that says it belongs to the release,
+// and with nothing anywhere saying this controller put it there.
+func createConfigByHand(t *testing.T, cli *dockerclient.Client, release, name string) {
+	t.Helper()
+	_, err := cli.ConfigCreate(context.Background(), swarm.ConfigSpec{
+		Annotations: swarm.Annotations{
+			Name:   name,
+			Labels: map[string]string{"com.docker.stack.namespace": release},
+		},
+		Data: []byte("not ours\n"),
+	})
+	if err != nil {
+		t.Fatalf("creating config %q by hand: %v", name, err)
+	}
+	t.Cleanup(func() { _ = cli.ConfigRemove(context.Background(), name) })
 }

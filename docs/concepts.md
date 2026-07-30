@@ -135,16 +135,21 @@ is this" but "is any application still declaring this release". Only a release
 that fails both is left behind; see
 [configuration § renaming an application](configuration.md#renaming-an-application).
 
-The same question is asked one scope down. A *service* inside a release carries
-only the stack's `com.docker.stack.namespace` label, which says where it lives
-and not who put it there — anything can set it. So before deleting a service its
-chart has stopped declaring, the controller looks for a stored revision of that
-release, stamped by it for this application, that declared the service. A
-service that passes is **orphaned**: provably installed from this repository and
-provably no longer wanted. One that does not is **unmanaged**, reported and never
-touched. It is the release-level orphan/unmanaged distinction applied to what is
-inside a release; see
-[configuration § a service a chart stops declaring](configuration.md#a-service-a-chart-stops-declaring).
+The same question is asked one scope down, and for all four kinds a manifest
+declares. A *service, network, config or secret* inside a release carries only
+the stack's `com.docker.stack.namespace` label, which says where it lives and not
+who put it there — anything can set it. So before deleting one its chart has
+stopped declaring, the controller looks for a stored revision of that release,
+stamped by it for this application, that declared it. One that passes is
+**orphaned**: provably installed from this repository and provably no longer
+wanted. One that does not is **unmanaged**, reported and never touched. It is the
+release-level orphan/unmanaged distinction applied to what is inside a release;
+see
+[configuration § what a chart stops declaring](configuration.md#what-a-chart-stops-declaring).
+
+One rule and one ownership model, applied once per kind rather than over a merged
+list — Swarm scopes all four into a single namespace of names, so a name is only
+ever evidence about its own kind.
 
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by

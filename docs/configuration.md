@@ -236,8 +236,8 @@ When and how a plan is applied.
 | `historyMax` | engine default | revisions kept per release (one Docker config each); older revisions are pruned |
 | `prune` | `false` | delete the resources of a release this application no longer declares. Only ever its own releases — see [prune](#prune) |
 | `pruneVolumes` | `false` | extend `prune` to the named volumes of what it deletes. Requires `prune`; set alone it is a config error |
-| `pruneServices` | `false` | delete a service this application's chart used to declare and no longer does. Stands alone — it does not require `prune`; see [prune](#prune) |
-| `pruneFirst` | `false` | delete before installing rather than after, so a replaced release never overlaps its replacement. Requires `prune` or `pruneServices`; see [ordering](#ordering-and-workloads-that-must-never-run-twice) |
+| `pruneResources` | `false` | delete a service, network, config or secret this application's chart used to declare and no longer does. Stands alone — it does not require `prune`; see [prune](#prune) |
+| `pruneFirst` | `false` | delete before installing rather than after, so a replaced release never overlaps its replacement. Requires `prune` or `pruneResources`; see [ordering](#ordering-and-workloads-that-must-never-run-twice) |
 
 (The `swarmcli-cd app sync --wait` *client* command has its own, separate
 `--timeout`, defaulting to 5m — that bounds how long the CLI watches, not the
@@ -322,7 +322,7 @@ declares that is **missing** from the swarm, and one running under the stack's
 namespace that the manifest does not declare (**unexpected**). An unexpected
 service is never *converged* — a redeploy would leave it exactly where it is,
 since applying deletes nothing. Removing it is a different switch:
-[`syncPolicy.pruneServices`](#a-service-a-chart-stops-declaring), which deletes
+[`syncPolicy.pruneResources`](#what-a-chart-stops-declaring), which deletes
 only what the controller can prove it installed.
 
 Environment **values are never reported** — only whether a variable is `set`,
@@ -338,7 +338,9 @@ rollback configs, restart policies, and placement preferences. Networks, configs
 and secrets are not compared as *resources* either — Swarm cannot update a
 network in place, and configs and secrets are immutable with their content
 hashed into the name, so a change to either is already a manifest-level
-difference.
+difference. What *is* reported for those three is the one finding that is not a
+comparison at all: one the repository has stopped declaring, which
+[`syncPolicy.pruneResources`](#what-a-chart-stops-declaring) will delete.
 
 ## Where the app set lives
 
@@ -554,32 +556,39 @@ applications:
   - name: edge
     syncPolicy:
       automated: true
-      prune: true          # delete releases this application no longer declares
-      pruneVolumes: false  # and their volumes; requires prune
-      pruneServices: true  # delete services its charts no longer declare
+      prune: true           # delete releases this application no longer declares
+      pruneVolumes: false   # and their volumes; requires prune
+      pruneResources: true  # delete what its charts no longer declare
 ```
 
 Not to be confused with `historyMax`, which trims a release's revision *history*
 and never touches anything deployed.
 
-#### A service a chart stops declaring
+#### What a chart stops declaring
 
-`prune` above is about a whole release. A service **inside** a release that is
-still declared is a different case and has its own switch, because applying
-deletes nothing: edit a chart to drop a service and the next sync deploys what
-is left and never mentions the one that went. It keeps running, and every later
-reconcile honestly reports the release unchanged, because the rendered manifest
-really does match the last applied one.
+`prune` above is about a whole release. A service, network, config or secret
+**inside** a release that is still declared is a different case and has its own
+switch, because applying deletes nothing: edit a chart to drop any of them and
+the next sync deploys what is left and never mentions the one that went. It stays
+on the swarm, and every later reconcile honestly reports the release unchanged,
+because the rendered manifest really does match the last applied one.
 
-`pruneServices` deletes it. It does **not** require `prune`: that decides what
+`pruneResources` deletes it. It does **not** require `prune`: that decides what
 happens to a release this application stopped declaring, this decides what
 happens inside one it still declares, and wanting the second without the first
 is a reasonable position rather than half a config.
 
-A service is deleted only when the swarm, git and this controller's own records
+One switch covers all four kinds because it is one statement — *this chart is
+authoritative about what exists in its own release*. **Configs and secrets are
+the ones that accumulate fastest.** They are immutable, so a content change has
+to arrive as a new name; the applier refuses one and tells you to hash the
+content into the name. A chart that does as it is told therefore strands its
+previous copy on **every value change**, not only when you remove a declaration.
+
+A resource is deleted only when the swarm, git and this controller's own records
 all agree:
 
-1. it is running under the release's `com.docker.stack.namespace`;
+1. it carries the release's `com.docker.stack.namespace` label;
 2. the freshly rendered manifest does not declare it;
 3. a stored revision **stamped by this controller for this application**
    declared it.
@@ -589,32 +598,48 @@ namespace label. A stack is a name prefix plus that label and nothing more — n
 `/stacks` endpoint, no owner references — and anything can carry it, so a sidecar
 somebody attached by hand reads exactly like a service the controller installed.
 A stored revision does not: this controller wrote it, it names the owner, and it
-never changes afterwards. The label says where a service lives; the record says
+never changes afterwards. The label says where a resource lives; the record says
 whose it is.
 
-A service failing the third clause is **reported and never deleted**. It shows
-as `unexpected` without the `(orphaned)` marker, which is also how a service
+The four kinds are proved separately, so a config never inherits a same-named
+service's evidence — Swarm scopes all four into one namespace of names, and
+`web_app` can legitimately be both.
+
+A resource failing the third clause is **reported and never deleted**. A service
+shows as `unexpected` without the `(orphaned)` marker, which is also how one
 older than the release's retained history reads — `historyMax` keeps everything
 by default, so that only arises if you set it.
 
-It works in either drift mode. Removing a service from a template is git moving,
+It works in either drift mode. Removing something from a template is git moving,
 not the swarm moving, so coupling it to `driftDetection: live` would make it a
-no-op under the default. Enabling it costs one service list per deployed release
+no-op under the default. Enabling it costs four list calls per deployed release
 per reconcile, and reads a release's history only when that release actually has
-a candidate.
+a candidate — one read answering all four kinds.
 
-Volumes the pruned service mounted are **left in place** and reported, not
-deleted, even with `pruneVolumes` on. That flag means "when a whole release goes,
-its data goes with it"; a service leaving a template is a far more frequent
-event, and nothing here can prove another stack does not mount the same volume.
+**A resource still in use is not deleted, and that is not an error.** Swarm
+refuses to remove a config, secret or network that anything still references, and
+one whose service was removed a moment ago is still referenced while its tasks
+shut down. The refusal is logged and the next reconcile tries again; nothing is
+lost by waiting, because the evidence is a stored revision that is still there.
+A network with tasks still draining routinely takes a second pass.
+
+Volumes are **left in place** and reported, not deleted, even with `pruneVolumes`
+on. That flag means "when a whole release goes, its data goes with it"; something
+leaving a template is a far more frequent event, and nothing here can prove
+another stack does not mount the same volume. The external networks swarmcli
+auto-created for a release are treated the same way, and resources a chart
+declares as `external:` are never candidates at all — they are not ours to
+create, so they are not ours to delete.
 
 `swarmcli-cd app get` marks what a sync will remove, so a manual-policy
 application shows it before anything acts on it:
 
 ```
-SERVICE          REASON                  FIELD  DESIRED  LIVE
-web_sidecar      unexpected (orphaned)
-web_stranger     unexpected
+KIND     NAME             REASON                  FIELD  DESIRED  LIVE
+service  web_sidecar      unexpected (orphaned)
+service  web_stranger     unexpected
+config   web_conf-a1b2c3  unexpected (orphaned)
+network  web_internal     unexpected (orphaned)
 ```
 
 #### Ordering, and workloads that must never run twice
@@ -677,6 +702,13 @@ Networks that swarmcli auto-created for a release are **left in place** and
 reported in the log, not deleted: they may be shared with another stack. The
 same is true of anything prune could not remove — the failure is logged, the
 release keeps its owner stamp, and the next sweep tries again.
+
+One case `pruneResources` cannot defend against: a network a chart declares with
+an explicit `name:`, which suppresses the namespace prefix but not the namespace
+label. Two stacks can both declare the same name and both label it as theirs, so
+dropping it from one chart makes it a candidate. Swarm refuses to remove a
+network anything is attached to, which covers the case that would hurt; a shared
+network with no live tasks on it is not covered.
 
 ### Startup, when the set is not there yet
 

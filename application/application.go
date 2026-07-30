@@ -113,23 +113,34 @@ type SyncPolicy struct {
 	// data in a volume cannot be recreated from anything.
 	PruneVolumes bool `json:"pruneVolumes,omitempty" yaml:"pruneVolumes,omitempty"`
 
-	// PruneServices deletes a service that this application's own chart used to
-	// declare and no longer does. Off by default, for the same reason as Prune.
+	// PruneResources deletes a service, network, config or secret that this
+	// application's own chart used to declare and no longer does. Off by
+	// default, for the same reason as Prune.
 	//
 	// It is a sibling of Prune rather than an extension of it, and deliberately
 	// does not require it: Prune decides what happens to a whole release the
 	// application stopped declaring, this decides what happens inside a release
 	// it still declares, and an operator may reasonably want the second without
-	// the first. Applying deletes nothing, so without this a service dropped
-	// from a template runs until somebody removes it by hand.
+	// the first. Applying deletes nothing, so without this a resource dropped
+	// from a template stays until somebody removes it by hand.
 	//
-	// A service is deleted only when the swarm, git and this controller's own
-	// records all agree: it runs under the release's stack namespace, the
+	// One consent covers all four kinds because it is one statement: this
+	// chart is authoritative about what exists in its own release. Configs and
+	// secrets are the ones that accumulate fastest — they are immutable, so a
+	// chart that hashes content into the name as the applier tells it to
+	// strands the previous copy on every value change, not only when a
+	// declaration is removed.
+	//
+	// A resource is deleted only when the swarm, git and this controller's own
+	// records all agree: it carries the release's stack namespace label, the
 	// rendered manifest does not declare it, and a revision this controller
 	// stamped for this application did. The namespace label alone is not
 	// evidence — anything can carry it — which is why the third clause exists.
 	// See the prune package.
-	PruneServices bool `json:"pruneServices,omitempty" yaml:"pruneServices,omitempty"`
+	//
+	// Volumes are never included, and neither are the external networks
+	// swarmcli auto-created for a release: both are reported and left in place.
+	PruneResources bool `json:"pruneResources,omitempty" yaml:"pruneResources,omitempty"`
 
 	// PruneFirst deletes before installing, instead of after.
 	//
@@ -271,6 +282,12 @@ type Drift struct {
 	// Services counts the services that differ, across every release. It is the
 	// number a list row shows without descending into Releases.
 	Services int `json:"services"`
+	// Resources counts the networks, configs and secrets a sync will delete,
+	// across every release. Separate from Services because they are different
+	// findings: a service here differs from what the repository declares,
+	// whereas a resource here is one the repository has stopped declaring at
+	// all.
+	Resources int `json:"resources,omitempty"`
 	// Message names the worst release, or says why the comparison could not be
 	// made when State is Unknown.
 	Message string `json:"message,omitempty"`
@@ -280,11 +297,41 @@ type Drift struct {
 type ReleaseDrift struct {
 	State    DriftState     `json:"state"`
 	Services []ServiceDrift `json:"services,omitempty"`
+	// Resources are the networks, configs and secrets a sync will delete:
+	// carrying the release's namespace label, absent from the render, and
+	// declared by a revision this controller stamped for this application.
+	//
+	// Every entry is an orphan by construction, which is why there is no
+	// Orphaned field to set. Unlike a service, none of these kinds is compared
+	// field by field — Swarm cannot update a network in place, and configs and
+	// secrets are immutable — so a difference in one is already a manifest-level
+	// difference and there is nothing else a resource entry could mean.
+	Resources []ResourceDrift `json:"resources,omitempty"`
 	// Message is why State is Unknown. A release whose live state could not be
 	// read is not converged, so this is the only record that the question was
 	// asked and went unanswered.
 	Message string `json:"message,omitempty"`
 }
+
+// ResourceDrift is one network, config or secret a sync will delete.
+//
+// Name is namespace-scoped, as it is on the swarm — the name docker network ls
+// or docker config ls shows, and what an operator would type to remove it by
+// hand. Kind is needed because the three share one namespace of names and a
+// name alone does not say what to look at.
+type ResourceDrift struct {
+	Kind ResourceKind `json:"kind"`
+	Name string       `json:"name"`
+}
+
+// ResourceKind names the kind of a ResourceDrift entry.
+type ResourceKind string
+
+const (
+	ResourceNetwork ResourceKind = "network"
+	ResourceConfig  ResourceKind = "config"
+	ResourceSecret  ResourceKind = "secret"
+)
 
 // ServiceDrift is one service that does not match.
 //
@@ -305,7 +352,7 @@ type ServiceDrift struct {
 	// which the stack's namespace label alone could never establish. Read it as
 	// "this goes on the next sync".
 	//
-	// Only ever set when SyncPolicy.PruneServices is on, because that is the
+	// Only ever set when SyncPolicy.PruneResources is on, because that is the
 	// only case where the proof is worth computing. An unexpected service on an
 	// application that has not enabled it carries no marker and is not a
 	// candidate for anything — the same distinction charts.Plan draws between

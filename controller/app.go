@@ -330,28 +330,34 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 // is what git asked for. A release with nothing to report prints nothing.
 func printDrift(out io.Writer, releases []application.ReleaseStatus) {
 	for _, r := range releases {
-		if r.Drift == nil || len(r.Drift.Services) == 0 {
+		if r.Drift == nil || (len(r.Drift.Services) == 0 && len(r.Drift.Resources) == 0) {
 			continue
 		}
-		rows := make([][]string, 0, len(r.Drift.Services))
+		rows := make([][]string, 0, len(r.Drift.Services)+len(r.Drift.Resources))
 		for _, s := range r.Drift.Services {
 			reason := driftReason(s)
 			if len(s.Fields) == 0 {
 				// Missing or unexpected: the service itself is the finding, and
 				// there is no field to name.
-				rows = append(rows, []string{s.Name, reason, "", "", ""})
+				rows = append(rows, []string{"service", s.Name, reason, "", "", ""})
 				continue
 			}
 			for _, f := range s.Fields {
-				rows = append(rows, []string{s.Name, reason, f.Field, f.Desired, f.Live})
+				rows = append(rows, []string{"service", s.Name, reason, f.Field, f.Desired, f.Live})
 			}
 			if s.Truncated > 0 {
-				rows = append(rows, []string{s.Name, reason,
+				rows = append(rows, []string{"service", s.Name, reason,
 					fmt.Sprintf("(and %d more)", s.Truncated), "", ""})
 			}
 		}
+		// Always orphaned, and never field-compared: a network cannot be updated
+		// in place and a config is immutable, so the only finding either can
+		// produce is that the repository has stopped declaring it.
+		for _, res := range r.Drift.Resources {
+			rows = append(rows, []string{string(res.Kind), res.Name, "unexpected (orphaned)", "", "", ""})
+		}
 		_, _ = fmt.Fprintf(out, "\n%s drift:\n", r.Name)
-		table(out, []string{"SERVICE", "REASON", "FIELD", "DESIRED", "LIVE"}, rows)
+		table(out, []string{"KIND", "NAME", "REASON", "FIELD", "DESIRED", "LIVE"}, rows)
 	}
 }
 
@@ -360,7 +366,7 @@ func printDrift(out io.Writer, releases []application.ReleaseStatus) {
 //
 // The distinction is the whole of what makes deleting one safe, so it belongs in
 // front of an operator before they enable anything: an orphaned service is what
-// a sync will remove once syncPolicy.pruneServices is on, and an unexpected one
+// a sync will remove once syncPolicy.pruneResources is on, and an unexpected one
 // without the marker is something this controller will never touch.
 func driftReason(s application.ServiceDrift) string {
 	if s.Orphaned {

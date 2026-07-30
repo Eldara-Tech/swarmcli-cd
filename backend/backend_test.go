@@ -274,9 +274,9 @@ func TestMissingConfigsAndSecretsAreCreated(t *testing.T) {
 // the defect #1 names, so the difference is reported.
 func TestExistingNetworkIsNotRecreatedButIsReported(t *testing.T) {
 	var log strings.Builder
-	api := &fakeAPI{networks: []network.Summary{{
-		ID: "n", Name: "s_front", Driver: "overlay", Attachable: false,
-	}}}
+	existing := stackNetwork("n", "s_front", "s")
+	existing.Driver, existing.Attachable = "overlay", false
+	api := &fakeAPI{networks: []network.Summary{existing}}
 	b := New(api, Options{Log: slog.New(slog.NewTextHandler(&log, nil))})
 
 	st := stack("s")
@@ -315,8 +315,8 @@ func TestRemoveStackRemovesServicesFirstThenWhatTheyUsed(t *testing.T) {
 	api := &fakeAPI{
 		existing: []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{Name: "s_web"}}}},
 		configs:  []swarm.Config{{ID: "cfg", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_site", "s")}}},
-		secrets:  []swarm.Secret{{ID: "sec", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_key"}}}},
-		networks: []network.Summary{{ID: "net", Name: "s_front"}},
+		secrets:  []swarm.Secret{{ID: "sec", Spec: swarm.SecretSpec{Annotations: stackScoped("s_key", "s")}}},
+		networks: []network.Summary{stackNetwork("net", "s_front", "s")},
 	}
 
 	if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
@@ -713,8 +713,8 @@ func TestRemoveStackTreatsAnAlreadyDeletedResourceAsDone(t *testing.T) {
 			api := &fakeAPI{
 				existing:  []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{Name: "s_web"}}}},
 				configs:   []swarm.Config{{ID: "cfg", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_site", "s")}}},
-				secrets:   []swarm.Secret{{ID: "sec", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_key"}}}},
-				networks:  []network.Summary{{ID: "net", Name: "s_front"}},
+				secrets:   []swarm.Secret{{ID: "sec", Spec: swarm.SecretSpec{Annotations: stackScoped("s_key", "s")}}},
+				networks:  []network.Summary{stackNetwork("net", "s_front", "s")},
 				removeErr: map[string]error{missing: errdefs.ErrNotFound},
 			}
 
@@ -741,7 +741,7 @@ func TestRemoveStackTreatsAnAlreadyDeletedResourceAsDone(t *testing.T) {
 func TestRemoveStackAcceptsAFailureThatLeftNothingBehind(t *testing.T) {
 	api := &fakeAPI{
 		existing:   []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{Name: "s_web"}}}},
-		networks:   []network.Summary{{ID: "net", Name: "s_front"}},
+		networks:   []network.Summary{stackNetwork("net", "s_front", "s")},
 		removeErr:  map[string]error{"network:net": errors.New("network net not found")},
 		removeGone: map[string]bool{"network:net": true},
 	}
@@ -755,7 +755,7 @@ func TestRemoveStackAcceptsAFailureThatLeftNothingBehind(t *testing.T) {
 // them as "the stack is still here" and turn every removal into a failure.
 func TestRemoveStackIgnoresReleaseRecordsWhenRechecking(t *testing.T) {
 	api := &fakeAPI{
-		networks: []network.Summary{{ID: "net", Name: "s_front"}},
+		networks: []network.Summary{stackNetwork("net", "s_front", "s")},
 		configs: []swarm.Config{{ID: "rel", Spec: swarm.ConfigSpec{
 			Annotations: swarm.Annotations{
 				Name:   "swarmcli.release.s.v1",
@@ -775,7 +775,7 @@ func TestRemoveStackIgnoresReleaseRecordsWhenRechecking(t *testing.T) {
 // not for "the daemon refused".
 func TestRemoveStackStillFailsOnARealError(t *testing.T) {
 	api := &fakeAPI{
-		networks:  []network.Summary{{ID: "net", Name: "s_front"}},
+		networks:  []network.Summary{stackNetwork("net", "s_front", "s")},
 		removeErr: map[string]error{"network:net": errors.New("has active endpoints")},
 	}
 
@@ -790,6 +790,16 @@ func TestRemoveStackStillFailsOnARealError(t *testing.T) {
 // RemoveStack has to find it by.
 func stackScoped(name, stack string) swarm.Annotations {
 	return swarm.Annotations{
+		Name:   name,
+		Labels: map[string]string{convert.LabelNamespace: stack},
+	}
+}
+
+// stackNetwork is the same thing for a network, which carries its labels on the
+// summary rather than in annotations.
+func stackNetwork(id, name, stack string) network.Summary {
+	return network.Summary{
+		ID:     id,
 		Name:   name,
 		Labels: map[string]string{convert.LabelNamespace: stack},
 	}

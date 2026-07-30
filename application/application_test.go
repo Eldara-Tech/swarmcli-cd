@@ -314,13 +314,13 @@ func TestReleaseDriftRoundTrip(t *testing.T) {
 	}
 }
 
-// The one place pruneServices widens the wire: a manifest-mode application that
+// The one place pruneResources widens the wire: a manifest-mode application that
 // has enabled it does gain a drift axis, carrying the orphans and nothing else.
 //
 // No field comparison was performed and none is implied, which is what keeps
 // `live`'s cost out of the default mode. The invariant above is untouched — it
 // is about an application that has enabled nothing.
-func TestManifestModeWithServicePruneCarriesOrphansAndNoFieldDrift(t *testing.T) {
+func TestManifestModeWithResourcePruneCarriesOrphansAndNoFieldDrift(t *testing.T) {
 	status := Status{
 		Sync: Sync{State: SyncOutOfSync, Summary: SyncSummary{Unchanged: 1}},
 		Releases: []ReleaseStatus{{
@@ -355,5 +355,52 @@ func TestAnUnprovenUnexpectedServiceCarriesNoOrphanedField(t *testing.T) {
 	}
 	if want := `{"name":"api_stranger","reason":"unexpected"}`; string(data) != want {
 		t.Errorf("got %s, want %s", data, want)
+	}
+}
+
+// A departed network, config or secret rides on the same axis, as its own list.
+// Every entry is an orphan by construction, so there is no marker to carry: the
+// three kinds are never field-compared, so appearing here can only mean the
+// repository has stopped declaring it.
+func TestDepartedResourcesMarshalAsTheirOwnAxis(t *testing.T) {
+	data, err := json.Marshal(ReleaseDrift{
+		State: DriftStateDetected,
+		Resources: []ResourceDrift{
+			{Kind: ResourceConfig, Name: "api_conf-a1b2"},
+			{Kind: ResourceNetwork, Name: "api_internal"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	const want = `{"state":"detected","resources":[` +
+		`{"kind":"config","name":"api_conf-a1b2"},` +
+		`{"kind":"network","name":"api_internal"}]}`
+	if string(data) != want {
+		t.Errorf("got %s\nwant %s", data, want)
+	}
+}
+
+// Every addition for #80 is additive and omitempty, so an application that has
+// not enabled the sweep marshals exactly as it did before.
+func TestAStatusWithoutTheSweepCarriesNoResourceFields(t *testing.T) {
+	data, err := json.Marshal(ReleaseDrift{
+		State:    DriftStateDetected,
+		Services: []ServiceDrift{{Name: "api_web", Reason: DriftModified}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "resources") {
+		t.Errorf("got %s, want no resources key at all", data)
+	}
+
+	summary, err := json.Marshal(Drift{State: DriftStateDetected, Services: 1})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := `{"state":"detected","services":1}`; string(summary) != want {
+		t.Errorf("got %s, want %s", summary, want)
 	}
 }

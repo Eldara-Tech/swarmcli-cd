@@ -389,10 +389,10 @@ func Application(releases []application.ReleaseStatus) *application.Drift {
 		switch rel.Drift.State {
 		case application.DriftStateDetected:
 			out.Services += len(rel.Drift.Services)
+			out.Resources += len(rel.Drift.Resources)
 			if out.State != application.DriftStateDetected {
 				out.State = application.DriftStateDetected
-				out.Message = fmt.Sprintf("release %q: %d service(s) do not match the repository",
-					rel.Name, len(rel.Drift.Services))
+				out.Message = detectedMessage(rel.Name, rel.Drift)
 			}
 		case application.DriftStateUnknown:
 			if out.State == application.DriftStateNone {
@@ -406,4 +406,22 @@ func Application(releases []application.ReleaseStatus) *application.Drift {
 		return nil
 	}
 	return out
+}
+
+// detectedMessage says what was found in the worst release.
+//
+// A release with no departed resources reads exactly as it did before the sweep
+// learned about them, so an application that has not enabled pruneResources sees
+// no change at all. One with nothing but departed resources must not say "0
+// service(s) do not match", which is both false and the opposite of the point.
+func detectedMessage(release string, d *application.ReleaseDrift) string {
+	switch {
+	case len(d.Resources) == 0:
+		return fmt.Sprintf("release %q: %d service(s) do not match the repository", release, len(d.Services))
+	case len(d.Services) == 0:
+		return fmt.Sprintf("release %q: %d resource(s) the repository no longer declares", release, len(d.Resources))
+	default:
+		return fmt.Sprintf("release %q: %d service(s) do not match the repository and %d resource(s) it no longer declares",
+			release, len(d.Services), len(d.Resources))
+	}
 }
