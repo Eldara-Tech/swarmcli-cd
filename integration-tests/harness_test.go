@@ -439,6 +439,29 @@ func removeVolumeWhenReleased(cli *dockerclient.Client, name string) error {
 	}
 }
 
+// removeNetworkWhenReleased deletes a network once the tasks attached to it have
+// gone.
+//
+// It has to retry for the same reason removeVolumeWhenReleased does: Swarm
+// refuses to remove a network anything still references, and a task that has just
+// been told to stop still does. Best effort — this is teardown of something a
+// test created outside any stack, so RemoveStack will never reach it.
+func removeNetworkWhenReleased(t *testing.T, cli *dockerclient.Client, name string) {
+	t.Helper()
+	deadline := time.Now().Add(volumeReleaseTimeout)
+	for {
+		err := cli.NetworkRemove(context.Background(), name)
+		if err == nil || errdefs.IsNotFound(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Logf("cleanup: removing network %q: %v", name, err)
+			return
+		}
+		time.Sleep(time.Second)
+	}
+}
+
 // liveDriftApp is an application that decides sync against the running
 // ServiceSpec rather than only against the last apply.
 func liveDriftApp(name, repoDir string, automated bool) application.Spec {

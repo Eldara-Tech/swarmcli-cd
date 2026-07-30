@@ -7,8 +7,11 @@ package integration
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
@@ -329,6 +332,135 @@ func TestLiveDriftDetectsAndRestoresADetachedNetwork(t *testing.T) {
 	if d := driftOf(t, rec, "network"); d == nil || d.State != application.DriftStateNone {
 		t.Errorf("drift after converging = %+v, want none", d)
 	}
+}
+
+// The service discovery mode, moved by hand on the service that declares none.
+//
+// Correcting it is the half no unit test can reach. The manifest said nothing
+// about the mode, so the spec this controller writes back carries an *empty* one,
+// and whether that puts a dnsrr service back on vip is the daemon's answer rather
+// than this package's — the comparison only normalises what it reads.
+//
+// The sidecar rather than the app, because Swarm refuses dnsrr on a service with
+// ingress publishing: the app could not be moved this way at all.
+func TestLiveDriftDetectsAndRestoresTheEndpointMode(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-endpoint"
+	repo := gitRepo(t, richChartFiles(release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, liveDriftApp("endpoint", repo, false))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "endpoint"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	updateOutOfBand(t, cli, release+"_sidecar", func(spec *swarm.ServiceSpec) {
+		if spec.EndpointSpec == nil {
+			spec.EndpointSpec = &swarm.EndpointSpec{}
+		}
+		spec.EndpointSpec.Mode = swarm.ResolutionModeDNSRR
+	})
+
+	if err := rec.Sync(ctx, "endpoint"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	got := fieldOf(t, driftOf(t, rec, "endpoint"), release+"_sidecar", "endpointMode")
+	if got.Desired != "vip" || got.Live != "dnsrr" {
+		t.Errorf("endpointMode drift = %+v, want vip against dnsrr", got)
+	}
+
+	if err := rec.SyncNow(ctx, "endpoint"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	// Read the daemon, not the report: what was written back names no mode, so
+	// this asserts the daemon's reading of an empty one.
+	svc := serviceOf(t, cli, release+"_sidecar")
+	if svc.Spec.EndpointSpec == nil || svc.Spec.EndpointSpec.Mode != swarm.ResolutionModeVIP {
+		t.Errorf("endpoint mode after converging = %+v, want vip", svc.Spec.EndpointSpec)
+	}
+	if d := driftOf(t, rec, "endpoint"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
+}
+
+// An attachment to a network the stack does not own — the case the unscoped
+// listing exists for.
+//
+// LiveNetworkNames reads every network on the swarm rather than those carrying
+// this stack's namespace label, precisely so an id like this one can be named. A
+// scoped listing could not name it, and an attachment that cannot be named is not
+// reported at all: the drift would be silently invisible rather than wrong. So
+// this is the test that says that choice was necessary and that it works.
+func TestLiveDriftReportsAnAttachmentOutsideTheStack(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-extra"
+	const shared = "e2e-live-extra-shared"
+	repo := gitRepo(t, richChartFiles(release, 1))
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	ctx := context.Background()
+	if _, err := cli.NetworkCreate(ctx, shared, network.CreateOptions{Driver: "overlay"}); err != nil {
+		t.Fatalf("creating a network outside the stack: %v", err)
+	}
+	t.Cleanup(func() { removeNetworkWhenReleased(t, cli, shared) })
+
+	rec := reconciler(t, liveDriftApp("extra", repo, false))
+	if err := rec.SyncNow(ctx, "extra"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	// Attached by name, which the daemon resolves to the id it stores — the whole
+	// reason the comparison has to resolve it back.
+	updateOutOfBand(t, cli, release+"_sidecar", func(spec *swarm.ServiceSpec) {
+		spec.TaskTemplate.Networks = append(spec.TaskTemplate.Networks,
+			swarm.NetworkAttachmentConfig{Target: shared})
+	})
+	waitForRunning(t, cli, release, 2)
+
+	if err := rec.Sync(ctx, "extra"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	got := fieldOf(t, driftOf(t, rec, "extra"), release+"_sidecar", "networks")
+	if got.Desired != release+"_internal" {
+		t.Errorf("desired networks = %q, want only what the chart declares", got.Desired)
+	}
+	if want := []string{release + "_internal", shared}; !namesExactly(got.Live, want) {
+		t.Errorf("live networks = %q, want %v — named, not an id", got.Live, want)
+	}
+
+	// And it goes on a converge, because the spec a redeploy writes lists the
+	// attachments the manifest declares and no others.
+	if err := rec.SyncNow(ctx, "extra"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	svc := serviceOf(t, cli, release+"_sidecar")
+	if n := len(svc.Spec.TaskTemplate.Networks); n != 1 {
+		t.Errorf("attachments after converging = %d, want the chart's one", n)
+	}
+	if d := driftOf(t, rec, "extra"); d == nil || d.State != application.DriftStateNone {
+		t.Errorf("drift after converging = %+v, want none", d)
+	}
+}
+
+// namesExactly reports whether a rendered network list names these and no others.
+// Order-insensitive deliberately: the rendering sorts, but asserting on that
+// ordering would make the test about ASCII rather than about what is attached.
+func namesExactly(rendered string, want []string) bool {
+	got := strings.Split(rendered, ", ")
+	slices.Sort(got)
+	w := slices.Clone(want)
+	slices.Sort(w)
+	return slices.Equal(got, w)
 }
 
 // A service deleted out of band. The health axis only notices when a release has
