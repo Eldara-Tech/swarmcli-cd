@@ -1411,6 +1411,18 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 			r.prune(ctx, spec, backend, engine, plan.Orphaned),
 			r.pruneServices(ctx, spec, backend, doomed),
 		); err != nil {
+			// Reported as a failed sync, which the other ordering's identical
+			// failure deliberately is not. The asymmetry is the whole point of
+			// the option: this sweep runs before the apply and stops it, so
+			// nothing was deployed and the sync delivered none of what the
+			// repository asked for. Below, the deploy has already landed and only
+			// the cleanup did not, so its result stands.
+			//
+			// Returning bare left a sync-started with no outcome on the event
+			// stream and a status still showing the *previous* sync's result —
+			// so the one ordering that guarantees nothing is running was also the
+			// one that reported the last time something was (#107).
+			r.failSync(ctx, spec.Name, checkout.Revision, started, err)
 			return err
 		}
 	}
@@ -1528,6 +1540,46 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	afterLive, _ := r.observe(ctx, spec, backend, engine, after)
 	r.record(spec.Name, backend, after, checkout.Revision, result, afterLive)
 	return nil
+}
+
+// failSync terminates a sync that delivered nothing: it dispatches sync-failed
+// and records the outcome, so that a notifier pairing sync-started with an
+// outcome gets one and the status stops reporting the sync before this.
+//
+// Only the pruneFirst sweep uses it. The path below it needs a result on the
+// success side too, for record to commit alongside the confirming re-plan, and a
+// helper that produced both would be the shape this file had when a cleanup
+// failure was being reported as a failed deploy. This one says one thing.
+//
+// A cancelled context is not a failure and gets neither event nor result, for
+// the reason apply gives: a shutdown caught mid-sweep is the controller
+// stopping, not the sweep failing.
+func (r *Reconciler) failSync(ctx context.Context, app, revision string, started time.Time, err error) {
+	if cancelled(err) {
+		return
+	}
+
+	result := &application.SyncResult{
+		Revision:   revision,
+		StartedAt:  started,
+		FinishedAt: r.now(),
+		Succeeded:  false,
+		Error:      err.Error(),
+	}
+	notify.Dispatch(ctx, notify.Event{
+		Application: app,
+		Type:        notify.SyncFailed,
+		Revision:    revision,
+		At:          result.FinishedAt,
+		Message:     err.Error(),
+	})
+	// recordResult and not record: reconcileLocked published this pass's plan,
+	// revision, drift and releases before apply was called, and nothing has been
+	// deployed since, so the outcome is the only thing missing. Re-reading the
+	// swarm would ask about a state that has not moved. Health catches up on the
+	// next reconcile, when record reads this result as SyncFailed — exactly how a
+	// failed apply already behaves.
+	r.recordResult(app, result)
 }
 
 // converge redeploys the releases whose running services no longer match the

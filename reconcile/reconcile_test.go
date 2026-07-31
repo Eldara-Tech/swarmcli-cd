@@ -1567,22 +1567,93 @@ func TestACancelledSyncIsNotDispatchedAsAFailure(t *testing.T) {
 // The prune paths build their errors out of ctx.Err() too — prune.purgeVolumes
 // literally returns it — so a shutdown during a teardown raised prune-failed for
 // something that had not failed.
+//
+// Both orderings, because they report a sweep failure differently and a
+// cancellation is not a sweep failure under either: the pruneFirst one also
+// dispatches sync-failed and writes a result, and must not do that for a
+// controller that is merely stopping.
 func TestACancelledPruneIsNotDispatchedAsAFailure(t *testing.T) {
+	for _, pruneFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pruneFirst=%v", pruneFirst), func(t *testing.T) {
+			rec := listen(t)
+			engine := &fakeEngine{
+				plans:     []*charts.Plan{orphaning("old"), synced()},
+				uninstErr: map[string]error{"old": fmt.Errorf("removing volume %q: %w", "old_data", context.Canceled)},
+			}
+			spec := pruningSpec("edge", false)
+			spec.SyncPolicy.PruneFirst = pruneFirst
+			r := newTest(t, []application.Spec{spec}, engine, nil)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := r.Sync(ctx, "edge"); err == nil {
+				t.Fatal("Sync = nil, want the cancellation returned to the loop")
+			}
+
+			for _, unwanted := range []notify.EventType{notify.PruneFailed, notify.SyncFailed} {
+				if slices.Contains(rec.types(), unwanted) {
+					t.Errorf("events = %v, want no %s for a clean shutdown", rec.types(), unwanted)
+				}
+			}
+			// Not "no result": under the default ordering the apply has already
+			// landed and recorded a successful one by the time the sweep is
+			// cancelled, which is right. What must never appear is a *failed*
+			// result, under either ordering.
+			view, _ := r.View("edge")
+			if last := view.Status.Sync.LastSync; last != nil && !last.Succeeded {
+				t.Errorf("lastSync = %+v, want no failure written down for a clean shutdown", last)
+			}
+		})
+	}
+}
+
+// Under pruneFirst the sweep runs before the apply and its failure stops it, so
+// nothing was deployed and the sync delivered nothing at all. It used to return
+// bare: the event stream carried a sync-started that never ended, and the status
+// went on reporting the previous sync — so the one ordering that guarantees
+// nothing is running was also the one that showed the last time something was
+// (#107).
+//
+// The other ordering is the opposite case and keeps the opposite answer, which
+// TestPruneFailureDoesNotFailTheSync pins. If that one starts failing, this
+// change has leaked across the branch.
+func TestPruneFirstFailureIsReportedAsAFailedSync(t *testing.T) {
 	rec := listen(t)
 	engine := &fakeEngine{
 		plans:     []*charts.Plan{orphaning("old"), synced()},
-		uninstErr: map[string]error{"old": fmt.Errorf("removing volume %q: %w", "old_data", context.Canceled)},
+		uninstErr: map[string]error{"old": errors.New("network still attached")},
 	}
-	r := newTest(t, []application.Spec{pruningSpec("edge", false)}, engine, nil)
+	spec := pruningSpec("edge", false)
+	spec.SyncPolicy.PruneFirst = true
+	r := newTest(t, []application.Spec{spec}, engine, nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := r.Sync(ctx, "edge"); err == nil {
-		t.Fatal("Sync = nil, want the cancellation returned to the loop")
+	// A sync that worked, so that "the status still shows the last one" is a
+	// thing this test can actually catch rather than infer from a nil.
+	previous := &application.SyncResult{Revision: strings.Repeat("b", 40), Succeeded: true}
+	r.recordResult("edge", previous)
+
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Fatal("Sync = nil, want the sweep failure")
 	}
 
-	if got := rec.types(); slices.Contains(got, notify.PruneFailed) {
-		t.Errorf("events = %v, want no prune-failed for a clean shutdown", got)
+	// The premise: nothing was deployed. Without this the assertions below would
+	// pass just as well on a sync that had in fact landed.
+	if engine.applyCount() != 0 {
+		t.Fatalf("applied %d times, want 0 — the sweep stops the apply, which is what makes this a failed sync", engine.applyCount())
+	}
+	view, _ := r.View("edge")
+	last := view.Status.Sync.LastSync
+	switch {
+	case last == nil || last == previous:
+		t.Errorf("lastSync = %+v, want this sync's outcome rather than the one before it", last)
+	case last.Succeeded:
+		t.Errorf("lastSync = %+v, want a failure — none of what the repository declares was deployed", last)
+	case !strings.Contains(last.Error, "network still attached"):
+		t.Errorf("lastSync.Error = %q, want the sweep failure named", last.Error)
+	}
+	want := []notify.EventType{notify.DriftDetected, notify.SyncStarted, notify.PruneFailed, notify.SyncFailed}
+	if got := rec.types(); !equal(got, want) {
+		t.Errorf("events = %v, want %v — a started sync is terminated", got, want)
 	}
 }
 
