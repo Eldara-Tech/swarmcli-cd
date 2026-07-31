@@ -69,7 +69,7 @@ func assertDisjoint(t *testing.T, a, b reflect.Value, path string) {
 	}
 
 	switch a.Kind() {
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if a.IsNil() {
 			// A nil on one side and not the other is a difference DeepEqual
 			// above has already caught.
