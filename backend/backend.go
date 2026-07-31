@@ -127,7 +127,7 @@ const (
 //	secrets:
 //	  x:
 //	    name: swarmcli-cd-token
-//	    file: ./anything-readable
+//	    driver: vault
 //
 // and conversion then resolves both the declaration and the reference to that
 // name. So the stack's own set contains it, externalRefs correctly reports the
