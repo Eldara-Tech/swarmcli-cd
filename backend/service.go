@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/client"
+
+	"github.com/Eldara-Tech/swarmcli/charts"
 
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
@@ -116,6 +119,9 @@ func (b *Backend) ApplyServices(ctx context.Context, stack *cdcompose.Stack, res
 	if err != nil {
 		return err
 	}
+	if err := b.rejectForeignNamespace(ctx, stack.Namespace.Name(), existing); err != nil {
+		return err
+	}
 
 	for _, svc := range stack.Services {
 		name := stack.Namespace.Scope(svc.Name)
@@ -150,6 +156,112 @@ func (b *Backend) stackServices(ctx context.Context, namespace string) (map[stri
 		out[s.Spec.Name] = s
 	}
 	return out, nil
+}
+
+// rejectForeignNamespace refuses to write into a stack namespace that already
+// has services and that this engine has no record of installing.
+//
+// The rule the sweep applies before it deletes a service is that the label says
+// *where* a resource lives and the record says *whose* it is (#62, one scope
+// down). The write path had no such rule at all: the services to update were
+// whatever carried the namespace label, and a spec was written over each of them
+// unread. Anything that can name a release can therefore name a stack — the
+// namespace is a label anyone can carry, and a release name is chosen by whoever
+// writes the release file — and the chart's spec lands on somebody else's
+// services, with that chart's image, mounts and placement (#102).
+//
+// The record is the second signal here as it is there. A release the engine has
+// installed has at least one release-history config, written by this controller
+// through CreateConfig; a stack put on the swarm by `docker stack deploy`, by
+// another tool, or by hand has none, whatever labels its services carry. So:
+//
+//   - nothing running under the namespace — an install into empty space — is not
+//     a claim on anything and needs no record. This is the ordinary first deploy.
+//   - services running and a record of ours: the release is one the engine
+//     installed, and updating its services is what a sync is.
+//   - services running and no record: they are not ours to write over, and the
+//     deploy is refused before a single service is created or updated.
+//
+// The third case refuses two things that used to go through, and the second is
+// the one worth stating. It refuses adopting a hand-deployed stack by naming a
+// release after it — which was never a decision anybody made, it was the absence
+// of this check, and the release would then also be the stack that a later
+// uninstall or prune deletes. And it refuses installing *alongside* one, with no
+// name collision at all, because a namespace is the unit RemoveStack and every
+// sweep act on: sharing one with a stack this engine did not install means the
+// first uninstall takes both. It also closes the two-commit version of the
+// takeover, where a release is first installed into a foreign namespace under
+// harmless service names and only then grows a service named like one already
+// there.
+//
+// An operator who really means to bring an existing stack under GitOps removes
+// it first and lets the controller install it — which is a decision they make,
+// visible in what the deploy does, rather than a spec silently overwritten.
+func (b *Backend) rejectForeignNamespace(ctx context.Context, namespace string, existing map[string]swarm.Service) error {
+	if len(existing) == 0 {
+		return nil
+	}
+	ours, err := b.releaseRecorded(ctx, namespace)
+	if err != nil {
+		return err
+	}
+	if ours {
+		return nil
+	}
+	names := make([]string, 0, len(existing))
+	for name := range existing {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return fmt.Errorf("refusing to deploy release %q: %s already run under its stack namespace and this "+
+		"controller has no release record for it, so they were deployed by something else — a `docker stack "+
+		"deploy`, another tool, or the controller's own stack — and this release would write its services "+
+		"over them. Give the release a name of its own, or remove that stack first if it is meant to be "+
+		"managed from here", namespace, strings.Join(names, ", "))
+}
+
+// releaseRecorded reports whether the chart engine holds a release record for
+// this release — the proof that the stack under its namespace is one this
+// controller deployed.
+//
+// Matched by the engine's exported labels rather than by the config name, for the
+// reason releaseConfigNames gives: that name format is unexported, and a rename
+// there would silently stop this proving anything.
+//
+// A record carrying a stack namespace is not a record. A chart can put any
+// labels it likes on a config it declares, so these labels are forgeable — but a
+// config created by a stack deploy is stamped with that stack's namespace on the
+// way in (convert.AddStackLabel, which writes the label last and so cannot be
+// talked out of it), while a genuine record is written through CreateConfig with
+// com.swarmcli.* labels and no namespace at all. That absence is already
+// load-bearing — it is what keeps RemoveStack from deleting a release's history —
+// and it is what tells a record from a chart claiming to be one.
+//
+// Any owner counts, including none. The stamp answers a different question than
+// this does: which of this controller's applications installed a release, so that
+// a sweep does not delete another controller's work. Requiring it here would
+// refuse the two handovers the engine and the docs describe as supported — a
+// release installed from the command line and then adopted by an application, and
+// every release on the swarm after --controller-id is changed, which is corrected
+// precisely by redeploying each one once.
+func (b *Backend) releaseRecorded(ctx context.Context, release string) (bool, error) {
+	list, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{
+		Filters: filters.NewArgs(filters.Arg("label", charts.LabelRelease+"="+release)),
+	})
+	if err != nil {
+		return false, fmt.Errorf("listing release %q's records to check whether this controller installed it: %w",
+			release, err)
+	}
+	for _, c := range list {
+		if c.Spec.Labels[charts.LabelType] != charts.TypeRelease {
+			continue
+		}
+		if _, stacked := c.Spec.Labels[convert.LabelNamespace]; stacked {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func (b *Backend) createService(ctx context.Context, name string, spec swarm.ServiceSpec, resolve string) error {
