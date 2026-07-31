@@ -53,6 +53,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -254,11 +255,30 @@ func (r *pathReader) read(context.Context) (document, error) {
 	return document{Data: data, Path: filepath.Join(r.cfg.Dir, r.cfg.Path)}, nil
 }
 
-// readContained returns the whole app-set file under root.
+// maxAppSetSize bounds the app-set file.
+//
+// This is content the controller did not write — a checkout, or a directory
+// something else keeps current — and os.ReadFile sizes its buffer from the file,
+// so a four-gigabyte applications.yaml exhausted the controller before the
+// decoder saw a byte, and did it again every interval. yaml.v3 caps alias
+// expansion, which is why the billion-laughs half of this needs nothing; the
+// size half had nothing at all.
+//
+// The chart engine bounds its own reads of untrusted content the same way — 16
+// MiB for an index, 20 MiB for an archive, 10 MiB per file in a chart — and the
+// number is smaller here because the content is: an application spec is a few
+// hundred bytes, so this is room for tens of thousands of them, orders of
+// magnitude beyond any set one controller reconciles.
+const maxAppSetSize = 4 << 20 // 4 MiB
+
+// readContained returns the whole app-set file under root, refusing one larger
+// than maxAppSetSize.
 //
 // One shot, not a stat followed by a read: with an atomic publisher there is
 // nothing to gain from looking first, and with a careless one the gap between
-// the two calls is where the file changes. The containment check is the same
+// the two calls is where the file changes. The bound is applied to the bytes as
+// they arrive for the same reason — a size taken from a stat is a size the
+// content can exceed by the time it is read. The containment check is the same
 // one values files go through — this tree is written by something other than
 // the controller, and a symlink in it must not turn a config read into a read
 // of whatever the controller can reach.
@@ -274,9 +294,21 @@ func readContained(root, path string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("the app-set file %s: %w", filepath.Join(root, path), err)
 	}
-	data, err := os.ReadFile(file)
+
+	f, err := os.Open(file)
 	if err != nil {
 		return nil, fmt.Errorf("reading the app-set file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// One byte past the limit, so a file exactly at it still loads and anything
+	// over it is known to be over rather than silently truncated to it.
+	data, err := io.ReadAll(io.LimitReader(f, maxAppSetSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading the app-set file: %w", err)
+	}
+	if len(data) > maxAppSetSize {
+		return nil, fmt.Errorf("the app-set file %s is larger than the %d-byte limit", filepath.Join(root, path), maxAppSetSize)
 	}
 	return data, nil
 }

@@ -335,3 +335,31 @@ applications:
 		t.Fatalf("Parse = %v, want nil", err)
 	}
 }
+
+// An operator who writes nothing gets the bound; one who writes 0 gets the chart
+// engine's keep-everything. Both have to survive the parse as different answers,
+// which is the whole reason historyMax is a pointer.
+func TestHistoryMaxDistinguishesUnsetFromZero(t *testing.T) {
+	base := "applications:\n  - name: edge\n    source:\n      repoURL: https://x/y.git\n" +
+		"      revision: main\n      releaseFile: r.yaml\n"
+
+	f, err := Parse([]byte(base), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if got := f.Applications[0].SyncPolicy; got.HistoryMax != nil {
+		t.Errorf("historyMax = %v, want it left unset", *got.HistoryMax)
+	} else if got.Retention() != application.DefaultHistoryMax {
+		t.Errorf("Retention() = %d, want the default %d", got.Retention(), application.DefaultHistoryMax)
+	}
+
+	f, err = Parse([]byte(base+"    syncPolicy: {historyMax: 0}\n"), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want an explicit zero accepted", err)
+	}
+	if got := f.Applications[0].SyncPolicy; got.HistoryMax == nil || *got.HistoryMax != 0 {
+		t.Fatalf("historyMax = %v, want an explicit 0", got.HistoryMax)
+	} else if got.Retention() != 0 {
+		t.Errorf("Retention() = %d, want 0 — an explicit zero still means keep all", got.Retention())
+	}
+}

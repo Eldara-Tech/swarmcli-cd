@@ -15,6 +15,7 @@ import (
 
 func fullView() View {
 	at := time.Date(2026, 7, 22, 9, 41, 10, 0, time.UTC)
+	historyMax := 20
 	return View{
 		Spec: Spec{
 			Name: "edge",
@@ -29,7 +30,7 @@ func fullView() View {
 				Interval:   Duration(60 * time.Second),
 				Wait:       true,
 				Timeout:    Duration(10 * time.Minute),
-				HistoryMax: 20,
+				HistoryMax: &historyMax,
 			},
 			DriftDetection: DriftManifest,
 		},
@@ -425,5 +426,51 @@ func TestAStatusWithoutTheSweepCarriesNoResourceFields(t *testing.T) {
 	}
 	if want := `{"state":"detected","services":1}`; string(summary) != want {
 		t.Errorf("got %s, want %s", summary, want)
+	}
+}
+
+// The three answers historyMax has, and why it needs a pointer to give them.
+// Absent is the bound the controller applies for you; an explicit 0 is the chart
+// engine's keep-everything, which was the old default and is the thing that
+// fills a manager's raft log one deploy at a time.
+func TestRetention(t *testing.T) {
+	keepAll, twenty := 0, 20
+	for name, tc := range map[string]struct {
+		policy SyncPolicy
+		want   int
+	}{
+		"absent":                  {SyncPolicy{}, DefaultHistoryMax},
+		"explicit zero keeps all": {SyncPolicy{HistoryMax: &keepAll}, 0},
+		"a number":                {SyncPolicy{HistoryMax: &twenty}, 20},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.policy.Retention(); got != tc.want {
+				t.Errorf("Retention() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// An application that says nothing about historyMax still marshals without the
+// key: the default is applied where the number is used, not written into the
+// spec the API serves back.
+func TestAnUnsetHistoryMaxIsAbsentFromTheWire(t *testing.T) {
+	data, err := json.Marshal(SyncPolicy{Automated: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "historyMax") {
+		t.Errorf("got %s, want no historyMax key", data)
+	}
+
+	keepAll := 0
+	data, err = json.Marshal(SyncPolicy{Automated: true, HistoryMax: &keepAll})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// omitempty on a pointer omits nil, not the zero it points at — which is the
+	// whole reason the field is one.
+	if !strings.Contains(string(data), `"historyMax":0`) {
+		t.Errorf("got %s, want an explicit zero on the wire", data)
 	}
 }

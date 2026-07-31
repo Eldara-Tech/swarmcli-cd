@@ -467,14 +467,17 @@ func TestCreateConfigStampsTheCreationTime(t *testing.T) {
 	}
 }
 
-// One list call, not a list plus an inspect per config. This runs on every
-// reconcile against a store that grows by one config per release revision.
+// One list call, not a list plus an inspect per config. This runs several times
+// per reconcile against a store that grows by one config per release revision.
 //
-// The payload has to ride along, or the engine inspects each release config to
-// decode it and the saving is undone one revision at a time.
+// A release record's payload has to ride along, or the engine inspects each one
+// to decode it and the saving is undone one revision at a time.
 func TestListConfigsDoesNotInspectEachOne(t *testing.T) {
 	api := &fakeAPI{configs: []swarm.Config{
-		{Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "a", Labels: map[string]string{"k": "v"}}, Data: []byte("payload-a")}},
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli.release.web.v1", Labels: map[string]string{charts.LabelType: charts.TypeRelease, "k": "v"}},
+			Data:        []byte("payload-a"),
+		}},
 		{Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "b"}}},
 	}}
 
@@ -482,7 +485,7 @@ func TestListConfigsDoesNotInspectEachOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListConfigs = %v, want nil", err)
 	}
-	if len(got) != 2 || got[0].Name != "a" || got[0].Labels["k"] != "v" {
+	if len(got) != 2 || got[0].Name != "swarmcli.release.web.v1" || got[0].Labels["k"] != "v" {
 		t.Errorf("configs = %+v, want name and labels carried through", got)
 	}
 	if string(got[0].Data) != "payload-a" {
@@ -490,6 +493,48 @@ func TestListConfigsDoesNotInspectEachOne(t *testing.T) {
 	}
 	if api.inspects != 0 {
 		t.Errorf("inspected %d configs; the list response already holds all of it", api.inspects)
+	}
+}
+
+// Every config's name and labels, and only a release record's payload.
+//
+// The listing cannot be filtered: the engine asks this one method both which
+// configs hold release history and which names exist at all, and the second is
+// asked about a chart's external configs, which carry no swarmcli label — so a
+// filter would report an external config that exists as missing and refuse the
+// deploy. What the daemon sends cannot be narrowed, but what is held on to can:
+// nothing ever decodes a config that is not a release record, and a stack's own
+// mounted configs are exactly the payloads that would otherwise be retained for
+// the length of a plan, on the manager holding the raft log.
+func TestListConfigsKeepsOnlyReleasePayloads(t *testing.T) {
+	api := &fakeAPI{configs: []swarm.Config{
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli.release.web.v3", Labels: map[string]string{charts.LabelType: charts.TypeRelease}},
+			Data:        []byte("a release record"),
+		}},
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "web_nginx.conf", Labels: map[string]string{"com.docker.stack.namespace": "web"}},
+			Data:        []byte("somebody else's half a megabyte"),
+		}},
+	}}
+
+	got, err := testBackend(t, api, nil).ListConfigs(context.Background())
+	if err != nil {
+		t.Fatalf("ListConfigs = %v, want nil", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("configs = %+v, want every config listed so the external-config pre-flight can still see them", got)
+	}
+	if string(got[0].Data) != "a release record" {
+		t.Errorf("release record Data = %q, want the payload the list response carried", got[0].Data)
+	}
+	if got[1].Name != "web_nginx.conf" || got[1].Data != nil {
+		t.Errorf("config = %+v, want its name kept and its payload dropped", got[1])
+	}
+	// Unfiltered, and it has to stay that way: the pre-flight asks about names
+	// carrying no swarmcli label at all.
+	if len(api.labelFilters) != 1 || api.labelFilters[0] != "" {
+		t.Errorf("label filters = %q, want one unfiltered list call", api.labelFilters)
 	}
 }
 

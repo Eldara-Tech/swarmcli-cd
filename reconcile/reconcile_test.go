@@ -445,10 +445,11 @@ func TestApplyStampsTheControllersOwner(t *testing.T) {
 	planned := outOfSync()
 	planned.Owner = "cd/default/edge" // what PlanApply returns for the owner it was given
 	engine := &fakeEngine{plans: []*charts.Plan{planned, synced()}}
+	historyMax := 20
 	r := newTest(t, []application.Spec{{
 		Name:           "edge",
 		Source:         application.Source{RepoURL: "https://example.com/x.git", Revision: "main"},
-		SyncPolicy:     application.SyncPolicy{Automated: true, Wait: true, Timeout: application.Duration(90 * time.Second), HistoryMax: 20},
+		SyncPolicy:     application.SyncPolicy{Automated: true, Wait: true, Timeout: application.Duration(90 * time.Second), HistoryMax: &historyMax},
 		DriftDetection: application.DriftManifest,
 	}}, engine, nil)
 
@@ -3531,6 +3532,192 @@ func TestABackendThatCannotListResourcesStillSweepsServices(t *testing.T) {
 	}
 	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
 		t.Errorf("pruned services %v, want %v — the readable half still works", backend.pruned(), want)
+	}
+}
+
+// ------------------------------------------- history and reproducible renders
+
+// An application that says nothing about historyMax gets the bound rather than
+// the chart engine's keep-everything. Each revision is a Docker Config in raft,
+// written by every deploy that changes anything, so "keep all" is a slow leak on
+// the manager node with nothing to stop it.
+func TestHistoryIsBoundedByDefault(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := engine.opts[0].HistoryMax; got != application.DefaultHistoryMax {
+		t.Errorf("HistoryMax = %d, want the default %d", got, application.DefaultHistoryMax)
+	}
+}
+
+// And an operator who writes 0 down still gets keep-everything, because that is
+// what the number has always meant to the engine.
+func TestAnExplicitZeroHistoryMaxStillKeepsEverything(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}}
+	keepAll := 0
+	app := spec("edge", true)
+	app.SyncPolicy.HistoryMax = &keepAll
+	r := newTest(t, []application.Spec{app}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := engine.opts[0].HistoryMax; got != 0 {
+		t.Errorf("HistoryMax = %d, want 0 — an explicit zero means keep all", got)
+	}
+}
+
+// A chart whose render is not reproducible deploys, is immediately planned as
+// out of date again, and would deploy again for ever: every service rewritten,
+// every task rolled and another revision stored, on every interval. The
+// confirming re-plan sees it; this is it acting on what it saw.
+func TestANonReproducibleRenderIsDeployedOnceAndThenHeld(t *testing.T) {
+	// Always out of date, however often it is planned — which is exactly what
+	// {{ now }} in a label produces.
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync()}}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("first Sync = %v, want nil", err)
+	}
+	if engine.applyCount() != 1 {
+		t.Fatalf("applied %d times on the first sync, want 1", engine.applyCount())
+	}
+
+	err := r.Sync(context.Background(), "edge")
+	if err == nil {
+		t.Fatal("second Sync = nil, want it refused: the chart does not render the same twice")
+	}
+	if !strings.Contains(err.Error(), "does not render the same twice") {
+		t.Errorf("error = %v, want it to name the cause", err)
+	}
+	if engine.applyCount() != 1 {
+		t.Errorf("applied %d times, want the redeploy loop stopped after the first", engine.applyCount())
+	}
+	// Reported, not hidden: the reconcile really did not converge.
+	view, _ := r.View("edge")
+	if !strings.Contains(view.Status.Error, "does not render the same twice") {
+		t.Errorf("status error = %q, want the hold explained on the status", view.Status.Error)
+	}
+}
+
+// The hold is on that revision. A commit is the remedy, and it must not need a
+// manual sync to be picked up.
+func TestANewRevisionReleasesTheHold(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync()}}
+	fetcher := &fakeFetcher{revision: strings.Repeat("a", 40)}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, fetcher)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Fatal("Sync = nil, want the application held at the revision it did not settle at")
+	}
+
+	fetcher.mu.Lock()
+	fetcher.revision = strings.Repeat("b", 40)
+	fetcher.mu.Unlock()
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync after a new commit = %v, want the hold released", err)
+	}
+	if engine.applyCount() != 2 {
+		t.Errorf("applied %d times, want the new revision deployed", engine.applyCount())
+	}
+}
+
+// An operator asking explicitly is the way past it. The hold exists to stop an
+// unattended loop redeploying for ever, not to refuse a person.
+func TestAForcedSyncIgnoresTheHold(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync()}}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Fatal("Sync = nil, want it held")
+	}
+
+	if err := r.SyncNow(context.Background(), "edge"); err != nil {
+		t.Fatalf("SyncNow = %v, want a forced sync to deploy anyway", err)
+	}
+	if engine.applyCount() != 2 {
+		t.Errorf("applied %d times, want the forced sync to have deployed", engine.applyCount())
+	}
+}
+
+// The ordinary case must not be caught by any of this: a re-plan that comes back
+// settled leaves nothing held, so the next tick deploys the next commit.
+func TestASettledRePlanHoldsNothing(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced(), outOfSync(), synced()}}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	for i := range 2 {
+		if err := r.Sync(context.Background(), "edge"); err != nil {
+			t.Fatalf("Sync %d = %v, want nil", i, err)
+		}
+	}
+	if engine.applyCount() != 2 {
+		t.Errorf("applied %d times, want a chart that settles deployed on both passes", engine.applyCount())
+	}
+}
+
+// Editing the application clears the hold too. A new spec is a different chart
+// path or a different values file, so whatever the old one could not render
+// reproducibly is no longer evidence about this one — and an edit made to fix it
+// must not then need a manual sync to take effect.
+func TestReplaceClearsTheHold(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync()}}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Fatal("Sync = nil, want it held")
+	}
+
+	edited := spec("edge", true)
+	edited.Source.ReleaseFile = "swarm/other.yaml"
+	if err := r.Replace(edited); err != nil {
+		t.Fatalf("Replace = %v, want nil", err)
+	}
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync after an edit = %v, want the hold cleared", err)
+	}
+	if engine.applyCount() != 2 {
+		t.Errorf("applied %d times, want the edited application deployed", engine.applyCount())
+	}
+}
+
+// A render that is unstable only sometimes — a date that rolls over at midnight
+// is the honest version of it — settles by itself, and must not stay held once
+// it has. The hold means "the last render at this revision did not match what is
+// stored", so a plan that does match clears it whether or not anything is
+// deployed.
+func TestAPlanThatMatchesClearsTheHold(t *testing.T) {
+	// Out of sync, still out of sync after the apply (held), then a render that
+	// matches, then out of sync again — which must deploy rather than refuse.
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), outOfSync(), synced(), outOfSync(), synced()}}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("first Sync = %v, want nil", err)
+	}
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync over a settled plan = %v, want nil", err)
+	}
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync after the render settled = %v, want the hold cleared", err)
+	}
+	if engine.applyCount() != 2 {
+		t.Errorf("applied %d times, want the second deploy to have gone ahead", engine.applyCount())
 	}
 }
 
