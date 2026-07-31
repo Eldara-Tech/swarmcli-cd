@@ -44,7 +44,7 @@ applications:
       interval: 3m        # how often to reconcile this application; omit to use the controller default (3m)
       wait: true          # block each release until its services converge, and roll back on a failed rollout
       timeout: 10m        # how long `wait` waits before giving up
-      historyMax: 20      # revisions kept per release (one Docker config each); older ones are pruned
+      historyMax: 20      # revisions kept per release (one Docker config each); older ones are pruned. Omit for 10; 0 keeps every revision for ever
 
   # ───────────────────────────────────────────────────────────────────────────
   # Source type 2 — one chart, no release file.

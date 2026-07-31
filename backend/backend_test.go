@@ -20,6 +20,7 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/compose/convert"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/api/types/volume"
@@ -467,14 +468,17 @@ func TestCreateConfigStampsTheCreationTime(t *testing.T) {
 	}
 }
 
-// One list call, not a list plus an inspect per config. This runs on every
-// reconcile against a store that grows by one config per release revision.
+// One list call, not a list plus an inspect per config. This runs several times
+// per reconcile against a store that grows by one config per release revision.
 //
-// The payload has to ride along, or the engine inspects each release config to
-// decode it and the saving is undone one revision at a time.
+// A release record's payload has to ride along, or the engine inspects each one
+// to decode it and the saving is undone one revision at a time.
 func TestListConfigsDoesNotInspectEachOne(t *testing.T) {
 	api := &fakeAPI{configs: []swarm.Config{
-		{Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "a", Labels: map[string]string{"k": "v"}}, Data: []byte("payload-a")}},
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli.release.web.v1", Labels: map[string]string{charts.LabelType: charts.TypeRelease, "k": "v"}},
+			Data:        []byte("payload-a"),
+		}},
 		{Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "b"}}},
 	}}
 
@@ -482,7 +486,7 @@ func TestListConfigsDoesNotInspectEachOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListConfigs = %v, want nil", err)
 	}
-	if len(got) != 2 || got[0].Name != "a" || got[0].Labels["k"] != "v" {
+	if len(got) != 2 || got[0].Name != "swarmcli.release.web.v1" || got[0].Labels["k"] != "v" {
 		t.Errorf("configs = %+v, want name and labels carried through", got)
 	}
 	if string(got[0].Data) != "payload-a" {
@@ -490,6 +494,48 @@ func TestListConfigsDoesNotInspectEachOne(t *testing.T) {
 	}
 	if api.inspects != 0 {
 		t.Errorf("inspected %d configs; the list response already holds all of it", api.inspects)
+	}
+}
+
+// Every config's name and labels, and only a release record's payload.
+//
+// The listing cannot be filtered: the engine asks this one method both which
+// configs hold release history and which names exist at all, and the second is
+// asked about a chart's external configs, which carry no swarmcli label — so a
+// filter would report an external config that exists as missing and refuse the
+// deploy. What the daemon sends cannot be narrowed, but what is held on to can:
+// nothing ever decodes a config that is not a release record, and a stack's own
+// mounted configs are exactly the payloads that would otherwise be retained for
+// the length of a plan, on the manager holding the raft log.
+func TestListConfigsKeepsOnlyReleasePayloads(t *testing.T) {
+	api := &fakeAPI{configs: []swarm.Config{
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli.release.web.v3", Labels: map[string]string{charts.LabelType: charts.TypeRelease}},
+			Data:        []byte("a release record"),
+		}},
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "web_nginx.conf", Labels: map[string]string{"com.docker.stack.namespace": "web"}},
+			Data:        []byte("somebody else's half a megabyte"),
+		}},
+	}}
+
+	got, err := testBackend(t, api, nil).ListConfigs(context.Background())
+	if err != nil {
+		t.Fatalf("ListConfigs = %v, want nil", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("configs = %+v, want every config listed so the external-config pre-flight can still see them", got)
+	}
+	if string(got[0].Data) != "a release record" {
+		t.Errorf("release record Data = %q, want the payload the list response carried", got[0].Data)
+	}
+	if got[1].Name != "web_nginx.conf" || got[1].Data != nil {
+		t.Errorf("config = %+v, want its name kept and its payload dropped", got[1])
+	}
+	// Unfiltered, and it has to stay that way: the pre-flight asks about names
+	// carrying no swarmcli label at all.
+	if len(api.labelFilters) != 1 || api.labelFilters[0] != "" {
+		t.Errorf("label filters = %q, want one unfiltered list call", api.labelFilters)
 	}
 }
 
@@ -1020,8 +1066,9 @@ func stackNetwork(id, name, stack string) network.Summary {
 // ---------------------------------------- the controller's own state (#63)
 
 // controllerService is this controller as Swarm holds it: deployed as the stack
-// the README says to deploy it as, and mounting its own bootstrap config and its
-// admin token under the names a reference resolves by.
+// the README says to deploy it as, mounting its own bootstrap config and its
+// admin token under the names a reference resolves by, and carrying the two
+// mounts stack.yml gives it.
 //
 // The target rename on the secret is the point. MountedSecretNames would derive
 // "token" from /run/secrets and never match the "swarmcli-cd-token" a tenant
@@ -1031,6 +1078,13 @@ func stackNetwork(id, name, stack string) network.Summary {
 // The namespace label comes off the same read and is the whole of #102: `docker
 // stack deploy -c stack.yml swarmcli-cd` puts it there, so it is the name no
 // release may claim.
+//
+// The volume is #103's half of the same read, and unlike the secret it is not
+// derivable from anywhere else at all: nothing on the filesystem says which
+// swarm volume /var/lib/swarmcli-cd is. The bind beside it is there so that the
+// self-read is exercised on a spec that has both kinds — a guard that collected
+// every mount would refuse a tenant naming the host path /var/run/docker.sock,
+// which is a different question and a deliberately open one.
 func controllerService() swarm.ServiceSpec {
 	return swarm.ServiceSpec{Annotations: swarm.Annotations{
 		Name:   "swarmcli-cd_controller",
@@ -1044,6 +1098,10 @@ func controllerService() swarm.ServiceSpec {
 			SecretName: "swarmcli-cd-token",
 			File:       &swarm.SecretReferenceFileTarget{Name: "token"},
 		}},
+		Mounts: []mount.Mount{
+			{Type: mount.TypeBind, Source: "/var/run/docker.sock", Target: "/var/run/docker.sock", ReadOnly: true},
+			{Type: mount.TypeVolume, Source: "swarmcli-cd_swarmcli-cd-data", Target: "/var/lib/swarmcli-cd"},
+		},
 	}}}
 }
 
@@ -1854,5 +1912,204 @@ func TestOutsideASwarmTheNamespaceGuardIsInert(t *testing.T) {
 	}
 	if _, err := b.StackVolumes(context.Background(), "swarmcli-cd"); err != nil {
 		t.Fatalf("StackVolumes = %v, want no guard for a controller that has no stack", err)
+	}
+}
+
+// -------------------------------- the volume and the network (#103)
+
+// mountsAVolume is a stack whose service mounts a volume it did not create.
+//
+// The two forms are the two ways a manifest names one, and they are the same two
+// #86 found for a secret: `external: true` with a sibling `name:`, and a
+// stack-owned entry whose `name:` points at something that already exists. They
+// are one code path by the time conversion is done — convert.Volumes puts
+// whatever `name:` said on the mount either way — which is exactly why the guard
+// reads the mount rather than the declaration.
+func mountsAVolume(name string, external bool) string {
+	entry := "volumes:\n  loot:\n    name: " + name + "\n"
+	if external {
+		entry = "volumes:\n  loot:\n    external: true\n    name: " + name + "\n"
+	}
+	return "services:\n  thief:\n    image: busybox\n    volumes: [\"loot:/loot\"]\n" + entry
+}
+
+// A named volume is addressed on the node by name with no namespace on the
+// reference, exactly as a secret is on the cluster — so a stack naming the
+// controller's own gets it.
+//
+// What that is worth is not the controller's own state so much as everyone
+// else's: the volume holds every application's git clone and chart cache. Read,
+// it is the content of every watched private repository. Written, it is the next
+// reconcile deploying the attacker's tree under the victim application's name,
+// which is tenant to tenant rather than merely tenant to controller.
+func TestDeployStackRefusesMountingTheControllersOwnVolume(t *testing.T) {
+	for _, external := range []bool{true, false} {
+		name := "declared"
+		if external {
+			name = "external"
+		}
+		t.Run(name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+
+			err := testBackend(t, api, nil).DeployStack("tenant",
+				mountsAVolume("swarmcli-cd_swarmcli-cd-data", external), ResolveNever)
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the stack refused for mounting the controller's own volume")
+			}
+			for _, want := range []string{"thief", "swarmcli-cd_swarmcli-cd-data", "chart cache"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+			// Refused whole, before the network the stack also declares is created.
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// The false-positive half. Sharing a volume between stacks is what `external:`
+// is for, and a chart's own volume is namespace-scoped and nobody else's — only
+// the controller's own is off limits.
+func TestAStackMayMountAnyOtherVolume(t *testing.T) {
+	for _, tc := range []struct{ name, manifest string }{
+		{"an operator's shared volume", mountsAVolume("shared-cache", true)},
+		{"the chart's own", "services:\n  app:\n    image: busybox\n    volumes: [\"data:/data\"]\nvolumes:\n  data: {}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A fake of its own per case: this one records what it creates, so a
+			// second deploy through the same one sees the first's services under a
+			// namespace with no release record and is refused for that instead (#105).
+			if err := testBackend(t, asController(&fakeAPI{}), nil).DeployStack("tenant", tc.manifest, ResolveNever); err != nil {
+				t.Fatalf("DeployStack = %v, want the volume allowed", err)
+			}
+		})
+	}
+}
+
+// joinsANetwork is the network shape of the same two forms.
+func joinsANetwork(name string, external bool) string {
+	entry := "networks:\n  inside:\n    name: " + name + "\n"
+	if external {
+		entry = "networks:\n  inside:\n    external: true\n    name: " + name + "\n"
+	}
+	return "services:\n  thief:\n    image: busybox\n    networks: [inside]\n" + entry
+}
+
+// The controller's API holds root-equivalent access to the swarm behind one
+// shared bearer token over plaintext HTTP, and stack.yml publishes no port for
+// it — being reachable only from inside the swarm is what makes that acceptable.
+// A stack that joins the controller's own network is inside.
+func TestDeployStackRefusesJoiningTheControllersOwnNetwork(t *testing.T) {
+	for _, external := range []bool{true, false} {
+		name := "declared"
+		if external {
+			name = "external"
+		}
+		t.Run(name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+
+			err := testBackend(t, api, nil).DeployStack("tenant",
+				joinsANetwork("swarmcli-cd_default", external), ResolveNever)
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the stack refused for joining the controller's own network")
+			}
+			for _, want := range []string{"swarmcli-cd_default", "this controller itself"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// And the namespace itself, which is a network name a manifest can write even
+// though `docker stack deploy` would never produce one.
+func TestDeployStackRefusesANetworkNamedForTheControllersStack(t *testing.T) {
+	api := asController(&fakeAPI{})
+
+	err := testBackend(t, api, nil).DeployStack("tenant", joinsANetwork("swarmcli-cd", true), ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the controller's own namespace refused as a network name")
+	}
+	if !strings.Contains(err.Error(), "this controller itself") {
+		t.Errorf("error %q is not the network guard refusing the stack", err)
+	}
+	if len(api.created) != 0 || len(api.order) != 0 {
+		t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+	}
+}
+
+// The false-positive half again, and the reason the rule is the controller's own
+// namespace rather than every network it is attached to: a shared external
+// network is the ordinary way to put a stack behind an ingress proxy, and a
+// chart's own network is scoped to its release.
+func TestAStackMayJoinAnyOtherNetwork(t *testing.T) {
+	for _, tc := range []struct{ name, release, manifest string }{
+		{"an operator's shared network", "tenant", joinsANetwork("traefik-public", true)},
+		{"the chart's own", "tenant", "services:\n  app:\n    image: busybox\n"},
+		// "swarmcli-cd-apps_default" starts with the controller's namespace and is
+		// not scoped under it. A prefix test without the separator would refuse it.
+		{"a release named like ours", "swarmcli-cd-apps", "services:\n  app:\n    image: busybox\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := testBackend(t, asController(&fakeAPI{}), nil).DeployStack(tc.release, tc.manifest, ResolveNever); err != nil {
+				t.Fatalf("DeployStack = %v, want the network allowed", err)
+			}
+		})
+	}
+}
+
+// A controller that is not a swarm service has nothing mounted by Swarm and no
+// stack of its own, so both guards are inert rather than refusing everything —
+// the same answer the secret and config halves give, for the same reason. A
+// development run against a swarm that happens to hold a volume or a network by
+// these names must deploy exactly as before.
+func TestOutsideASwarmTheVolumeAndNetworkGuardsAreInert(t *testing.T) {
+	for _, tc := range []struct{ name, manifest string }{
+		{"volume", mountsAVolume("swarmcli-cd_swarmcli-cd-data", true)},
+		{"network", joinsANetwork("swarmcli-cd_default", true)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := testBackend(t, &fakeAPI{}, nil).DeployStack("tenant", tc.manifest, ResolveNever); err != nil {
+				t.Fatalf("DeployStack = %v, want no guard for a controller with no stack of its own", err)
+			}
+		})
+	}
+}
+
+// The fail-closed property #101 established, on the two channels added since. A
+// daemon that could not be asked is not the news that this controller has no
+// volume and no stack of its own: the deploy fails, and the failure is not
+// cached, so the next one tries again.
+func TestAnUnreachableDaemonRefusesAVolumeOrNetworkDeploy(t *testing.T) {
+	for _, tc := range []struct{ name, manifest string }{
+		{"volume", mountsAVolume("swarmcli-cd_swarmcli-cd-data", true)},
+		{"network", joinsANetwork("swarmcli-cd_default", true)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{selfErr: connectionFailure(t)})
+			b := testBackend(t, api, nil)
+
+			err := b.DeployStack("tenant", tc.manifest, ResolveNever)
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
+			}
+			if !client.IsErrConnectionFailed(err) {
+				t.Errorf("DeployStack = %v, want the daemon's connection failure surfaced", err)
+			}
+
+			api.selfErr = nil
+			if err := b.DeployStack("tenant", tc.manifest, ResolveNever); err == nil {
+				t.Fatal("DeployStack = nil, want the guard on once the daemon answers")
+			}
+			if len(api.created) != 0 {
+				t.Errorf("%d services created despite the refusal", len(api.created))
+			}
+		})
 	}
 }

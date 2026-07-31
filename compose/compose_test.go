@@ -233,25 +233,102 @@ func TestRelativeBindSourceIsRejected(t *testing.T) {
 }
 
 // The shapes that do have a meaning on a worker node must still pass. An
-// over-eager check here would reject the traefik chart, which binds the docker
-// socket.
+// over-eager check here — anything reaching for a host-path policy rather than
+// for the socket — would reject most charts that persist anything.
 func TestAbsoluteBindsAndNamedVolumesAreAccepted(t *testing.T) {
 	got := convertOK(t, `
 services:
   app:
     image: x
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - data:/data
+      - /srv/app/data:/data:ro
+      - /var/lib/app:/state
+      - /var/run/app.sock:/run/app.sock
+      - data:/data2
       - /anonymous
       - {type: volume, source: named, target: /named}
+      - {type: bind, source: /etc/app.conf, target: /etc/app.conf}
 volumes:
   data: {}
   named: {}
 `, "s", nil)
 
-	if n := len(got.Services[0].Spec.TaskTemplate.ContainerSpec.Mounts); n != 4 {
-		t.Errorf("got %d mounts, want 4", n)
+	if n := len(got.Services[0].Spec.TaskTemplate.ContainerSpec.Mounts); n != 7 {
+		t.Errorf("got %d mounts, want 7", n)
+	}
+}
+
+// A chart binding the daemon's socket is root on the node it lands on, and a
+// chart chooses where its services run — so this is the bind that makes every
+// other guard in this package and in backend decoration. It is refused before
+// anything else looks at the manifest.
+//
+// The cases are the ways of writing it, not the ways of meaning it. Both spellings
+// of the socket, because /var/run is a symlink to /run on every systemd host and
+// this cannot resolve a symlink on a node it has never seen; any directory holding
+// it, because a bind of /var/run is the same socket one `ls` further in; and a path
+// that only Clean tells apart from the literal.
+//
+// The traefik case is the real one. It is the fixture's own manifest with the
+// bind the published chart actually carries, and it is what this refusal costs:
+// the swarm provider needs the daemon, so that chart cannot be reconciled by this
+// controller at all and has to be deployed beside it. That is deliberate and
+// deliberately not configurable — see checkBindSources.
+func TestABindReachingTheDockerSocketIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, volumes string }{
+		{"the socket", `["/var/run/docker.sock:/var/run/docker.sock"]`},
+		{"read only", `["/var/run/docker.sock:/var/run/docker.sock:ro"]`},
+		{"the other spelling", `["/run/docker.sock:/var/run/docker.sock"]`},
+		{"the directory holding it", `["/var/run:/var/run"]`},
+		{"the other directory", `["/run:/run"]`},
+		{"one level further out", `["/var:/host/var"]`},
+		{"the whole root filesystem", `["/:/host"]`},
+		{"a trailing slash", `["/var/run/:/var/run"]`},
+		{"an unclean path", `["/var/lib/../run/docker.sock:/var/run/docker.sock"]`},
+		{"long syntax", `[{type: bind, source: /var/run/docker.sock, target: /var/run/docker.sock}]`},
+		// The type that is not a bind and names a host path anyway. Nothing else
+		// in this package would notice, and the manifest converts without
+		// complaint — see bindSource.
+		{"long syntax as a named pipe", `[{type: npipe, source: /var/run/docker.sock, target: /var/run/docker.sock}]`},
+		{"traefik", `["/var/run/docker.sock:/var/run/docker.sock:ro", "certs:/certificates"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Convert(context.Background(),
+				"services:\n  app:\n    image: traefik:v3.7.1\n    volumes: "+tc.volumes+"\n"+
+					"volumes:\n  certs: {}\n", "s", fakeAPI{})
+			if err == nil {
+				t.Fatal("Convert = nil, want a bind reaching the docker socket refused")
+			}
+			if !strings.Contains(err.Error(), "docker daemon's socket") {
+				t.Errorf("error %q does not say why", err)
+			}
+			if !strings.Contains(err.Error(), `service "app"`) {
+				t.Errorf("error %q does not name the service", err)
+			}
+		})
+	}
+}
+
+// The rule is "a path from which docker.sock is reachable by name" and stops
+// there. A check that matched on a substring, or that reached for a general
+// host-path policy, would refuse every one of these — and a host-path policy is a
+// design of its own (#64) rather than something to arrive at by accident here.
+func TestAnOrdinaryHostPathIsNotTheDockerSocket(t *testing.T) {
+	for _, source := range []string{
+		"/var/run/app.sock",
+		"/var/run/docker.sock.bak",
+		"/var/lib/docker",
+		"/var/lib/docker/volumes",
+		"/srv/docker.sock",
+		"/etc/docker",
+		"/runtime",
+		"/var/runtime",
+	} {
+		t.Run(source, func(t *testing.T) {
+			if sock, reaches := reachesDockerSocket(source); reaches {
+				t.Errorf("reachesDockerSocket(%q) = %q, want it accepted", source, sock)
+			}
+		})
 	}
 }
 
@@ -306,7 +383,7 @@ services:
     environment:
       PORT: "80"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /srv/www:/usr/share/nginx/html:ro
     networks: [front]
 networks:
   front: {}

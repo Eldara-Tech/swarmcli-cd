@@ -127,7 +127,7 @@ they cannot select its version, which is why a `ref` carries its own `version`.
 | `ref` | one of path/ref | `repository/chart`; needs `version` and `repositories` |
 | `version` | with `ref` | the pinned chart version — **required** with a ref, because a floating pin would silently upgrade production on the next reconcile |
 | `values` | optional | values files, as paths within the repo |
-| `repositories` | with `ref` | `name` + `url` for each chart repository the ref resolves against |
+| `repositories` | with `ref` | `name` + `url` for each chart repository the ref resolves against; the URL must be `https://` |
 
 **Path safety.** `releaseFile`, `chart.path` and every `values` entry must be
 relative and stay inside the checkout: an absolute path, or one that escapes with
@@ -135,6 +135,15 @@ relative and stay inside the checkout: an absolute path, or one that escapes wit
 symlink is refused again at render time — repository content is not trusted the
 way your own configuration is, and a values file pointing at `/run/secrets` would
 otherwise be read and merged into a manifest.
+
+**Chart repositories are https-only.** A chart repository serves the tarball
+that *becomes* the workload, so anyone on the path to it chooses what runs on
+your swarm — and the digest a chart publishes travels in the same `index.yaml`
+over the same connection, so it does not close that. A plaintext git remote is
+refused for the same reason. There is no opt-out here; the chart engine ships
+one, and this controller does not set it. A repository `name` is held to
+letters, digits, dot, dash and underscore, starting with a letter or digit, for
+a separate reason: it becomes a file in the chart cache.
 
 ### `registryAuth` (optional)
 
@@ -169,12 +178,14 @@ the raft log and is never injected into a deployed container or returned by
 
 #### What a reconciled stack may not reference
 
-Swarm secrets and configs are **cluster-global objects referenced by name**.
-There is no namespace on that reference: a stack declaring one as `external:`
-gets whatever exists under that name, whoever created it. So the controller
-refuses to deploy a stack that reaches for anything of its own, and refuses it
-whole — before any network, config, secret or service is created, so nothing is
-left half-deployed.
+Swarm secrets and configs are **cluster-global objects referenced by name**, and
+a named volume is the same thing on whichever node runs the task. There is no
+namespace on that reference: a stack declaring one as `external:` gets whatever
+exists under that name, whoever created it. So the controller refuses to deploy a
+stack that reaches for anything of its own, and refuses it whole — before any
+network, config, secret or service is created, so nothing is left half-deployed.
+A bind mount of the docker socket is refused on the same terms and for a larger
+reason; that is [below](#the-docker-socket-which-a-chart-may-not-bind).
 
 Reaching for a name is not the only way to get at it. A manifest can also put
 that name on a resource it declares as **its own**, which is not an `external:`
@@ -190,25 +201,36 @@ secrets:
 A secret that already exists is not created again, so the stack would simply be
 handed the real one — and its labels rewritten into the stack's namespace, where
 uninstalling that release would delete it. Declared names are therefore checked
-against the same three sets as referenced ones, whether or not any service mounts
-them (swarmcli-cd#86). A chart's own config or secret is unaffected: its name is
+against the same sets as referenced ones, whether or not any service mounts them
+(swarmcli-cd#86). A chart's own config or secret is unaffected: its name is
 namespace-scoped to `<release>_<name>`, so it is nobody else's.
 
-Three things are off limits:
+Five things are off limits:
 
 | | |
 |---|---|
 | the controller's **secrets** | the admin token, the git token, every `registryAuth` credential |
 | the controller's **configs** | the application set, which names every repository, revision, destination and policy this controller applies |
 | the engine's **release records** | one Docker config per release revision (`com.swarmcli.type=release`), each holding a rendered manifest |
+| the controller's **volume** | every application's git clone and chart cache. Read, it is the content of every private repository the controller watches; **written**, it is what the next reconcile deploys under the victim application's name |
+| the controller's **network** | its own stack's networks. The API holds root-equivalent access behind one bearer token over plaintext HTTP and publishes no port, and being reachable only from inside the swarm is what makes that acceptable |
 
-The first two are read from the controller's **own service spec**, not from the
+The first four are read from the controller's **own service spec**, not from the
 filesystem. A secret arrives at `/run/secrets/<name>` so a directory listing
 almost answers it — but that yields the mount *target*, and a `stack.yml` written
 in compose's long form can rename it, which would leave the guard comparing the
 wrong name and silently matching nothing. A config has no such path at all: it
-lands wherever `target:` puts it, with nothing tying that back to its name. The
-service spec has both under the names a reference actually resolves by.
+lands wherever `target:` puts it, with nothing tying that back to its name, and
+nothing on the filesystem says which swarm volume a mount point is. The service
+spec has all of them under the names a reference actually resolves by.
+
+Networks are the exception, and deliberately: a service spec names its networks
+by **id**, so the same read cannot yield a name to compare. The rule is instead
+the controller's own stack namespace — `swarmcli-cd` and anything scoped under it
+— which needs no second lookup and refuses nothing an operator chose. What that
+leaves open is exactly the operator's own choice: a shared network you attached
+the controller to is reachable by everything else already on it, which is a
+topology decision rather than a stack reaching for something.
 
 The release records cannot come from a set read once at startup, because a new
 one is written on every deploy. They are matched by their label at deploy time.
@@ -221,9 +243,54 @@ answering with an error — the deploy **fails** rather than proceeding unguarde
 and the next one tries again. A failure is never remembered as "nothing is
 mounted": only an answer is.
 
-An ordinary `external:` reference to a config or secret an operator created for
-their own stacks is unaffected, and so is a chart declaring and mounting its own.
-Only the controller's own and the engine's own are refused.
+An ordinary `external:` reference to a config, secret, volume or network an
+operator created for their own stacks is unaffected, and so is a chart declaring
+and mounting its own. Only the controller's own and the engine's own are refused.
+
+##### The docker socket, which a chart may not bind
+
+None of the above means anything on its own, because a bind mount of the daemon's
+socket is root on the node the task lands on — and a chart chooses where its
+services run:
+
+```yaml
+services:
+  x:
+    image: alpine
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # refused
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+```
+
+On a manager that socket **is** the swarm's control plane: the stack can read the
+controller's secrets out of its own service spec, write any spec over any
+service, or delete the controller. So a bind whose source reaches the socket is
+refused — the socket itself under either of its names (`/run/docker.sock` and
+`/var/run/docker.sock` are the same file on a systemd host), and any directory it
+sits in, because `- /var/run:/var/run` is the same socket one directory further
+in.
+
+This is the guard that makes the app-set boundary meaningful. Committing to the
+app-set repository is root-equivalent and is meant to be protected as such,
+[separately from an application's own chart](#the-trust-boundary); a chart that
+can reach the daemon collapses the two.
+
+**The refusal is flat, and it has a cost.** There is no allowlist and no
+per-application policy, so a workload that genuinely wants the daemon — Traefik's
+swarm provider, a Portainer agent, an autoheal sidecar — cannot be reconciled by
+this controller and has to be deployed beside it, by hand or by whatever deploys
+the controller. That is the trade this controller makes to be a multi-tenant one.
+
+**What is not refused: any other host path.** The rule is the socket, not a
+host-path policy. A bind of the daemon's data root (`/var/lib/docker`) still
+reaches the contents of every named volume on that node, the controller's
+included, so the volume rule above is a guard on a *name* rather than on the
+bytes. Closing that means deciding per application which host paths a chart may
+name at all, which is [swarmcli-cd#64](https://github.com/Eldara-Tech/swarmcli-cd/issues/64)
+and is not in this build. Until it is, **treat every chart repository a controller
+reconciles as trusted with the nodes its applications run on.**
 
 **Static credentials only.** The controller image ships no docker credential
 helpers, so a `config.json` using `credsStore` or `credHelpers` is refused at
@@ -253,7 +320,7 @@ When and how a plan is applied.
 | `interval` | controller default (3m) | how often to reconcile this application, as a duration string (`90s`, `5m`) |
 | `wait` | `false` | block each release until its services converge, and — when the service declares `update_config.failure_action: rollback` — let Swarm roll it back on a failed rollout |
 | `timeout` | engine default | how long `wait` waits for a rollout before giving up |
-| `historyMax` | engine default | revisions kept per release (one Docker config each); older revisions are pruned |
+| `historyMax` | `10` | revisions kept per release (one Docker config each); older revisions are pruned after a deploy that succeeded. An explicit `0` keeps every revision, which is what the chart engine has always read the number as — and, on a controller deploying on a timer, a slow leak into the manager's raft log |
 | `prune` | `false` | delete the resources of a release this application no longer declares. Only ever its own releases — see [prune](#prune) |
 | `pruneVolumes` | `false` | extend `prune` to the named volumes of what it deletes. Requires `prune`; set alone it is a config error |
 | `pruneResources` | `false` | delete a service, network, config or secret this application's chart used to declare and no longer does. Stands alone — it does not require `prune`; see [prune](#prune) |
@@ -265,6 +332,22 @@ apply itself.)
 
 Releases are applied in the order the release file lists them; use `wait: true`
 if a later release needs an earlier one live first.
+
+#### A chart that does not render the same twice
+
+Every sync re-plans once the apply has landed, to confirm it. A release that the
+confirming re-plan **still** calls out of date, moments after being deployed, has
+a chart whose render is not reproducible — `{{ now }}` stamped into a label,
+`uuidv4`, `randAlphaNum`. Nothing about that converges: every reconcile would
+rewrite every service in the release, roll every task, and store another revision,
+on every interval for ever.
+
+So the controller deploys it once and then holds the application at that
+revision, saying so on the status and in the log. The hold lifts when something
+could actually change the answer — a new commit, an edit to the application, or
+`swarmcli-cd app sync`, which is never subject to it. The remedy is to take the
+non-deterministic value out of the render, or to pin it in a values file so that
+changing it is a commit.
 
 ### `driftDetection` (optional)
 
@@ -803,8 +886,10 @@ service's evidence — Swarm scopes all four into one namespace of names, and
 
 A resource failing the third clause is **reported and never deleted**. A service
 shows as `unexpected` without the `(orphaned)` marker, which is also how one
-older than the release's retained history reads — `historyMax` keeps everything
-by default, so that only arises if you set it.
+older than the release's retained history reads — with the default `historyMax`
+of 10 that means a resource declared only by a revision more than ten deploys
+ago, and setting `historyMax: 0` removes even that case at the price of an
+unbounded revision store.
 
 It works in either drift mode. Removing something from a template is git moving,
 not the swarm moving, so coupling it to `driftDetection: live` would make it a
@@ -1018,7 +1103,7 @@ line that shows exactly what the controller is following is worth having in
 |---|---|---|
 | `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config. Static mode |
 | `--listen` | `:8080` | API listen address |
-| `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume so a restart does not re-clone everything |
+| `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume so a restart does not re-clone everything. An application that leaves the set has both reclaimed, one app-set interval after it goes |
 | `--appset-repo` | — | pull the app set from this repository. Selects **git** mode |
 | `--appset-revision` | — | branch, tag or SHA to track. Required with `--appset-repo`; an unpinned app set would follow whatever the default branch happens to point at |
 | `--appset-dir` | — | read the app set from a directory something else keeps current. Selects **path** mode |

@@ -185,6 +185,24 @@ func (s *Sourcer) open(ctx context.Context, dir, url string) (*gogit.Repository,
 	return repo, nil
 }
 
+// clone makes the application's checkout. Full depth, deliberately.
+//
+// A shallow clone would be the obvious way to make each one smaller, and it
+// cannot be used here: resolve accepts whatever the spec wrote, and
+// config.validateSource requires it, so an application may pin to an arbitrary
+// commit — which is the whole point of pinning. CloneOptions.Depth fetches N
+// commits back from a *ref*, so a depth-1 clone holds the tip and nothing else,
+// and any revision that is not the tip — yesterday's commit, the one a rollback
+// names, a tag whose target is behind the boundary — cannot be resolved at all.
+// go-git has no unshallow either: it only moves a clone's shallow boundary for a
+// fetch that carries a depth of its own, and the refresh path above carries none.
+// So a clone made shallow stays pinned at the boundary it was created with, and
+// the only recovery for a revision behind it is to discard the clone and take a
+// full one — which is the cost the shallow clone was supposed to be avoiding.
+//
+// The size that actually grows without bound is the *number* of clones, not the
+// depth of each: one per application name ever declared, kept for ever. That is
+// what package reclaim removes.
 func (s *Sourcer) clone(ctx context.Context, dir, url string) (*gogit.Repository, error) {
 	repo, err := gogit.PlainCloneContext(ctx, dir, false, &gogit.CloneOptions{
 		URL:  url,

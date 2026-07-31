@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 
@@ -106,23 +108,27 @@ func MountedSecretNames(dir string) (map[string]struct{}, error) {
 	return out, nil
 }
 
-// What a reconciled stack may not touch, and why — the same three answers
-// whether it reached for the name or claimed it.
+// What a reconciled stack may not touch, and why — the same answers whether it
+// reached for the name or claimed it.
 const (
 	whatControllerSecret = "a credential belonging to the controller"
 	whatControllerConfig = "this controller's own state; the application set names every " +
 		"repository, revision and destination this controller applies"
 	whatReleaseRecord = "a chart release record; those hold the rendered manifest of every " +
 		"release on this swarm"
+	whatControllerVolume = "this controller's own volume; it holds every application's git clone " +
+		"and chart cache, so reading it is every watched repository's content and writing it is " +
+		"what the next reconcile deploys under another application's name"
 )
 
 // rejectForbiddenResources refuses a stack that reaches outside itself for one of
-// the controller's own secrets or configs, or for the chart engine's release
-// history — and a stack that declares one of those names as its own.
+// the controller's own secrets, configs, volumes or networks, or for the chart
+// engine's release history — and a stack that declares one of those names as its
+// own.
 //
-// Secrets and configs are cluster-global objects addressed by name, so both
-// checks are a name comparison. The second one is not redundant, and #86 is the
-// proof: a manifest can put any name it likes on a resource it declares,
+// Secrets, configs and volumes are cluster-global objects addressed by name, so
+// each check is a name comparison. The declared half is not redundant, and #86 is
+// the proof: a manifest can put any name it likes on a resource it declares,
 //
 //	secrets:
 //	  x:
@@ -137,37 +143,43 @@ const (
 // the secret is relabelled into the stack's namespace, where a later RemoveStack
 // deletes it. Declaring a name is not the same as owning it.
 //
-// The cost is one pair of reads per deploy, and only for a stack that either
-// reaches outside itself or declares a secret or config at all. A stack that does
-// neither costs no lookup.
+// A volume needs no second pass for that, and a network needs no first one.
+// Nothing pre-creates a volume — DeployStack says why — so a top-level `volumes:`
+// entry does nothing at all until a service mounts it, and conversion has already
+// folded `external: true`, a bare `name:` and plain namespace scoping into the one
+// name the mount carries (convert.Volumes). A network is the mirror image: a
+// service's attachment is only legible from the stack's network list, and both
+// halves of that list are names a manifest chose, so both are compared.
+//
+// The cost is one listing of the release records per deploy, and only for a stack
+// that references or declares a config at all. What this controller has mounted
+// is read unconditionally and costs nothing extra: DeployStack has already made
+// that read before reaching here, because rejectOwnNamespace compares the release
+// name against the same answer, and it is memoised for the life of the process.
 func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose.Stack) error {
-	// Read at most once per deploy, and only if there is something to compare
-	// against them. Inside the loops each would be read once per service, for an
-	// answer that cannot differ between them.
-	var mine selfMounts
-	var history map[string]struct{}
-	load := func() error {
-		if history != nil {
-			return nil
-		}
-		var err error
-		if mine, err = b.mounts(ctx); err != nil {
-			return err
-		}
-		history, err = b.releaseConfigNames(ctx)
+	mine, err := b.mounts(ctx)
+	if err != nil {
 		return err
+	}
+
+	// The release records are the read worth conditioning on: a fresh listing of a
+	// set that grows by one config per deploy, where the answer above is a cached
+	// pair of round trips. Memoised for this call, because inside the loop it
+	// would otherwise be read once per config reference.
+	var history map[string]struct{}
+	records := func() (map[string]struct{}, error) {
+		if history == nil {
+			var err error
+			if history, err = b.releaseConfigNames(ctx); err != nil {
+				return nil, err
+			}
+		}
+		return history, nil
 	}
 
 	// What a service reaches outside the stack for.
 	for _, svc := range stack.Services {
 		secrets, configs := externalRefs(stack, svc)
-		if len(secrets) == 0 && len(configs) == 0 {
-			continue
-		}
-		if err := load(); err != nil {
-			return err
-		}
-
 		for _, name := range secrets {
 			_, wired := b.forbiddenSecrets[name]
 			_, mounted := mine.secrets[name]
@@ -179,8 +191,17 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			if _, forbidden := mine.configs[name]; forbidden {
 				return mountsForbidden(svc.Name, "config", name, whatControllerConfig)
 			}
-			if _, forbidden := history[name]; forbidden {
+			known, err := records()
+			if err != nil {
+				return err
+			}
+			if _, forbidden := known[name]; forbidden {
 				return mountsForbidden(svc.Name, "config", name, whatReleaseRecord)
+			}
+		}
+		for _, name := range volumeSources(svc) {
+			if _, forbidden := mine.volumes[name]; forbidden {
+				return mountsForbidden(svc.Name, "volume", name, whatControllerVolume)
 			}
 		}
 	}
@@ -189,27 +210,61 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	// it: the adoption happens in applySecrets and applyConfigs, which run over
 	// everything the manifest declares, so an unmounted declaration relabels the
 	// controller's resource just the same.
-	if len(stack.Secrets) > 0 || len(stack.Configs) > 0 {
-		if err := load(); err != nil {
+	for _, spec := range stack.Secrets {
+		_, wired := b.forbiddenSecrets[spec.Name]
+		_, mounted := mine.secrets[spec.Name]
+		if wired || mounted {
+			return declaresForbidden("secret", spec.Name, whatControllerSecret)
+		}
+	}
+	for _, spec := range stack.Configs {
+		if _, forbidden := mine.configs[spec.Name]; forbidden {
+			return declaresForbidden("config", spec.Name, whatControllerConfig)
+		}
+		known, err := records()
+		if err != nil {
 			return err
 		}
-		for _, spec := range stack.Secrets {
-			_, wired := b.forbiddenSecrets[spec.Name]
-			_, mounted := mine.secrets[spec.Name]
-			if wired || mounted {
-				return declaresForbidden("secret", spec.Name, whatControllerSecret)
-			}
+		if _, forbidden := known[spec.Name]; forbidden {
+			return declaresForbidden("config", spec.Name, whatReleaseRecord)
 		}
-		for _, spec := range stack.Configs {
-			if _, forbidden := mine.configs[spec.Name]; forbidden {
-				return declaresForbidden("config", spec.Name, whatControllerConfig)
-			}
-			if _, forbidden := history[spec.Name]; forbidden {
-				return declaresForbidden("config", spec.Name, whatReleaseRecord)
-			}
+	}
+
+	// And the networks, which are neither reached for nor claimed so much as
+	// joined. Both lists: an `external:` entry names a network the manifest
+	// expects to find, and a declared one carries whatever `name:` said, which
+	// applyNetworks then finds already there, leaves alone, and attaches the
+	// stack's services to.
+	for _, name := range stack.ExternalNetworks {
+		if inControllersStack(mine.namespace, name) {
+			return joinsForbidden(name, mine.namespace)
+		}
+	}
+	for _, nw := range stack.Networks {
+		if inControllersStack(mine.namespace, nw.Name) {
+			return joinsForbidden(nw.Name, mine.namespace)
 		}
 	}
 	return nil
+}
+
+// inControllersStack reports whether a network name belongs to the stack this
+// controller itself was deployed as — the namespace, or anything scoped under it.
+//
+// A namespace comparison and not a set of names, because the controller's own
+// service spec names its networks by id (see selfMounts.volumes), and resolving
+// those would take a third round trip inside the self-read for an answer that is
+// worse: it would also refuse whatever shared network an operator deliberately
+// attached this controller to, which is the operator's own topology rather than a
+// tenant reaching for something. What is left uncovered is exactly that case — a
+// tenant joining a network the operator put the controller on can reach its API,
+// and so can everything else already there.
+//
+// A controller that is not a swarm service has no namespace and this is inert,
+// the same answer rejectOwnNamespace gives, for the same reason: there is nothing
+// of ours there to join.
+func inControllersStack(namespace, name string) bool {
+	return namespace != "" && (name == namespace || strings.HasPrefix(name, namespace+"_"))
 }
 
 func mountsForbidden(service, kind, name, what string) error {
@@ -221,6 +276,14 @@ func declaresForbidden(kind, name, what string) error {
 	return fmt.Errorf("this stack declares %s %q, which is %s; a reconciled stack may not declare "+
 		"one of those names as its own, because Swarm addresses a %s by name — the existing one "+
 		"would be handed to this stack's services and relabelled as this stack's", kind, name, what, kind)
+}
+
+func joinsForbidden(name, namespace string) error {
+	return fmt.Errorf("this stack joins network %q, which belongs to the stack this controller itself "+
+		"is deployed as (%s); a reconciled stack may not join it. The controller's API is deliberately "+
+		"unpublished and reachable only from inside the swarm, which is what makes a single bearer token "+
+		"over plaintext HTTP an acceptable design — a stack on that network is on the inside. Give the "+
+		"stack a network of its own", name, namespace)
 }
 
 // externalRefs names the secrets and configs one service references that the
@@ -258,6 +321,34 @@ func externalRefs(stack *cdcompose.Stack, svc cdcompose.Service) (secrets, confi
 		}
 	}
 	return secrets, configs
+}
+
+// volumeSources names the volumes one service mounts.
+//
+// All of them, unlike externalRefs, which drops the ones the stack declares.
+// There is nothing to drop: a top-level `volumes:` entry creates nothing (Swarm
+// makes a named volume on the node that first needs it, which is why DeployStack
+// pre-creates none), so the entry contributes only the name the mount ends up
+// carrying — namespace-scoped, or whatever `name:` said, for an `external: true`
+// entry and a stack-owned one alike (convert.Volumes). That name is the whole of
+// what the node will address, so it is the whole of what is worth comparing, and
+// a declaration no service mounts reaches nothing.
+//
+// Binds are not here. A bind names a path rather than a cluster-wide name, so
+// there is nothing for it to collide with — and the reason it is not a hole in
+// this guard but a known gap beside it is in compose.reachesDockerSocket.
+func volumeSources(svc cdcompose.Service) []string {
+	cs := svc.Spec.TaskTemplate.ContainerSpec
+	if cs == nil {
+		return nil
+	}
+	out := make([]string, 0, len(cs.Mounts))
+	for _, m := range cs.Mounts {
+		if m.Type == mount.TypeVolume && m.Source != "" {
+			out = append(out, m.Source)
+		}
+	}
+	return out
 }
 
 // rejectOwnNamespace refuses a release whose name is the stack namespace this

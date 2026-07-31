@@ -67,6 +67,13 @@ type LoopOptions struct {
 	// Nil is report-only — the default, and what every deployment that has not
 	// asked for prune gets.
 	Pruner Pruner
+
+	// Reclaimer deletes the on-disk caches — the clone and the chart cache — of
+	// an application that has left the set. Unlike Pruner it is not an opt-in:
+	// it deletes nothing that is deployed and nothing that cannot be rebuilt
+	// from git. Nil is a loop with no data directory to sweep, which is what a
+	// test wants.
+	Reclaimer Reclaimer
 }
 
 // Pruner deletes the deployed resources of applications absent from the set it
@@ -77,6 +84,16 @@ type LoopOptions struct {
 // assert that it was never called.
 type Pruner interface {
 	Departed(ctx context.Context, desired, declared []string) ([]string, error)
+}
+
+// Reclaimer deletes the on-disk caches of applications absent from the set it
+// is given. *reclaim.Sweeper implements it.
+//
+// An interface for the reason Pruner is one: it is the other thing in this loop
+// that removes something, and a test has to be able to read exactly what it was
+// told to keep.
+type Reclaimer interface {
+	Sweep(keep []string) error
 }
 
 // Loop keeps the running set equal to the app set.
@@ -95,10 +112,11 @@ type Loop struct {
 	mode   string
 	source string
 
-	interval time.Duration
-	log      *slog.Logger
-	creds    func(application.Spec) (regauth.Resolver, error)
-	pruner   Pruner
+	interval  time.Duration
+	log       *slog.Logger
+	creds     func(application.Spec) (regauth.Resolver, error)
+	pruner    Pruner
+	reclaimer Reclaimer
 
 	mu sync.RWMutex
 	// lastErr is why the last attempt failed, and stale reports that the load
@@ -132,7 +150,8 @@ func NewLoop(src *Loader, rec Reconciler, o LoopOptions) *Loop {
 	}
 	return &Loop{
 		src: src, rec: rec, mode: o.Mode, source: o.Source,
-		interval: o.Interval, log: o.Log, creds: o.Credentials, pruner: o.Pruner,
+		interval: o.Interval, log: o.Log, creds: o.Credentials,
+		pruner: o.Pruner, reclaimer: o.Reclaimer,
 	}
 }
 
@@ -215,6 +234,15 @@ func (l *Loop) Once(ctx context.Context) (err error) {
 	if err == nil {
 		err = l.pruneDeparted(ctx, file.Applications)
 	}
+	// Deliberately not behind that gate. What this deletes is a cache rebuilt on
+	// the next fetch, and it is keyed on the set the reconciler actually holds
+	// rather than on the file — so an application whose removal failed keeps its
+	// clone, and one whose add failed loses only a cache. Letting the data
+	// directory fill because some unrelated application will not start is the
+	// worse failure by a distance, and the volume it fills is the manager's.
+	if rerr := l.reclaimDeparted(); rerr != nil {
+		err = errors.Join(err, rerr)
+	}
 	// Recorded either way, so a pass that succeeded clears a previous failure —
 	// including a pass that found nothing to do, because the set having become
 	// readable again is itself the news.
@@ -293,6 +321,30 @@ func (l *Loop) pruneDeparted(ctx context.Context, desired []application.Spec) er
 	l.recordPruned(pruned)
 	if err != nil {
 		return fmt.Errorf("pruning departed applications: %w", err)
+	}
+	return nil
+}
+
+// reclaimDeparted deletes the on-disk caches of applications the reconciler no
+// longer holds.
+//
+// Driven by the running set rather than by the file, and that is what makes it
+// safe rather than merely tidy: an application whose Remove failed is still in
+// it and keeps its checkout, so there is no pass in which the file has dropped a
+// name that something here is still reconciling. The other direction — a sync
+// the API started before the removal, which Remove neither cancels nor waits for
+// (#106) — is covered by the sweep's own grace period, not by this.
+func (l *Loop) reclaimDeparted() error {
+	if l.reclaimer == nil {
+		return nil
+	}
+	views := l.rec.Views()
+	names := make([]string, 0, len(views))
+	for _, view := range views {
+		names = append(names, view.Spec.Name)
+	}
+	if err := l.reclaimer.Sweep(names); err != nil {
+		return fmt.Errorf("reclaiming the caches of departed applications: %w", err)
 	}
 	return nil
 }

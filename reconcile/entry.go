@@ -106,6 +106,14 @@ type appEntry struct {
 	// it is kept per application rather than per revision.
 	plan *charts.Plan
 
+	// unstable is the checkout revision at which the confirming re-plan found
+	// releases still out of date immediately after a successful apply, and
+	// unstableReleases names them. Empty means the last apply confirmed. It is
+	// what stops a chart whose render is not reproducible being redeployed for
+	// ever; see checkReproducible.
+	unstable         string
+	unstableReleases []string
+
 	// pruneFailures counts consecutive failed deletions of one resource, keyed
 	// by pruneKey, and is the whole of what makes maxPruneAttempts possible: a
 	// sweep re-derives its candidates from the swarm on every pass and so

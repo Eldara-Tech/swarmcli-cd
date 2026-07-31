@@ -247,20 +247,36 @@ func (b *Backend) CreateConfig(ctx context.Context, name string, data []byte, la
 	return err
 }
 
-// ListConfigs returns every config's name, labels and payload.
+// ListConfigs returns every config's name and labels, and the payload of the
+// ones holding release history.
 //
 // One ConfigList call and nothing else. A config's payload comes back in the
 // list response, not only on inspect, so passing it through means the engine
 // decodes release history straight from this call instead of inspecting each
 // stored revision (Eldara-Tech/swarmcli#510). That matters here more than
-// anywhere: this runs on every reconcile, against a store that grows by one
-// config per release revision, and a controller reconciles on a timer whether
-// or not anything changed.
+// anywhere: this runs several times per reconcile per application, against a
+// store that grows by one config per release revision, and a controller
+// reconciles on a timer whether or not anything changed.
 //
-// Deliberately unfiltered. The engine reads this for two different questions —
-// which configs hold release history, and which config names exist at all — and
-// the second one is asked about external configs, which carry no swarmcli label
-// to filter on.
+// Deliberately unfiltered, and that is a conclusion rather than an omission. The
+// engine asks this one method two different questions — which configs hold
+// release history, and which config names exist at all — and the second is asked
+// about a chart's external configs, which carry no swarmcli label. Filtering on
+// the release label server-side would answer the first cheaply and make the
+// second report every external config as absent, which is a hard error refusing
+// the deploy. Nor is there a projection to ask for instead: GET /configs is
+// converted by the same daemon function as GET /configs/{id}, so a name cannot
+// be fetched without its payload — unlike a secret, whose payload the list
+// deliberately withholds — and the accepted filters are id, name, names and
+// label, with no negation to list "everything else" with.
+//
+// What can be bounded is what is *kept*. Only a release record is ever decoded —
+// ConfigMeta.Data is documented as optional, and allRevisions skips anything not
+// carrying the release label before it looks — so every other config contributes
+// its name and labels and its payload is dropped here rather than held for the
+// length of a plan. On a swarm whose stacks mount configs of their own that is
+// the difference between retaining the release store and retaining the whole
+// config store, on the manager node holding the raft log.
 func (b *Backend) ListConfigs(ctx context.Context) ([]charts.ConfigMeta, error) {
 	configs, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{})
 	if err != nil {
@@ -268,7 +284,11 @@ func (b *Backend) ListConfigs(ctx context.Context) ([]charts.ConfigMeta, error) 
 	}
 	out := make([]charts.ConfigMeta, 0, len(configs))
 	for _, c := range configs {
-		out = append(out, charts.ConfigMeta{Name: c.Spec.Name, Labels: c.Spec.Labels, Data: c.Spec.Data})
+		meta := charts.ConfigMeta{Name: c.Spec.Name, Labels: c.Spec.Labels}
+		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
+			meta.Data = c.Spec.Data
+		}
+		out = append(out, meta)
 	}
 	return out, nil
 }

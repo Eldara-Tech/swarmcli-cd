@@ -155,7 +155,9 @@ func validateApplication(app application.Spec) error {
 	if app.SyncPolicy.Interval < 0 || app.SyncPolicy.Timeout < 0 {
 		return fmt.Errorf("%q: syncPolicy interval and timeout cannot be negative", app.Name)
 	}
-	if app.SyncPolicy.HistoryMax < 0 {
+	// Nil is "not set", which means the default; only a number written down can
+	// be wrong. An explicit 0 is legal and means keep every revision.
+	if app.SyncPolicy.HistoryMax != nil && *app.SyncPolicy.HistoryMax < 0 {
 		return fmt.Errorf("%q: syncPolicy historyMax cannot be negative", app.Name)
 	}
 	// Refused rather than ignored. Obeying half of a destructive instruction is
