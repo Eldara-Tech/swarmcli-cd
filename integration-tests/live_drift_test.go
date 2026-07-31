@@ -564,13 +564,16 @@ func TestLiveDriftDetectsAnOutOfBandSecretRemoval(t *testing.T) {
 	}
 
 	d := driftOf(t, rec, "secret")
-	got := fieldOf(t, d, release+"_app", "secrets["+release+"_token]")
+	// Keyed by the name on the swarm, which since #99 is the operator's rather
+	// than a scoped one — the fixture references both resources as `external:`.
+	got := fieldOf(t, d, release+"_app", "secrets["+externalSecretName(release)+"]")
 	// The reference's file target is the source name when the manifest gives no
-	// explicit one, which is what lands under /run/secrets.
+	// explicit one, which is what lands under /run/secrets. That is the compose
+	// key, so it is unchanged by the resource being external.
 	if got.Desired != "token" || got.Live != "(absent)" {
 		t.Errorf("secret drift = %+v, want the mount target against nothing", got)
 	}
-	assertNotReported(t, d, "configs["+release+"_site]")
+	assertNotReported(t, d, "configs["+externalConfigName(release)+"]")
 
 	if err := rec.SyncNow(ctx, "secret"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)

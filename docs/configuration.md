@@ -184,7 +184,7 @@ reference at all:
 secrets:
   x:
     name: swarmcli-cd-token     # not this stack's to name
-    file: ./anything
+    driver: vault
 ```
 
 A secret that already exists is not created again, so the stack would simply be

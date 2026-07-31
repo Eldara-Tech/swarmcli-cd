@@ -6,7 +6,6 @@ package compose
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -88,8 +87,13 @@ networks:
 // Map iteration order is one of the named defects of `docker stack deploy`.
 // Reproducing it would make every reconcile of an unchanged manifest produce a
 // differently ordered work list, so the plan diff would be noise.
+//
+// The secrets are driver-backed and there are no configs, because since #99 that
+// is the whole of what a stack can still own: `file:` is refused, and an
+// `external:` declaration is a reference to an operator's resource rather than
+// something this stack creates, so it never reaches Stack.Configs at all.
 func TestConvertOrdersEverythingByName(t *testing.T) {
-	manifest := `
+	got := convertOK(t, `
 services:
   zeta:
     image: a
@@ -103,35 +107,18 @@ services:
 networks:
   zulu: {}
   alpha: {}
-configs:
-  zconf:
-    file: ./z.txt
-  aconf:
-    file: ./a.txt
 secrets:
   zsec:
-    file: ./z.key
+    driver: vault
   asec:
-    file: ./a.key
-`
-	dir := t.TempDir()
-	for _, f := range []string{"z.txt", "a.txt", "z.key", "a.key"} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	manifest = strings.ReplaceAll(manifest, "./", dir+"/")
-
-	got := convertOK(t, manifest, "s", nil)
+    driver: vault
+`, "s", nil)
 
 	if names := serviceNames(got); !reflect.DeepEqual(names, []string{"alpha", "middle", "zeta"}) {
 		t.Errorf("services = %v, want them sorted", names)
 	}
 	if names := networkNames(got); !reflect.DeepEqual(names, []string{"s_alpha", "s_zulu"}) {
 		t.Errorf("networks = %v, want them sorted", names)
-	}
-	if len(got.Configs) != 2 || got.Configs[0].Name != "s_aconf" || got.Configs[1].Name != "s_zconf" {
-		t.Errorf("configs = %+v, want them sorted and scoped", got.Configs)
 	}
 	if len(got.Secrets) != 2 || got.Secrets[0].Name != "s_asec" || got.Secrets[1].Name != "s_zsec" {
 		t.Errorf("secrets = %+v, want them sorted and scoped", got.Secrets)
@@ -268,20 +255,80 @@ volumes:
 	}
 }
 
+// The controller's filesystem is the one place a chart must not be able to
+// reach, and before #99 three keys reached it. The secret case is the whole
+// vulnerability: the chart names its own secret, so every guard downstream — all
+// of which compare names — sees a stack minding its own business, while the data
+// Swarm stores under that name is this controller's admin token.
+func TestFileSourcesAreRefused(t *testing.T) {
+	for _, tc := range []struct{ name, manifest, names string }{
+		{
+			"secret",
+			"services:\n  x:\n    image: alpine\n    secrets: [loot]\n" +
+				"secrets:\n  loot:\n    file: /run/secrets/swarmcli-cd-token\n",
+			`secret "loot"`,
+		},
+		{
+			"config",
+			"services:\n  x:\n    image: alpine\n    configs: [loot]\n" +
+				"configs:\n  loot:\n    file: /run/secrets/swarmcli-cd-token\n",
+			`config "loot"`,
+		},
+		{
+			"env_file",
+			"services:\n  x:\n    image: alpine\n    env_file: /run/secrets/swarmcli-cd-token\n",
+			`service "x"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Convert(context.Background(), tc.manifest, "s", fakeAPI{})
+			if err == nil {
+				t.Fatal("Convert = nil, want a manifest reading the controller's filesystem to be refused")
+			}
+			if !strings.Contains(err.Error(), tc.names) {
+				t.Errorf("error %q does not name what was refused", err)
+			}
+			if !strings.Contains(err.Error(), "controller's own filesystem") {
+				t.Errorf("error %q does not say why", err)
+			}
+		})
+	}
+}
+
+// The refusal is of a key, not of a path, so it must not be reachable by a
+// manifest that names no path at all. An over-eager version of this check would
+// refuse most charts there are.
+func TestAManifestWithoutFileSourcesIsUntouched(t *testing.T) {
+	got := convertOK(t, `
+services:
+  web:
+    image: nginx
+    environment:
+      PORT: "80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [front]
+networks:
+  front: {}
+`, "s", nil)
+
+	if len(got.Services) != 1 || len(got.Networks) != 1 {
+		t.Errorf("got %+v, want the manifest converted untouched", got)
+	}
+}
+
 // Resolving a referenced secret to its id is the one thing conversion cannot do
 // offline, and getting it wrong means a service that references a secret Swarm
 // will not attach.
+//
+// Both are `external:`, which is also this file's regression test for #99: the
+// key that check refuses is `file:`, and an external declaration carries no path
+// — it names something an operator created on the swarm. Its name is the
+// operator's rather than namespace-scoped, for the same reason.
 func TestServiceSecretsAndConfigsResolveThroughTheClient(t *testing.T) {
-	dir := t.TempDir()
-	for _, f := range []string{"api.key", "app.conf"} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
 	api := fakeAPI{
-		secrets: []swarm.Secret{{ID: "sec-id", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
-		configs: []swarm.Config{{ID: "cfg-id", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_appconf"}}}},
+		secrets: []swarm.Secret{{ID: "sec-id", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "apikey"}}}},
+		configs: []swarm.Config{{ID: "cfg-id", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "appconf"}}}},
 	}
 	got := convertOK(t, `
 services:
@@ -291,35 +338,34 @@ services:
     configs: [appconf]
 secrets:
   apikey:
-    file: `+filepath.Join(dir, "api.key")+`
+    external: true
 configs:
   appconf:
-    file: `+filepath.Join(dir, "app.conf")+`
+    external: true
 `, "s", api)
 
 	spec := got.Services[0].Spec.TaskTemplate.ContainerSpec
-	if len(spec.Secrets) != 1 || spec.Secrets[0].SecretID != "sec-id" || spec.Secrets[0].SecretName != "s_apikey" {
+	if len(spec.Secrets) != 1 || spec.Secrets[0].SecretID != "sec-id" || spec.Secrets[0].SecretName != "apikey" {
 		t.Errorf("secrets = %+v, want the id the daemon reported", spec.Secrets)
 	}
-	if len(spec.Configs) != 1 || spec.Configs[0].ConfigID != "cfg-id" || spec.Configs[0].ConfigName != "s_appconf" {
+	if len(spec.Configs) != 1 || spec.Configs[0].ConfigID != "cfg-id" || spec.Configs[0].ConfigName != "appconf" {
 		t.Errorf("configs = %+v, want the id the daemon reported", spec.Configs)
+	}
+	// An external declaration is a reference; there is nothing for this stack
+	// to create.
+	if len(got.Secrets) != 0 || len(got.Configs) != 0 {
+		t.Errorf("secrets = %+v, configs = %+v, want nothing to create", got.Secrets, got.Configs)
 	}
 }
 
-// declaresAndMounts is the chart shape swarmcli-cd#84 was filed for: it brings
-// its own config and secret and mounts them. Files, because that is the only way
-// compose carries content, resolved against this process's filesystem.
-func declaresAndMounts(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	write := func(name, content string) string {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return path
-	}
-	return `
+// declaresAndMounts is the chart shape swarmcli-cd#84 was filed for: it mounts a
+// secret of its own that does not exist until this controller creates it, next to
+// a reference to a config that already does.
+//
+// The secret is driver-backed because since #99 that is the only content a stack
+// can own — `file:` was the other way, and it read the controller's filesystem
+// rather than the chart's.
+const declaresAndMounts = `
 services:
   app:
     image: busybox
@@ -327,21 +373,18 @@ services:
     secrets: [apikey]
 configs:
   site:
-    file: ` + write("site.conf", "listen 80;\n") + `
+    external: true
 secrets:
   apikey:
-    file: ` + write("api.key", "s3cr3t\n") + `
+    driver: vault
 `
-}
 
 // The conversion that is applied cannot also be the one that decides whether to
 // apply it: it resolves each reference against the daemon, and a chart's own
 // config does not exist until this controller creates it. So Convert refuses
 // this manifest, and ConvertUnresolved is what the mount guard reads instead.
 func TestConvertUnresolvedNeedsNothingToExistYet(t *testing.T) {
-	manifest := declaresAndMounts(t)
-
-	_, err := Convert(context.Background(), manifest, "rel", fakeAPI{})
+	_, err := Convert(context.Background(), declaresAndMounts, "rel", fakeAPI{})
 	if err == nil {
 		t.Fatal("Convert = nil, want a reference to a resource that does not exist yet to fail")
 	}
@@ -349,22 +392,22 @@ func TestConvertUnresolvedNeedsNothingToExistYet(t *testing.T) {
 		t.Errorf("error %q is not the unresolvable reference", err)
 	}
 
-	got, err := ConvertUnresolved(context.Background(), manifest, "rel", fakeAPI{})
+	got, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", fakeAPI{})
 	if err != nil {
 		t.Fatalf("ConvertUnresolved = %v, want nil", err)
 	}
 
 	// The names are the ones a deploy will create and mount; only the ids are
 	// made up, and nothing reads those.
-	if len(got.Configs) != 1 || got.Configs[0].Name != "rel_site" {
-		t.Errorf("configs = %+v, want one scoped rel_site to create", got.Configs)
+	if len(got.Configs) != 0 {
+		t.Errorf("configs = %+v, want nothing to create for an external reference", got.Configs)
 	}
 	if len(got.Secrets) != 1 || got.Secrets[0].Name != "rel_apikey" {
 		t.Errorf("secrets = %+v, want one scoped rel_apikey to create", got.Secrets)
 	}
 	cs := got.Services[0].Spec.TaskTemplate.ContainerSpec
-	if len(cs.Configs) != 1 || cs.Configs[0].ConfigName != "rel_site" || cs.Configs[0].ConfigID != unresolvedID {
-		t.Errorf("mounted configs = %+v, want rel_site with an unresolved id", cs.Configs)
+	if len(cs.Configs) != 1 || cs.Configs[0].ConfigName != "site" || cs.Configs[0].ConfigID != unresolvedID {
+		t.Errorf("mounted configs = %+v, want site with an unresolved id", cs.Configs)
 	}
 	if len(cs.Secrets) != 1 || cs.Secrets[0].SecretName != "rel_apikey" || cs.Secrets[0].SecretID != unresolvedID {
 		t.Errorf("mounted secrets = %+v, want rel_apikey with an unresolved id", cs.Secrets)
@@ -375,14 +418,13 @@ func TestConvertUnresolvedNeedsNothingToExistYet(t *testing.T) {
 // on everything except the ids. If they could disagree on a name, a stack refused
 // by the first could still be deployed by the second.
 func TestConvertUnresolvedDiffersOnlyByTheIds(t *testing.T) {
-	manifest := declaresAndMounts(t)
 	api := fakeAPI{
-		configs: []swarm.Config{{ID: "cfg-id", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "rel_site"}}}},
+		configs: []swarm.Config{{ID: "cfg-id", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "site"}}}},
 		secrets: []swarm.Secret{{ID: "sec-id", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "rel_apikey"}}}},
 	}
 
-	resolved := convertOK(t, manifest, "rel", api)
-	unresolved, err := ConvertUnresolved(context.Background(), manifest, "rel", api)
+	resolved := convertOK(t, declaresAndMounts, "rel", api)
+	unresolved, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", api)
 	if err != nil {
 		t.Fatalf("ConvertUnresolved = %v, want nil", err)
 	}

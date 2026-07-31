@@ -13,9 +13,15 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 )
 
-// The case in #80, for the three kinds #75 left open. A network, a config and a
-// secret dropped from a template are removed; the ones the chart still declares
-// are not.
+// The case in #80, for the one kind of #75's three that a manifest can still put
+// in range. A network dropped from a template is removed; the one the chart still
+// declares is not.
+//
+// It covered configs and secrets too until #99 refused the only key that let a
+// chart declare either. Nothing in the sweep changed — an `external:` reference
+// is not a declaration, so no manifest can produce a stack-owned config or secret
+// for it to consider — and rather than assert over two kinds that can no longer
+// be there, this now covers the one that can. See chartFilesWithPrunables.
 //
 // Deliberately the default drift mode, for the reason the service sweep is:
 // dropping something from a template is git moving, not the swarm moving, and a
@@ -30,8 +36,7 @@ import (
 func TestResourcesDroppedFromATemplateArePruned(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-res-prune"
-	dir := t.TempDir()
-	repo := gitRepo(t, chartFilesWithPrunables(t, release, dir, true))
+	repo := gitRepo(t, chartFilesWithPrunables(release, true))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
 	rec := reconciler(t, sweepingApp("edge", repo, application.DriftManifest))
@@ -44,35 +49,23 @@ func TestResourcesDroppedFromATemplateArePruned(t *testing.T) {
 
 	// Everything the chart declared is there, so what follows is a removal
 	// rather than something that was never created.
-	if got, want := stackConfigNames(t, cli, release), []string{release + "_drop", release + "_keep"}; !slices.Equal(got, want) {
-		t.Fatalf("configs = %v, want %v before the drop", got, want)
-	}
-	if got, want := stackSecretNames(t, cli, release), []string{release + "_drop"}; !slices.Equal(got, want) {
-		t.Fatalf("secrets = %v, want %v before the drop", got, want)
+	if got, want := stackNetworkNames(t, cli, release), []string{release + "_drop", release + "_keep"}; !slices.Equal(got, want) {
+		t.Fatalf("networks = %v, want %v before the drop", got, want)
 	}
 	kept := serviceOf(t, cli, release+"_app").ID
 	records := releaseRecordCount(t, cli, release)
 
-	commitChange(t, repo, chartFilesWithPrunables(t, release, dir, false))
+	commitChange(t, repo, chartFilesWithPrunables(release, false))
 
-	wantConfigs := []string{release + "_keep"}
 	wantNetworks := []string{release + "_keep"}
 	syncUntilConverged(t, rec, "edge", func() bool {
-		return slices.Equal(stackConfigNames(t, cli, release), wantConfigs) &&
-			len(stackSecretNames(t, cli, release)) == 0 &&
-			slices.Equal(stackNetworkNames(t, cli, release), wantNetworks)
+		return slices.Equal(stackNetworkNames(t, cli, release), wantNetworks)
 	})
 
 	// The half the chart still declares survives. A sweep that deleted
 	// everything under the namespace would pass without this.
-	if got := stackConfigNames(t, cli, release); !slices.Equal(got, wantConfigs) {
-		t.Errorf("configs = %v, want only the one still declared", got)
-	}
 	if got := stackNetworkNames(t, cli, release); !slices.Equal(got, wantNetworks) {
 		t.Errorf("networks = %v, want only the one still declared", got)
-	}
-	if got := stackSecretNames(t, cli, release); len(got) != 0 {
-		t.Errorf("secrets = %v, want the dropped one gone", got)
 	}
 
 	// The service sweep still works, and the surviving service keeps its id — a
@@ -94,11 +87,16 @@ func TestResourcesDroppedFromATemplateArePruned(t *testing.T) {
 // The #62 lesson, one kind further out. A config carrying the stack's namespace
 // label that no revision of ours ever declared is not ours to delete, whatever
 // the label says — the label says where it lives, not who put it there.
+//
+// #99 made this the load-bearing test of the config sweep rather than a corner of
+// it. No manifest can declare a config any more, so declaredNames reports none
+// for every release there is, and every namespace-labelled config on the swarm is
+// now something the sweep sees as undeclared. The ownership check is the only
+// thing between that and deleting all of them, and this is what holds it down.
 func TestAConfigThisControllerNeverDeclaredIsNeverPruned(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-res-stranger"
-	dir := t.TempDir()
-	repo := gitRepo(t, chartFilesWithPrunables(t, release, dir, true))
+	repo := gitRepo(t, chartFilesWithPrunables(release, true))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
 	rec := reconciler(t, sweepingApp("edge", repo, application.DriftManifest))
@@ -114,9 +112,9 @@ func TestAConfigThisControllerNeverDeclaredIsNeverPruned(t *testing.T) {
 
 	// Drop the extras, so the sweep runs and has something it may legitimately
 	// delete beside the one it may not.
-	commitChange(t, repo, chartFilesWithPrunables(t, release, dir, false))
+	commitChange(t, repo, chartFilesWithPrunables(release, false))
 	syncUntilConverged(t, rec, "edge", func() bool {
-		return len(stackSecretNames(t, cli, release)) == 0
+		return slices.Equal(stackNetworkNames(t, cli, release), []string{release + "_keep"})
 	})
 
 	if got := stackConfigNames(t, cli, release); !slices.Contains(got, stranger) {

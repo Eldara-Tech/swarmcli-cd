@@ -7,8 +7,6 @@ package integration
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -141,87 +139,21 @@ func TestAStackMayNotMountAReleaseRecord(t *testing.T) {
 	}
 }
 
-// claimerChartFiles is the other way to get at a name: the config is one of the
-// stack's **own** — no `external:` anywhere — and `name:` points it at something
-// that already exists. Conversion namespace-scopes a declaration by default,
-// which is what makes an unscoped one worth refusing.
+// The other way to get at a name — the config is one of the stack's **own**, no
+// `external:` anywhere, and `name:` points it at something that already exists —
+// used to be covered here by TestAStackMayNotClaimAReleaseRecordAsItsOwn.
 //
-// The `file:` is sourced from a directory the test owns, resolved against the
-// controller's filesystem — which here is the test process. Its contents are
-// irrelevant: a resource that already exists is never created from them.
-func claimerChartFiles(t *testing.T, release, target string) map[string]string {
-	t.Helper()
-	decoy := filepath.Join(t.TempDir(), "decoy.conf")
-	if err := os.WriteFile(decoy, []byte("not the real thing\n"), 0o600); err != nil {
-		t.Fatalf("writing the decoy: %v", err)
-	}
-	files := chartFiles(release, 1)
-	files["charts/app/templates/stack.yaml"] = "" +
-		"version: \"3.9\"\n" +
-		"services:\n" +
-		"  claimer:\n" +
-		"    image: busybox:1.36\n" +
-		"    command: [\"sleep\", \"3600\"]\n" +
-		"    configs: [\"mine\"]\n" +
-		"    deploy:\n" +
-		"      labels:\n" +
-		"        com.swarmcli.release: {{ .Release.Name }}\n" +
-		"configs:\n" +
-		"  mine:\n" +
-		"    name: \"" + target + "\"\n" +
-		"    file: " + decoy + "\n"
-	return files
-}
-
-// A tenant stack may not claim one of the engine's release records as its own
-// (#86).
+// #99 removed the route rather than the rule. That shape needs a stack-owned
+// config, a config's only content is `file:`, and `file:` read the controller's
+// own filesystem, so it is refused before conversion. A config has no `driver:`
+// to declare it without content the way a secret does, so there is no manifest
+// left that reaches the declared-name branch of the guard for a config, and no
+// honest way to deploy this against a real swarm.
 //
-// This is the same theft as the test above by a different route, and the route is
-// the point: nothing here is an `external:` reference, so the guard's reference
-// check sees a name the stack declares and passes it, and CE's external-reference
-// pre-flight has nothing to pre-flight either. What used to stop it was the
-// applier noticing, three steps later, that a config with that name already held
-// different content — an error about immutability, for an attempt to take another
-// release's rendered manifest over, after a network had already been created.
-//
-// A real swarm is what makes it a proof: the record exists under the name the
-// manifest claims, the daemon would have handed it over, and the refusal comes
-// from the applier rather than from something upstream declining for an unrelated
-// reason.
-func TestAStackMayNotClaimAReleaseRecordAsItsOwn(t *testing.T) {
-	cli := dockerClient(t)
-	const (
-		victim  = "e2e-claim-victim"
-		claimer = "e2e-claim-claimer"
-	)
-	victimRepo := gitRepo(t, chartFiles(victim, 1))
-	t.Cleanup(func() { removeStack(t, victim); removeStack(t, claimer) })
-
-	ctx := context.Background()
-	rec := reconciler(t, releaseApp("victim", victimRepo, true))
-	if err := rec.SyncNow(ctx, "victim"); err != nil {
-		t.Fatalf("SyncNow(victim) = %v, want nil", err)
-	}
-	waitForRunning(t, cli, victim, 1)
-
-	record := "swarmcli.release." + victim + ".v1"
-	claimerRepo := gitRepo(t, claimerChartFiles(t, claimer, record))
-
-	rec2 := reconciler(t, releaseApp("claimer", claimerRepo, true))
-	err := rec2.SyncNow(ctx, "claimer")
-	if err == nil {
-		t.Fatal("SyncNow(claimer) = nil, want the deploy refused for claiming a release record")
-	}
-	if !strings.Contains(err.Error(), "declares") || !strings.Contains(err.Error(), "release record") {
-		t.Fatalf("SyncNow(claimer) = %v, want it refused by the mount guard for declaring the name", err)
-	}
-
-	if names := serviceNamesOf(t, cli, claimer); len(names) != 0 {
-		t.Errorf("services = %v, want none created by a refused deploy", names)
-	}
-	// The victim's record is still the victim's, with its own content and no
-	// tenant namespace label on it.
-	if got := configLabels(t, cli, record)["com.docker.stack.namespace"]; got != "" {
-		t.Errorf("the release record carries namespace label %q; a refused deploy relabelled it", got)
-	}
-}
+// The rule is still enforced and still tested: backend's
+// TestDeployStackRefusesAStackDeclaringAReleaseRecordName addresses
+// rejectForbiddenResources directly. What is gone is the end-to-end proof — that
+// the record exists under the claimed name, that the refusal comes from the
+// applier rather than from something upstream, and that a refused deploy leaves
+// the victim's record unlabelled. Restore this test if a chart is ever given a
+// way to carry content of its own.

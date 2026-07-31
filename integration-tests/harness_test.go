@@ -289,11 +289,10 @@ func removeStack(t *testing.T, release string) {
 // must not touch.
 //
 // Configs and secrets are absent here because this fixture does not need them —
-// see chartFilesWithPrunables for one that declares both. Compose sources them
-// with `file:`, which the loader resolves against the controller's own
-// filesystem; that reads like a fixture cannot have one, but in these tests the
-// controller *is* the test process, so an absolute path under t.TempDir() works.
-// What must not appear is a path hard-coded to somebody's checkout.
+// see richChartFiles for one that references both. Since #99 that has to be an
+// `external:` reference to something already on the swarm: a chart cannot carry
+// content, because the only key that ever did read the controller's own
+// filesystem rather than the chart's.
 //
 // What this fixture is for is the two behaviours only a real swarm can show — a
 // network that can only be removed once its tasks are gone, and a volume that
@@ -483,23 +482,19 @@ func liveDriftApp(name, repoDir string, automated bool) application.Spec {
 //
 // Two services, so that "one of them is missing" is a case that exists.
 //
-// It takes t because a mounted config and secret have to come from somewhere:
-// compose sources them with `file:`, resolved against the controller's own
-// filesystem, which in these tests is the test process — so a path under
-// t.TempDir() is exactly right, and a path hard-coded to somebody's checkout is
-// what must not appear. See chartFilesWithPrunables, which does the same.
+// It takes t because the mounted config and secret have to exist on the swarm
+// before the deploy: they are `external:`, which since #99 is the only way a
+// chart can reference either. The fixture creates them itself, named after the
+// release so that the twelve tests using it do not share one pair.
+//
+// What the comparison actually reads is the reference on the service — a name,
+// an id and a target path — and an external reference carries all three, so
+// nothing about the mount comparison is weaker for the resources being an
+// operator's rather than the stack's. What no longer happens is the deploy
+// creating them, which this fixture never asserted.
 func richChartFiles(t *testing.T, release string, replicas int) map[string]string {
 	t.Helper()
-	dir := t.TempDir()
-	write := func(name, content string) string {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatalf("writing fixture file %q: %v", path, err)
-		}
-		return path
-	}
-	siteFile := write("site.conf", "listen 8080\n")
-	tokenFile := write("token", "s3cr3t\n")
+	site, token := createExternalConfigAndSecret(t, release)
 
 	files := chartFiles(release, replicas)
 	files["charts/app/templates/stack.yaml"] = "" +
@@ -633,14 +628,73 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 		"  internal: {}\n" +
 		"volumes:\n" +
 		"  data: {}\n" +
+		// `external: true` with a sibling `name:` — the service keeps referencing
+		// the compose key, and the name is what the resource is called on the
+		// swarm. That is the form Eldara-Tech/swarmcli#513 taught CE's
+		// external-reference pre-flight to resolve, and this repo pins past it.
 		"configs:\n" +
 		"  site:\n" +
-		"    file: " + siteFile + "\n" +
+		"    external: true\n" +
+		"    name: \"" + site + "\"\n" +
 		"secrets:\n" +
 		"  token:\n" +
-		"    file: " + tokenFile + "\n"
+		"    external: true\n" +
+		"    name: \"" + token + "\"\n"
 	return files
 }
+
+// createExternalConfigAndSecret puts a config and a secret on the swarm for a
+// chart to reference, the way an operator would, and returns their names.
+//
+// Since #99 a chart cannot carry content of its own, so a fixture that needs a
+// mounted config or secret has to be handed one. These carry no namespace label:
+// they are nobody's stack's, which is the whole point of an external reference,
+// and it also keeps them out of every stack-scoped lister in this file.
+//
+// Removal is best-effort and runs after the stack's, because t.Cleanup is LIFO
+// and every caller registers this first. Swarm refuses to remove a config a
+// service still holds, and a cleanup that failed the test for losing that race
+// would be worse than a leftover on a developer's swarm.
+func createExternalConfigAndSecret(t *testing.T, release string) (config, secret string) {
+	t.Helper()
+	cli := dockerClient(t)
+	ctx := context.Background()
+	config, secret = externalConfigName(release), externalSecretName(release)
+
+	// Best effort, for a leftover from a run that did not reach its cleanup: the
+	// name is fixed per release, so one stale resource would fail the create and
+	// every test using this fixture with it.
+	_ = cli.ConfigRemove(ctx, config)
+	_ = cli.SecretRemove(ctx, secret)
+
+	if _, err := cli.ConfigCreate(ctx, swarm.ConfigSpec{
+		Annotations: swarm.Annotations{Name: config},
+		Data:        []byte("listen 8080\n"),
+	}); err != nil {
+		t.Fatalf("creating external config %q: %v", config, err)
+	}
+	t.Cleanup(func() { _ = cli.ConfigRemove(ctx, config) })
+
+	if _, err := cli.SecretCreate(ctx, swarm.SecretSpec{
+		Annotations: swarm.Annotations{Name: secret},
+		Data:        []byte("s3cr3t\n"),
+	}); err != nil {
+		t.Fatalf("creating external secret %q: %v", secret, err)
+	}
+	t.Cleanup(func() { _ = cli.SecretRemove(ctx, secret) })
+
+	return config, secret
+}
+
+// externalConfigName and externalSecretName are what richChartFiles' resources
+// are called on the swarm.
+//
+// Named here rather than spelled out at each use because a live drift field is
+// keyed by the reference's name — `secrets[<name>]` — so an assertion about one
+// has to agree with the fixture exactly. A hyphen rather than the `_` of a scoped
+// name, because these belong to no stack.
+func externalConfigName(release string) string { return release + "-site" }
+func externalSecretName(release string) string { return release + "-token" }
 
 // richTasks is how many running tasks richChartFiles deploys for a given app
 // replica count: the app's own, plus the sidecar beside it.
@@ -797,17 +851,6 @@ func sweepingApp(name, repoDir string, mode application.DriftDetection) applicat
 	return app
 }
 
-// configLabels reads one config's labels by name, for asserting that a resource
-// belonging to somebody else was left alone.
-func configLabels(t *testing.T, cli *dockerclient.Client, name string) map[string]string {
-	t.Helper()
-	cfg, _, err := cli.ConfigInspectWithRaw(context.Background(), name)
-	if err != nil {
-		t.Fatalf("inspecting config %q: %v", name, err)
-	}
-	return cfg.Spec.Labels
-}
-
 // serviceNamesOf lists a stack's running services by scoped name.
 func serviceNamesOf(t *testing.T, cli *dockerclient.Client, release string) []string {
 	t.Helper()
@@ -847,40 +890,26 @@ func createServiceByHand(t *testing.T, cli *dockerclient.Client, release, name s
 
 // ------------------------------------------ what a chart stops declaring (#80)
 
-// chartFilesWithPrunables is a stack that declares all four kinds and puts half
-// of each behind a value, so that one commit drops a service, a network, a
-// config and a secret while changing nothing else about the release.
+// chartFilesWithPrunables is a stack that puts a service and a network behind a
+// value, so that one commit drops both while changing nothing else about the
+// release.
 //
 // The half that stays is the point. A sweep that deleted everything under the
 // namespace would satisfy a fixture that only dropped things, so `keep` is
 // declared in both renders and asserted to survive.
 //
-// dir is a directory the test owns. Compose sources a config or secret with
-// `file:`, resolved against the controller's filesystem — which in these tests
-// is the test process, so an absolute path under t.TempDir() is exactly right.
-//
-// `app` mounts the `keep` config deliberately: a chart mounting a config it
-// declares itself is what swarmcli-cd#84 made impossible, so this is that fix
-// under a real daemon as well as a config the sweep must not touch. `drop` and
-// the secret stay unmounted, because the sweep is meant to remove those two and
-// Swarm refuses to remove a config or secret a service is using.
+// It used to drop a config and a secret too, and that was most of what it was
+// for — #80 covered the three kinds #75 left open. Since #99 a stack cannot own
+// either: content came from `file:`, which read the controller's filesystem, and
+// an `external:` declaration is a reference that declaredNames deliberately does
+// not report, so it is never a sweep candidate. There is no manifest left that
+// puts a config or a secret in range of the sweep, so those two are gone rather
+// than converted into a case that would pass while exercising nothing.
 //
 // The drop of the `drop` network is what needs the real swarm: the sidecar is
 // attached to it, so it cannot be removed until that service's tasks have
 // drained.
-func chartFilesWithPrunables(t *testing.T, release, dir string, extras bool) map[string]string {
-	t.Helper()
-	write := func(name, content string) string {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatalf("writing fixture file %q: %v", path, err)
-		}
-		return path
-	}
-	keepFile := write("keep.conf", "keep\n")
-	dropFile := write("drop.conf", "drop\n")
-	secretFile := write("drop.secret", "s3cr3t\n")
-
+func chartFilesWithPrunables(release string, extras bool) map[string]string {
 	files := chartFiles(release, 1)
 	files["charts/app/values.yaml"] = "replicas: 1\nextras: " + truth(extras) + "\n"
 	files["charts/app/templates/stack.yaml"] = "" +
@@ -890,7 +919,6 @@ func chartFilesWithPrunables(t *testing.T, release, dir string, extras bool) map
 		"    image: busybox:1.36\n" +
 		"    command: [\"sleep\", \"3600\"]\n" +
 		"    networks: [keep]\n" +
-		"    configs: [keep]\n" +
 		"    deploy:\n" +
 		"      replicas: {{ .Values.replicas }}\n" +
 		"      labels:\n" +
@@ -908,18 +936,6 @@ func chartFilesWithPrunables(t *testing.T, release, dir string, extras bool) map
 		"  keep: {}\n" +
 		"{{- if .Values.extras }}\n" +
 		"  drop: {}\n" +
-		"{{- end }}\n" +
-		"configs:\n" +
-		"  keep:\n" +
-		"    file: " + keepFile + "\n" +
-		"{{- if .Values.extras }}\n" +
-		"  drop:\n" +
-		"    file: " + dropFile + "\n" +
-		"{{- end }}\n" +
-		"{{- if .Values.extras }}\n" +
-		"secrets:\n" +
-		"  drop:\n" +
-		"    file: " + secretFile + "\n" +
 		"{{- end }}\n"
 	return files
 }
@@ -939,21 +955,6 @@ func stackConfigNames(t *testing.T, cli *dockerclient.Client, release string) []
 			continue
 		}
 		names = append(names, c.Spec.Name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// stackSecretNames lists a stack's secrets by scoped name.
-func stackSecretNames(t *testing.T, cli *dockerclient.Client, release string) []string {
-	t.Helper()
-	secrets, err := cli.SecretList(context.Background(), swarm.SecretListOptions{Filters: stackFilter(release)})
-	if err != nil {
-		t.Fatalf("listing secrets of %q: %v", release, err)
-	}
-	names := make([]string, 0, len(secrets))
-	for _, s := range secrets {
-		names = append(names, s.Spec.Name)
 	}
 	sort.Strings(names)
 	return names
