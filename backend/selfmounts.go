@@ -11,6 +11,7 @@ import (
 
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/swarm"
 )
 
@@ -35,6 +36,17 @@ type selfMounts struct {
 	namespace string
 	secrets   map[string]struct{}
 	configs   map[string]struct{}
+	// volumes names the volumes Swarm has mounted into this controller — for the
+	// shipped stack.yml, the one holding every application's git clone and chart
+	// cache.
+	//
+	// By name, because that is what a mount carries: the daemon rewrites a
+	// service's *network* attachments to ids as it creates the service
+	// (daemon/cluster.populateNetworkID — see LiveNetworkNames, which exists to
+	// undo it) but stores a mount's Source exactly as it was given. That
+	// difference is why the network half of the same guard compares namespaces
+	// instead: there would be no names here to compare one against.
+	volumes map[string]struct{}
 }
 
 // selfMountCache holds that answer for the life of the process.
@@ -57,9 +69,9 @@ type selfMountCache struct {
 	val    selfMounts
 }
 
-// mounts names the secrets and configs Swarm has mounted into this controller,
-// and the stack namespace it deployed it under, reading its own service spec the
-// first time it is asked.
+// mounts names the secrets, configs and volumes Swarm has mounted into this
+// controller, and the stack namespace it deployed it under, reading its own
+// service spec the first time it is asked.
 //
 // # Why the daemon rather than the filesystem
 //
@@ -174,11 +186,21 @@ func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 	}
 	out.secrets = make(map[string]struct{}, len(cs.Secrets))
 	out.configs = make(map[string]struct{}, len(cs.Configs))
+	out.volumes = make(map[string]struct{}, len(cs.Mounts))
 	for _, ref := range cs.Secrets {
 		out.secrets[ref.SecretName] = struct{}{}
 	}
 	for _, ref := range cs.Configs {
 		out.configs[ref.ConfigName] = struct{}{}
+	}
+	// Only the named volumes. A bind's source is a path on the node rather than a
+	// cluster-wide name, so nothing a tenant manifest writes resolves *to* it —
+	// naming the same path is the host-path question compose.reachesDockerSocket
+	// leaves open, not this one. An anonymous volume has no source at all.
+	for _, m := range cs.Mounts {
+		if m.Type == mount.TypeVolume && m.Source != "" {
+			out.volumes[m.Source] = struct{}{}
+		}
 	}
 	return out, nil
 }
