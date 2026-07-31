@@ -140,7 +140,13 @@ type updateCall struct {
 // spec fields.
 func (f *fakeAPI) ClientVersion() string { return "1.51" }
 
-func (f *fakeAPI) ServiceList(_ context.Context, o swarm.ServiceListOptions) ([]swarm.Service, error) {
+// The context is honoured, as the real client's is. A fake that ignored it would
+// let a caller reading the swarm on an uncancellable context ship green — which
+// is exactly what happened before charts.Backend took one.
+func (f *fakeAPI) ServiceList(ctx context.Context, o swarm.ServiceListOptions) ([]swarm.Service, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
 	if f.listErr != nil {
 		return nil, f.listErr
@@ -898,18 +904,26 @@ func (f *fakeAPI) VolumeRemove(_ context.Context, name string, _ bool) error {
 	return f.removeErr[key]
 }
 
-func (f *fakeAPI) NodeList(context.Context, swarm.NodeListOptions) ([]swarm.Node, error) {
+func (f *fakeAPI) NodeList(ctx context.Context, _ swarm.NodeListOptions) ([]swarm.Node, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.nodeErr != nil {
 		return nil, f.nodeErr
 	}
 	return f.nodes, nil
 }
 
-func (f *fakeAPI) TaskList(context.Context, swarm.TaskListOptions) ([]swarm.Task, error) {
+func (f *fakeAPI) TaskList(ctx context.Context, _ swarm.TaskListOptions) ([]swarm.Task, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return f.tasks, nil
 }
 
-func (f *fakeAPI) Info(context.Context) (system.Info, error) { return system.Info{}, nil }
+func (f *fakeAPI) Info(ctx context.Context) (system.Info, error) {
+	return system.Info{}, ctx.Err()
+}
 
 // The other half of the digest case, and the one that only matters once a
 // controller corrects drift: the live image is not ours.

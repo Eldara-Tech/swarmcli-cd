@@ -6,7 +6,9 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,9 +92,9 @@ type blockingBackend struct {
 	release chan struct{}
 }
 
-func (b *blockingBackend) StackServices(string) []charts.ServiceState { return nil }
+func (b *blockingBackend) StackServices(context.Context, string) []charts.ServiceState { return nil }
 
-func (b *blockingBackend) ReadStackServices(string) ([]charts.ServiceState, error) {
+func (b *blockingBackend) ReadStackServices(context.Context, string) ([]charts.ServiceState, error) {
 	select {
 	case b.entered <- struct{}{}:
 	default:
@@ -386,4 +388,201 @@ func shorten(t *testing.T, d *time.Duration, to time.Duration) {
 	was := *d
 	*d = to
 	t.Cleanup(func() { *d = was })
+}
+
+// countingReader is the honest single read with a call counter, and no batched
+// seam — so it stands in for a backend that has not implemented one.
+type countingReader struct {
+	charts.Backend
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingReader) StackServices(context.Context, string) []charts.ServiceState { return nil }
+
+func (c *countingReader) ReadStackServices(context.Context, string) ([]charts.ServiceState, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return nil, nil
+}
+
+func (c *countingReader) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// batchingReader implements the batched seam and counts how many times the swarm
+// was actually asked.
+type batchingReader struct {
+	countingReader
+	mu        sync.Mutex
+	reads     int
+	lastAsked []string
+}
+
+func (b *batchingReader) ReadStacks(_ context.Context, releases []string) (map[string][]charts.ServiceState, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reads++
+	b.lastAsked = slices.Clone(releases)
+	out := make(map[string][]charts.ServiceState, len(releases))
+	for _, r := range releases {
+		out[r] = nil
+	}
+	return out, nil
+}
+
+func (b *batchingReader) stats() (int, []string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reads, slices.Clone(b.lastAsked)
+}
+
+// threeReleases is a plan whose releases are all deployed, so all three are read.
+func threeReleases() *charts.Plan {
+	return &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "whoami", Ref: "repo/whoami", Action: charts.ActionUnchanged, ToVersion: "0.1.8"},
+		{Name: "api", Ref: "repo/api", Action: charts.ActionUnchanged, ToVersion: "0.1.8"},
+		{Name: "web", Ref: "repo/web", Action: charts.ActionUnchanged, ToVersion: "0.1.8"},
+	}}
+}
+
+// TestTheSwarmIsReadOncePerReconcileNotOncePerRelease is #134.
+//
+// The read behind StackServices is a whole-swarm snapshot — NodeList,
+// ServiceList, TaskList and Info — filtered by stack name afterwards. Asking it
+// per release fetched the entire swarm per release and threw away all but one
+// stack's worth each time, so three releases meant three identical round trips
+// on every reconcile, against the manager the controller runs on.
+func TestTheSwarmIsReadOncePerReconcileNotOncePerRelease(t *testing.T) {
+	backend := &batchingReader{}
+	r := newTestWith(t, []application.Spec{spec("edge", true)},
+		&fakeEngine{plans: []*charts.Plan{threeReleases()}}, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	reads, asked := backend.stats()
+	if reads != 1 {
+		t.Errorf("asked the swarm %d times for three releases, want 1", reads)
+	}
+	slices.Sort(asked)
+	if want := []string{"api", "web", "whoami"}; !slices.Equal(asked, want) {
+		t.Errorf("asked about %v, want %v", asked, want)
+	}
+	if n := backend.countingReader.count(); n != 0 {
+		t.Errorf("fell back to %d per-release reads despite the batched seam", n)
+	}
+}
+
+// A backend without the batched seam still works, one read per release, which is
+// what a Phase 3 remote backend reached through the same swarms seam gets.
+func TestABackendWithoutTheBatchedReadStillAnswers(t *testing.T) {
+	backend := &countingReader{}
+	r := newTestWith(t, []application.Spec{spec("edge", true)},
+		&fakeEngine{plans: []*charts.Plan{threeReleases()}}, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if n := backend.count(); n != 3 {
+		t.Errorf("read %d releases, want 3 — the fallback must still answer for each", n)
+	}
+	if view, _ := r.View("edge"); len(view.Status.Releases) != 3 {
+		t.Errorf("recorded %d releases, want 3", len(view.Status.Releases))
+	}
+}
+
+// A read that fails publishes every release as unread rather than as a swarm
+// with nothing on it, which is the distinction #107 turned on. The batched read
+// is all-or-nothing precisely so that answer stays available.
+func TestAFailedBatchedReadIsNotAnEmptySwarm(t *testing.T) {
+	r := newTestWith(t, []application.Spec{spec("edge", true)},
+		&fakeEngine{plans: []*charts.Plan{threeReleases()}}, nil, fakeRegistry{backend: &failingBatchReader{}})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil: a failed read is reported, not a failed reconcile", err)
+	}
+
+	view, _ := r.View("edge")
+	for _, rel := range view.Status.Releases {
+		if rel.Health.State == application.HealthMissing {
+			t.Fatalf("release %q reported missing; an unreadable daemon is not an empty swarm", rel.Name)
+		}
+	}
+}
+
+type failingBatchReader struct{ charts.Backend }
+
+func (failingBatchReader) StackServices(context.Context, string) []charts.ServiceState { return nil }
+
+func (failingBatchReader) ReadStacks(context.Context, []string) (map[string][]charts.ServiceState, error) {
+	return nil, errors.New("daemon unreachable")
+}
+
+// TestTheDaemonReadRunsUnderTheSyncsContext is what the CE widening bought, and
+// the last of #106's four.
+//
+// charts.Backend declared DeployStack, RemoveStack, RefreshSnapshot and
+// StackServices with no context, so this backend substituted
+// context.Background() at every one of them and cancellation could not reach the
+// daemon at all: a controller being shut down, or an application being retired,
+// could only wait for whatever was in flight. Eldara-Tech/swarmcli#532 widened
+// them; this is the end of that thread arriving.
+//
+// Asserted on the read rather than on the deploy because the engine is faked
+// here — CE's own suite covers Apply threading it to DeployStack — and because
+// the read is on every reconcile, not only on one that deploys.
+func TestTheDaemonReadRunsUnderTheSyncsContext(t *testing.T) {
+	backend := &ctxCapturingBackend{read: make(chan context.Context, 4)}
+	r := newTestWith(t, []application.Spec{spec("edge", true)},
+		&fakeEngine{plans: []*charts.Plan{synced(), synced()}}, nil, fakeRegistry{backend: backend})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Sync(ctx, "edge") }()
+
+	var readCtx context.Context
+	select {
+	case readCtx = <-backend.read:
+	case <-time.After(respond):
+		t.Fatal("the reconcile never read the swarm")
+	}
+
+	// The point: it is the sync's context, not one this backend invented.
+	if readCtx.Done() == nil {
+		t.Fatal("the swarm read runs under a context that can never be cancelled")
+	}
+	cancel()
+	select {
+	case <-readCtx.Done():
+	case <-time.After(respond):
+		t.Fatal("cancelling the sync did not reach the context the swarm read runs under")
+	}
+	<-done
+}
+
+// ctxCapturingBackend hands back the context its swarm read was given.
+type ctxCapturingBackend struct {
+	charts.Backend
+	read chan context.Context
+}
+
+func (b *ctxCapturingBackend) StackServices(context.Context, string) []charts.ServiceState {
+	return nil
+}
+
+func (b *ctxCapturingBackend) ReadStacks(ctx context.Context, releases []string) (map[string][]charts.ServiceState, error) {
+	select {
+	case b.read <- ctx:
+	default:
+	}
+	out := make(map[string][]charts.ServiceState, len(releases))
+	for _, r := range releases {
+		out[r] = nil
+	}
+	return out, nil
 }
