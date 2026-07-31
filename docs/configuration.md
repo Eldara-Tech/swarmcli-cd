@@ -947,6 +947,9 @@ line that shows exactly what the controller is following is worth having in
 | `--appset-dir` | — | read the app set from a directory something else keeps current. Selects **path** mode |
 | `--appset-path` | `applications.yaml` in path mode | the set's path within the repository or the directory. Required with `--appset-repo` |
 | `--appset-interval` | `3m` | how often the app set is re-read |
+| `--prune` | off | delete the resources of an application that has left the app set instead of leaving its stack running and reporting it as orphaned. See [prune](#prune) |
+| `--prune-volumes` | off | extend `--prune` to named volumes, the one part nothing can restore. Requires `--prune` |
+| `--controller-id` | `default` | this controller's identity, stamped on every release it installs. Two controllers on one swarm must be given different ones; see [two controllers on one swarm](#two-controllers-on-one-swarm) |
 | `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
 | `--log-format` | `text` | `text` or `json` |
 

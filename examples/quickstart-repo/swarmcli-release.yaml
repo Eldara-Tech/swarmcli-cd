@@ -4,8 +4,8 @@
 # git and reconciled continuously.
 #
 # Do not set `owner:` here. When swarmcli-cd applies a release file it stamps
-# every release with its own owner, cd/<application-name>, so the file's owner is
-# ignored — see ../../docs/concepts.md#ownership.
+# every release with its own owner, cd/<controller-id>/<application>, so the
+# file's owner is ignored — see ../../docs/concepts.md#ownership.
 apiVersion: v1
 releases:
   - name: whoami

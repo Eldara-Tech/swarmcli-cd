@@ -22,10 +22,16 @@ golangci-lint run ./...
 ## Conventions
 
 - **Module path** is `github.com/Eldara-Tech/swarmcli-cd`. It depends on CE as a
-  normal versioned module (`require github.com/Eldara-Tech/swarmcli v1.13.0-rc2`)
-  — **no `replace`, no sibling checkout**. That is deliberate: swarmcli-be pays
-  the sibling-checkout tax, and renaming CE's module (Eldara-Tech/swarmcli#476)
-  existed precisely so this repo would not have to.
+  normal versioned module — **no `replace`, no sibling checkout**. That is
+  deliberate: swarmcli-be pays the sibling-checkout tax, and renaming CE's
+  module (Eldara-Tech/swarmcli#476) existed precisely so this repo would not
+  have to. Ask `go.mod` what the pin is rather than trusting a version written
+  down anywhere, including here:
+  ```bash
+  go list -m -f '{{.Version}}' github.com/Eldara-Tech/swarmcli
+  ```
+  A pseudo-version is the normal state between CE releases and builds fine;
+  what it costs at release time is in [RELEASING.md](RELEASING.md).
 - **SPDX header** on every `.go` and `.sh` file, or `licence.yml` fails:
   ```go
   // SPDX-License-Identifier: Apache-2.0
@@ -87,16 +93,49 @@ cmd/swarmcli-cd/   one-line main; the entry point is controller/
 controller/        entry point, command dispatch, daemon wiring, CLI rendering
 client/            HTTP client for the API; the CLI goes through it, not the
                    reconciler, so a UI can do everything the CLI can (D3)
+api/               the HTTP server: the endpoint set and the SSE event stream
 application/       Application spec + status: the wire contract
+config/            reads and validates the applications file
+appset/            where that file comes from — mounted, git, or a directory
+                   something else keeps current — and the loop re-reading it
+
+reconcile/         the pull loop: one goroutine per application, fetch → render
+                   → plan → apply
+git/               fetches a repository and pins it to a commit, on go-git
+                   rather than a git binary
+source/            a checked-out tree → what the chart engine's PlanApply takes
+compose/           a rendered manifest → Swarm specs; the half of
+                   charts.Backend that needs no daemon
+backend/           applies those specs through the moby client — the half that
+                   needs one
+health/            whether what is running actually works — the axis sync does
+                   not answer
+drift/             whether the swarm matches git: drift.go is manifest mode,
+                   live.go the ServiceSpec comparison
+prune/             deletes what git no longer declares, and the ownership rules
+                   deciding what may be deleted at all
+regauth/           per-application registry credentials, from Docker secrets
+
+seam/              the init()-registration mechanism the four seams share (D6)
+swarms/            seam — which swarm a destination resolves to
+authz/             seam — who is calling the API and what they may do
+notify/            seam — reconcile events out; appends rather than replaces
+secrets/           seam — secret material read from an application's own tree
+
 Dockerfile         alpine, no docker binary; stamps both version ldflags
 stack.yml          the in-swarm deploy: manager node, docker.sock, config+secret
+examples/          a commented applications.yaml, a quickstart repo, an app-set
+                   repo
+integration-tests/ `-tags integration`, against a real swarm
 scripts/           check-spdx.sh
 docs/
-.github/workflows/ ci.yml, check_labels.yml, licence.yml
+.github/workflows/ ci.yml, check_labels.yml, licence.yml, integration-tests.yml,
+                   release.yml
 ```
 
 Packages land with the code that needs them rather than as empty directories,
-so this grows one issue at a time.
+so this grows one issue at a time — and this list is the thing that goes stale
+when one lands, so add it here in the same PR.
 
 **Do not put them under `internal/`.** Issue #1 sketches an `internal/` tree
 (`app`, `git`, `render`, `reconcile`, `health`, `swarms`, `store`, `api`,
