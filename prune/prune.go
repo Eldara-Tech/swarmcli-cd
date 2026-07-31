@@ -108,6 +108,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
 )
 
@@ -232,8 +233,8 @@ func purgeVolumes(ctx context.Context, log *slog.Logger, backend charts.Backend,
 // delete the release records — the only thing a later sweep finds the release
 // by — for volumes still sitting on the node that was missing. That is #108
 // re-created one layer up, so the count is checked against the swarm's own
-// through the same swarmSizer purgeThisNode uses, and anything short of equal
-// gets the same honest warning and the same label filter.
+// through the same capability.SwarmSizer purgeThisNode uses, and anything short
+// of equal gets the same honest warning and the same label filter.
 //
 // A node the registry *named* and then could not reach is different, and does
 // fail the whole purge: the registry has contradicted itself, which is a
@@ -432,19 +433,12 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 	return nil
 }
 
-// swarmSizer counts the swarm's nodes. *backend.Backend implements it; a
-// backend that does not cannot say whether its volume listing was the whole
-// swarm's, which for a deletion has to mean the same as knowing it was not.
-type swarmSizer interface {
-	SwarmNodes(ctx context.Context) (int, error)
-}
-
 // swarmSize returns how many nodes the swarm has, and whether that could be
 // established at all. A backend that cannot say, or that failed to, reports
 // false — which for a deletion has to mean the same as knowing the answer was
 // not the one being hoped for.
 func swarmSize(ctx context.Context, backend charts.Backend) (int, bool) {
-	s, ok := backend.(swarmSizer)
+	s, ok := backend.(capability.SwarmSizer)
 	if !ok {
 		return 0, false
 	}
