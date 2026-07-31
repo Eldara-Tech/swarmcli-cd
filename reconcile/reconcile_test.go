@@ -256,6 +256,14 @@ func (r *recorder) Notify(_ context.Context, e notify.Event) {
 	r.got = append(r.got, e)
 }
 
+// events is every event as it was dispatched, for the assertions that are about
+// a field rather than about which events were raised.
+func (r *recorder) events() []notify.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.got)
+}
+
 func (r *recorder) types() []notify.EventType {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2566,7 +2574,7 @@ func TestOutOfBandWriteIsReported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scoped := r.withOutOfBandNotifier(context.Background(), b, "edge")
+	scoped := r.withOutOfBandNotifier(context.Background(), b, spec("edge", true))
 	if err := scoped.DeployStack(t.Context(), "edge", "", ""); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
@@ -4060,5 +4068,51 @@ func TestViewsHandOutSnapshotsOfTheStore(t *testing.T) {
 
 	if second := r.Views(); second[0].Status.Releases[0].Name == "rewritten" {
 		t.Error("one caller's write changed what the next caller is given")
+	}
+}
+
+// ------------------------------------------ every event names its swarm (#131)
+
+// notify.Event.Swarm shipped declared, documented and never written: all
+// thirteen dispatch sites filled Application and Type and left the destination
+// empty, so a Business Edition notifier routing production alerts to one channel
+// and staging to another saw every event arrive from the default destination.
+//
+// Asserted over whatever the run raises rather than over a fixed list, because
+// what this has to survive is a *fourteenth* dispatch site: the bug was never
+// that one literal was wrong, it was that each of them had to remember a field
+// only a multi-swarm build could miss. The spread below is the load-bearing
+// part — one event type would pass this while twelve sites stayed empty.
+func TestEveryEventNamesTheDestinationItConcerns(t *testing.T) {
+	rec := listen(t)
+	spec := sweepingSpec("edge", application.DriftLive)
+	spec.Destination.Swarm = "production"
+
+	// Drifted, so the run also corrects and announces the correction; the sweep
+	// on top of it removes one service and is refused three resources. Six event
+	// types out of one sync, across six different dispatch sites.
+	backend := refusingSweep()
+	backend.live["whoami"]["whoami_app"] = swarm.Service{ID: "id-app", Spec: serviceSpec("whoami_app", 3)}
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{spec}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	events := rec.events()
+	seen := map[notify.EventType]struct{}{}
+	for _, e := range events {
+		seen[e.Type] = struct{}{}
+		if e.Swarm != "production" {
+			t.Errorf("event %s carries swarm %q, want the application's destination", e.Type, e.Swarm)
+		}
+		if e.Application != "edge" {
+			t.Errorf("event %s carries application %q, want edge", e.Type, e.Application)
+		}
+	}
+	if len(seen) < 5 {
+		t.Errorf("saw %d event types (%v), want the spread this test is built to cover — "+
+			"a run that stopped raising events would pass every assertion above", len(seen), rec.types())
 	}
 }
