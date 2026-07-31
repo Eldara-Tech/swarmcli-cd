@@ -216,8 +216,10 @@ one is written on every deploy. They are matched by their label at deploy time.
 Nothing here needs configuring, and there is no flag to forget. A controller that
 is **not** running as a Swarm service — a development run — has nothing mounted
 by Swarm and nothing of its own to protect, so this is inert rather than broken.
-If the daemon is reachable but will not answer, the deploy **fails** rather than
-proceeding unguarded, and the next one tries again.
+If that read does not get through — the daemon unreachable, or reachable and
+answering with an error — the deploy **fails** rather than proceeding unguarded,
+and the next one tries again. A failure is never remembered as "nothing is
+mounted": only an answer is.
 
 An ordinary `external:` reference to a config or secret an operator created for
 their own stacks is unaffected, and so is a chart declaring and mounting its own.
