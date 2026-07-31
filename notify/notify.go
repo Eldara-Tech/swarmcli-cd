@@ -66,6 +66,22 @@ type Event struct {
 	Revision    string // the resolved commit, where one applies
 	Message     string
 	At          time.Time
+	// Swarm is the destination the event concerns, as
+	// application.Spec.Destination names it. Empty is the swarm the controller
+	// runs in.
+	//
+	// It is here because routing is what a Business Edition notifier does —
+	// production alerts to one channel, staging to another — and without it the
+	// only thing to route on is Message, which is prose written for a human.
+	// Deciding where an alert goes by matching on a sentence is a notifier that
+	// breaks when somebody improves the wording.
+	//
+	// **The reconciler does not set it yet (#131.)** Every event it dispatches
+	// leaves it empty, which is exactly right for a build that resolves one
+	// swarm and exactly wrong for one that does not. The field is here anyway
+	// because Event is a struct: it costs nothing now and the alternative is a
+	// second change to the same type later.
+	Swarm string
 }
 
 // Notifier receives events.

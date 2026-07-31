@@ -121,6 +121,8 @@ regauth/           per-application registry credentials, from Docker secrets
 
 seam/              the init()-registration mechanism the four seams share (D6)
 swarms/            seam — which swarm a destination resolves to
+swarms/local/      its OSS default, blank-imported by cmd/ so that the seam
+                   stays a contract and importing it does not link backend/
 authz/             seam — who is calling the API and what they may do
 notify/            seam — reconcile events out; appends rather than replaces
 secrets/           seam — secret material read from an application's own tree
@@ -171,3 +173,13 @@ Per D6 the private `swarmcli-cd-be` companion is deferred to Phase 3, but the
 `SecretProvider`, each an interface with a working OSS default, replaced via Go
 `init()` self-registration (the mechanism swarmcli-be already uses — see its
 `docs/extensibility.md`). No build tags, no stubbed files in the public tree.
+
+The companion does not exist yet, and that is the whole of the deadline: every
+parameter list a companion implements is frozen the day it ships, and every
+struct field stays free forever. **So take parameters as structs from the first
+commit** — `swarms.Target`, `swarms.Node`, `secrets.Request`, `authz.Subject`,
+`notify.Event` all exist for that reason. Where a capability may genuinely be
+absent, state it as an optional interface the caller type-asserts for rather
+than as a method on the seam, so a companion implementing one thing does not
+have to stub four (`swarms.Lister`, `swarms.NodeReach`). `docs/extensibility.md`
+is the fuller version, including what a companion still cannot do.

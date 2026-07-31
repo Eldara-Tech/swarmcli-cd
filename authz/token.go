@@ -97,6 +97,14 @@ func (t *token) Authenticate(r *http.Request) (Subject, error) {
 // administrator, so there is nothing left to decide.
 func (t *token) Authorize(_ context.Context, _ Subject, _ Action, _ string) error { return nil }
 
+// Visible implements Authorizer. There is one subject and it may see
+// everything, so there is nothing to narrow — the applications come back as
+// they went in, including a nil, which is the empty list a caller ranges over
+// without noticing.
+func (t *token) Visible(_ context.Context, _ Subject, _ Action, applications []string) ([]string, error) {
+	return applications, nil
+}
+
 // bearer extracts the credential from an Authorization header, accepting the
 // scheme case-insensitively as RFC 7235 requires.
 func bearer(header string) (string, bool) {

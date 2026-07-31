@@ -43,6 +43,10 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
+
+	// The OSS registry, which the binary blank-imports from its main. These
+	// tests build the same wiring without that main, so they take it here.
+	_ "github.com/Eldara-Tech/swarmcli-cd/swarms/local"
 )
 
 // branch is the branch every fixture repository commits to. The application's
@@ -274,7 +278,7 @@ func waitForRunning(t *testing.T, cli *dockerclient.Client, release string, want
 // stack would make the next run's assertions lie.
 func removeStack(t *testing.T, release string) {
 	t.Helper()
-	backend, err := swarms.Get().Backend(context.Background(), "")
+	backend, err := swarms.Get().Backend(context.Background(), swarms.Target{})
 	if err != nil {
 		t.Logf("cleanup: resolving backend: %v", err)
 		return

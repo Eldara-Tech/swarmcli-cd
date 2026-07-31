@@ -477,6 +477,50 @@ func TestPlaintextProviderLeavesValuesInPlace(t *testing.T) {
 	}
 }
 
+// The provider is told which application the material belongs to, so one
+// holding per-application key material can pick a key. A path and some bytes
+// say nothing about who they belong to, and the builder is the only thing that
+// knows.
+func TestProviderIsToldWhichApplicationTheMaterialBelongsTo(t *testing.T) {
+	seen := &recordingProvider{}
+	useProvider(t, seen)
+
+	co := tree(t, map[string]string{
+		"charts/hello/Chart.yaml": "apiVersion: v1\nname: hello\nversion: 0.1.0\n",
+		"values/plain.yaml":       "image: whoami\n",
+	})
+
+	got, err := builder(t).Build(context.Background(), "edge", application.Source{
+		Chart: &application.ChartSource{Release: "hello", Path: "charts/hello", Values: []string{"values/plain.yaml"}},
+	}, co)
+	if err != nil {
+		t.Fatalf("Build = %v, want nil", err)
+	}
+	if _, err := got.ReadFile(got.ReleaseFile.ValuesPaths(got.ReleaseFile.Releases[0])[0]); err != nil {
+		t.Fatalf("ReadFile = %v, want nil", err)
+	}
+
+	if len(seen.requests) != 1 {
+		t.Fatalf("the provider saw %d requests, want 1", len(seen.requests))
+	}
+	if got := seen.requests[0].Application; got != "edge" {
+		t.Errorf("Request.Application = %q, want edge", got)
+	}
+	// The path is still the repository's view of it, which is the other half of
+	// what a provider decides on.
+	if got := seen.requests[0].Path; got != "values/plain.yaml" {
+		t.Errorf("Request.Path = %q, want values/plain.yaml", got)
+	}
+}
+
+// recordingProvider passes everything through and keeps what it was asked.
+type recordingProvider struct{ requests []secrets.Request }
+
+func (p *recordingProvider) Resolve(_ context.Context, req secrets.Request) ([]byte, error) {
+	p.requests = append(p.requests, req)
+	return req.Data, nil
+}
+
 // The provider's error aborts the plan: the engine calls the reader while
 // planning, and a values file that cannot be resolved must not be rendered.
 func TestProviderErrorFailsTheRead(t *testing.T) {

@@ -19,6 +19,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/swarms"
 )
 
 const testController = "prod"
@@ -28,7 +29,7 @@ type fakeSwarms struct {
 	backend charts.Backend
 }
 
-func (f fakeSwarms) Backend(context.Context, string) (charts.Backend, error) {
+func (f fakeSwarms) Backend(context.Context, swarms.Target) (charts.Backend, error) {
 	return f.backend, f.err
 }
 
@@ -775,5 +776,353 @@ func TestEachVolumeGetsItsOwnSettleBudget(t *testing.T) {
 	}
 	if want := []string{"gone"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("pruned applications = %v, want %v", got, want)
+	}
+}
+
+// ---------------------------------------------------------------- node reach
+
+// reachingSwarms is a registry that has solved what the OSS one cannot: a
+// handle to each node's own daemon. Separate from fakeSwarms rather than a
+// field on it, because "does not implement swarms.NodeReach" is the case the
+// whole node-local fallback hangs on and a method cannot be un-declared.
+type reachingSwarms struct {
+	fakeSwarms
+	nodes    []swarms.Node
+	nodesErr error
+	// backends is the node-local daemon of each node, by hostname. A hostname
+	// absent from it is a node the registry named and then cannot reach.
+	backends map[string]*fakeBackend
+}
+
+func (r reachingSwarms) Nodes(context.Context, swarms.Target) ([]swarms.Node, error) {
+	return r.nodes, r.nodesErr
+}
+
+func (r reachingSwarms) NodeBackend(_ context.Context, _ swarms.Target, n swarms.Node) (swarms.NodeBackend, error) {
+	b, ok := r.backends[n.Hostname]
+	if !ok {
+		return nil, errors.New("no route to " + n.Hostname)
+	}
+	return b, nil
+}
+
+// node is one reachable node holding the named volumes of release "api".
+func node(hostname string, volumes ...string) (swarms.Node, *fakeBackend) {
+	return swarms.Node{ID: "id-" + hostname, Hostname: hostname},
+		&fakeBackend{volumes: map[string][]string{"api": volumes}}
+}
+
+// prunerReaching builds a Pruner whose registry can reach nodes, over the same
+// swarm-level backend the sweep itself uses.
+func prunerReaching(t *testing.T, e *fakeEngine, b charts.Backend, reg reachingSwarms, w io.Writer) *Pruner {
+	t.Helper()
+	reg.fakeSwarms = fakeSwarms{backend: b}
+	return New(Options{
+		Swarms:       reg,
+		Engine:       func(charts.Backend) Engine { return e },
+		Volumes:      true,
+		ControllerID: testController,
+		Log:          slog.New(slog.NewTextHandler(w, nil)),
+	})
+}
+
+// The whole of what #108 left open. A stack's ordinary named volumes live on
+// whichever nodes ran its tasks, and the daemon's volume list answers from the
+// node's own store — so a registry that can hand back a daemon per node is the
+// only thing that makes the purge complete.
+func TestVolumesArePurgedOnEveryNodeTheRegistryReaches(t *testing.T) {
+	var buf bytes.Buffer
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+
+	// Three nodes: the controller's own, one holding the volume the stack
+	// actually scheduled, and one holding nothing.
+	n1, b1 := node("manager-1")
+	n2, b2 := node("worker-1", "api_data")
+	n3, b3 := node("worker-2", "api_cache", "api_logs")
+	reg := reachingSwarms{
+		nodes:    []swarms.Node{n1, n2, n3},
+		backends: map[string]*fakeBackend{"manager-1": b1, "worker-1": b2, "worker-2": b3},
+	}
+
+	// The swarm-level backend sees none of them, which is exactly what made
+	// this undeletable before — and says the swarm has the three nodes the
+	// registry reached, which is what lets the purge claim it covered them.
+	swarmWide := sizedBackend{fakeBackend: &fakeBackend{}, nodes: 3}
+
+	got, err := prunerReaching(t, e, swarmWide, reg, &buf).Departed(t.Context(), []string{"kept"}, nil)
+	if err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+
+	if len(b1.removedVol) != 0 {
+		t.Errorf("node with no volumes had %v removed", b1.removedVol)
+	}
+	if want := []string{"api_data"}; !slices.Equal(b2.removedVol, want) {
+		t.Errorf("worker-1 removed %v, want %v", b2.removedVol, want)
+	}
+	if want := []string{"api_cache", "api_logs"}; !slices.Equal(b3.removedVol, want) {
+		t.Errorf("worker-2 removed %v, want %v", b3.removedVol, want)
+	}
+	if len(swarmWide.removedVol) != 0 {
+		t.Errorf("the swarm-level backend was asked to remove %v; the purge is per node now", swarmWide.removedVol)
+	}
+
+	log := buf.String()
+	if !strings.Contains(log, "every node of the swarm") {
+		t.Errorf("log %q does not report the purge as swarm-wide", log)
+	}
+	// Node attribution, because "api_data was deleted" is not something an
+	// operator can check without knowing where it was.
+	if !strings.Contains(log, "worker-1/api_data") {
+		t.Errorf("log %q does not say which node each volume came off", log)
+	}
+	// And none of the node-local hedging, which would now be false.
+	if strings.Contains(log, "node-local") {
+		t.Errorf("log %q still warns about nodes it did reach", log)
+	}
+	if want := []string{"gone"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("pruned applications = %v, want %v", got, want)
+	}
+}
+
+// A registry that cannot reach nodes leaves everything exactly as it was: the
+// node-local purge, and the warning that says so. This is the OSS build, and it
+// is the floor the seam must not lower.
+func TestARegistryWithoutNodeReachKeepsTheNodeLocalPurge(t *testing.T) {
+	var buf bytes.Buffer
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	b := sizedBackend{
+		fakeBackend: &fakeBackend{volumes: map[string][]string{"api": {"api_data"}}},
+		nodes:       3,
+	}
+
+	if _, err := prunerLogging(t, e, b, true, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+
+	if want := []string{"api_data"}; !slices.Equal(b.removedVol, want) {
+		t.Errorf("removed %v, want %v from the controller's own node", b.removedVol, want)
+	}
+	log := buf.String()
+	if !strings.Contains(log, "node-local") {
+		t.Errorf("log %q does not say the listing was node-local", log)
+	}
+	if strings.Contains(log, "every node of the swarm") {
+		t.Errorf("log %q claims a swarm-wide purge from a registry that reaches one node", log)
+	}
+}
+
+// A registry implementing swarms.NodeReach has claimed it can reach these
+// nodes, so a node it then cannot list or delete on is a real failure — not the
+// expected partial answer the node-local purge lives with. The release records
+// stay, and the next sweep tries again.
+func TestAPurgeAcrossNodesFailsRatherThanCoveringPart(t *testing.T) {
+	reachable, backend := node("worker-1", "api_data")
+	unreachable := swarms.Node{ID: "id-worker-2", Hostname: "worker-2"}
+
+	cases := map[string]struct {
+		reg  reachingSwarms
+		want string
+	}{
+		"the node list could not be read": {
+			reg:  reachingSwarms{nodesErr: errors.New("the proxy is down")},
+			want: "the proxy is down",
+		},
+		// Not "there were no volumes". A registry that reaches nothing has not
+		// looked, and treating that as a finished purge would delete the records
+		// that are the only way to find this release again.
+		"the registry reaches no node": {
+			reg:  reachingSwarms{nodes: nil},
+			want: "reaches no node",
+		},
+		"a node cannot be reached": {
+			reg: reachingSwarms{
+				nodes:    []swarms.Node{reachable, unreachable},
+				backends: map[string]*fakeBackend{"worker-1": backend},
+			},
+			want: "worker-2",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+
+			got, err := prunerReaching(t, e, &fakeBackend{}, tc.reg, io.Discard).
+				Departed(t.Context(), []string{"kept"}, nil)
+			if err == nil {
+				t.Fatal("Departed = nil, want the purge failure")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not name %q", err, tc.want)
+			}
+			if len(got) != 0 {
+				t.Errorf("pruned = %v, want nothing reported as pruned", got)
+			}
+			// The records carry the owner stamp, which is the only thing a
+			// later sweep finds this release by.
+			if len(e.pruned()) != 0 {
+				t.Errorf("uninstalled %v; a failed purge must keep the release records", e.pruned())
+			}
+		})
+	}
+}
+
+// The settle budget is per volume on every node too. The containers holding a
+// volume on worker-2 drain on their own schedule, not on whatever worker-1's
+// took.
+func TestEachNodesVolumesGetTheirOwnSettleBudget(t *testing.T) {
+	restoreTimeout, restoreInterval := volumeSettleTimeout, volumeSettleInterval
+	volumeSettleTimeout, volumeSettleInterval = 100*time.Millisecond, 0
+	t.Cleanup(func() { volumeSettleTimeout, volumeSettleInterval = restoreTimeout, restoreInterval })
+
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	n1, b1 := node("worker-1", "api_data")
+	n2, b2 := node("worker-2", "api_data")
+	// The first node's volume spends more than a whole budget, as a stack
+	// whose stop_grace_period outlasts the timeout does.
+	b1.volDelay = map[string]time.Duration{"api_data": 150 * time.Millisecond}
+	// The second needs one retry, which a budget shared across the swarm can no
+	// longer afford by the time this node is reached.
+	b2.volInUse = map[string]int{"api_data": 1}
+	reg := reachingSwarms{
+		nodes:    []swarms.Node{n1, n2},
+		backends: map[string]*fakeBackend{"worker-1": b1, "worker-2": b2},
+	}
+
+	if _, err := prunerReaching(t, e, &fakeBackend{}, reg, io.Discard).
+		Departed(t.Context(), []string{"kept"}, nil); err != nil {
+		t.Fatalf("Departed = %v, want nil — the second node's volume has its own budget", err)
+	}
+	for host, b := range map[string]*fakeBackend{"worker-1": b1, "worker-2": b2} {
+		if want := []string{"api_data"}; !slices.Equal(b.removedVol, want) {
+			t.Errorf("%s removed %v, want %v", host, b.removedVol, want)
+		}
+	}
+}
+
+// A release that declared no volumes says nothing, on either path. Every node
+// was asked, so an empty answer really is an empty answer — but it is still not
+// a deletion, and the line an operator goes looking for is about data going.
+func TestAPurgeAcrossNodesThatFoundNothingSaysNothing(t *testing.T) {
+	var buf bytes.Buffer
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	n1, b1 := node("worker-1")
+	reg := reachingSwarms{nodes: []swarms.Node{n1}, backends: map[string]*fakeBackend{"worker-1": b1}}
+	swarmWide := sizedBackend{fakeBackend: &fakeBackend{}, nodes: 1}
+
+	if _, err := prunerReaching(t, e, swarmWide, reg, &buf).
+		Departed(t.Context(), []string{"kept"}, nil); err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+	if strings.Contains(buf.String(), "deleted the release's volumes") {
+		t.Errorf("log %q reports a deletion for a release that had no volumes", buf.String())
+	}
+}
+
+// The registry hands over the nodes it can reach, and Nodes documents that one
+// it cannot connect to should be left out — which a swarm with a node down
+// routinely produces. Treating that list as the whole swarm would log a
+// completed purge and then delete the release records, which are the only thing
+// a later sweep finds the release by: #108 re-created one layer up, inside the
+// build that was supposed to have fixed it.
+func TestAPurgeThatCouldNotCoverEveryNodeDoesNotClaimItDid(t *testing.T) {
+	cases := map[string]charts.Backend{
+		// Four nodes in the swarm, two reached.
+		"the swarm has more nodes than the registry reached": sizedBackend{
+			fakeBackend: &fakeBackend{}, nodes: 4,
+		},
+		// A count that could not be read is not a match, for the reason a count
+		// that could not be read is not one node.
+		"the node count could not be read": sizedBackend{
+			fakeBackend: &fakeBackend{}, err: errors.New("this node is not a swarm manager"),
+		},
+		"the backend cannot answer at all": &fakeBackend{},
+	}
+
+	for name, swarmWide := range cases {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+			n1, b1 := node("worker-1", "api_data")
+			n2, b2 := node("worker-2")
+			reg := reachingSwarms{
+				nodes:    []swarms.Node{n1, n2},
+				backends: map[string]*fakeBackend{"worker-1": b1, "worker-2": b2},
+			}
+
+			if _, err := prunerReaching(t, e, swarmWide, reg, &buf).
+				Departed(t.Context(), []string{"kept"}, nil); err != nil {
+				t.Fatalf("Departed = %v, want nil", err)
+			}
+
+			// What it reached, it still deletes. Refusing would make the purge
+			// fail permanently on every swarm with a node down.
+			if want := []string{"api_data"}; !slices.Equal(b1.removedVol, want) {
+				t.Errorf("worker-1 removed %v, want %v", b1.removedVol, want)
+			}
+
+			log := buf.String()
+			if strings.Contains(log, "every node of the swarm") {
+				t.Errorf("log %q claims a swarm-wide purge it could not establish", log)
+			}
+			if !strings.Contains(log, "could not be shown to be all of them") {
+				t.Errorf("log %q does not say the coverage is unproven", log)
+			}
+			// Named, so an operator can tell which nodes were covered from the
+			// ones that were not.
+			if !strings.Contains(log, "worker-1") || !strings.Contains(log, "worker-2") {
+				t.Errorf("log %q does not name the nodes that were covered", log)
+			}
+			if !strings.Contains(log, "label=com.docker.stack.namespace=api") {
+				t.Errorf("log %q does not hand over the filter that finds what is left", log)
+			}
+		})
+	}
+}
+
+// A purge that gives up part-way through has already deleted data irreversibly,
+// and the error names only the node it stopped on. Something has to say what
+// went, or the one destructive thing this package does happens silently.
+func TestAPurgeThatFailsPartWayReportsWhatItAlreadyDeleted(t *testing.T) {
+	var buf bytes.Buffer
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	done, b := node("worker-1", "api_data")
+	unreachable := swarms.Node{ID: "id-worker-2", Hostname: "worker-2"}
+	reg := reachingSwarms{
+		nodes:    []swarms.Node{done, unreachable},
+		backends: map[string]*fakeBackend{"worker-1": b},
+	}
+
+	if _, err := prunerReaching(t, e, &fakeBackend{}, reg, &buf).
+		Departed(t.Context(), []string{"kept"}, nil); err == nil {
+		t.Fatal("Departed = nil, want the purge failure")
+	}
+
+	if want := []string{"api_data"}; !slices.Equal(b.removedVol, want) {
+		t.Fatalf("worker-1 removed %v, want %v — nothing was deleted, so there is nothing to report", b.removedVol, want)
+	}
+	log := buf.String()
+	if !strings.Contains(log, "before the purge failed") {
+		t.Errorf("log %q does not report the volumes that went before it gave up", log)
+	}
+	if !strings.Contains(log, "worker-1/api_data") {
+		t.Errorf("log %q does not name what was deleted", log)
+	}
+}
+
+// A registry that gave no hostname is still named in the error, by its id.
+// Otherwise the one thing an operator has to go on is an empty string.
+func TestANodeWithNoHostnameIsNamedByItsID(t *testing.T) {
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	reg := reachingSwarms{nodes: []swarms.Node{{ID: "z3k9q1"}}}
+
+	_, err := prunerReaching(t, e, &fakeBackend{}, reg, io.Discard).
+		Departed(t.Context(), []string{"kept"}, nil)
+	if err == nil {
+		t.Fatal("Departed = nil, want the unreachable node's failure")
+	}
+	if !strings.Contains(err.Error(), "z3k9q1") {
+		t.Errorf("error %q does not name the node by its id", err)
 	}
 }

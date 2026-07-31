@@ -73,7 +73,7 @@ type fakeRegistry struct {
 	backend charts.Backend
 }
 
-func (f fakeRegistry) Backend(context.Context, string) (charts.Backend, error) {
+func (f fakeRegistry) Backend(context.Context, swarms.Target) (charts.Backend, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -1334,8 +1334,8 @@ func TestConcurrentMutationAndReadsAreRaceFree(t *testing.T) {
 // so a test can give one application a good destination and another a bad one.
 type swarmRouter map[string]charts.Backend
 
-func (s swarmRouter) Backend(_ context.Context, name string) (charts.Backend, error) {
-	if b, ok := s[name]; ok {
+func (s swarmRouter) Backend(_ context.Context, t swarms.Target) (charts.Backend, error) {
+	if b, ok := s[t.Swarm]; ok {
 		return b, nil
 	}
 	return nil, errors.New("unknown swarm")
@@ -2525,7 +2525,7 @@ func (b *conflictingBackend) DeployStack(string, string, string) error {
 }
 
 // Swarm's one signal that something else is writing was being detected and
-// thrown away: swarms.local builds the backend with an empty Options, so the
+// thrown away: swarms/local builds the backend with an empty Options, so the
 // callback was the no-op default and production never set it.
 func TestOutOfBandWriteIsReported(t *testing.T) {
 	rec := listen(t)
@@ -2536,7 +2536,7 @@ func TestOutOfBandWriteIsReported(t *testing.T) {
 	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
 
 	// The engine is a fake, so drive the notifier the way a real apply would.
-	b, err := fakeRegistry{backend: backend}.Backend(context.Background(), "")
+	b, err := fakeRegistry{backend: backend}.Backend(context.Background(), swarms.Target{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -398,6 +398,10 @@ func (bearerAuthorizer) Authorize(context.Context, authz.Subject, authz.Action, 
 	return nil
 }
 
+func (bearerAuthorizer) Visible(_ context.Context, _ authz.Subject, _ authz.Action, apps []string) ([]string, error) {
+	return apps, nil
+}
+
 // errNoSuchApplication is what the stub returns for an application it does not
 // have; the API turns it into the response the client sees.
 var errNoSuchApplication = errors.New("no such application")

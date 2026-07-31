@@ -74,9 +74,27 @@
 //
 // The sweep covers the swarm this controller runs in, because swarms.Registry
 // resolves exactly that one and cannot enumerate others (D2). That is complete
-// for the OSS build. A multi-swarm companion replacing the seam would have to
-// extend it with a lister before this could find a departed application's
-// releases on a swarm it no longer names.
+// for the OSS build.
+//
+// swarms.Lister is now the shape a multi-swarm companion enumerates through,
+// and this does not yet use it. The missing piece is not here: the sweep spares
+// any release the current applications still declare, and it matches those by
+// release name, which is unique within a swarm and not across them. Handed
+// several swarms and one unqualified list, it would spare a release on swarm B
+// because a different one shares its name on swarm A — and delete one on B that
+// nothing on B declares. Making that safe is a change to what the app-set loop
+// hands this, and it belongs with the companion that can test it.
+//
+// # One node
+//
+// The releases are found through the swarm's manager API, but a stack's named
+// volumes are not: the daemon's volume list answers from the node's own store,
+// and an ordinary named volume is created by the engine that ran the task
+// mounting it. swarms.NodeReach is how a registry says it can reach the nodes
+// themselves, and purgeVolumes uses it when it is there. The OSS default is not
+// — see swarms.NodeReach for why that is a deployment fact rather than an
+// omission — so purgeThisNode deletes what the controller's own node holds and
+// says exactly that.
 package prune
 
 import (
@@ -109,15 +127,9 @@ type Engine interface {
 	List(ctx context.Context) ([]charts.Release, error)
 }
 
-// How long Release waits for **one** volume to be released by the tasks that
+// How long settle waits for **one** volume to be released by the tasks that
 // were using it, and how often it retries. Variables rather than constants so a
 // test does not spend the real interval discovering that the retry works.
-//
-// Per volume and not per release, because the thing being waited for is per
-// volume: each one is held by its own containers, which shut down in their own
-// time. A whole-release budget makes the last volume of a large stack inherit
-// whatever the first few spent, so the same stack passes or fails depending on
-// how many volumes it happens to declare.
 //
 // Thirty seconds is a guess at "the containers have gone", and it is not
 // derived from stop_grace_period — the daemon waits that long before killing a
@@ -148,12 +160,12 @@ var (
 // log is taken rather than returned-to, because what a volume purge managed is
 // not a value the two callers would do anything different with — it is a thing
 // an operator has to be told, and only this knows what was and was not covered.
-func Release(ctx context.Context, log *slog.Logger, backend charts.Backend, engine Uninstaller, release string, volumes bool) (*charts.UninstallResult, error) {
+func Release(ctx context.Context, log *slog.Logger, backend charts.Backend, engine Uninstaller, release string, volumes VolumePurge) (*charts.UninstallResult, error) {
 	if err := backend.RemoveStack(release); err != nil {
 		return nil, fmt.Errorf("removing the stack: %w", err)
 	}
-	if volumes {
-		if err := purgeVolumes(ctx, log, backend, release); err != nil {
+	if volumes.Enabled {
+		if err := purgeVolumes(ctx, log, backend, release, volumes); err != nil {
 			return nil, err
 		}
 	}
@@ -161,15 +173,203 @@ func Release(ctx context.Context, log *slog.Logger, backend charts.Backend, engi
 	return engine.Uninstall(ctx, release, false)
 }
 
-// purgeVolumes deletes the stack's named volumes that this node can see,
-// waiting for the tasks that mounted them to let go, and says plainly when that
-// was not all of them.
+// VolumePurge says whether to delete a release's named volumes, and how far the
+// caller can reach to find them.
+//
+// The reach is here rather than taken from the seam inside the purge because
+// prune owns policy and not wiring: a package that resolved a process-global
+// registry behind its caller's back would be untestable without registering
+// one, and Release's two callers would stop being able to say what they meant.
+//
+// A struct rather than the bool this replaced, so that the answer to "how far
+// can you reach" can grow — a node allowlist, a per-node deadline — without a
+// third parameter appearing on Release each time.
+type VolumePurge struct {
+	// Enabled is the opt-in, and the zero value is off. Volumes are the only
+	// irreversible thing a prune deletes: everything else it removes is
+	// recreated from git the moment the application comes back.
+	Enabled bool
+	// Registry is what the purge asks for a handle to each node of the
+	// destination. A registry implementing swarms.NodeReach makes the purge
+	// cover every node of the swarm; one that does not — the OSS default, for
+	// the deployment reasons swarms.NodeReach gives — leaves it covering the
+	// node the controller talks to, which is what it has always covered. Nil is
+	// the same as one that cannot.
+	Registry swarms.Registry
+	// Target is the destination whose nodes to reach. It is ignored by a
+	// registry that cannot reach any.
+	Target swarms.Target
+}
+
+// purgeVolumes deletes the stack's named volumes, over as much of the swarm as
+// the registry can reach.
+//
+// A registry implementing swarms.NodeReach can hand back a daemon per node, and
+// the purge is then complete: every node is asked what the stack left on it and
+// told to delete it. A registry that cannot — the OSS default, because a Swarm
+// node does not expose its daemon and this controller holds one socket — leaves
+// the purge covering the controller's own node, which is what purgeThisNode
+// reports honestly rather than as a finished job.
+func purgeVolumes(ctx context.Context, log *slog.Logger, backend charts.Backend, release string, purge VolumePurge) error {
+	// A nil Registry fails this assertion like any other that cannot reach a
+	// node, which is what makes VolumePurge{Enabled: true} on its own mean
+	// exactly what the bool it replaced meant.
+	if reach, ok := purge.Registry.(swarms.NodeReach); ok {
+		return purgeEveryNode(ctx, log, backend, reach, purge.Target, release)
+	}
+	return purgeThisNode(ctx, log, backend, release)
+}
+
+// purgeEveryNode deletes the release's volumes on each node the registry
+// reaches, and — the part that keeps this honest — only claims to have covered
+// the swarm when it can show that it did.
+//
+// The registry decides which nodes to hand over, and Nodes documents that a
+// node it cannot connect to should be left out rather than listed and failed
+// on. That is the recoverable answer, but it means the list is not
+// self-evidently the whole swarm: a swarm with a node down is the ordinary
+// case, and trusting the count would let this log a completed purge and then
+// delete the release records — the only thing a later sweep finds the release
+// by — for volumes still sitting on the node that was missing. That is #108
+// re-created one layer up, so the count is checked against the swarm's own
+// through the same swarmSizer purgeThisNode uses, and anything short of equal
+// gets the same honest warning and the same label filter.
+//
+// A node the registry *named* and then could not reach is different, and does
+// fail the whole purge: the registry has contradicted itself, which is a
+// transient inconsistency worth retrying rather than a reachability limit worth
+// reporting. The caller has not yet deleted the release records, so the next
+// sweep finds the release again — the recovery every other prune failure gets.
+// A node that is permanently gone must therefore be omitted by Nodes, not
+// listed; listing it is what would strand an application in a purge that can
+// never finish, which is the hazard purgeThisNode's own docstring exists to
+// avoid.
+func purgeEveryNode(ctx context.Context, log *slog.Logger, backend charts.Backend, reach swarms.NodeReach, t swarms.Target, release string) error {
+	nodes, err := reach.Nodes(ctx, t)
+	if err != nil {
+		return fmt.Errorf("listing the swarm's nodes: %w", err)
+	}
+	if len(nodes) == 0 {
+		// Not "there were no volumes". A registry that reaches nothing has not
+		// looked, and returning nil here would let the caller delete the
+		// records that are the only way to find this release again.
+		return fmt.Errorf("purging the volumes of release %q: the registry reaches no node of this swarm", release)
+	}
+
+	var deleted []string
+	// failed wraps an error that abandons the purge part-way through, so that
+	// what has already been irreversibly deleted is reported rather than lost
+	// behind the reason the rest was not. Data went; something has to say so.
+	failed := func(err error) error {
+		if len(deleted) > 0 {
+			log.Warn("deleted some of the release's volumes before the purge failed; the rest are still there",
+				"release", release, "volumes", deleted)
+		}
+		return err
+	}
+
+	for _, node := range nodes {
+		nb, err := reach.NodeBackend(ctx, t, node)
+		if err != nil {
+			return failed(fmt.Errorf("reaching node %s: %w", nodeName(node), err))
+		}
+		names, err := nb.StackVolumes(ctx, release)
+		if err != nil {
+			return failed(fmt.Errorf("listing the release's volumes on node %s: %w", nodeName(node), err))
+		}
+		for _, name := range names {
+			if err := settle(ctx, func(ctx context.Context) error { return nb.RemoveVolume(ctx, name) }); err != nil {
+				return failed(fmt.Errorf("removing volume %q on node %s: %w", name, nodeName(node), err))
+			}
+			deleted = append(deleted, nodeName(node)+"/"+name)
+		}
+	}
+
+	// Equal, and nothing weaker. A count that could not be read is not a match,
+	// for the reason swarmWideVolumes gives: the claim being made is that
+	// nothing was missed, and only the swarm's own count can establish it.
+	if size, known := swarmSize(ctx, backend); known && size == len(nodes) {
+		// Warn, like every other deletion here — this is data going — but only
+		// when there was some. Unlike the node-local case an empty listing does
+		// mean the release had no volumes, because every node was asked.
+		if len(deleted) > 0 {
+			log.Warn("deleted the release's volumes on every node of the swarm",
+				"release", release, "nodes", len(nodes), "volumes", deleted)
+		}
+		return nil
+	}
+
+	// Warn whether or not anything was deleted, and especially when nothing
+	// was: the registry handed over the nodes it could reach, and a swarm with
+	// a node down is the ordinary case rather than an error. What must not
+	// happen is this reading as a completed purge.
+	log.Warn("deleted the release's volumes on the nodes the registry could reach, which could not be shown to be "+
+		"all of them; any volumes the release left on a node this did not cover are still there",
+		"release", release, "nodes", nodeNames(nodes), "volumes", deleted,
+		"remedy", "docker volume ls --filter label=com.docker.stack.namespace="+release+", on each node")
+	return nil
+}
+
+// nodeName is what a node is called in a log line or an error: the hostname an
+// operator recognises, falling back to the id when a registry did not give one.
+//
+// A hostname is not unique — Swarm does not require one — so where two nodes
+// share one, this names them the same. `docker node ls` is what tells them
+// apart, and the remedy above sends an operator to each node anyway.
+func nodeName(n swarms.Node) string {
+	if n.Hostname != "" {
+		return n.Hostname
+	}
+	return n.ID
+}
+
+// nodeNames is what the partial warning reports, so that an operator can tell
+// which nodes were covered from the ones that were not.
+func nodeNames(nodes []swarms.Node) []string {
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, nodeName(n))
+	}
+	return out
+}
+
+// settle retries one volume's removal until the tasks that mounted it have let
+// go of it.
 //
 // The services were removed a moment ago and Swarm does not wait for their
 // containers to die, so the first attempt routinely fails with "volume is in
 // use". Retrying is not papering over a race — it is the only way to observe
 // the thing this is waiting for; the daemon offers no "tasks have drained"
 // signal to poll instead.
+//
+// The budget is per volume and starts here, because the thing being waited for
+// is per volume: each one is held by its own containers, which shut down in
+// their own time. Sharing a budget across a stack makes the last volume answer
+// for the first, so the same stack passes or fails depending on how many
+// volumes it happens to declare.
+func settle(ctx context.Context, remove func(context.Context) error) error {
+	deadline := time.Now().Add(volumeSettleTimeout)
+	for {
+		err := remove(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("still in use after %s: %w", volumeSettleTimeout, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(volumeSettleInterval):
+		}
+	}
+}
+
+// purgeThisNode deletes the stack's named volumes that the controller's own
+// node can see, and says plainly when that was not all of them.
 //
 // A volume that never frees is returned as an error and, because the caller
 // has not yet deleted the release records, is retried by the next sweep rather
@@ -180,8 +380,9 @@ func Release(ctx context.Context, log *slog.Logger, backend charts.Backend, engi
 // The listing is node-local — see backend.StackVolumes for the daemon's own
 // code path — so on a swarm of more than one node this removes the volumes of
 // the node the controller talks to and nothing else. Nothing in the OSS build
-// can reach the others: swarms.Registry resolves one swarm as one daemon (D2),
-// and there is no swarm-wide listing of named volumes to ask for instead.
+// can reach the others: swarms.Registry resolves one swarm as one daemon (D2)
+// and its default implements no swarms.NodeReach, and there is no swarm-wide
+// listing of named volumes to ask for instead.
 //
 // It does not stop and it does not refuse. Stopping would make --prune-volumes
 // permanently fail on every multi-node swarm, including for the great majority
@@ -199,33 +400,15 @@ func Release(ctx context.Context, log *slog.Logger, backend charts.Backend, engi
 // volumes themselves keep the stack's namespace label, which is a durable
 // marker `docker volume ls` finds on each node, and that is the thread the
 // warning below hands over.
-func purgeVolumes(ctx context.Context, log *slog.Logger, backend charts.Backend, release string) error {
+func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend, release string) error {
 	names, err := backend.StackVolumes(ctx, release)
 	if err != nil {
 		return fmt.Errorf("listing the stack's volumes: %w", err)
 	}
 
 	for _, name := range names {
-		// Per volume. Each is held by its own containers and drains on its own
-		// schedule, so sharing one budget across a stack makes the last volume
-		// answer for the first.
-		deadline := time.Now().Add(volumeSettleTimeout)
-		for {
-			err := backend.RemoveVolume(ctx, name)
-			if err == nil {
-				break
-			}
-			if ctx.Err() != nil {
-				return fmt.Errorf("removing volume %q: %w", name, ctx.Err())
-			}
-			if time.Now().After(deadline) {
-				return fmt.Errorf("removing volume %q: still in use after %s: %w", name, volumeSettleTimeout, err)
-			}
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("removing volume %q: %w", name, ctx.Err())
-			case <-time.After(volumeSettleInterval):
-			}
+		if err := settle(ctx, func(ctx context.Context) error { return backend.RemoveVolume(ctx, name) }); err != nil {
+			return fmt.Errorf("removing volume %q: %w", name, err)
 		}
 	}
 
@@ -256,16 +439,25 @@ type swarmSizer interface {
 	SwarmNodes(ctx context.Context) (int, error)
 }
 
+// swarmSize returns how many nodes the swarm has, and whether that could be
+// established at all. A backend that cannot say, or that failed to, reports
+// false — which for a deletion has to mean the same as knowing the answer was
+// not the one being hoped for.
+func swarmSize(ctx context.Context, backend charts.Backend) (int, bool) {
+	s, ok := backend.(swarmSizer)
+	if !ok {
+		return 0, false
+	}
+	n, err := s.SwarmNodes(ctx)
+	return n, err == nil
+}
+
 // swarmWideVolumes reports whether a node-local volume listing was in fact the
 // whole swarm's — which is exactly the single-node case, and nothing weaker
 // will do. A count that could not be read is not one node.
 func swarmWideVolumes(ctx context.Context, backend charts.Backend) bool {
-	s, ok := backend.(swarmSizer)
-	if !ok {
-		return false
-	}
-	n, err := s.SwarmNodes(ctx)
-	return err == nil && n == 1
+	n, known := swarmSize(ctx, backend)
+	return known && n == 1
 }
 
 // Options configures a Pruner. Everything has a working default.
@@ -348,7 +540,7 @@ func (p *Pruner) Departed(ctx context.Context, desired, declared []string) ([]st
 		return nil, nil
 	}
 
-	backend, err := p.swarms.Backend(ctx, "")
+	backend, err := p.swarms.Backend(ctx, swarms.Target{})
 	if err != nil {
 		return nil, fmt.Errorf("resolving the local swarm: %w", err)
 	}
@@ -445,7 +637,11 @@ func (p *Pruner) stillListed(ctx context.Context, engine Engine, failed []failur
 }
 
 func (p *Pruner) uninstall(ctx context.Context, backend charts.Backend, engine Engine, app, release string) error {
-	result, err := Release(ctx, p.log, backend, engine, release, p.volumes)
+	result, err := Release(ctx, p.log, backend, engine, release, VolumePurge{
+		Enabled:  p.volumes,
+		Registry: p.swarms,
+		Target:   swarms.Target{},
+	})
 	if err != nil {
 		return fmt.Errorf("pruning release %q of departed application %q: %w", release, app, err)
 	}
