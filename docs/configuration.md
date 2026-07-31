@@ -127,7 +127,7 @@ they cannot select its version, which is why a `ref` carries its own `version`.
 | `ref` | one of path/ref | `repository/chart`; needs `version` and `repositories` |
 | `version` | with `ref` | the pinned chart version — **required** with a ref, because a floating pin would silently upgrade production on the next reconcile |
 | `values` | optional | values files, as paths within the repo |
-| `repositories` | with `ref` | `name` + `url` for each chart repository the ref resolves against |
+| `repositories` | with `ref` | `name` + `url` for each chart repository the ref resolves against; the URL must be `https://` |
 
 **Path safety.** `releaseFile`, `chart.path` and every `values` entry must be
 relative and stay inside the checkout: an absolute path, or one that escapes with
@@ -135,6 +135,15 @@ relative and stay inside the checkout: an absolute path, or one that escapes wit
 symlink is refused again at render time — repository content is not trusted the
 way your own configuration is, and a values file pointing at `/run/secrets` would
 otherwise be read and merged into a manifest.
+
+**Chart repositories are https-only.** A chart repository serves the tarball
+that *becomes* the workload, so anyone on the path to it chooses what runs on
+your swarm — and the digest a chart publishes travels in the same `index.yaml`
+over the same connection, so it does not close that. A plaintext git remote is
+refused for the same reason. There is no opt-out here; the chart engine ships
+one, and this controller does not set it. A repository `name` is held to
+letters, digits, dot, dash and underscore, starting with a letter or digit, for
+a separate reason: it becomes a file in the chart cache.
 
 ### `registryAuth` (optional)
 

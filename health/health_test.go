@@ -55,6 +55,17 @@ func TestReleaseHealthPerService(t *testing.T) {
 			message: "update paused",
 		},
 		{
+			name: "a completed rollback is wedged",
+			// At parity, and past the stability window, on the spec the deploy
+			// set out to replace: swarmkit restores the previous spec before it
+			// marks the rollback complete. The engine used to fall through to
+			// the parity check here and answer converged, so this read Healthy
+			// (Eldara-Tech/swarmcli#530, this repo's #104 item 4).
+			state:   charts.ServiceState{Name: "api", Running: 2, Desired: 2, UpdateState: "rollback_completed", NewestTaskAge: stableAge},
+			want:    application.HealthDegraded,
+			message: "rolled back",
+		},
+		{
 			name: "inside the stability window",
 			state: charts.ServiceState{
 				Name: "api", Running: 1, Desired: 1,
