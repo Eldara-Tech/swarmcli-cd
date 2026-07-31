@@ -2688,6 +2688,12 @@ func (r *Reconciler) setError(e *appEntry, err error) {
 }
 
 // View returns one application's spec and last observed status.
+//
+// The status is cloned, so what the caller gets is a snapshot it owns. A Status
+// is handed out by value but carries slices and pointers, so without this every
+// caller shared the store's backing array and its *ReleaseDrift, *Compat and
+// *SyncResult — safe only while nobody sorted, appended or wrote through them,
+// which is an invariant nothing stated and nothing enforced. See Status.Clone.
 func (r *Reconciler) View(app string) (application.View, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -2695,10 +2701,11 @@ func (r *Reconciler) View(app string) (application.View, bool) {
 	if !ok {
 		return application.View{}, false
 	}
-	return application.View{Spec: e.spec, Status: e.status}, true
+	return application.View{Spec: e.spec.Clone(), Status: e.status.Clone()}, true
 }
 
-// Views returns every application, in the order they were declared or added.
+// Views returns every application, in the order they were declared or added,
+// each a snapshot the caller owns for the reason View gives.
 func (r *Reconciler) Views() []application.View {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -2706,7 +2713,7 @@ func (r *Reconciler) Views() []application.View {
 	out := make([]application.View, 0, len(r.order))
 	for _, name := range r.order {
 		e := r.apps[name]
-		out = append(out, application.View{Spec: e.spec, Status: e.status})
+		out = append(out, application.View{Spec: e.spec.Clone(), Status: e.status.Clone()})
 	}
 	return out
 }

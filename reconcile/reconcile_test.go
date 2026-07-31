@@ -4014,3 +4014,51 @@ func TestAnIntervalBelowTheFloorIsClamped(t *testing.T) {
 		t.Errorf("intervalFor(no policy) = %s, want the controller-wide interval untouched", got)
 	}
 }
+
+// What View and Views return is the caller's, not the store's.
+//
+// A Status is handed out by value but carries slices and pointers, so every
+// caller used to share the reconciler's backing array and its *ReleaseDrift,
+// *Compat and *SyncResult. That was safe only while nobody sorted, appended or
+// wrote through them — an invariant nothing stated and nothing enforced, and one
+// that would have broken inside the store, for every other caller at once.
+func TestViewHandsOutASnapshotOfTheStore(t *testing.T) {
+	r := newTest(t, []application.Spec{spec("edge", true)}, &fakeEngine{plans: []*charts.Plan{synced()}}, nil)
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	handed, ok := r.View("edge")
+	if !ok || len(handed.Status.Releases) == 0 {
+		t.Fatal("no releases were recorded, so there is nothing to write through")
+	}
+	handed.Status.Releases[0].Name = "rewritten"
+	handed.Status.Sync.Revision = "rewritten"
+
+	again, _ := r.View("edge")
+	if again.Status.Releases[0].Name == "rewritten" {
+		t.Error("a caller writing to what View returned changed the store")
+	}
+	if again.Status.Sync.Revision == "rewritten" {
+		t.Error("a caller writing to the returned Sync changed the store")
+	}
+}
+
+// The same for the list, which is the one an API handler and the app-set loop
+// both hold at once.
+func TestViewsHandOutSnapshotsOfTheStore(t *testing.T) {
+	r := newTest(t, []application.Spec{spec("edge", true)}, &fakeEngine{plans: []*charts.Plan{synced()}}, nil)
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	first := r.Views()
+	if len(first) == 0 || len(first[0].Status.Releases) == 0 {
+		t.Fatal("no releases were recorded, so there is nothing to write through")
+	}
+	first[0].Status.Releases[0].Name = "rewritten"
+
+	if second := r.Views(); second[0].Status.Releases[0].Name == "rewritten" {
+		t.Error("one caller's write changed what the next caller is given")
+	}
+}
