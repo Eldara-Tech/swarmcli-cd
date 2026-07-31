@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -48,6 +49,11 @@ type Checkout struct {
 type Sourcer struct {
 	root string
 	auth Auth
+
+	// mu guards trees, which holds one lock per application: the working tree
+	// each Fetch mutates. See lockFor.
+	mu    sync.Mutex
+	trees map[string]*sync.Mutex
 }
 
 // New returns a Sourcer caching under root.
@@ -56,7 +62,38 @@ type Sourcer struct {
 // sourcer should be drivable from a test without touching the process
 // environment, and the controller should have exactly one place that reads
 // configuration. See AuthFromEnv.
-func New(root string, auth Auth) *Sourcer { return &Sourcer{root: root, auth: auth} }
+func New(root string, auth Auth) *Sourcer {
+	return &Sourcer{root: root, auth: auth, trees: map[string]*sync.Mutex{}}
+}
+
+// lockFor returns the lock guarding one application's working tree, creating it
+// on first use.
+//
+// A clone is one directory that Fetch rewrites in place — Checkout(Force) then
+// Clean(Dir:true) — so two Fetch calls for one application interleave one
+// checkout with the other's render, and the manifest that gets deployed can be a
+// mixture of two commits that never existed together in git.
+//
+// This belongs here rather than in the caller. "One clone per application" is
+// this type's own invariant, and a lock the reconciler holds would only hold
+// while the reconciler's own scheduling is doing what it expects. It is the
+// backstop for exactly the case where that is not true: a Remove whose bounded
+// wait ran out, leaving a departed application's fetch still running when the
+// same name returns to the set with a new entry and a new lease.
+//
+// Keyed by application, not by URL: an application repointed at a different
+// repository still uses the same directory, and it is the directory being
+// protected.
+func (s *Sourcer) lockFor(app string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, ok := s.trees[app]
+	if !ok {
+		lock = &sync.Mutex{}
+		s.trees[app] = lock
+	}
+	return lock
+}
 
 // Fetch brings the application's repository up to date and checks out the
 // revision its source names, returning the working tree and the commit it
@@ -72,6 +109,16 @@ func (s *Sourcer) Fetch(ctx context.Context, app string, src application.Source)
 	if err := supportedURL(src.RepoURL); err != nil {
 		return Checkout{}, err
 	}
+
+	// Held for the whole call, not just the checkout: open may delete and
+	// re-clone the directory, and the returned Checkout is only a promise about
+	// the tree for as long as nobody else is rewriting it. The caller renders
+	// from it after this returns, which the reconciler's own per-application
+	// lease is what serialises; this guards the case where that lease has been
+	// given up on. See lockFor.
+	lock := s.lockFor(app)
+	lock.Lock()
+	defer lock.Unlock()
 
 	dir := filepath.Join(s.root, app)
 	repo, err := s.open(ctx, dir, src.RepoURL)

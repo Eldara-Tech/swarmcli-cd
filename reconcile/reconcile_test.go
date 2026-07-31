@@ -1632,7 +1632,11 @@ func TestPruneFirstFailureIsReportedAsAFailedSync(t *testing.T) {
 	// A sync that worked, so that "the status still shows the last one" is a
 	// thing this test can actually catch rather than infer from a nil.
 	previous := &application.SyncResult{Revision: strings.Repeat("b", 40), Succeeded: true}
-	r.recordResult("edge", previous)
+	e, err := r.entry("edge")
+	if err != nil {
+		t.Fatalf("entry: %v", err)
+	}
+	r.recordResult(e, previous)
 
 	if err := r.Sync(context.Background(), "edge"); err == nil {
 		t.Fatal("Sync = nil, want the sweep failure")
@@ -2675,6 +2679,17 @@ func wedgedStates() []charts.ServiceState {
 	return []charts.ServiceState{{Name: "whoami_app", Running: 1, Desired: 1, UpdateState: "paused"}}
 }
 
+// A rollout Swarm undid: at parity and past the stability window, on the
+// previous spec. NewestTaskAge is the point of the fixture — it is what made the
+// engine's parity check answer converged before Eldara-Tech/swarmcli#530, so a
+// state without it would prove nothing about the switch.
+func rolledBackStates() []charts.ServiceState {
+	return []charts.ServiceState{{
+		Name: "whoami_app", Running: 1, Desired: 1,
+		UpdateState: "rollback_completed", NewestTaskAge: time.Hour,
+	}}
+}
+
 func waitingSpec(name string, automated bool) application.Spec {
 	s := liveSpec(name, automated)
 	s.SyncPolicy.Wait = true
@@ -2737,6 +2752,37 @@ func TestConvergeThatWedgesFailsTheSync(t *testing.T) {
 	// Deployed but not settled, so it is not announced as corrected.
 	if slices.Contains(rec.types(), notify.DriftConverged) {
 		t.Error("announced a correction that never converged")
+	}
+}
+
+// The other half of the same failure, and it could not be closed in this
+// repository: awaitConverged's judgement is charts.Rollup's on purpose rather
+// than a second copy of the predicate, and the predicate let rollback_completed
+// fall through to the parity check. So a correction Swarm undid reached parity
+// on the spec the correction was trying to remove, outlived the stability
+// window, and reported converged — a successful sync, a DriftConverged event,
+// and a release reading healthy. #104 item 4; fixed in Eldara-Tech/swarmcli#530
+// and reaching this repository through the pin.
+func TestConvergeThatSwarmRolledBackFailsTheSync(t *testing.T) {
+	fastPolling(t)
+	rec := listen(t)
+	backend := converging(rolledBackStates())
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{waitingSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	err := r.Sync(context.Background(), "edge")
+	if err == nil {
+		t.Fatal("Sync = nil, want the rolled-back correction surfaced")
+	}
+	if !strings.Contains(err.Error(), "whoami") || !strings.Contains(err.Error(), "rolled back") {
+		t.Errorf("error %q does not name the release and why it did not converge", err)
+	}
+	view, _ := r.View("edge")
+	if last := view.Status.Sync.LastSync; last == nil || last.Succeeded {
+		t.Errorf("lastSync = %+v, want a failure recorded", last)
+	}
+	if slices.Contains(rec.types(), notify.DriftConverged) {
+		t.Error("announced a correction Swarm had already undone")
 	}
 }
 

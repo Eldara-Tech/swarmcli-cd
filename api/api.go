@@ -41,7 +41,10 @@ type Reconciler interface {
 	View(app string) (application.View, bool)
 	Diffs(app string) ([]application.ReleaseDiff, error)
 	History(ctx context.Context, app string) (application.History, error)
-	SyncNow(ctx context.Context, app string) error
+	// AcceptSync rather than SyncNow: the handler has to know whether a sync was
+	// started before it writes the response, and the sync itself outlives the
+	// request. See sync below.
+	AcceptSync(app string) (func(context.Context) error, error)
 }
 
 // Controller reports the controller's own state, as distinct from the
@@ -224,15 +227,27 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 // in front of it, with no way for the caller to learn what happened afterwards.
 // The event stream and the status endpoint are how a caller follows it, which
 // is what they are for.
+// A request that arrives while one sync is running and another is already queued
+// behind it is coalesced onto that queued one rather than adding to the pile.
+// Still 202, because the state the caller asked to have reconciled will be
+// reconciled — by the sync already waiting, which has not read the repository
+// yet. The response says which of the two happened rather than claiming a sync
+// was started that was not.
 func (s *Server) sync(w http.ResponseWriter, r *http.Request) {
 	app := r.PathValue("app")
-	if _, ok := s.rec.View(app); !ok {
+
+	run, err := s.rec.AcceptSync(app)
+	switch {
+	case errors.Is(err, reconcile.ErrSyncPending):
+		write(w, http.StatusAccepted, map[string]any{"application": app, "accepted": true, "coalesced": true})
+		return
+	case err != nil:
 		fail(w, http.StatusNotFound, "no such application")
 		return
 	}
 
 	s.syncing(app, func(ctx context.Context) {
-		if err := s.rec.SyncNow(ctx, app); err != nil {
+		if err := run(ctx); err != nil {
 			// Already recorded on the application's status and dispatched as a
 			// sync-failed event; this is the log line that says a manual one
 			// was what failed.
