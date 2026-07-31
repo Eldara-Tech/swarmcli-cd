@@ -292,7 +292,7 @@ func TestCreatesServicesThatDoNotExist(t *testing.T) {
 // would create it again on every reconcile, and the daemon would answer "name
 // conflicts with an existing object" forever.
 func TestASecondApplyUpdatesWhatTheFirstCreated(t *testing.T) {
-	api := &fakeAPI{}
+	api := installed(&fakeAPI{}, "s")
 	b := testBackend(t, api, nil)
 	ctx := context.Background()
 

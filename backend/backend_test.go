@@ -1323,6 +1323,10 @@ func TestTheControllersOwnMountsAreReadOnce(t *testing.T) {
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	})
+	// The fake now records service creates, so the second deploy sees the first's
+	// services. A real DeployStack writes a release record on the way through;
+	// the fake does not, so stand one in or the ownership guard refuses (#102).
+	installed(api, "s")
 	b := testBackend(t, api, nil)
 
 	for range 3 {
@@ -1493,6 +1497,10 @@ func TestAContainerThisDaemonDoesNotKnowIsAnAnswer(t *testing.T) {
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	}
+	// The fake now records service creates, so the second deploy sees the first's
+	// services. A real DeployStack writes a release record on the way through;
+	// the fake does not, so stand one in or the ownership guard refuses (#102).
+	installed(api, "s")
 	b := testBackend(t, api, nil)
 
 	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {
