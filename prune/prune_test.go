@@ -63,7 +63,7 @@ type sizedBackend struct {
 
 func (b sizedBackend) SwarmNodes(context.Context) (int, error) { return b.nodes, b.err }
 
-func (b *fakeBackend) RemoveStack(name string) error {
+func (b *fakeBackend) RemoveStack(_ context.Context, name string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.removedStacks = append(b.removedStacks, name)

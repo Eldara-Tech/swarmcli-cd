@@ -274,12 +274,13 @@ func waitForRunning(t *testing.T, cli *dockerclient.Client, release string, want
 // stack would make the next run's assertions lie.
 func removeStack(t *testing.T, release string) {
 	t.Helper()
-	backend, err := swarms.Get().Backend(context.Background(), "")
+	ctx := context.Background()
+	backend, err := swarms.Get().Backend(ctx, "")
 	if err != nil {
 		t.Logf("cleanup: resolving backend: %v", err)
 		return
 	}
-	if err := backend.RemoveStack(release); err != nil {
+	if err := backend.RemoveStack(ctx, release); err != nil {
 		t.Logf("cleanup: removing stack %q: %v", release, err)
 	}
 }

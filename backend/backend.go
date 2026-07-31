@@ -432,9 +432,7 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 // conversion is the one whose specs are applied.
 //
 // Nothing is deleted. Phase 1 is explicitly no prune.
-func (b *Backend) DeployStack(name, manifest, resolve string) error {
-	ctx := context.Background()
-
+func (b *Backend) DeployStack(ctx context.Context, name, manifest, resolve string) error {
 	// Before the manifest is even converted: a release claiming the controller's
 	// own stack is refused whatever it declares, because the collision is the
 	// name and not anything in the chart.
@@ -507,7 +505,7 @@ func (b *Backend) DeployStack(name, manifest, resolve string) error {
 // they carry com.swarmcli.* labels rather than a stack namespace, so the filter
 // below cannot see them — which is what lets a release be uninstalled and its
 // history still be readable.
-func (b *Backend) RemoveStack(name string) error {
+func (b *Backend) RemoveStack(ctx context.Context, name string) error {
 	// A destructive call with no stack to scope to would build the filter
 	// "com.docker.stack.namespace=", and what that matches is the daemon's
 	// business rather than something to find out here. The engine validates
@@ -516,8 +514,6 @@ func (b *Backend) RemoveStack(name string) error {
 	if name == "" {
 		return fmt.Errorf("refusing to remove a stack with no name")
 	}
-
-	ctx := context.Background()
 
 	// And the name that is worse than none: this controller's own. Nothing below
 	// checks who owns what — that is what `docker stack rm` does and what this
@@ -648,7 +644,7 @@ func (b *Backend) stackRemains(ctx context.Context, name string) (bool, error) {
 // snapshot with a 3s TTL and has to be told when it has gone stale. Here every
 // read fetches, which is what makes one process able to serve several swarms
 // without them evicting each other's state.
-func (b *Backend) RefreshSnapshot() error { return nil }
+func (b *Backend) RefreshSnapshot(context.Context) error { return nil }
 
 // StackServices reads one stack's live service states.
 //
@@ -664,8 +660,8 @@ func (b *Backend) RefreshSnapshot() error { return nil }
 // caller polls, so an unavailable daemon is "not converged yet" rather than a
 // failure to report. That is true of awaitConverged and false of everything
 // that asks once and then takes a view — see ReadStackServices.
-func (b *Backend) StackServices(name string) []charts.ServiceState {
-	states, _ := b.ReadStackServices(name)
+func (b *Backend) StackServices(ctx context.Context, name string) []charts.ServiceState {
+	states, _ := b.ReadStackServices(ctx, name)
 	return states
 }
 
@@ -685,11 +681,38 @@ func (b *Backend) StackServices(name string) []charts.ServiceState {
 // The reconciler reaches this one through an optional-interface upgrade, the
 // same way it reaches WithRegistryAuth, so a backend that cannot answer reads
 // exactly as it did before.
-func (b *Backend) ReadStackServices(name string) ([]charts.ServiceState, error) {
-	snap, err := docker.SnapshotWith(context.Background(), b.api)
+func (b *Backend) ReadStackServices(ctx context.Context, name string) ([]charts.ServiceState, error) {
+	snap, err := docker.SnapshotWith(ctx, b.api)
 	if err != nil {
 		b.log.Warn("reading the swarm snapshot failed", "stack", name, "error", err)
 		return nil, fmt.Errorf("reading the swarm snapshot: %w", err)
 	}
 	return charts.ServiceStatesFrom(snap, name), nil
+}
+
+// ReadStacks answers for several releases from one look at the swarm.
+//
+// It exists because the read above is not scoped to a release at all: the
+// snapshot is the whole swarm — NodeList, ServiceList, TaskList and Info — and
+// ServiceStatesFrom filters it afterwards. Asking per release therefore fetched
+// the entire swarm per release and discarded all but one stack's worth of it
+// each time, so an application declaring ten releases spent ten identical round
+// trips on every reconcile, against the manager this controller runs on.
+//
+// All-or-nothing, which is the same answer the single read gives: either the
+// snapshot arrived and every release is in the map, or it did not and none are.
+// An empty slice for a release therefore means the swarm really has no services
+// under that name, which is precisely the distinction #107 turned on.
+func (b *Backend) ReadStacks(ctx context.Context, releases []string) (map[string][]charts.ServiceState, error) {
+	snap, err := docker.SnapshotWith(ctx, b.api)
+	if err != nil {
+		b.log.Warn("reading the swarm snapshot failed", "stacks", releases, "error", err)
+		return nil, fmt.Errorf("reading the swarm snapshot: %w", err)
+	}
+
+	out := make(map[string][]charts.ServiceState, len(releases))
+	for _, release := range releases {
+		out[release] = charts.ServiceStatesFrom(snap, release)
+	}
+	return out, nil
 }

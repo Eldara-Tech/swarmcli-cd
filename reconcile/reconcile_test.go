@@ -97,9 +97,11 @@ type stubBackend struct {
 	removed *[]string
 }
 
-func (s stubBackend) StackServices(name string) []charts.ServiceState { return s.states[name] }
+func (s stubBackend) StackServices(_ context.Context, name string) []charts.ServiceState {
+	return s.states[name]
+}
 
-func (s stubBackend) RemoveStack(name string) error {
+func (s stubBackend) RemoveStack(_ context.Context, name string) error {
 	if s.removed != nil {
 		*s.removed = append(*s.removed, name)
 	}
@@ -122,7 +124,7 @@ type recordingBackend struct {
 	auth      regauth.Resolver
 }
 
-func (b recordingBackend) StackServices(string) []charts.ServiceState { return nil }
+func (b recordingBackend) StackServices(context.Context, string) []charts.ServiceState { return nil }
 
 func (b recordingBackend) WithForbiddenSecrets(names map[string]struct{}) charts.Backend {
 	b.forbidden = names
@@ -914,7 +916,7 @@ type countingBackend struct {
 	calls int
 }
 
-func (c *countingBackend) StackServices(string) []charts.ServiceState {
+func (c *countingBackend) StackServices(context.Context, string) []charts.ServiceState {
 	c.calls++
 	return nil
 }
@@ -925,7 +927,7 @@ func (c *countingBackend) StackServices(string) []charts.ServiceState {
 // upgrade is that the two answer differently.
 type unreadableBackend struct{ stubBackend }
 
-func (unreadableBackend) ReadStackServices(string) ([]charts.ServiceState, error) {
+func (unreadableBackend) ReadStackServices(context.Context, string) ([]charts.ServiceState, error) {
 	return nil, errors.New("daemon unreachable")
 }
 
@@ -1982,7 +1984,7 @@ func (b *driftBackend) attempted() []string {
 	return slices.Clone(b.attemptedResources)
 }
 
-func (b *driftBackend) DeployStack(name, manifest, _ string) error {
+func (b *driftBackend) DeployStack(_ context.Context, name, manifest, _ string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.deployed = append(b.deployed, name+"|"+manifest)
@@ -2521,7 +2523,7 @@ func (b *conflictingBackend) WithOutOfBandNotifier(fn func(string)) charts.Backe
 	return &c
 }
 
-func (b *conflictingBackend) DeployStack(string, string, string) error {
+func (b *conflictingBackend) DeployStack(context.Context, string, string, string) error {
 	for range b.fires {
 		b.notify("edge_web")
 	}
@@ -2545,7 +2547,7 @@ func TestOutOfBandWriteIsReported(t *testing.T) {
 		t.Fatal(err)
 	}
 	scoped := r.withOutOfBandNotifier(context.Background(), b, "edge")
-	if err := scoped.DeployStack("edge", "", ""); err != nil {
+	if err := scoped.DeployStack(t.Context(), "edge", "", ""); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 
@@ -2645,7 +2647,7 @@ type convergingBackend struct {
 	calls  int
 }
 
-func (b *convergingBackend) StackServices(string) []charts.ServiceState {
+func (b *convergingBackend) StackServices(context.Context, string) []charts.ServiceState {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.calls++

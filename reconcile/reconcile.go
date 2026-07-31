@@ -600,20 +600,68 @@ func (r *Reconciler) withOutOfBandNotifier(ctx context.Context, b charts.Backend
 // swarm", the loudest thing the health rollup can say, so one slow daemon
 // flipped every release of an application from healthy to missing (#107).
 //
-// CE's interface is not ours to widen, so the honest read is an upgrade beside
-// it, in the shape liveDriftBackend and resourceLister already use. A backend
-// that does not implement it reads exactly as before.
+// The honest read is an upgrade beside it, in the shape liveDriftBackend and
+// resourceLister already use. A backend that does not implement it reads exactly
+// as before.
 type stackServicesReader interface {
-	ReadStackServices(name string) ([]charts.ServiceState, error)
+	ReadStackServices(ctx context.Context, name string) ([]charts.ServiceState, error)
+}
+
+// stacksReader is the optional interface a backend implements to answer for
+// several releases from one look at the swarm. *backend.Backend satisfies it.
+//
+// The read behind StackServices is a whole-swarm snapshot — NodeList,
+// ServiceList, TaskList and Info — which is then filtered by stack name. Asking
+// it once per release therefore fetched the entire swarm once per release and
+// threw away all but one stack's worth each time, so an application declaring
+// ten releases cost ten identical round trips on every single reconcile, on the
+// manager node the controller itself runs on.
+//
+// One request, one answer, filtered per release afterwards, which is what the
+// call already did internally.
+type stacksReader interface {
+	ReadStacks(ctx context.Context, releases []string) (map[string][]charts.ServiceState, error)
 }
 
 // stackServices reads one release's live services, keeping the read failure
 // where the backend can tell one from an empty stack.
-func stackServices(b charts.Backend, release string) ([]charts.ServiceState, error) {
+func stackServices(ctx context.Context, b charts.Backend, release string) ([]charts.ServiceState, error) {
 	if sr, ok := b.(stackServicesReader); ok {
-		return sr.ReadStackServices(release)
+		return sr.ReadStackServices(ctx, release)
 	}
-	return b.StackServices(release), nil
+	return b.StackServices(ctx, release), nil
+}
+
+// readStacks reads several releases' live services at once.
+//
+// The contract is all-or-nothing, and deliberately so: a nil error means every
+// requested release is in the map, and a non-nil one means the swarm could not
+// be read and none of them are. That is what the underlying call actually does —
+// one snapshot either arrives or does not — and it is the reading #107 settled
+// on, where a daemon that could not be asked must never be published as a swarm
+// with no services on it.
+//
+// The fallback for a backend without the batched seam keeps that contract rather
+// than a weaker one: it stops at the first failure, because every one of its
+// per-release calls is the same whole-swarm read and a failure of one is a
+// failure of all.
+func readStacks(ctx context.Context, b charts.Backend, releases []string) (map[string][]charts.ServiceState, error) {
+	if len(releases) == 0 {
+		return nil, nil
+	}
+	if sr, ok := b.(stacksReader); ok {
+		return sr.ReadStacks(ctx, releases)
+	}
+
+	out := make(map[string][]charts.ServiceState, len(releases))
+	for _, release := range releases {
+		states, err := stackServices(ctx, b, release)
+		if err != nil {
+			return nil, err
+		}
+		out[release] = states
+	}
+	return out, nil
 }
 
 // liveDriftBackend is the optional interface a backend implements to expose the
@@ -1686,7 +1734,7 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	// would never look like a transition.
 	was := r.syncState(e)
 	wasLive := r.driftState(e)
-	r.record(e, backend, plan, checkout.Revision, nil, live)
+	r.record(ctx, e, backend, plan, checkout.Revision, nil, live)
 
 	// Both notifications come before the gate below, because something found and
 	// not correctable is exactly the case an operator has to be told about: the
@@ -2009,7 +2057,7 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 	// reading is cheap in the case that matters — a sweep that worked leaves no
 	// candidates, so no history is read at all.
 	afterLive, _ := r.observe(ctx, e, spec, backend, engine, after)
-	r.record(e, backend, after, checkout.Revision, result, afterLive)
+	r.record(ctx, e, backend, after, checkout.Revision, result, afterLive)
 	return nil
 }
 
@@ -2089,7 +2137,7 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := backend.DeployStack(release, manifests[release], ""); err != nil {
+		if err := backend.DeployStack(ctx, release, manifests[release], ""); err != nil {
 			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
 			continue
 		}
@@ -2161,7 +2209,7 @@ func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, 
 	deadline := r.now().Add(timeout)
 
 	for {
-		switch c := charts.Rollup(backend.StackServices(release)); c.Phase {
+		switch c := charts.Rollup(backend.StackServices(ctx, release)); c.Phase {
 		case charts.PhaseWedged:
 			// Swarm has given up and will not continue on its own, so waiting
 			// out the deadline would only delay the same answer.
@@ -2472,7 +2520,7 @@ func (r *Reconciler) currentSpec(e *appEntry) application.Spec {
 // none of it and kept answering, so nothing restarted the container. Reading
 // first is safe because the caller holds the application's lease: no other sync
 // for it can be writing the fields this reads.
-func (r *Reconciler) record(e *appEntry, backend charts.Backend, plan *charts.Plan, revision string, result *application.SyncResult, live map[string]*application.ReleaseDrift) {
+func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Backend, plan *charts.Plan, revision string, result *application.SyncResult, live map[string]*application.ReleaseDrift) {
 	sync, releases := drift.FromPlan(plan)
 	sync.Revision = revision
 
@@ -2492,23 +2540,37 @@ func (r *Reconciler) record(e *appEntry, backend charts.Backend, plan *charts.Pl
 	// health of each release is decided against the outcome recorded above
 	// rather than against the previous tick's.
 	syncFailed := sync.LastSync != nil && !sync.LastSync.Succeeded
+
+	// One read for every release that has one, rather than one read each. A
+	// release the plan would install is declared and not deployed, which is
+	// knowable from the plan, so it is left out of the request rather than asked
+	// about and ignored.
+	deployed := make([]string, 0, len(releases))
+	for i := range releases {
+		if releases[i].Action != application.ActionInstall {
+			deployed = append(deployed, releases[i].Name)
+		}
+	}
+	states, readErr := readStacks(ctx, backend, deployed)
+	if readErr != nil {
+		r.log.Warn("reading the swarm failed; publishing this application's releases as unread",
+			"application", e.name, "error", readErr)
+	}
+
 	for i := range releases {
 		rel := &releases[i]
-		var states []charts.ServiceState
-		var readErr error
-		if rel.Action != application.ActionInstall {
-			states, readErr = stackServices(backend, rel.Name)
-		}
 		rel.Health, rel.Services = health.Release(health.Input{
-			States: states,
+			States: states[rel.Name],
 			// A release the plan would install is declared and not deployed.
 			// That is knowable from the plan, so it costs no call to the swarm.
 			Installed:  rel.Action != application.ActionInstall,
 			SyncFailed: syncFailed,
 			// This is the one caller that must not read an unavailable daemon as
 			// an empty swarm: it asks once and publishes the answer, rather than
-			// polling until one arrives. See stackServicesReader.
-			ReadFailed: readErr != nil,
+			// polling until one arrives. See stackServicesReader. readStacks is
+			// all-or-nothing, so a release that was asked about and is absent
+			// from the answer was not read at all.
+			ReadFailed: readErr != nil && rel.Action != application.ActionInstall,
 		})
 
 		// Fold the live comparison into the sync axis. A release whose running

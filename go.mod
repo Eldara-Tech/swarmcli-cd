@@ -3,7 +3,7 @@ module github.com/Eldara-Tech/swarmcli-cd
 go 1.26
 
 require (
-	github.com/Eldara-Tech/swarmcli v1.13.0-rc5.0.20260731084324-06c820fdfb6f
+	github.com/Eldara-Tech/swarmcli v1.13.0-rc5.0.20260731104716-fb0a6634ddef
 	github.com/containerd/errdefs v1.0.0
 	github.com/distribution/reference v0.6.0
 	github.com/docker/cli v28.5.1+incompatible

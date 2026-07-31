@@ -149,7 +149,7 @@ var (
 // not a value the two callers would do anything different with — it is a thing
 // an operator has to be told, and only this knows what was and was not covered.
 func Release(ctx context.Context, log *slog.Logger, backend charts.Backend, engine Uninstaller, release string, volumes bool) (*charts.UninstallResult, error) {
-	if err := backend.RemoveStack(release); err != nil {
+	if err := backend.RemoveStack(ctx, release); err != nil {
 		return nil, fmt.Errorf("removing the stack: %w", err)
 	}
 	if volumes {
