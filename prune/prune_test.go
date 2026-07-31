@@ -102,7 +102,13 @@ type uninstalled struct {
 type fakeEngine struct {
 	releases []charts.Release
 	listErr  error
-	fail     map[string]error
+	// listErrAt is the 1-based call from which List starts failing; 0 means the
+	// first. The re-check after a failed uninstall is the second call, and
+	// failing only that one is the only way to reach the path where the sweep
+	// holds diagnoses it cannot check.
+	listErrAt int
+	listCalls int
+	fail      map[string]error
 	// gone marks a release that its failing Uninstall nevertheless finished —
 	// the records are deleted, so a later List no longer has it. That is what a
 	// spurious stack-removal error looks like from the outside.
@@ -113,7 +119,11 @@ type fakeEngine struct {
 }
 
 func (e *fakeEngine) List(context.Context) ([]charts.Release, error) {
-	return e.releases, e.listErr
+	e.listCalls++
+	if e.listErr != nil && e.listCalls >= max(e.listErrAt, 1) {
+		return nil, e.listErr
+	}
+	return e.releases, nil
 }
 
 func (e *fakeEngine) Uninstall(_ context.Context, release string, purgeVolumes bool) (*charts.UninstallResult, error) {
@@ -411,6 +421,36 @@ func TestPartiallyFailedApplicationIsNotReportedAsPruned(t *testing.T) {
 	}
 	if want := []string{"api", "web"}; !reflect.DeepEqual(e.pruned(), want) {
 		t.Errorf("uninstalled %v, want both attempted (%v)", e.pruned(), want)
+	}
+}
+
+// The re-check exists to decide whether the uninstall failures were real, so a
+// re-check that itself fails leaves the sweep with the failures and no verdict.
+// Reporting only its own error threw away one wrapped diagnosis per release that
+// would not come down and replaced them all with "re-checking which releases are
+// left", which names nothing an operator can act on (#107).
+func TestARecheckFailureKeepsTheUninstallDiagnoses(t *testing.T) {
+	e := &fakeEngine{
+		releases: []charts.Release{owned("api", "gone"), owned("web", "gone")},
+		fail: map[string]error{
+			"api": errors.New("network still attached"),
+			"web": errors.New("volume is in use"),
+		},
+		listErr:   errors.New("daemon unreachable"),
+		listErrAt: 2,
+	}
+
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{"kept"}, nil)
+	if err == nil {
+		t.Fatal("Departed = nil, want the failures reported")
+	}
+	if len(got) != 0 {
+		t.Errorf("pruned applications = %v, want none — nothing was proved gone", got)
+	}
+	for _, want := range []string{"network still attached", "volume is in use", "daemon unreachable"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q is missing %q", err, want)
+		}
 	}
 }
 

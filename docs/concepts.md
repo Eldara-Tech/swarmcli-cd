@@ -35,14 +35,24 @@ out-of-sync case carries a summary of the plan that made it so, counted by actio
 — how many releases would be installed, upgraded, or left unchanged.
 
 **Health** answers *is what is running actually working?* It is `healthy`,
-`progressing`, `degraded`, or `missing`. `missing` — declared but not present —
-is deliberately distinct from `degraded` — present but unhealthy; an operator and
-a UI both need to tell those apart.
+`progressing`, `degraded`, `missing`, or `unknown`. `missing` — declared but not
+present — is deliberately distinct from `degraded` — present but unhealthy; an
+operator and a UI both need to tell those apart. `unknown` is the swarm not
+having been readable at all, which is distinct again: an unreachable daemon is
+not a stack that has gone away, and reporting it as one would raise the loudest
+alarm this axis has about something that is very likely fine.
 
 They are independent axes. A stack can be perfectly synced and badly degraded at
 the same time, and collapsing the two would lose the distinction that makes the
 view useful. Every list row shows both, plus a `3/4` service count, without
 having to open the application.
+
+Both are the last *successful* observation, so a reconcile that never reached one
+leaves them saying what they said before. When that happens the list grows a
+`RECONCILE` column marking the affected rows, and prints the reason under the
+table; `app get` and the JSON carry the full error either way. Without the
+column, an application whose repository has been unreachable for a week reports
+last week's verdict beside a timestamp of seconds ago.
 
 **Drift** is what the sync axis reports between deploys. On a manual application,
 the controller reconciles, sees the swarm no longer matches git, and records

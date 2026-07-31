@@ -117,8 +117,19 @@ func (logNotifier) Notify(ctx context.Context, e Event) {
 
 	level := slog.LevelInfo
 	switch e.Type {
-	case SyncFailed, PruneFailed:
+	case SyncFailed:
 		level = slog.LevelError
+	// Warn, not Error, and this is the case CLAUDE.md names to define the level:
+	// "a prune held, a resource left behind". A prune that did not complete does
+	// not fail the sync — the deploy landed, and what is left is retried next
+	// interval — and for the network, config and secret sweep it is the expected
+	// answer while the services that referenced them are still draining. Error
+	// therefore fired every interval, beside a Warn line the reconciler had just
+	// written about the same fact, for something working as intended. Where a
+	// sweep does fail the reconcile, loop logs that at Error itself; this line
+	// would only be a second copy of it.
+	case PruneFailed:
+		level = slog.LevelWarn
 	// Warn, not Info: a stack was deleted. It is the line an operator goes
 	// looking for when something they expected to be running is not.
 	case ResourcesPruned:

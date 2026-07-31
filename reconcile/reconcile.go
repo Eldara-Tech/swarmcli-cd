@@ -488,6 +488,32 @@ func (r *Reconciler) withOutOfBandNotifier(ctx context.Context, b charts.Backend
 	})
 }
 
+// stackServicesReader is the optional interface a backend implements to report
+// a failed read rather than an empty stack. *backend.Backend satisfies it.
+//
+// charts.Backend.StackServices has no error return, and for its CE caller that
+// is right: it polls, so a daemon that could not be asked is "not converged yet"
+// and the next poll asks again. awaitConverged below is that caller. record is
+// not — it turns the same nil into "deployed, but no services are present on the
+// swarm", the loudest thing the health rollup can say, so one slow daemon
+// flipped every release of an application from healthy to missing (#107).
+//
+// CE's interface is not ours to widen, so the honest read is an upgrade beside
+// it, in the shape liveDriftBackend and resourceLister already use. A backend
+// that does not implement it reads exactly as before.
+type stackServicesReader interface {
+	ReadStackServices(name string) ([]charts.ServiceState, error)
+}
+
+// stackServices reads one release's live services, keeping the read failure
+// where the backend can tell one from an empty stack.
+func stackServices(b charts.Backend, release string) ([]charts.ServiceState, error) {
+	if sr, ok := b.(stackServicesReader); ok {
+		return sr.ReadStackServices(release)
+	}
+	return b.StackServices(release), nil
+}
+
 // liveDriftBackend is the optional interface a backend implements to expose the
 // two halves of a live drift comparison. *backend.Backend satisfies it.
 //
@@ -1342,6 +1368,22 @@ func backoff(interval time.Duration, failures int) time.Duration {
 	return d
 }
 
+// cancelled reports that an error is the controller stopping rather than
+// something going wrong.
+//
+// loop above already makes that judgement for the backoff, and everything that
+// reports needs the same one. Two routine triggers made it a lie: every rolling
+// restart cancels each application's context mid-flight — near-certain under
+// syncPolicy.wait, where an apply blocks for as long as the rollout takes — and
+// Remove cancels the application it is retiring. Both arrived as context.Canceled
+// wrapped in whatever the call was doing at the time, were dispatched as
+// sync-failed and recorded as an application-level error, and so paged somebody
+// for a clean shutdown or for one application cleanly retired (#107).
+//
+// context.Canceled only. A deadline that expired is a timeout, which is a real
+// failure and exactly what syncPolicy.timeout exists to report.
+func cancelled(err error) bool { return errors.Is(err, context.Canceled) }
+
 // Sync reconciles one application now, applying if its policy allows.
 func (r *Reconciler) Sync(ctx context.Context, app string) error {
 	return r.reconcile(ctx, app, false)
@@ -1529,6 +1571,18 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 			r.prune(ctx, spec, backend, engine, plan.Orphaned),
 			r.pruneServices(ctx, spec, backend, doomed),
 		); err != nil {
+			// Reported as a failed sync, which the other ordering's identical
+			// failure deliberately is not. The asymmetry is the whole point of
+			// the option: this sweep runs before the apply and stops it, so
+			// nothing was deployed and the sync delivered none of what the
+			// repository asked for. Below, the deploy has already landed and only
+			// the cleanup did not, so its result stands.
+			//
+			// Returning bare left a sync-started with no outcome on the event
+			// stream and a status still showing the *previous* sync's result —
+			// so the one ordering that guarantees nothing is running was also the
+			// one that reported the last time something was (#107).
+			r.failSync(ctx, spec.Name, checkout.Revision, started, err)
 			return err
 		}
 	}
@@ -1551,6 +1605,17 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	// apply is the wrong moment to start correcting something else.
 	if applyErr == nil {
 		applyErr = r.converge(ctx, spec, backend, plan, drifted)
+	}
+
+	// A cancelled context is not an outcome and is dispatched as neither. The
+	// controller is stopping, or Remove is retiring this application; both used
+	// to arrive here as sync-failed carrying "context canceled" through every
+	// notifier the deployment has, and to be written down as a failed sync. With
+	// syncPolicy.wait an apply blocks for as long as the rollout takes, so a
+	// clean `docker service update` of the controller paged somebody for each
+	// application it caught mid-apply — which is most of them (#107).
+	if cancelled(applyErr) {
+		return fmt.Errorf("applying: %w", applyErr)
 	}
 
 	result := &application.SyncResult{
@@ -1586,14 +1651,18 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	// everything that is not harmed by a moment of overlap. Before, so the
 	// re-plan below observes the swarm as prune left it rather than reporting
 	// the releases it has just deleted straight back as orphans.
+	//
+	// Held rather than returned on the spot, so that the resource sweep below is
+	// still reached. That is the whole of the change here: returning early meant
+	// one release whose teardown was stuck silenced the config, secret and
+	// network sweep for every release in the plan, under a comment claiming the
+	// sweep ran "always here, under both orderings" (#107).
+	var swept error
 	if !spec.SyncPolicy.PruneFirst {
-		if err := errors.Join(
+		swept = errors.Join(
 			r.prune(ctx, spec, backend, engine, plan.Orphaned),
 			r.pruneServices(ctx, spec, backend, doomed),
-		); err != nil {
-			r.recordResult(spec.Name, result)
-			return err
-		}
+		)
 	}
 
 	// Always here, under both orderings, and never before the apply.
@@ -1605,6 +1674,11 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	// already gone by the time their configs are attempted, which is the best
 	// order available rather than a compromise.
 	r.pruneResources(ctx, spec, backend, doomed)
+
+	if swept != nil {
+		r.recordResult(spec.Name, result)
+		return swept
+	}
 
 	after, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{
 		Owner:    application.OwnerID(r.controller, spec.Name),
@@ -1626,6 +1700,46 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	afterLive, _ := r.observe(ctx, spec, backend, engine, after)
 	r.record(spec.Name, backend, after, checkout.Revision, result, afterLive)
 	return nil
+}
+
+// failSync terminates a sync that delivered nothing: it dispatches sync-failed
+// and records the outcome, so that a notifier pairing sync-started with an
+// outcome gets one and the status stops reporting the sync before this.
+//
+// Only the pruneFirst sweep uses it. The path below it needs a result on the
+// success side too, for record to commit alongside the confirming re-plan, and a
+// helper that produced both would be the shape this file had when a cleanup
+// failure was being reported as a failed deploy. This one says one thing.
+//
+// A cancelled context is not a failure and gets neither event nor result, for
+// the reason apply gives: a shutdown caught mid-sweep is the controller
+// stopping, not the sweep failing.
+func (r *Reconciler) failSync(ctx context.Context, app, revision string, started time.Time, err error) {
+	if cancelled(err) {
+		return
+	}
+
+	result := &application.SyncResult{
+		Revision:   revision,
+		StartedAt:  started,
+		FinishedAt: r.now(),
+		Succeeded:  false,
+		Error:      err.Error(),
+	}
+	notify.Dispatch(ctx, notify.Event{
+		Application: app,
+		Type:        notify.SyncFailed,
+		Revision:    revision,
+		At:          result.FinishedAt,
+		Message:     err.Error(),
+	})
+	// recordResult and not record: reconcileLocked published this pass's plan,
+	// revision, drift and releases before apply was called, and nothing has been
+	// deployed since, so the outcome is the only thing missing. Re-reading the
+	// swarm would ask about a state that has not moved. Health catches up on the
+	// next reconcile, when record reads this result as SyncFailed — exactly how a
+	// failed apply already behaves.
+	r.recordResult(app, result)
 }
 
 // converge redeploys the releases whose running services no longer match the
@@ -1805,7 +1919,10 @@ func (r *Reconciler) prune(ctx context.Context, spec application.Spec, backend c
 		})
 	}
 	err := errors.Join(errs...)
-	if err != nil {
+	// Not for a cancellation: a teardown the controller stopped part-way through
+	// has not failed, and prune.purgeVolumes builds its error straight out of
+	// ctx.Err().
+	if err != nil && !cancelled(err) {
 		notify.Dispatch(ctx, notify.Event{
 			Application: spec.Name,
 			Type:        notify.PruneFailed,
@@ -1882,7 +1999,8 @@ func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, b
 		})
 	}
 	err := errors.Join(errs...)
-	if err != nil {
+	// Not for a cancellation, for the reason the release sweep gives.
+	if err != nil && !cancelled(err) {
 		notify.Dispatch(ctx, notify.Event{
 			Application: spec.Name,
 			Type:        notify.PruneFailed,
@@ -1979,7 +2097,8 @@ func (r *Reconciler) pruneResources(ctx context.Context, spec application.Spec, 
 			Message:     "pruned " + strings.Join(removed, ", "),
 		})
 	}
-	if err := errors.Join(errs...); err != nil {
+	// Not for a cancellation, for the reason the release sweep gives.
+	if err := errors.Join(errs...); err != nil && !cancelled(err) {
 		notify.Dispatch(ctx, notify.Event{
 			Application: spec.Name,
 			Type:        notify.PruneFailed,
@@ -2044,8 +2163,9 @@ func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Pla
 	for i := range releases {
 		rel := &releases[i]
 		var states []charts.ServiceState
+		var readErr error
 		if rel.Action != application.ActionInstall {
-			states = backend.StackServices(rel.Name)
+			states, readErr = stackServices(backend, rel.Name)
 		}
 		rel.Health, rel.Services = health.Release(health.Input{
 			States: states,
@@ -2053,6 +2173,10 @@ func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Pla
 			// That is knowable from the plan, so it costs no call to the swarm.
 			Installed:  rel.Action != application.ActionInstall,
 			SyncFailed: syncFailed,
+			// This is the one caller that must not read an unavailable daemon as
+			// an empty swarm: it asks once and publishes the answer, rather than
+			// polling until one arrives. See stackServicesReader.
+			ReadFailed: readErr != nil,
 		})
 
 		// Fold the live comparison into the sync axis. A release whose running
@@ -2105,7 +2229,15 @@ func (r *Reconciler) recordResult(app string, result *application.SyncResult) {
 // setError records why a reconcile failed without discarding what was last
 // observed. A repository that cannot be reached does not make the swarm's
 // state unknown — it makes it unverified, which is what the error says.
+//
+// A cancellation is not one of those and is dropped: the controller stopping,
+// or this application being removed from the set, is not a reason to leave
+// "context canceled" as the last word on every application in the list.
 func (r *Reconciler) setError(app string, err error) {
+	if cancelled(err) {
+		return
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.apps[app]

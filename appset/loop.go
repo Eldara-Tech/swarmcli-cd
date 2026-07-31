@@ -460,6 +460,12 @@ func (l *Loop) record(err error, stale bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.stale = stale
+	// A cancelled context is the controller stopping, not a pass that failed.
+	// Left as it was rather than cleared: what the status endpoint should report
+	// on the way down is the last real outcome, not "context canceled".
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	if err == nil {
 		l.lastErr = ""
 		return

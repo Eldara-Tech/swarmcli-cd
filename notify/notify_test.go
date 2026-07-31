@@ -67,6 +67,42 @@ func TestLogNotifierWritesTheEvent(t *testing.T) {
 	}
 }
 
+// The level is the contract, not decoration: CLAUDE.md defines Warn as
+// something an operator must see but that did not stop the loop — a prune held,
+// a resource left behind — and Error as a reconcile or a component failing. Each
+// of these was assigned deliberately and none of them was covered, so demoting
+// resources-pruned to Info left the suite green while the one line an operator
+// greps for after a stack disappears went quiet.
+func TestLogNotifierLevelsFollowTheContract(t *testing.T) {
+	for _, tc := range []struct {
+		event EventType
+		want  string
+		why   string
+	}{
+		{SyncStarted, "INFO", "lifecycle"},
+		{SyncSucceeded, "INFO", "lifecycle"},
+		{DriftDetected, "INFO", "a commit moved; the next sync applies it"},
+		{SyncFailed, "ERROR", "a reconcile failed"},
+		{PruneFailed, "WARN", "a prune held is the case the contract names for Warn, and it does not fail the sync"},
+		{ResourcesPruned, "WARN", "the controller deleted somebody's running stack"},
+		{LiveDriftDetected, "WARN", "somebody changed a running service outside git"},
+		{DriftConverged, "WARN", "the controller overwrote that change"},
+	} {
+		t.Run(string(tc.event), func(t *testing.T) {
+			var buf bytes.Buffer
+			restore := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+			t.Cleanup(func() { slog.SetDefault(restore) })
+
+			logNotifier{}.Notify(context.Background(), Event{Application: "edge", Type: tc.event})
+
+			if want := "level=" + tc.want; !strings.Contains(buf.String(), want) {
+				t.Errorf("logged %q, want %s — %s", buf.String(), want, tc.why)
+			}
+		})
+	}
+}
+
 // Empty optional fields are left out rather than logged as empty attributes.
 func TestLogNotifierOmitsEmptyFields(t *testing.T) {
 	var buf bytes.Buffer

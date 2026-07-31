@@ -631,6 +631,45 @@ func TestAppListOmitsTheDriftColumnWhenNothingUsesIt(t *testing.T) {
 	}
 }
 
+// SYNC, HEALTH and REVISION are all the last successful observation, and
+// nothing moves them when a reconcile never reaches one. So an application whose
+// repository has been unreachable for a week reported last week's plan as
+// "synced / healthy" with an observedAt of three seconds ago, and Status.Error —
+// the only field that said otherwise — appeared in `app get` and the JSON alone
+// (#107).
+func TestAppListMarksAnApplicationWhoseReconcileIsFailing(t *testing.T) {
+	view := syncedView()
+	view.Status.Error = "fetching source: dial tcp 10.0.0.9:22: connect: connection refused"
+	server := start(t, &stubReconciler{view: view})
+
+	code, stdout, stderr := cli(t, server, "app", "list")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	// The column marks the row, and the reason goes under the table — a REASON
+	// cell wide enough for a dial error would wreck every other row.
+	for _, want := range []string{"RECONCILE", "failed", "edge: the last reconcile failed", "connection refused"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+}
+
+// And it stays off a fleet that is fine, for the reason the drift column does:
+// a column of "ok" down a list of twenty says nothing, and would bury the one
+// row that has something to report on the day there is one.
+func TestAppListOmitsTheReconcileColumnWhenNothingIsFailing(t *testing.T) {
+	server := start(t, &stubReconciler{view: syncedView()})
+
+	code, stdout, stderr := cli(t, server, "app", "list")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if strings.Contains(stdout, "RECONCILE") {
+		t.Errorf("stdout = %q, want no reconcile column when every reconcile got through", stdout)
+	}
+}
+
 func TestAppListShowsDrift(t *testing.T) {
 	server := start(t, &stubReconciler{view: driftedView()})
 

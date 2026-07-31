@@ -221,9 +221,27 @@ func appList(ctx context.Context, c *client.Client, out io.Writer, format string
 		}
 	}
 
-	headers := []string{"NAME", "SYNC", "HEALTH", "SERVICES", "REVISION"}
+	// The reconcile column appears on the same terms, and for a sharper reason.
+	// SYNC, HEALTH and REVISION are all the last *successful* observation, and
+	// nothing moves them when a reconcile never gets as far as one — so an
+	// application whose repository has been unreachable for a week reported last
+	// week's plan under an observedAt of three seconds ago, and the row read
+	// green (#107). This is the column that says not to believe the others.
+	showError := false
+	for _, v := range apps.Applications {
+		if v.Status.Error != "" {
+			showError = true
+			break
+		}
+	}
+
+	headers := []string{"NAME", "SYNC"}
 	if showDrift {
-		headers = []string{"NAME", "SYNC", "DRIFT", "HEALTH", "SERVICES", "REVISION"}
+		headers = append(headers, "DRIFT")
+	}
+	headers = append(headers, "HEALTH", "SERVICES", "REVISION")
+	if showError {
+		headers = append(headers, "RECONCILE")
 	}
 
 	rows := make([][]string, 0, len(apps.Applications))
@@ -237,9 +255,13 @@ func appList(ctx context.Context, c *client.Client, out io.Writer, format string
 			services(v.Status.Health.Services),
 			short(v.Status.Sync.Revision),
 		)
+		if showError {
+			row = append(row, reconcileColumn(v.Status.Error))
+		}
 		rows = append(rows, row)
 	}
 	table(out, headers, rows)
+	printReconcileErrors(out, apps.Applications)
 	return nil
 }
 
@@ -252,6 +274,38 @@ func driftColumn(d *application.Drift) string {
 		return "-"
 	}
 	return state(d.State)
+}
+
+// reconcileColumn says whether the last reconcile got through. "ok" rather than
+// a dash for the ones that did: unlike the drift column, every application was
+// asked, so a dash would claim the question does not apply here — and this
+// column only exists at all because one of them answered badly.
+func reconcileColumn(err string) string {
+	if err == "" {
+		return "ok"
+	}
+	return "failed"
+}
+
+// printReconcileErrors names why, under the table rather than in it.
+//
+// The choice printRollbacks makes, for the same reason: a reconcile error is a
+// sentence — a repository URL and a dial error, a chart that would not render —
+// and a cell wide enough for one would wreck every other row. The column says
+// which application to stop trusting; this says what happened to it, so the
+// common case needs no second command.
+func printReconcileErrors(out io.Writer, apps []application.View) {
+	first := true
+	for _, v := range apps {
+		if v.Status.Error == "" {
+			continue
+		}
+		if first {
+			_, _ = fmt.Fprintln(out)
+			first = false
+		}
+		_, _ = fmt.Fprintf(out, "%s: the last reconcile failed — %s\n", v.Spec.Name, v.Status.Error)
+	}
 }
 
 func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app string) error {

@@ -685,6 +685,35 @@ func TestStackServicesReportsNothingWhenTheSnapshotFails(t *testing.T) {
 	}
 }
 
+// The same read for the caller that does not poll. Without the error it cannot
+// tell an empty stack from a daemon that did not answer, and the health rollup
+// reads the first as "deployed, but no services are present on the swarm" — the
+// loudest thing it can say about a stack that is fine (#107).
+func TestReadStackServicesKeepsTheSnapshotFailure(t *testing.T) {
+	states, err := testBackend(t, &errAPI{err: errors.New("daemon unreachable")}, nil).ReadStackServices("s")
+	if err == nil {
+		t.Fatal("ReadStackServices err = nil, want the snapshot failure")
+	}
+	if !strings.Contains(err.Error(), "daemon unreachable") {
+		t.Errorf("err = %v, want the daemon's own failure carried", err)
+	}
+	if states != nil {
+		t.Errorf("states = %v, want none", states)
+	}
+}
+
+// And a stack the daemon answered about, with nothing under it, is not an error.
+// That is the case Missing exists for, and it has to survive the fix.
+func TestReadStackServicesReportsAnEmptyStackWithoutAnError(t *testing.T) {
+	states, err := testBackend(t, &fakeAPI{}, nil).ReadStackServices("s")
+	if err != nil {
+		t.Fatalf("ReadStackServices err = %v, want nil", err)
+	}
+	if len(states) != 0 {
+		t.Errorf("states = %v, want none", states)
+	}
+}
+
 // A network create that fails aborts the deploy: the services about to be
 // created would reference a network that is not there.
 func TestNetworkCreateFailureAbortsTheDeploy(t *testing.T) {
