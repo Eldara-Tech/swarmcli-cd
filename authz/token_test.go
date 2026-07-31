@@ -136,7 +136,7 @@ func TestAuthenticateAcceptsAnySchemeCase(t *testing.T) {
 func TestAuthorizeAllowsEverything(t *testing.T) {
 	tok := newToken(env(map[string]string{EnvToken: "s3cret"}), files(nil))
 
-	for _, act := range []Action{ActionRead, ActionSync} {
+	for _, act := range []Action{ActionRead, ActionDiff, ActionHistory, ActionSync} {
 		if err := tok.Authorize(context.Background(), Subject{Name: "admin"}, act, "edge"); err != nil {
 			t.Errorf("Authorize(%s) = %v, want nil", act, err)
 		}

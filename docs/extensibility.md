@@ -252,6 +252,6 @@ controller's log rather than only in the companion's source.
 
 It is the last open item of
 [#111](https://github.com/Eldara-Tech/swarmcli-cd/issues/111), and deliberately
-not done alongside the rest of it: a registration point whose most dangerous
-permitted use is an unauthenticated endpoint on a controller holding the Docker
-socket wants a review of its own rather than a paragraph in a larger change.
+not landed with the rest of it: this is a new registration mechanism, and one
+whose worst case is the paragraph above deserves a review of its own rather than
+a corner of a larger change.

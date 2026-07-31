@@ -132,6 +132,54 @@ func (denyAuthn) Authenticate(*http.Request) (authz.Subject, error) {
 	return authz.Subject{}, errors.New("no token")
 }
 
+// projectAuthorizer is the shape a companion implementing projects has: one
+// subject, one application, and nothing said about the rest. It is what the
+// seam could express and the API could not ask.
+//
+// Both its methods refuse a subject that is not the one Authenticate returned,
+// so a guard that dropped the subject on the way to a handler fails these tests
+// as a 403 rather than passing them by accident.
+type projectAuthorizer struct{ visible string }
+
+func (projectAuthorizer) Ready() error { return nil }
+
+func (projectAuthorizer) Authenticate(*http.Request) (authz.Subject, error) {
+	return authz.Subject{Name: "tenant", Groups: []string{"project-a"}}, nil
+}
+
+func (p projectAuthorizer) Authorize(_ context.Context, s authz.Subject, _ authz.Action, app string) error {
+	if s.Name != "tenant" {
+		return errors.New("the subject the guard authenticated did not reach the decision")
+	}
+	// An empty application is the unscoped question the guard asks for a
+	// collection endpoint, which this tenant is allowed to ask.
+	if app == "" || app == p.visible {
+		return nil
+	}
+	return errors.New("not yours")
+}
+
+func (p projectAuthorizer) Visible(_ context.Context, s authz.Subject, _ authz.Action, apps []string) ([]string, error) {
+	if s.Name != "tenant" {
+		return nil, errors.New("the subject the guard authenticated did not reach the decision")
+	}
+	var out []string
+	for _, app := range apps {
+		if app == p.visible {
+			out = append(out, app)
+		}
+	}
+	return out, nil
+}
+
+// refuseVisible authenticates and authorises the endpoint but cannot answer the
+// per-member question — a policy engine that did not respond.
+type refuseVisible struct{ *allowAll }
+
+func (refuseVisible) Visible(context.Context, authz.Subject, authz.Action, []string) ([]string, error) {
+	return nil, errors.New("policy engine unavailable")
+}
+
 type denyAuthz struct{ authz.Authorizer }
 
 func (denyAuthz) Authenticate(*http.Request) (authz.Subject, error) {
@@ -532,17 +580,25 @@ func TestEveryApiEndpointIsGuarded(t *testing.T) {
 	})
 }
 
-// Reading and syncing are different actions, and an application-scoped request
+// Every endpoint asks its own question, and an application-scoped request
 // carries its application so a companion's RBAC can scope on it.
+//
+// Diff and history are not `read`. A list row is a state and a revision; a diff
+// is the rendered manifest and a history is a walk of the swarm's stored
+// revisions, and an authorizer implementing projects has a reason to grant the
+// first and not the others. While every route passed ActionRead it could not say
+// so, and the constants are additive, so the distinction costs nothing to make.
 func TestAuthorizerIsAskedTheRightQuestion(t *testing.T) {
 	a := &allowAll{}
 	_, h := testServer(t, &fakeReconciler{views: []application.View{view("edge")}}, a)
 
 	do(t, h, "GET", "/api/v1/applications")
 	do(t, h, "GET", "/api/v1/applications/edge")
+	do(t, h, "GET", "/api/v1/applications/edge/diff")
+	do(t, h, "GET", "/api/v1/applications/edge/history")
 	do(t, h, "POST", "/api/v1/applications/edge/sync")
 
-	want := []string{"read:", "read:edge", "sync:edge"}
+	want := []string{"read:", "read:edge", "diff:edge", "history:edge", "sync:edge"}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if len(a.calls) != len(want) {
@@ -552,6 +608,132 @@ func TestAuthorizerIsAskedTheRightQuestion(t *testing.T) {
 		if a.calls[i] != want[i] {
 			t.Errorf("call %d = %q, want %q", i, a.calls[i], want[i])
 		}
+	}
+}
+
+// The list is a collection, and authorising a collection once is a decision
+// about the collection rather than about its members: it can only allow or deny
+// the whole thing. A tenant with read access to one application therefore
+// enumerated every application's name, repository URL, revision and error text,
+// which is the disclosure Visible exists to close.
+func TestTheListIsNarrowedToWhatTheSubjectMaySee(t *testing.T) {
+	views := []application.View{view("edge"), view("prod")}
+
+	_, narrowed := testServer(t, &fakeReconciler{views: views}, projectAuthorizer{visible: "edge"})
+	rr := do(t, narrowed, "GET", "/api/v1/applications")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "prod") {
+		t.Errorf("body %q names an application the subject may not see", rr.Body.String())
+	}
+	got := decode[struct {
+		Applications []application.View `json:"applications"`
+	}](t, rr)
+	if len(got.Applications) != 1 || got.Applications[0].Spec.Name != "edge" {
+		t.Fatalf("list = %+v, want only edge", got.Applications)
+	}
+
+	// An authorizer with nothing to narrow — which is the free build's, and the
+	// zero-configuration answer — still returns everything. Narrowing must be
+	// something an authorizer does, not something the API does to it.
+	_, whole := testServer(t, &fakeReconciler{views: views}, nil)
+	got = decode[struct {
+		Applications []application.View `json:"applications"`
+	}](t, do(t, whole, "GET", "/api/v1/applications"))
+	if len(got.Applications) != 2 {
+		t.Fatalf("got %d applications, want both: an authorizer that narrows nothing narrows nothing", len(got.Applications))
+	}
+}
+
+// An authorizer that cannot answer the per-member question must not be read as
+// permitting every member. Visible's error is a 403, like Authorize's.
+func TestAListTheAuthorizerCannotNarrowIsRefused(t *testing.T) {
+	_, h := testServer(t, &fakeReconciler{views: []application.View{view("edge"), view("prod")}},
+		refuseVisible{&allowAll{}})
+
+	rr := do(t, h, "GET", "/api/v1/applications")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "edge") || strings.Contains(rr.Body.String(), "prod") {
+		t.Errorf("body %q served the list it could not narrow", rr.Body.String())
+	}
+}
+
+// The event stream is the same collection arriving live, and it had the same
+// hole: the endpoint was authorised once and then published every
+// application's events to whoever was attached.
+//
+// Each event is about one application, so each is authorised as it arrives. The
+// one the subject may not see is published first, so a stream that carried it is
+// caught by the very next read rather than by a timeout.
+func TestTheEventStreamOnlyCarriesWhatTheSubjectMaySee(t *testing.T) {
+	s, h := testServer(t, &fakeReconciler{}, projectAuthorizer{visible: "edge"})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", srv.URL+"/api/v1/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Wait for the subscription rather than sleeping on it.
+	for range 200 {
+		if s.events.count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if s.events.count() != 1 {
+		t.Fatal("the request never subscribed")
+	}
+
+	for _, app := range []string{"prod", "edge"} {
+		s.Notify(context.Background(), notify.Event{
+			Application: app,
+			Type:        notify.SyncSucceeded,
+			Revision:    "abc123",
+			At:          time.Unix(0, 0).UTC(),
+		})
+	}
+
+	// Read off the goroutine and bound the wait. A filter that dropped both
+	// events would otherwise leave this blocked on a stream nothing will ever
+	// write to, and the failure would be the test binary's own timeout minutes
+	// later rather than this assertion.
+	type frame struct {
+		text string
+		err  error
+	}
+	frames := make(chan frame, 1)
+	go func() {
+		buf := make([]byte, 512)
+		n, err := resp.Body.Read(buf)
+		frames <- frame{string(buf[:n]), err}
+	}()
+
+	var got frame
+	select {
+	case got = <-frames:
+	case <-time.After(2 * time.Second):
+		t.Fatal("nothing arrived: the one event the subject may see was filtered out too")
+	}
+	if got.err != nil && got.err != io.EOF {
+		t.Fatalf("reading the stream: %v", got.err)
+	}
+	if strings.Contains(got.text, "prod") {
+		t.Errorf("frame %q carries an application the subject may not see", got.text)
+	}
+	if !strings.Contains(got.text, `"application":"edge"`) {
+		t.Errorf("frame %q lost the one event the subject may see", got.text)
 	}
 }
 

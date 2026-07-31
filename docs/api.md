@@ -43,12 +43,24 @@ curl -H "Authorization: Bearer $SWARMCLI_CD_ADMIN_TOKEN" \
      http://127.0.0.1:8080/api/v1/applications
 ```
 
-The default authorizer checks one shared token and grants two actions: `read`
-(every `GET`) and `sync` (the `POST`). A missing or wrong token is `401`. The
+The default authorizer checks one shared token and grants every action there is:
+`read` (the status, list, detail and event-stream endpoints), `diff`, `history`
+and `sync` (the `POST`). Those are four rather than two so that a licensed
+authorizer can grant one and not another — a diff is the rendered manifest and a
+history is a walk of the swarm's stored revisions, which are a different
+disclosure from a list row. With one shared token there is one subject and the
+distinction makes no difference. A missing or wrong token is `401`. The
 controller refuses to start with no token configured at all, so a `401` always
 means the token was presented and rejected, never that auth was off. SSO, per-user
 identity and RBAC are a licensed capability; see
 [extensibility.md](extensibility.md).
+
+The two endpoints that answer about every application are **narrowed rather than
+gated**: `GET /api/v1/applications` returns only the applications the caller may
+see, and `/api/v1/events` delivers only their events. With one shared token that
+is all of them; an authorizer implementing projects is what makes it fewer, and
+an authorizer that cannot answer refuses the request rather than serving the
+whole collection.
 
 `/healthz` takes no credential on purpose: a container healthcheck runs beside
 the process and cannot carry one without putting it in the stack file and in
@@ -195,7 +207,7 @@ is not this controller, which is what stops prune touching it; see
 Triggers a reconcile that applies whatever the plan contains, whether or not the
 policy is automated. It returns as soon as the sync is accepted; the sync itself
 runs detached. Follow it by polling the detail view, or watch `/events`. This is
-the one endpoint guarded by the `sync` action rather than `read`.
+the only endpoint that writes, and the only one guarded by the `sync` action.
 
 ## Event stream — `GET /api/v1/events`
 

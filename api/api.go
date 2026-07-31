@@ -118,20 +118,36 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/v1/status", s.guard(authz.ActionRead, s.status))
 	mux.Handle("GET /api/v1/applications", s.guard(authz.ActionRead, s.list))
 	mux.Handle("GET /api/v1/applications/{app}", s.guard(authz.ActionRead, s.detail))
-	mux.Handle("GET /api/v1/applications/{app}/diff", s.guard(authz.ActionRead, s.diff))
-	mux.Handle("GET /api/v1/applications/{app}/history", s.guard(authz.ActionRead, s.history))
+	mux.Handle("GET /api/v1/applications/{app}/diff", s.guard(authz.ActionDiff, s.diff))
+	mux.Handle("GET /api/v1/applications/{app}/history", s.guard(authz.ActionHistory, s.history))
 	mux.Handle("POST /api/v1/applications/{app}/sync", s.guard(authz.ActionSync, s.sync))
 	mux.Handle("GET /api/v1/events", s.guard(authz.ActionRead, s.stream))
 
 	return mux
 }
 
+// guarded is a handler that runs only behind the guard, and is handed the
+// subject the guard authenticated.
+//
+// A parameter rather than a value smuggled through the request context, because
+// two of these handlers make a second and finer authorisation decision with it —
+// list narrows its collection, the event stream authorises each event as it
+// arrives — and a context lookup that came back empty would hand them a zero
+// Subject. An authorizer given one fails closed, which is the right direction
+// and the wrong failure: it would look like a caller with no permissions rather
+// than like the wiring mistake it is.
+type guarded func(w http.ResponseWriter, r *http.Request, subject authz.Subject)
+
 // guard authenticates and authorises before the handler runs.
 //
 // Nothing behind it touches Docker, or even reads the reconciler's state, until
 // both have passed: the controller holds write access to the swarm, so an API
 // that authorised late would be one bug away from being a root shell.
-func (s *Server) guard(act authz.Action, h func(http.ResponseWriter, *http.Request)) http.Handler {
+//
+// What it decides is the endpoint, not the collection behind it. The two
+// endpoints that answer about every application ask again, per member, with what
+// this hands them.
+func (s *Server) guard(act authz.Action, h guarded) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		subject, err := s.authz.Authenticate(r)
 		if err != nil {
@@ -146,7 +162,7 @@ func (s *Server) guard(act authz.Action, h func(http.ResponseWriter, *http.Reque
 			fail(w, http.StatusForbidden, "forbidden")
 			return
 		}
-		h(w, r)
+		h(w, r, subject)
 	})
 }
 
@@ -158,7 +174,7 @@ func (s *Server) guard(act authz.Action, h func(http.ResponseWriter, *http.Reque
 // commit, a validation error naming applications — is exactly what an
 // unauthenticated caller should not be able to enumerate about a controller that
 // holds the docker socket.
-func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) status(w http.ResponseWriter, _ *http.Request, _ authz.Subject) {
 	if s.controller == nil {
 		write(w, http.StatusOK, application.ControllerStatus{Applications: len(s.rec.Views())})
 		return
@@ -166,17 +182,48 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	write(w, http.StatusOK, s.controller.Status())
 }
 
-// list serves the list view: every application with its sync state, health and
-// last synced revision, in one request.
+// list serves the list view: every application the caller may see, with its
+// sync state, health and last synced revision, in one request.
 //
 // Per-release detail is stripped. Status.Releases is omitempty precisely so
 // that a list of twenty applications is not twenty release tables, and its
 // absence unambiguously means "not requested" rather than "none" — the engine
 // rejects a release file declaring no releases.
-func (s *Server) list(w http.ResponseWriter, _ *http.Request) {
+//
+// Narrowed rather than served whole. The guard authorised this endpoint once,
+// with an empty application, which is a decision about the collection and not
+// about its members — so an authorizer implementing projects could only allow or
+// deny the entire list, and a tenant with read access to one application
+// enumerated every application's name, repository URL, revision and error text.
+// Visible is the per-member question asked in one call, which is what keeps a
+// companion backing it with a policy engine to one round trip for a list rather
+// than one per row.
+//
+// The reconciler's order survives, and a name Visible returned that was never
+// offered cannot conjure a row: what goes out is the views whose names came
+// back, not the names.
+func (s *Server) list(w http.ResponseWriter, r *http.Request, subject authz.Subject) {
 	views := s.rec.Views()
-	out := make([]application.View, 0, len(views))
+	names := make([]string, 0, len(views))
 	for _, v := range views {
+		names = append(names, v.Spec.Name)
+	}
+
+	visible, err := s.authz.Visible(r.Context(), subject, authz.ActionRead, names)
+	if err != nil {
+		fail(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	allowed := make(map[string]struct{}, len(visible))
+	for _, name := range visible {
+		allowed[name] = struct{}{}
+	}
+
+	out := make([]application.View, 0, len(allowed))
+	for _, v := range views {
+		if _, ok := allowed[v.Spec.Name]; !ok {
+			continue
+		}
 		v.Status.Releases = nil
 		out = append(out, v)
 	}
@@ -184,7 +231,7 @@ func (s *Server) list(w http.ResponseWriter, _ *http.Request) {
 }
 
 // detail serves one application with its releases and their services.
-func (s *Server) detail(w http.ResponseWriter, r *http.Request) {
+func (s *Server) detail(w http.ResponseWriter, r *http.Request, _ authz.Subject) {
 	view, ok := s.rec.View(r.PathValue("app"))
 	if !ok {
 		fail(w, http.StatusNotFound, "no such application")
@@ -194,7 +241,7 @@ func (s *Server) detail(w http.ResponseWriter, r *http.Request) {
 }
 
 // diff serves the manifest change each release would undergo.
-func (s *Server) diff(w http.ResponseWriter, r *http.Request) {
+func (s *Server) diff(w http.ResponseWriter, r *http.Request, _ authz.Subject) {
 	diffs, err := s.rec.Diffs(r.PathValue("app"))
 	switch {
 	case errors.Is(err, application.ErrNotPlanned):
@@ -210,7 +257,7 @@ func (s *Server) diff(w http.ResponseWriter, r *http.Request) {
 }
 
 // history serves every declared release's revisions in one request.
-func (s *Server) history(w http.ResponseWriter, r *http.Request) {
+func (s *Server) history(w http.ResponseWriter, r *http.Request, _ authz.Subject) {
 	hist, err := s.rec.History(r.Context(), r.PathValue("app"))
 	switch {
 	case errors.Is(err, application.ErrNotPlanned):
@@ -238,7 +285,7 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 // reconciled — by the sync already waiting, which has not read the repository
 // yet. The response says which of the two happened rather than claiming a sync
 // was started that was not.
-func (s *Server) sync(w http.ResponseWriter, r *http.Request) {
+func (s *Server) sync(w http.ResponseWriter, r *http.Request, _ authz.Subject) {
 	app := r.PathValue("app")
 
 	run, err := s.rec.AcceptSync(app)

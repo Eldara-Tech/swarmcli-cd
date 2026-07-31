@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 )
 
@@ -124,7 +125,13 @@ type wire struct {
 // with an ordinary client and no second protocol, browsers reconnect on their
 // own through EventSource, and the Phase 3 rbac-proxy forwards it without
 // needing to handle an upgrade.
-func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
+//
+// Every event is authorised against the subject that opened the stream. The
+// guard's one decision was about the endpoint, so without this a tenant with
+// read access to one application watched every application's syncs, drift and
+// failures go past — the same disclosure the list view had, arriving live rather
+// than on request.
+func (s *Server) stream(w http.ResponseWriter, r *http.Request, subject authz.Subject) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		// Nothing in the standard server does this, but a middleware that
@@ -153,6 +160,18 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 		case e, ok := <-events:
 			if !ok {
 				return
+			}
+			// Authorize rather than Visible: here the question really is about
+			// one application, because that is what an event is about. Asking
+			// per event rather than once at subscribe time also means a subject
+			// whose access is withdrawn stops being sent things without the
+			// connection having to be noticed and dropped — the decision is
+			// taken afresh, against the authorizer in force, for as long as the
+			// stream lives.
+			if err := s.authz.Authorize(r.Context(), subject, authz.ActionRead, e.Application); err != nil {
+				s.log.Debug("not delivering an event to a subscriber that may not see it",
+					"subscriber", id, "application", e.Application, "event", e.Type)
+				continue
 			}
 			payload, err := json.Marshal(wire{
 				Application: e.Application,
