@@ -6,6 +6,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
@@ -915,6 +916,56 @@ func (c *countingBackend) StackServices(string) []charts.ServiceState {
 	return nil
 }
 
+// unreadableBackend answers the honest read with a failure, the way
+// *backend.Backend does when the daemon is unreachable. It still satisfies the
+// plain StackServices, because charts.Backend requires it and the point of the
+// upgrade is that the two answer differently.
+type unreadableBackend struct{ stubBackend }
+
+func (unreadableBackend) ReadStackServices(string) ([]charts.ServiceState, error) {
+	return nil, errors.New("daemon unreachable")
+}
+
+// A daemon that could not be asked is not a stack with nothing in it. Reading
+// the second out of the first turned one slow daemon into every release of the
+// application reporting Missing — the loudest state the rollup has, and the one
+// alerting is watching for — while the stack ran perfectly (#107).
+func TestAnUnreadableSwarmMakesHealthUnknownRatherThanMissing(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{spec("edge", false)}, engine, nil,
+		fakeRegistry{backend: unreadableBackend{}})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthUnknown {
+		t.Errorf("health = %q, want unknown", view.Status.Health.State)
+	}
+	if len(view.Status.Releases) != 1 || view.Status.Releases[0].Health.State != application.HealthUnknown {
+		t.Errorf("releases = %+v, want the release unknown too", view.Status.Releases)
+	}
+}
+
+// The other half, and the reason the distinction had to be made at the backend
+// rather than by treating every empty answer as suspect: a stack that really has
+// gone still reads Missing.
+func TestAnEmptyStackIsStillMissing(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{spec("edge", false)}, engine, nil,
+		fakeRegistry{backend: stubBackend{}})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthMissing {
+		t.Errorf("health = %q, want missing", view.Status.Health.State)
+	}
+}
+
 // History reads the swarm rather than the status cache: the engine keeps one
 // Docker Config per revision in Raft, which is what makes history survive a
 // restart with no database here — and serving it from memory would make it
@@ -1473,6 +1524,64 @@ func TestPruneFailureDoesNotFailTheSync(t *testing.T) {
 	view, _ := r.View("edge")
 	if view.Status.Sync.LastSync == nil || !view.Status.Sync.LastSync.Succeeded {
 		t.Errorf("lastSync = %+v, want the apply still recorded as successful", view.Status.Sync.LastSync)
+	}
+}
+
+// A clean shutdown is not a failed sync. Two routine triggers: every rolling
+// restart of the controller cancels each application's context mid-apply — with
+// syncPolicy.wait the apply blocks for as long as the rollout takes, so a
+// `docker service update` of the controller is near-certain to catch one — and
+// Remove cancels the application it is retiring. Both used to dispatch
+// sync-failed carrying "context canceled" through every notifier the deployment
+// has, and to record a failed sync and an application-level error with it (#107).
+//
+// The cancellation arrives wrapped in whatever the call was doing at the time,
+// which is why the test wraps it too.
+func TestACancelledSyncIsNotDispatchedAsAFailure(t *testing.T) {
+	rec := listen(t)
+	engine := &fakeEngine{
+		plans:    []*charts.Plan{outOfSync(), synced()},
+		applyErr: fmt.Errorf("deploying release %q: %w", "whoami", context.Canceled),
+	}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := r.Sync(ctx, "edge"); err == nil {
+		t.Fatal("Sync = nil, want the cancellation returned to the loop")
+	}
+
+	if got := rec.types(); slices.Contains(got, notify.SyncFailed) {
+		t.Errorf("events = %v, want no sync-failed for a clean shutdown", got)
+	}
+	view, _ := r.View("edge")
+	if last := view.Status.Sync.LastSync; last != nil {
+		t.Errorf("lastSync = %+v, want none — the sync reached no outcome", last)
+	}
+	if view.Status.Error != "" {
+		t.Errorf("status error = %q, want none: a shutdown is not a broken application", view.Status.Error)
+	}
+}
+
+// The prune paths build their errors out of ctx.Err() too — prune.purgeVolumes
+// literally returns it — so a shutdown during a teardown raised prune-failed for
+// something that had not failed.
+func TestACancelledPruneIsNotDispatchedAsAFailure(t *testing.T) {
+	rec := listen(t)
+	engine := &fakeEngine{
+		plans:     []*charts.Plan{orphaning("old"), synced()},
+		uninstErr: map[string]error{"old": fmt.Errorf("removing volume %q: %w", "old_data", context.Canceled)},
+	}
+	r := newTest(t, []application.Spec{pruningSpec("edge", false)}, engine, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := r.Sync(ctx, "edge"); err == nil {
+		t.Fatal("Sync = nil, want the cancellation returned to the loop")
+	}
+
+	if got := rec.types(); slices.Contains(got, notify.PruneFailed) {
+		t.Errorf("events = %v, want no prune-failed for a clean shutdown", got)
 	}
 }
 
@@ -3232,6 +3341,28 @@ func TestAResourceStillInUseIsReportedAndTheReconcileSucceeds(t *testing.T) {
 	view, _ := r.View("edge")
 	if last := view.Status.Sync.LastSync; last == nil || !last.Succeeded {
 		t.Errorf("last sync = %+v, want a success", last)
+	}
+}
+
+// The two sweeps are independent, and the comment above pruneResources claimed
+// it ran "always here, under both orderings" while sitting six lines below a
+// return that skipped it. So one release whose service teardown was stuck
+// silenced the config, secret and network sweep for every release in the plan —
+// and a config left behind is exactly what nobody goes looking for afterwards
+// (#107).
+func TestAFailedServiceSweepDoesNotSilenceTheResourceSweep(t *testing.T) {
+	backend := resourceSweepBackend()
+	backend.removeErr = errors.New("service is updating")
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Fatal("Sync = nil, want the service removal failure reported")
+	}
+	want := []string{"config:c-old", "secret:k-old", "network:n-gone"}
+	if got := backend.prunedResources(); !slices.Equal(got, want) {
+		t.Errorf("pruned %v, want %v — a stuck service is no reason to leave the rest behind", got, want)
 	}
 }
 

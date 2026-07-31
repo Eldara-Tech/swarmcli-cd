@@ -303,7 +303,12 @@ func (p *Pruner) Departed(ctx context.Context, desired, declared []string) ([]st
 		// describe an already-finished deletion are dropped.
 		still, err := p.stillListed(ctx, engine, failed)
 		if err != nil {
-			errs = append(errs, err)
+			// Both, because the re-check is what decides whether those failures
+			// were real and it is the thing that just failed. Reporting only its
+			// own error replaced every diagnosis this sweep had — one wrapped
+			// error per release that would not uninstall — with "re-checking
+			// which releases are left", which names nothing to act on.
+			errs = append(errs, errors.Join(append(reasons(failed), err)...))
 			continue
 		}
 		if len(still) == 0 {
@@ -322,6 +327,15 @@ func (p *Pruner) Departed(ctx context.Context, desired, declared []string) ([]st
 type failure struct {
 	release string
 	err     error
+}
+
+// reasons is the errors of a failure list, in order.
+func reasons(failed []failure) []error {
+	out := make([]error, 0, len(failed))
+	for _, f := range failed {
+		out = append(out, f.err)
+	}
+	return out
 }
 
 // stillListed returns the failures whose releases the swarm still has.

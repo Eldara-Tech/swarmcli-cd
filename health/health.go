@@ -43,6 +43,16 @@ type Input struct {
 	// not succeed. It is what turns a rollout that is merely slow into one that
 	// is broken; see Release.
 	SyncFailed bool
+	// ReadFailed reports that the swarm could not be asked, so States is empty
+	// because nothing answered rather than because nothing is there.
+	//
+	// It exists because those two are the same value — a nil slice — coming out
+	// of charts.Backend.StackServices, which has no error return, and opposite
+	// findings coming out of Release: one is Missing, the loudest state here,
+	// and the other is Unknown. Without the distinction a daemon that was
+	// briefly unreachable flipped every release of an application to Missing and
+	// paged whoever was listening, for a stack running perfectly (#107).
+	ReadFailed bool
 }
 
 // Release rolls one release's services up to a health state, and returns the
@@ -53,6 +63,15 @@ func Release(in Input) (application.Health, []application.ServiceStatus) {
 		return application.Health{
 			State:   application.HealthMissing,
 			Message: "declared in the repository but not deployed",
+		}, nil
+	case in.ReadFailed:
+		// Asked and unanswerable, which is what Unknown is for and the one thing
+		// no other state may be used for: every one of them asserts something
+		// about the swarm, and nothing here has read it. Checked before the
+		// empty case below, which is the assertion this would otherwise become.
+		return application.Health{
+			State:   application.HealthUnknown,
+			Message: "the swarm could not be read, so this release's health is not known",
 		}, nil
 	case len(in.States) == 0:
 		// The release record exists but the swarm has no services under it.
@@ -153,13 +172,21 @@ func Application(releases []application.ReleaseStatus) application.Health {
 // live problem, whereas Missing is the ordinary state of a release that has
 // been declared and not yet synced — and the sync axis already says so, in the
 // row right next to it.
+//
+// Unknown outranks Healthy alone, and has to outrank it. A release whose swarm
+// could not be read is not a release known to be fine, so leaving it at the
+// bottom would let the releases that did answer report the whole application as
+// healthy on evidence nobody has — which is the same lie as the Missing one this
+// ordering was extended to fix, told the quiet way round (#107).
 func rank(s application.HealthState) int {
 	switch s {
 	case application.HealthDegraded:
-		return 3
+		return 4
 	case application.HealthMissing:
-		return 2
+		return 3
 	case application.HealthProgressing:
+		return 2
+	case application.HealthUnknown:
 		return 1
 	default:
 		return 0

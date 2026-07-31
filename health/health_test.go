@@ -130,6 +130,23 @@ func TestDeployedReleaseWithNoServicesIsMissing(t *testing.T) {
 	}
 }
 
+// The other empty list, and the one that used to be indistinguishable from it.
+// Nothing was read, so nothing may be asserted — and asserting the loudest thing
+// this package can say, on a stack that is running perfectly, is what one slow
+// daemon used to do to every release of an application (#107).
+func TestAReleaseWhoseSwarmCouldNotBeReadIsUnknown(t *testing.T) {
+	h, services := Release(Input{Installed: true, ReadFailed: true})
+	if h.State != application.HealthUnknown {
+		t.Errorf("health = %q, want unknown", h.State)
+	}
+	if strings.Contains(h.Message, "no services") {
+		t.Errorf("message = %q, want it not to claim the swarm is empty", h.Message)
+	}
+	if services != nil {
+		t.Errorf("services = %v, want none — none were read", services)
+	}
+}
+
 // The counts a list row renders, and the worst-wins rollup that decides its
 // colour. One degraded service must not be hidden behind two healthy ones.
 func TestReleaseRollupCountsAndWorstWins(t *testing.T) {
@@ -190,6 +207,10 @@ func TestApplicationRollup(t *testing.T) {
 		Name:   "db",
 		Health: application.Health{State: application.HealthDegraded, Services: application.ServiceCounts{Healthy: 0, Total: 1}},
 	}
+	unknown := application.ReleaseStatus{
+		Name:   "cache",
+		Health: application.Health{State: application.HealthUnknown},
+	}
 
 	t.Run("counts are summed across releases", func(t *testing.T) {
 		got := Application([]application.ReleaseStatus{healthy, progressing})
@@ -208,6 +229,12 @@ func TestApplicationRollup(t *testing.T) {
 			want     application.HealthState
 		}{
 			{"all healthy", []application.ReleaseStatus{healthy, healthy}, application.HealthHealthy},
+			// A release nobody could read must not be reported as fine on the
+			// strength of the ones that answered — the quiet half of #107.
+			{"unknown beats healthy", []application.ReleaseStatus{healthy, unknown}, application.HealthUnknown},
+			// And no further. "Could not tell" never outranks a problem somebody
+			// did manage to see.
+			{"progressing beats unknown", []application.ReleaseStatus{unknown, progressing}, application.HealthProgressing},
 			{"progressing beats healthy", []application.ReleaseStatus{healthy, progressing}, application.HealthProgressing},
 			{"missing beats progressing", []application.ReleaseStatus{progressing, missing}, application.HealthMissing},
 			{"degraded beats missing", []application.ReleaseStatus{missing, degraded}, application.HealthDegraded},

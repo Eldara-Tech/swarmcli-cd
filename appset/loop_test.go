@@ -343,6 +343,33 @@ func TestApplyRemovesBeforeItAdds(t *testing.T) {
 	}
 }
 
+// A cancelled context is the controller stopping, not a pass that failed. A
+// status endpoint scraped during a rolling restart used to report "context
+// canceled" as the app set's error — the cosmetic half of #107, and the half an
+// operator sees first.
+//
+// record is driven directly because it is the only writer of that field, and
+// reaching it through Once would mean a fake that fails an add with a
+// cancellation, which is not how a cancellation ever arrives.
+func TestACancelledPassKeepsTheLastRealOutcome(t *testing.T) {
+	loop, rec, publish := newLoop(t, oneApp, spec("edge", "releases/edge.yaml"))
+	rec.setFailAdd("core")
+	publish(twoApps)
+	if err := loop.Once(context.Background()); err == nil {
+		t.Fatal("Once = nil, want the failed add reported")
+	}
+	before := loop.Status().AppSet.Error
+	if before == "" {
+		t.Fatal("status error is empty, want the failure recorded first")
+	}
+
+	loop.record(errors.Join(errors.New("applying the set"), context.Canceled), false)
+
+	if got := loop.Status().AppSet.Error; got != before {
+		t.Errorf("status error = %q, want the last real outcome kept (%q)", got, before)
+	}
+}
+
 // One application that cannot be started is no reason to leave a departed one
 // reconciling, and no reason to skip the rest of the file.
 func TestApplyIsBestEffort(t *testing.T) {

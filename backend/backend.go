@@ -513,12 +513,34 @@ func (b *Backend) RefreshSnapshot() error { return nil }
 //
 // A snapshot that cannot be read returns nil, matching the CE backend: the
 // caller polls, so an unavailable daemon is "not converged yet" rather than a
-// failure to report.
+// failure to report. That is true of awaitConverged and false of everything
+// that asks once and then takes a view — see ReadStackServices.
 func (b *Backend) StackServices(name string) []charts.ServiceState {
+	states, _ := b.ReadStackServices(name)
+	return states
+}
+
+// ReadStackServices is the same read with the failure kept, for the caller that
+// has to tell "the swarm has no services under this release" from "the swarm
+// could not be asked".
+//
+// Those are one answer to StackServices and opposite findings to a health
+// rollup, which reads an empty list as the positive assertion "deployed, but no
+// services are present on the swarm". One slow daemon therefore flipped every
+// release of an application from healthy to missing — the loudest state the
+// rollup has, and the one anything alerting is watching for (#107).
+//
+// It is a method beside StackServices rather than its signature because
+// charts.Backend is CE's interface: widening it would change every
+// implementation CE has, for a distinction only this repository's caller needs.
+// The reconciler reaches this one through an optional-interface upgrade, the
+// same way it reaches WithRegistryAuth, so a backend that cannot answer reads
+// exactly as it did before.
+func (b *Backend) ReadStackServices(name string) ([]charts.ServiceState, error) {
 	snap, err := docker.SnapshotWith(context.Background(), b.api)
 	if err != nil {
-		b.log.Warn("reading the swarm snapshot failed; reporting no services", "stack", name, "error", err)
-		return nil
+		b.log.Warn("reading the swarm snapshot failed", "stack", name, "error", err)
+		return nil, fmt.Errorf("reading the swarm snapshot: %w", err)
 	}
-	return charts.ServiceStatesFrom(snap, name)
+	return charts.ServiceStatesFrom(snap, name), nil
 }
