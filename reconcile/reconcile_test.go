@@ -667,8 +667,8 @@ func TestDiffsComeFromTheLastPlan(t *testing.T) {
 	engine := &fakeEngine{plans: []*charts.Plan{outOfSync()}}
 	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
 
-	if _, err := r.Diffs("edge"); !errors.Is(err, ErrNotPlanned) {
-		t.Errorf("Diffs before any reconcile = %v, want ErrNotPlanned", err)
+	if _, err := r.Diffs("edge"); !errors.Is(err, application.ErrNotPlanned) {
+		t.Errorf("Diffs before any reconcile = %v, want application.ErrNotPlanned", err)
 	}
 
 	if err := r.Sync(context.Background(), "edge"); err != nil {
@@ -1074,8 +1074,8 @@ func TestHistoryFailureForADeployedReleaseIsAnError(t *testing.T) {
 
 func TestHistoryBeforeAnyReconcile(t *testing.T) {
 	r := newTest(t, []application.Spec{spec("edge", false)}, &fakeEngine{}, nil)
-	if _, err := r.History(context.Background(), "edge"); !errors.Is(err, ErrNotPlanned) {
-		t.Errorf("err = %v, want ErrNotPlanned", err)
+	if _, err := r.History(context.Background(), "edge"); !errors.Is(err, application.ErrNotPlanned) {
+		t.Errorf("err = %v, want application.ErrNotPlanned", err)
 	}
 	if _, err := r.History(context.Background(), "absent"); err == nil {
 		t.Error("History of an unknown application = nil, want an error")

@@ -1702,10 +1702,10 @@ func (r *Reconciler) Sync(ctx context.Context, app string) error {
 // deploy".
 //
 // Requests that arrive while one is already running collapse onto the single
-// one already queued, and the extras return ErrSyncPending. Without that, N
-// requests all serialised on the lease and redeployed the swarm N times, with
-// the scheduled tick queued behind all of them — at twenty requests under a wait
-// policy the application went unobserved for over an hour.
+// one already queued, and the extras return application.ErrSyncPending. Without
+// that, N requests all serialised on the lease and redeployed the swarm N
+// times, with the scheduled tick queued behind all of them — at twenty requests
+// under a wait policy the application went unobserved for over an hour.
 //
 // The queue slot goes back the moment this sync starts rather than when it
 // finishes. A request arriving while one runs is asking about a repository this
@@ -1720,8 +1720,8 @@ func (r *Reconciler) SyncNow(ctx context.Context, app string) error {
 }
 
 // AcceptSync reserves an application's manual-sync slot and returns the sync to
-// run, or ErrSyncPending if one is already running with another queued behind
-// it.
+// run, or application.ErrSyncPending if one is already running with another
+// queued behind it.
 //
 // The split exists so the caller can detach the work and still answer honestly.
 // The API returns 202 before the sync has done anything, so if the decision to
@@ -1736,7 +1736,7 @@ func (r *Reconciler) AcceptSync(app string) (func(context.Context) error, error)
 	select {
 	case e.pending <- struct{}{}:
 	default:
-		return nil, ErrSyncPending
+		return nil, application.ErrSyncPending
 	}
 
 	return func(ctx context.Context) error {
@@ -2832,10 +2832,6 @@ func (r *Reconciler) Views() []application.View {
 	return out
 }
 
-// ErrNotPlanned is returned when an application has not been reconciled yet, so
-// there is nothing to diff.
-var ErrNotPlanned = errors.New("no plan yet")
-
 // Diffs returns the manifest changes the last plan found. It does not
 // re-render: what it reports is what the status reports, which is the point.
 func (r *Reconciler) Diffs(app string) ([]application.ReleaseDiff, error) {
@@ -2851,7 +2847,7 @@ func (r *Reconciler) Diffs(app string) ([]application.ReleaseDiff, error) {
 		return nil, fmt.Errorf("no such application %q", app)
 	}
 	if plan == nil {
-		return nil, ErrNotPlanned
+		return nil, application.ErrNotPlanned
 	}
 	return drift.Diffs(plan), nil
 }
@@ -2880,7 +2876,7 @@ func (r *Reconciler) History(ctx context.Context, app string) (application.Histo
 		return application.History{}, fmt.Errorf("no such application %q", app)
 	}
 	if plan == nil {
-		return application.History{}, ErrNotPlanned
+		return application.History{}, application.ErrNotPlanned
 	}
 
 	backend, err := r.swarms.Backend(ctx, swarms.Target{Swarm: spec.Destination.Swarm})

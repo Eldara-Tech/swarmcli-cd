@@ -46,16 +46,6 @@ var drainTimeout = 5 * time.Second
 // separate question "has its work stopped", and Draining answers that one.
 var errStillSyncing = errors.New("still syncing")
 
-// ErrSyncPending reports that a manual sync was not started because one is
-// already running with another already queued behind it.
-//
-// Not an error the caller can do anything about, and deliberately not a failure:
-// the queued sync will read the same repository and deploy the same state, so
-// the request has been honoured by the time it matters. It exists so the API can
-// say which of the two happened rather than claiming to have started something
-// it did not.
-var ErrSyncPending = errors.New("a sync is already queued for this application")
-
 // appEntry is one application's mutable record: the spec it reconciles against,
 // what was last observed of it, and — through the lease below — every piece of
 // work being done on its behalf.

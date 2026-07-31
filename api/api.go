@@ -32,10 +32,15 @@ import (
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
-	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 )
 
 // Reconciler is what the API serves. *reconcile.Reconciler implements it.
+//
+// This package does not import reconcile, and the two sentinels the handlers
+// below match on live in application for that reason. An alternative reconciler
+// is the whole point of stating this as an interface, and one that had to import
+// the OSS applier — go-git, the chart engine, the moby client — for two error
+// values would have had no way to take it up.
 type Reconciler interface {
 	Views() []application.View
 	View(app string) (application.View, bool)
@@ -192,7 +197,7 @@ func (s *Server) detail(w http.ResponseWriter, r *http.Request) {
 func (s *Server) diff(w http.ResponseWriter, r *http.Request) {
 	diffs, err := s.rec.Diffs(r.PathValue("app"))
 	switch {
-	case errors.Is(err, reconcile.ErrNotPlanned):
+	case errors.Is(err, application.ErrNotPlanned):
 		// Not an error the caller can fix, and not a 404 either: the
 		// application exists and has simply not been reconciled yet.
 		write(w, http.StatusOK, map[string]any{"releases": []application.ReleaseDiff{}, "planned": false})
@@ -208,7 +213,7 @@ func (s *Server) diff(w http.ResponseWriter, r *http.Request) {
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	hist, err := s.rec.History(r.Context(), r.PathValue("app"))
 	switch {
-	case errors.Is(err, reconcile.ErrNotPlanned):
+	case errors.Is(err, application.ErrNotPlanned):
 		write(w, http.StatusOK, application.History{Releases: []application.ReleaseHistory{}})
 		return
 	case err != nil:
@@ -238,7 +243,7 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request) {
 
 	run, err := s.rec.AcceptSync(app)
 	switch {
-	case errors.Is(err, reconcile.ErrSyncPending):
+	case errors.Is(err, application.ErrSyncPending):
 		write(w, http.StatusAccepted, map[string]any{"application": app, "accepted": true, "coalesced": true})
 		return
 	case err != nil:

@@ -305,8 +305,8 @@ func TestManualSyncsCollapseOntoTheOneAlreadyQueued(t *testing.T) {
 	queued := syncing(t, r, "edge")
 	waitFor(t, "the second request to be queued", func() bool { return len(r.mustEntry(t, "edge").pending) == 1 })
 
-	if _, err := r.AcceptSync("edge"); !errors.Is(err, ErrSyncPending) {
-		t.Fatalf("AcceptSync = %v, want ErrSyncPending: a third request should collapse onto the queued one", err)
+	if _, err := r.AcceptSync("edge"); !errors.Is(err, application.ErrSyncPending) {
+		t.Fatalf("AcceptSync = %v, want application.ErrSyncPending: a third request should collapse onto the queued one", err)
 	}
 
 	gate.let()

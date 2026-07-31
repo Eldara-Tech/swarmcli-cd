@@ -27,7 +27,6 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
-	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 )
 
 // --- fakes ---
@@ -90,7 +89,7 @@ func (f *fakeReconciler) AcceptSync(app string) (func(context.Context) error, er
 	accept, pending := f.acceptErr, f.pending
 	f.mu.Unlock()
 	if pending {
-		return nil, reconcile.ErrSyncPending
+		return nil, application.ErrSyncPending
 	}
 	if accept != nil {
 		return nil, accept
@@ -258,7 +257,7 @@ func TestUnknownApplicationIs404(t *testing.T) {
 // 404: it exists, and there is simply nothing to diff. A UI renders an empty
 // panel, not a failure.
 func TestDiffBeforeTheFirstReconcile(t *testing.T) {
-	_, h := testServer(t, &fakeReconciler{diffErr: reconcile.ErrNotPlanned}, nil)
+	_, h := testServer(t, &fakeReconciler{diffErr: application.ErrNotPlanned}, nil)
 
 	rr := do(t, h, "GET", "/api/v1/applications/edge/diff")
 	if rr.Code != http.StatusOK {
@@ -571,6 +570,49 @@ func TestHealthzIsOpenAndSaysNothing(t *testing.T) {
 	}
 }
 
+// The Reconciler interface at the top of api.go exists so that something other
+// than the OSS applier can serve these endpoints, and it only does that if this
+// package compiles against nothing but the interface. An import of reconcile —
+// even for one sentinel error, which is what this was — makes it decorative:
+// any replacement would still have had to drag in go-git, the chart engine and
+// the moby client to answer a request. Both sentinels live in application.
+//
+// Derived from the source rather than written down, for the reason
+// registeredRoutes gives: a list kept beside the code is the list that stops
+// being true.
+func TestTheApiDoesNotImportTheReconciler(t *testing.T) {
+	const forbidden = "github.com/Eldara-Tech/swarmcli-cd/reconcile"
+
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, parser.ImportsOnly)
+	if err != nil {
+		t.Fatalf("parsing this package: %v", err)
+	}
+
+	parsed := 0
+	for _, pkg := range pkgs {
+		for name, file := range pkg.Files {
+			parsed++
+			for _, imp := range file.Imports {
+				path, err := strconv.Unquote(imp.Path.Value)
+				if err != nil {
+					t.Fatalf("%s: unquoting %s: %v", name, imp.Path.Value, err)
+				}
+				if path == forbidden {
+					t.Errorf("%s imports %s; the Reconciler interface is there so that it does not have to", name, forbidden)
+				}
+			}
+		}
+	}
+	// A parse that read nothing passes vacuously, which is the one way this
+	// test could stop checking anything without saying so.
+	if parsed == 0 {
+		t.Fatal("no source files parsed; this test stopped checking anything")
+	}
+}
+
 // --- event stream ---
 
 func TestEventStreamDeliversWhatTheNotifierIsGiven(t *testing.T) {
@@ -688,7 +730,7 @@ func TestDiffForAnUnknownApplication(t *testing.T) {
 }
 
 func TestHistoryBeforeTheFirstReconcile(t *testing.T) {
-	_, h := testServer(t, &fakeReconciler{histErr: reconcile.ErrNotPlanned}, nil)
+	_, h := testServer(t, &fakeReconciler{histErr: application.ErrNotPlanned}, nil)
 
 	rr := do(t, h, "GET", "/api/v1/applications/edge/history")
 	if rr.Code != http.StatusOK {
