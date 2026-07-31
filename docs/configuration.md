@@ -253,7 +253,7 @@ When and how a plan is applied.
 | `interval` | controller default (3m) | how often to reconcile this application, as a duration string (`90s`, `5m`) |
 | `wait` | `false` | block each release until its services converge, and — when the service declares `update_config.failure_action: rollback` — let Swarm roll it back on a failed rollout |
 | `timeout` | engine default | how long `wait` waits for a rollout before giving up |
-| `historyMax` | engine default | revisions kept per release (one Docker config each); older revisions are pruned |
+| `historyMax` | `10` | revisions kept per release (one Docker config each); older revisions are pruned after a deploy that succeeded. An explicit `0` keeps every revision, which is what the chart engine has always read the number as — and, on a controller deploying on a timer, a slow leak into the manager's raft log |
 | `prune` | `false` | delete the resources of a release this application no longer declares. Only ever its own releases — see [prune](#prune) |
 | `pruneVolumes` | `false` | extend `prune` to the named volumes of what it deletes. Requires `prune`; set alone it is a config error |
 | `pruneResources` | `false` | delete a service, network, config or secret this application's chart used to declare and no longer does. Stands alone — it does not require `prune`; see [prune](#prune) |
@@ -265,6 +265,22 @@ apply itself.)
 
 Releases are applied in the order the release file lists them; use `wait: true`
 if a later release needs an earlier one live first.
+
+#### A chart that does not render the same twice
+
+Every sync re-plans once the apply has landed, to confirm it. A release that the
+confirming re-plan **still** calls out of date, moments after being deployed, has
+a chart whose render is not reproducible — `{{ now }}` stamped into a label,
+`uuidv4`, `randAlphaNum`. Nothing about that converges: every reconcile would
+rewrite every service in the release, roll every task, and store another revision,
+on every interval for ever.
+
+So the controller deploys it once and then holds the application at that
+revision, saying so on the status and in the log. The hold lifts when something
+could actually change the answer — a new commit, an edit to the application, or
+`swarmcli-cd app sync`, which is never subject to it. The remedy is to take the
+non-deterministic value out of the render, or to pin it in a values file so that
+changing it is a commit.
 
 ### `driftDetection` (optional)
 
@@ -749,8 +765,10 @@ service's evidence — Swarm scopes all four into one namespace of names, and
 
 A resource failing the third clause is **reported and never deleted**. A service
 shows as `unexpected` without the `(orphaned)` marker, which is also how one
-older than the release's retained history reads — `historyMax` keeps everything
-by default, so that only arises if you set it.
+older than the release's retained history reads — with the default `historyMax`
+of 10 that means a resource declared only by a revision more than ten deploys
+ago, and setting `historyMax: 0` removes even that case at the price of an
+unbounded revision store.
 
 It works in either drift mode. Removing something from a template is git moving,
 not the swarm moving, so coupling it to `driftDetection: live` would make it a
@@ -943,7 +961,7 @@ line that shows exactly what the controller is following is worth having in
 |---|---|---|
 | `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config. Static mode |
 | `--listen` | `:8080` | API listen address |
-| `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume so a restart does not re-clone everything |
+| `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume so a restart does not re-clone everything. An application that leaves the set has both reclaimed, one app-set interval after it goes |
 | `--appset-repo` | — | pull the app set from this repository. Selects **git** mode |
 | `--appset-revision` | — | branch, tag or SHA to track. Required with `--appset-repo`; an unpinned app set would follow whatever the default branch happens to point at |
 | `--appset-dir` | — | read the app set from a directory something else keeps current. Selects **path** mode |

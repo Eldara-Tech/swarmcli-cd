@@ -111,11 +111,21 @@ type Destination struct {
 // HistoryMax map onto charts.InstallOptions; Interval overrides the
 // controller-wide poll interval for one application.
 type SyncPolicy struct {
-	Automated  bool     `json:"automated" yaml:"automated"`
-	Interval   Duration `json:"interval,omitempty" yaml:"interval,omitempty"`
-	Wait       bool     `json:"wait,omitempty" yaml:"wait,omitempty"`
-	Timeout    Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
-	HistoryMax int      `json:"historyMax,omitempty" yaml:"historyMax,omitempty"`
+	Automated bool     `json:"automated" yaml:"automated"`
+	Interval  Duration `json:"interval,omitempty" yaml:"interval,omitempty"`
+	Wait      bool     `json:"wait,omitempty" yaml:"wait,omitempty"`
+	Timeout   Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+
+	// HistoryMax bounds a release's stored revision history: the newest N are
+	// kept and the rest deleted after a deploy that succeeded. Absent means
+	// DefaultHistoryMax; an explicit 0 means keep every revision, which is the
+	// chart engine's own reading of the number.
+	//
+	// A pointer for exactly that reason. "Not set" and "set to keep all" have to
+	// stay different answers, and they were the same one — zero — while the
+	// default was to keep all, which is how a controller ends up writing one
+	// Docker config per deploy into a manager's raft log for ever. See Retention.
+	HistoryMax *int `json:"historyMax,omitempty" yaml:"historyMax,omitempty"`
 
 	// Prune deletes the resources of a release this application used to declare
 	// and no longer does. Off by default: reporting an orphan is safe and
@@ -192,6 +202,33 @@ type SyncPolicy struct {
 	// Means nothing without Prune or PruneResources — it orders whichever of
 	// them is on — and is refused rather than ignored.
 	PruneFirst bool `json:"pruneFirst,omitempty" yaml:"pruneFirst,omitempty"`
+}
+
+// DefaultHistoryMax is how many revisions of each release are kept when an
+// application does not say.
+//
+// Every revision is one Docker Config in the swarm's raft log carrying the whole
+// rendered manifest, written by every deploy that changes anything. Left
+// unbounded that is one of the two ways this controller can fill the disk of the
+// manager it runs on — a chart whose render is not reproducible being the other,
+// and the two compound: at the three-minute default such a chart writes some 480
+// of them per release per day. Ten is Helm's own --history-max default and is far
+// more than is ever read back; rollback context is the last few revisions, and
+// the record of what was deployed when is git's.
+const DefaultHistoryMax = 10
+
+// Retention is how many revisions of each release to keep: what HistoryMax says,
+// or DefaultHistoryMax when it says nothing. Zero — which only an explicit
+// `historyMax: 0` produces — keeps every revision, as the chart engine reads it.
+//
+// It lives on the type rather than in the config loader's defaults so that every
+// way a spec is built gets the same answer, including the ones that never pass
+// through a file.
+func (p SyncPolicy) Retention() int {
+	if p.HistoryMax == nil {
+		return DefaultHistoryMax
+	}
+	return *p.HistoryMax
 }
 
 // View is what every API read returns: the declared spec beside what the

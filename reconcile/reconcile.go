@@ -126,6 +126,14 @@ type appEntry struct {
 	// it is kept per application rather than per revision.
 	plan *charts.Plan
 
+	// unstable is the checkout revision at which the confirming re-plan found
+	// releases still out of date immediately after a successful apply, and
+	// unstableReleases names them. Empty means the last apply confirmed. It is
+	// what stops a chart whose render is not reproducible being redeployed for
+	// ever; see checkReproducible.
+	unstable         string
+	unstableReleases []string
+
 	// cancel stops this application's loop; done is closed when that goroutine
 	// has returned. Both are nil until the loop is started — before Run, or for
 	// an application added to a not-yet-running reconciler.
@@ -285,6 +293,11 @@ func (r *Reconciler) Replace(spec application.Spec) error {
 		return fmt.Errorf("no such application %q", spec.Name)
 	}
 	e.spec = spec
+	// A new spec is a new set of inputs — a different chart path, different
+	// values files — so whatever the old one could not render reproducibly is no
+	// longer evidence about this one. Held state that survived an edit meant to
+	// fix it would need a manual sync to shift, which is the wrong way round.
+	e.unstable, e.unstableReleases = "", nil
 	return nil
 }
 
@@ -1297,11 +1310,28 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		})
 	}
 
+	if install+upgrade == 0 {
+		// This render matched what is stored, so whatever the last apply could
+		// not reproduce, this plan did. Clearing here rather than only after the
+		// next apply is what keeps a chart that renders unstably *sometimes* —
+		// a date rolling over at midnight is the honest version of it — from
+		// staying held, and with it its drift correction, at a revision it has
+		// since settled at.
+		r.setUnstable(spec.Name, "", nil)
+	}
 	if install+upgrade+len(fixable)+len(doomed) == 0 {
 		return nil
 	}
 	if !spec.SyncPolicy.Automated && !force {
 		return nil
+	}
+	// Before checkCompat and before anything is written: an application whose
+	// last apply did not settle is held here. A forced sync is not subject to it
+	// — an operator asking explicitly is the way past.
+	if !force {
+		if err := r.checkReproducible(spec.Name, checkout.Revision); err != nil {
+			return err
+		}
 	}
 	if err := checkCompat(plan); err != nil {
 		return err
@@ -1337,6 +1367,69 @@ func checkCompat(plan *charts.Plan) error {
 		return nil
 	}
 	return fmt.Errorf("refusing to apply: %s", strings.Join(refused, "; "))
+}
+
+// unsettled names the releases a plan would still change, in plan order.
+func unsettled(plan *charts.Plan) []string {
+	var out []string
+	for _, rp := range plan.Releases {
+		if rp.Action != charts.ActionUnchanged {
+			out = append(out, rp.Name)
+		}
+	}
+	return out
+}
+
+// setUnstable records — or, with an empty revision, clears — the finding that an
+// application's render is not reproducible.
+func (r *Reconciler) setUnstable(app, revision string, releases []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.apps[app]; ok {
+		e.unstable, e.unstableReleases = revision, releases
+	}
+}
+
+// checkReproducible refuses to deploy an application whose last apply did not
+// settle at this revision.
+//
+// A chart that renders differently every time — `{{ now }}` in a label, uuidv4,
+// randAlphaNum, all ordinary Helm idioms, and CE's renderFuncs removes only env,
+// expandenv and getHostByName — makes every plan an upgrade. Nothing converges:
+// each reconcile rewrites every service in the release, rolls every task, and
+// writes another revision into raft. At the three-minute default that is a full
+// rolling restart every three minutes and some 480 Docker Configs per release per
+// day, indefinitely, on the manager node this controller runs on.
+//
+// The confirming re-plan has always been able to see it and only ever said so.
+// This is the acting half: deployed once, still out of date on the very next
+// render, is not a state another deploy improves. So the application is held at
+// that revision, and the hold is released by the thing that could actually change
+// the answer — a new commit, a changed spec, or an operator forcing a sync.
+//
+// The whole application is held rather than the offending release. An apply is
+// not release-granular in the way that would help: the prune, the drift
+// correction and the resource sweep all key off the same plan, and letting them
+// act on a render nobody can reproduce is how a config gets deleted on the
+// strength of one render and recreated by the next.
+//
+// It is not a backoff on top of a backoff. The reconcile loop already doubles its
+// interval per consecutive failure, so returning an error here is what turns a
+// three-minute redeploy loop into a thirty-minute one that deploys nothing while
+// the status and the log say why.
+func (r *Reconciler) checkReproducible(app, revision string) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	e, ok := r.apps[app]
+	if !ok || e.unstable == "" || e.unstable != revision {
+		return nil
+	}
+	return fmt.Errorf("refusing to deploy %s again at %s: it was deployed and the very next render planned it as out of date once more, "+
+		"so this chart does not render the same twice — a template using now, uuidv4 or randAlphaNum does exactly this. "+
+		"Redeploying would roll every task and store another revision on every interval without ever converging, so it is held "+
+		"until the revision changes, the application is edited, or a sync is requested",
+		strings.Join(e.unstableReleases, ", "), revision)
 }
 
 // apply deploys the plan and then re-plans.
@@ -1377,10 +1470,13 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 		// From the plan, not recomputed: apply must stamp the same owner it
 		// classified against, or a release is installed under one id and the
 		// next plan goes looking for its orphans under another.
-		Owner:      plan.Owner,
-		Wait:       spec.SyncPolicy.Wait,
-		Timeout:    time.Duration(spec.SyncPolicy.Timeout),
-		HistoryMax: spec.SyncPolicy.HistoryMax,
+		Owner:   plan.Owner,
+		Wait:    spec.SyncPolicy.Wait,
+		Timeout: time.Duration(spec.SyncPolicy.Timeout),
+		// Resolved rather than passed straight through: an application that says
+		// nothing gets application.DefaultHistoryMax, and only one that writes 0
+		// down gets the engine's keep-everything.
+		HistoryMax: spec.SyncPolicy.Retention(),
 	})
 	for _, res := range results {
 		r.log.Info("release applied", "application", spec.Name, "release", res.Name, "action", res.Action, "revision", res.Revision)
@@ -1456,6 +1552,17 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 		// reconcile's.
 		r.recordResult(spec.Name, result)
 		return fmt.Errorf("re-planning after apply: %w", err)
+	}
+	// The re-plan's other answer, and the acting half of what its comment above
+	// only surfaced. A release this apply has just deployed and that the very
+	// next render still calls out of date will not be reached by deploying it
+	// again, so it is recorded and the next reconcile at this revision refuses.
+	if stuck := unsettled(after); len(stuck) > 0 {
+		r.setUnstable(spec.Name, checkout.Revision, stuck)
+		r.log.Warn("a release was deployed and immediately planned as out of date again, so its chart does not render the same twice; it will not be deployed again at this revision",
+			"application", spec.Name, "releases", stuck, "revision", checkout.Revision)
+	} else {
+		r.setUnstable(spec.Name, "", nil)
 	}
 	// Re-observed, not carried forward: the correction and the sweep above are
 	// exactly the things this needs to confirm, and reporting the pre-apply

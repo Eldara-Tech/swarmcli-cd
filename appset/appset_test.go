@@ -657,3 +657,51 @@ func currentDir(t *testing.T, m mode) string {
 	}
 	return r.cfg.Dir
 }
+
+// The app-set file is content the controller did not write, read whole, every
+// interval. os.ReadFile sized its buffer from the file, so a four-gigabyte
+// applications.yaml exhausted the controller before the decoder saw a byte —
+// yaml.v3's alias cap covers the billion-laughs shape of this and nothing else.
+func TestAnOversizedAppSetIsRefused(t *testing.T) {
+	for name, newMode := range modes(oneApp) {
+		t.Run(name, func(t *testing.T) {
+			m := newMode(t)
+			if _, _, err := m.loader.Load(context.Background()); err != nil {
+				t.Fatalf("Load = %v, want the seed set to load", err)
+			}
+
+			// Valid YAML throughout, so what refuses it is the bound rather than
+			// the parser tripping over something else.
+			m.publish(oneApp + strings.Repeat("# padding to the brim\n", (maxAppSetSize/22)+64))
+
+			_, _, err := m.loader.Load(context.Background())
+			if err == nil {
+				t.Fatal("Load = nil, want an app-set file over the limit refused")
+			}
+			if !strings.Contains(err.Error(), "larger than the") {
+				t.Errorf("error = %v, want it to name the limit", err)
+			}
+			// Last-good is kept, as it is for any other failed load: the bound is
+			// a refusal, not a reason to stop reconciling what already validated.
+			if cur := m.loader.Current(); cur == nil || len(cur.Applications) != 1 {
+				t.Errorf("current set = %+v, want the last one that validated kept", cur)
+			}
+		})
+	}
+}
+
+// And a file up to the limit still loads, so the bound cannot quietly become a
+// smaller one than the message names.
+func TestAnAppSetAtTheLimitLoads(t *testing.T) {
+	m := pathMode(t, oneApp)
+	padding := strings.Repeat("#", maxAppSetSize-len(oneApp)-1) + "\n"
+	m.publish(oneApp + padding)
+
+	file, _, err := m.loader.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load = %v, want a file at the limit accepted", err)
+	}
+	if len(file.Applications) != 1 {
+		t.Errorf("got %d applications, want 1", len(file.Applications))
+	}
+}
