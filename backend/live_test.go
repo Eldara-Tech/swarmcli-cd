@@ -319,3 +319,113 @@ func TestResourceRemovalSurfacesARefusal(t *testing.T) {
 		t.Errorf("error %q does not name the service that would not go", err)
 	}
 }
+
+// ------------------------------------------ a network removal that worked (#108)
+
+// The other half of the reason stackRemains exists, on a path that had no
+// equivalent of it.
+//
+// A swarm-scoped network removal is proxied through swarmkit, whose helper for
+// a network is the one of its five siblings that does not classify "not found"
+// (daemon/cluster/helpers.go:238); it arrives as a 500 and so as ErrInternal,
+// which errdefs.IsNotFound answers false for. Reading the error alone therefore
+// reports a deletion that succeeded as a failed prune — on the path whose whole
+// purpose is honest reporting.
+func TestRemoveNetworkAcceptsAnUnclassifiedErrorThatLeftNothingBehind(t *testing.T) {
+	api := &fakeAPI{
+		networks:   []network.Summary{stackNetwork("n1", "s_front", "s")},
+		removeErr:  map[string]error{"network:n1": errors.New("network n1 not found")},
+		removeGone: map[string]bool{"network:n1": true},
+	}
+
+	if err := testBackend(t, api, nil).RemoveNetwork(context.Background(), "n1"); err != nil {
+		t.Fatalf("RemoveNetwork = %v, want nil — the network is gone, whatever the call said", err)
+	}
+}
+
+// The other half: a refusal that left the network in place is a real failure and
+// must not be explained away by the same re-check.
+func TestRemoveNetworkStillFailsWhenTheNetworkSurvived(t *testing.T) {
+	api := &fakeAPI{
+		networks:  []network.Summary{stackNetwork("n1", "s_front", "s")},
+		removeErr: map[string]error{"network:n1": errors.New("network n1 is in use by service other_web")},
+	}
+
+	err := testBackend(t, api, nil).RemoveNetwork(context.Background(), "n1")
+	if err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Fatalf("RemoveNetwork = %v, want the daemon's refusal surfaced", err)
+	}
+}
+
+// Neither error answers on its own: the removal may well have worked, and the
+// read that would have said so is the thing that failed. Both are reported.
+func TestRemoveNetworkReportsBothWhenTheRecheckAlsoFails(t *testing.T) {
+	api := &fakeAPI{
+		removeErr:  map[string]error{"network:n1": errors.New("network n1 not found")},
+		networkErr: errors.New("swarm unreachable"),
+	}
+
+	err := testBackend(t, api, nil).RemoveNetwork(context.Background(), "n1")
+	if err == nil || !strings.Contains(err.Error(), "not found") || !strings.Contains(err.Error(), "swarm unreachable") {
+		t.Fatalf("RemoveNetwork = %v, want both the removal error and the failed re-check", err)
+	}
+}
+
+// ------------------------------------------- adoption is not ownership (#108)
+
+// The gap Claim cannot close. A secret an operator seeded before any chart named
+// it is relabelled into the stack's namespace by applySecrets, which is the only
+// thing that makes it a sweep candidate — and a revision that merely declared
+// the name then reads as proof of ownership. Recovery would need material this
+// controller never had.
+//
+// The creation marker is the second half of the proof, and these two listers are
+// where it is required, because this is the read that decides what a candidate
+// even is.
+func TestLiveConfigsAndSecretsIgnoreWhatWasAdoptedRatherThanCreated(t *testing.T) {
+	api := &fakeAPI{
+		configs: []swarm.Config{
+			{ID: "c1", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_ours", "s")}},
+			{ID: "c2", Spec: swarm.ConfigSpec{Annotations: adopted("s_theirs", "s")}},
+		},
+		secrets: []swarm.Secret{
+			{ID: "k1", Spec: swarm.SecretSpec{Annotations: stackScoped("s_ours", "s")}},
+			{ID: "k2", Spec: swarm.SecretSpec{Annotations: adopted("s_theirs", "s")}},
+		},
+	}
+	b := testBackend(t, api, nil)
+	ctx := context.Background()
+
+	cfgs, err := b.LiveConfigs(ctx, "s")
+	if err != nil {
+		t.Fatalf("LiveConfigs = %v, want nil", err)
+	}
+	secs, err := b.LiveSecrets(ctx, "s")
+	if err != nil {
+		t.Fatalf("LiveSecrets = %v, want nil", err)
+	}
+
+	for what, got := range map[string]map[string]string{"configs": cfgs, "secrets": secs} {
+		if len(got) != 1 || got["s_ours"] == "" {
+			t.Errorf("%s = %v, want only the one this controller created", what, got)
+		}
+	}
+}
+
+// The deliberate asymmetry, asserted so that "make all four kinds the same"
+// cannot be applied here by eye. applyNetworks never relabels an existing
+// network into a stack's namespace, so there is no adoption to catch — and
+// requiring a marker would instead stop the sweep touching every network created
+// before the label existed, silently, which is the one kind the sweep can act on
+// at all now that a chart cannot own a config or secret (#99).
+func TestLiveNetworksDoNotRequireTheCreationMarker(t *testing.T) {
+	api := &fakeAPI{networks: []network.Summary{stackNetwork("n1", "s_front", "s")}}
+
+	got, err := testBackend(t, api, nil).LiveNetworks(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("LiveNetworks = %v, want nil", err)
+	}
+	if got["s_front"] != "n1" {
+		t.Errorf("networks = %v, want the stack's network in range of the sweep", got)
+	}
+}

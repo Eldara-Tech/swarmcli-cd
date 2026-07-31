@@ -57,6 +57,9 @@ type fakeAPI struct {
 	nodes      []swarm.Node
 	tasks      []swarm.Task
 	networkErr error
+	// nodeErr fails the node listing, which is what a worker node answers: only
+	// a manager can enumerate the swarm.
+	nodeErr error
 	// removeErr fails one removal, keyed as the removed slice records it
 	// ("network:net"). By default the resource survives the failure, which is a
 	// genuine refusal.
@@ -887,12 +890,18 @@ func (f *fakeAPI) VolumeList(_ context.Context, o volume.ListOptions) (volume.Li
 	return volume.ListResponse{Volumes: out}, nil
 }
 
+// VolumeRemove honours removeErr as the other removals do, so that a volume
+// that went between the list and the delete can be modelled at all.
 func (f *fakeAPI) VolumeRemove(_ context.Context, name string, _ bool) error {
-	f.removed = append(f.removed, "volume:"+name)
-	return nil
+	key := "volume:" + name
+	f.removed = append(f.removed, key)
+	return f.removeErr[key]
 }
 
 func (f *fakeAPI) NodeList(context.Context, swarm.NodeListOptions) ([]swarm.Node, error) {
+	if f.nodeErr != nil {
+		return nil, f.nodeErr
+	}
 	return f.nodes, nil
 }
 

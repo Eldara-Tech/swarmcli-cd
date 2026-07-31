@@ -665,6 +665,29 @@ Everything else prune deletes is recreated from git the moment the application
 comes back; the data in a volume is not. `--prune-volumes` without `--prune` is
 a startup error rather than a guess in either direction.
 
+**`--prune-volumes` only reaches the node the controller talks to.** Docker's
+`GET /volumes` answers from the *node-local* volume store — only CSI cluster
+volumes come from swarm, and only on a manager — and an ordinary named volume is
+created by whichever engine runs the task that mounts it. So on a swarm of more
+than one node, this deletes the departed release's volumes on the controller's
+node and cannot see, let alone remove, the ones its tasks left elsewhere. There
+is no swarm-wide listing of named volumes to ask for instead.
+
+The controller does not pretend otherwise. On a multi-node swarm every purge
+logs what it actually removed and says the listing was node-local, with the
+filter that finds the rest:
+
+```
+docker volume ls --filter label=com.docker.stack.namespace=<release>
+```
+
+run on each node. It does **not** stop and it does not hold the release records
+back: a later sweep on the same node would read the same node-local listing and
+be no better off, so refusing would only leave an application that can never
+finish being pruned — for the great majority of releases, which declare no named
+volume at all. **On a multi-node swarm, treat `--prune-volumes` as a
+best-effort convenience and the log line as the real inventory.**
+
 **With prune on, removing an application from the app set is an outage, not a
 pause.** Deleting the entry to "park" something deletes the deployment.
 
@@ -749,7 +772,9 @@ all agree:
 1. it carries the release's `com.docker.stack.namespace` label;
 2. the freshly rendered manifest does not declare it;
 3. a stored revision **stamped by this controller for this application**
-   declared it.
+   declared it;
+4. for a config or a secret, **this controller created it**, rather than finding
+   it already there.
 
 The third clause is what makes the deletion safe, and note what it is not: the
 namespace label. A stack is a name prefix plus that label and nothing more — no
@@ -758,6 +783,35 @@ somebody attached by hand reads exactly like a service the controller installed.
 A stored revision does not: this controller wrote it, it names the owner, and it
 never changes afterwards. The label says where a resource lives; the record says
 whose it is.
+
+The fourth exists because a revision proves the repository asked for a *name*,
+which is not the same as this controller having made the *object*. Applying a
+chart that declares a config or secret which already exists **adopts** it — the
+applier relabels it into the stack's namespace, exactly as `docker stack deploy`
+does — and that label is what makes it sweepable. So the pre-seed pattern, an
+operator running `docker secret create web_db_password` before a chart declares
+`db_password`, would end with the controller deleting material it never held a
+copy of. Configs and secrets it creates carry a `com.swarmcli.cd.created` label;
+adopted ones never gain one, and it is carried across updates rather than
+re-derived.
+
+**It applies to those two kinds and not to networks, because only those two
+adopt.** The applier leaves an existing network entirely alone rather than
+relabelling it, so a network can only be a candidate if it already carried the
+release's namespace label — which means either this controller created it or
+somebody labelled it as that release's on purpose. There is no adoption to
+catch, and requiring a marker there would instead stop the sweep touching every
+network created before the label existed.
+
+**For configs and secrets it is retroactive in the safe direction.** One created
+before this controller learned to mark them has no marker and cannot gain one —
+from here it is indistinguishable from one somebody else made — so it is
+reported and never deleted, the same answer clause 3 gives a resource older than
+the retained history. Since [#99](https://github.com/Eldara-Tech/swarmcli-cd/issues/99)
+a chart cannot own either kind anyway — `file:` reads the controller's own
+filesystem and is refused, and an `external:` declaration is a reference this
+controller did not create — so in practice clause 4 is a guard against the day
+that changes rather than a narrowing of what is swept today.
 
 The four kinds are proved separately, so a config never inherits a same-named
 service's evidence — Swarm scopes all four into one namespace of names, and
@@ -782,6 +836,27 @@ one whose service was removed a moment ago is still referenced while its tasks
 shut down. The refusal is logged and the next reconcile tries again; nothing is
 lost by waiting, because the evidence is a stored revision that is still there.
 A network with tasks still draining routinely takes a second pass.
+
+**Some refusals never clear, and after three passes the controller stops
+trying.** A chart that drops a network another stack is still attached to gets
+the same refusal on every reconcile for ever, and it is indistinguishable from a
+slow drain except by how long it has been going on. Retrying indefinitely is not
+free: it costs a history walk, a deploy of an unchanged plan, an event and an
+application permanently reporting out of sync, every interval, over something
+that will never happen. So the resource is **left in place, warned about on
+every pass that still finds it, and dropped from the sync axis** — the
+application goes back to `synced`, because nothing it will do is outstanding.
+Removing the resource is then yours:
+
+```
+WARN resources the release no longer declares could not be removed and will not
+     be tried again; remove them by hand once whatever still references them is
+     gone  application=edge release=whoami resources="[network whoami_gone]"
+```
+
+The count is per resource, is cleared by a removal that works, and is held in
+memory — so restarting the controller is also how you ask it to try again after
+clearing whatever was holding it.
 
 Volumes are **left in place** and reported, not deleted, even with `pruneVolumes`
 on. That flag means "when a whole release goes, its data goes with it"; something
@@ -968,7 +1043,7 @@ line that shows exactly what the controller is following is worth having in
 | `--appset-path` | `applications.yaml` in path mode | the set's path within the repository or the directory. Required with `--appset-repo` |
 | `--appset-interval` | `3m` | how often the app set is re-read |
 | `--prune` | off | delete the resources of an application that has left the app set instead of leaving its stack running and reporting it as orphaned. See [prune](#prune) |
-| `--prune-volumes` | off | extend `--prune` to named volumes, the one part nothing can restore. Requires `--prune` |
+| `--prune-volumes` | off | extend `--prune` to named volumes, the one part nothing can restore — and only on the controller's own node; see [prune](#prune). Requires `--prune` |
 | `--controller-id` | `default` | this controller's identity, stamped on every release it installs. Two controllers on one swarm must be given different ones; see [two controllers on one swarm](#two-controllers-on-one-swarm) |
 | `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
 | `--log-format` | `text` | `text` or `json` |

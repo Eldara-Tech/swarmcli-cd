@@ -4,6 +4,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -1632,6 +1633,9 @@ type driftBackend struct {
 	// removedResources records what the resource sweep deleted, as "<kind>:<id>",
 	// so one field carries both what went and that the right call was made.
 	removedResources []string
+	// attemptedResources records every removal that was *tried*, refusals
+	// included, which is the only thing that shows a sweep has stopped trying.
+	attemptedResources []string
 	// resourceRemoveErr fails a removal by "<kind>:<id>", modelling the daemon
 	// refusing to remove something still in use.
 	resourceRemoveErr map[string]error
@@ -1764,6 +1768,7 @@ func (b *driftBackend) removeResource(kind, id string, from map[string]map[strin
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	key := kind + ":" + id
+	b.attemptedResources = append(b.attemptedResources, key)
 	if err := b.resourceRemoveErr[key]; err != nil {
 		return err
 	}
@@ -1785,6 +1790,12 @@ func (b *driftBackend) prunedResources() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return slices.Clone(b.removedResources)
+}
+
+func (b *driftBackend) attempted() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.attemptedResources)
 }
 
 func (b *driftBackend) DeployStack(name, manifest, _ string) error {
@@ -3505,6 +3516,160 @@ func TestAPlanThatMatchesClearsTheHold(t *testing.T) {
 	}
 	if engine.applyCount() != 2 {
 		t.Errorf("applied %d times, want the second deploy to have gone ahead", engine.applyCount())
+	}
+}
+
+// ------------------------------ a refusal that never clears (#108)
+
+// refusingSweep is the case that used to run for ever: a release whose departed
+// resources Swarm will refuse on this reconcile and on every one after it —
+// a network another stack is still attached to gets swarmkit's
+// FailedPrecondition, rendered as HTTP 400, permanently.
+func refusingSweep() *driftBackend {
+	b := resourceSweepBackend()
+	b.resourceRemoveErr = map[string]error{
+		"config:c-old":   errors.New("config is in use by service other_web"),
+		"secret:k-old":   errors.New("secret is in use by service other_web"),
+		"network:n-gone": errors.New("network n-gone is in use by service other_web"),
+	}
+	return b
+}
+
+// Retrying for ever is not the same as costing nothing. Each pass was a full
+// observe with a history walk, an apply that deploys nothing, a warning, a
+// PruneFailed event and an application reporting out of sync — for ever, since
+// nothing about the evidence ever changes and the history is never trimmed past
+// the revision that proves the claim.
+func TestAResourceThatWillNeverGoStopsBeingRetried(t *testing.T) {
+	restore := maxPruneAttempts
+	maxPruneAttempts = 2
+	t.Cleanup(func() { maxPruneAttempts = restore })
+
+	backend := refusingSweep()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	for i := range 4 {
+		if err := r.Sync(context.Background(), "edge"); err != nil {
+			t.Fatalf("Sync %d = %v, want nil — a refusal is not a failed sync", i+1, err)
+		}
+	}
+
+	// Three resources, two attempts each, and then nothing.
+	if got := len(backend.attempted()); got != 6 {
+		t.Errorf("attempted %d removals over four syncs (%v), want 6 — two passes each and then no more",
+			got, backend.attempted())
+	}
+	// The apply gate is opened by something to delete, so it closes with them.
+	if got := engine.applyCount(); got != 2 {
+		t.Errorf("applied %d times, want 2 — a retained resource must not keep deploying an unchanged plan", got)
+	}
+}
+
+// The consequence an operator sees. A resource this controller has stopped
+// trying to delete is not "the next sync puts this right", and reporting it as
+// drift folds through to SyncOutOfSync — which is why the application could
+// never report Synced again however healthy it was.
+func TestAnApplicationIsSyncedOnceItHasGivenUpOnAResource(t *testing.T) {
+	restore := maxPruneAttempts
+	maxPruneAttempts = 2
+	t.Cleanup(func() { maxPruneAttempts = restore })
+
+	backend := refusingSweep()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	view, _ := r.View("edge")
+	if view.Status.Sync.State != application.SyncOutOfSync {
+		t.Fatalf("state after the first refusal = %q, want out of sync — it is still going to try", view.Status.Sync.State)
+	}
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	view, _ = r.View("edge")
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q, want synced — nothing here is waiting on a sync any more", view.Status.Sync.State)
+	}
+	for _, rel := range view.Status.Releases {
+		if rel.Drift != nil && len(rel.Drift.Resources) > 0 {
+			t.Errorf("release %q still reports %v as drift a sync will remove", rel.Name, rel.Drift.Resources)
+		}
+	}
+}
+
+// Given up on is not forgotten. There is nowhere else for this to be said — the
+// status reports what a sync will do, and this is no longer one of those things
+// — so it is warned about on every pass that still finds it, the same choice
+// appset.Loop makes for a held prune.
+func TestARetainedResourceIsWarnedAboutOnEveryPass(t *testing.T) {
+	restore := maxPruneAttempts
+	maxPruneAttempts = 1
+	t.Cleanup(func() { maxPruneAttempts = restore })
+
+	var log bytes.Buffer
+	backend := refusingSweep()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := New([]application.Spec{sweepingSpec("edge", application.DriftManifest)}, Options{
+		Fetcher:   &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{backend: backend},
+		NewEngine: func(charts.Backend) Engine { return engine },
+		Log:       slog.New(slog.NewTextHandler(&log, nil)),
+		Now:       func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+
+	for range 3 {
+		if err := r.Sync(context.Background(), "edge"); err != nil {
+			t.Fatalf("Sync = %v, want nil", err)
+		}
+	}
+
+	if n := strings.Count(log.String(), "will not be tried again"); n < 2 {
+		t.Errorf("warned %d times over the two passes after giving up, want one per pass: %s", n, log.String())
+	}
+	if !strings.Contains(log.String(), "network whoami_gone") {
+		t.Errorf("the warning does not name the resource to go and look at: %s", log.String())
+	}
+}
+
+// The count is per resource and is cleared by a removal that works, so a slow
+// drain that took three passes does not leave a name pre-condemned if it ever
+// comes back.
+func TestASuccessfulRemovalClearsTheFailureCount(t *testing.T) {
+	restore := maxPruneAttempts
+	maxPruneAttempts = 2
+	t.Cleanup(func() { maxPruneAttempts = restore })
+
+	backend := resourceSweepBackend()
+	// Refused once, as a config whose service is still draining is, and then
+	// allowed — the ordinary case the retry exists for.
+	backend.resourceRemoveErr = map[string]error{"config:c-old": errors.New("config is in use")}
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	backend.mu.Lock()
+	backend.resourceRemoveErr = nil
+	backend.mu.Unlock()
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if !slices.Contains(backend.prunedResources(), "config:c-old") {
+		t.Errorf("pruned %v, want the config gone on the pass that was allowed", backend.prunedResources())
+	}
+	view, _ := r.View("edge")
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q, want synced once everything went", view.Status.Sync.State)
 	}
 }
 

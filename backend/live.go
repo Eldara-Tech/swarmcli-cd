@@ -5,9 +5,11 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 
@@ -131,6 +133,20 @@ func (b *Backend) RemoveService(ctx context.Context, id string) error {
 // Name to id, because that is exactly what the sweep needs: it matches on the
 // scoped name, which is the only key a manifest and a live resource share, and
 // deletes by id for the reason RemoveService gives.
+//
+// The two that can be adopted also drop anything without the creation marker
+// resource.go writes, and that second condition is not a refinement of the
+// first — it is the other half of the ownership proof. The namespace label says
+// a resource belongs to a release, and applySecrets and applyConfigs put it on
+// objects they *adopted* rather than created, so a secret an operator seeded
+// before a chart ever named it carries the same label as one this controller
+// made. The marker is the only thing that tells them apart, and the difference
+// is whether deleting it loses material nothing can restore. Filtered here
+// rather than in the caller because this is the read that decides what a
+// candidate even is.
+//
+// LiveNetworks deliberately does not ask, because applyNetworks does not adopt:
+// see createdLabel.
 
 // LiveNetworks returns the networks carrying this stack's namespace label, by
 // scoped name.
@@ -146,8 +162,8 @@ func (b *Backend) LiveNetworks(ctx context.Context, stack string) (map[string]st
 	return out, nil
 }
 
-// LiveConfigs returns the configs carrying this stack's namespace label, by
-// scoped name.
+// LiveConfigs returns the configs this controller created under this stack's
+// namespace, by scoped name.
 //
 // A release-history config is never included. It carries com.swarmcli.* labels
 // and no namespace, so the filter above cannot see one anyway — this is the same
@@ -164,13 +180,16 @@ func (b *Backend) LiveConfigs(ctx context.Context, stack string) (map[string]str
 		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
 			continue
 		}
+		if _, ours := c.Spec.Labels[createdLabel]; !ours {
+			continue
+		}
 		out[c.Spec.Name] = c.ID
 	}
 	return out, nil
 }
 
-// LiveSecrets returns the secrets carrying this stack's namespace label, by
-// scoped name.
+// LiveSecrets returns the secrets this controller created under this stack's
+// namespace, by scoped name.
 func (b *Backend) LiveSecrets(ctx context.Context, stack string) (map[string]string, error) {
 	secrets, err := b.api.SecretList(ctx, swarm.SecretListOptions{Filters: stackFilter(stack)})
 	if err != nil {
@@ -178,6 +197,9 @@ func (b *Backend) LiveSecrets(ctx context.Context, stack string) (map[string]str
 	}
 	out := make(map[string]string, len(secrets))
 	for _, s := range secrets {
+		if _, ours := s.Spec.Labels[createdLabel]; !ours {
+			continue
+		}
 		out[s.Spec.Name] = s.ID
 	}
 	return out, nil
@@ -193,11 +215,59 @@ func (b *Backend) LiveSecrets(ctx context.Context, stack string) (map[string]str
 // A network Swarm has already garbage-collected is not an error. The last task
 // leaving an overlay network removes it, which routinely happens between the
 // sweep reading the network and deciding to delete it.
+//
+// Finding that out takes a second look, and classifying the error is not enough
+// on its own — the premise RemoveStack states and answers with stackRemains,
+// which this had no equivalent of. A swarm-scoped removal is proxied through
+// swarmkit, and the helper that resolves the network there is the one of its
+// five siblings that does *not* wrap "not found" in errdefs.NotFound
+// (daemon/cluster/helpers.go:238, against :51, :87, :131, :167 and :274 which
+// all do). An unclassified error is scored as Unknown and rendered 500
+// (api/server/httpstatus/status.go:16), which the client turns into ErrInternal
+// (client/errors.go:124), so errdefs.IsNotFound is false for a network that had
+// already gone. Reporting that as a failed prune, on the path whose whole
+// purpose is honest reporting, is the defect.
+//
+// So the state is the answer and the error is only a hint about where to look:
+// a removal that failed is followed by a re-read, and a network that is no
+// longer listed reached the state this was asking for whatever the call said.
 func (b *Backend) RemoveNetwork(ctx context.Context, id string) error {
-	if err := b.api.NetworkRemove(ctx, id); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("removing network %q: %w", id, err)
+	err := b.api.NetworkRemove(ctx, id)
+	if err == nil || errdefs.IsNotFound(err) {
+		return nil
 	}
-	return nil
+
+	gone, checkErr := b.networkGone(ctx, id)
+	if checkErr != nil {
+		// Both, because neither answers on its own: the removal may well have
+		// worked, and the read that would have said so is the thing that failed.
+		return errors.Join(fmt.Errorf("removing network %q: %w", id, err), checkErr)
+	}
+	if gone {
+		return nil
+	}
+	return fmt.Errorf("removing network %q: %w", id, err)
+}
+
+// networkGone reports whether the swarm still lists a network.
+//
+// Scoped by id rather than listing everything, because this is the network the
+// caller already holds — and the result is scanned for that id as well, so a
+// daemon or a fake that ignored the filter still gives the right answer rather
+// than a confident wrong one.
+func (b *Backend) networkGone(ctx context.Context, id string) (bool, error) {
+	nets, err := b.api.NetworkList(ctx, network.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("id", id)),
+	})
+	if err != nil {
+		return false, fmt.Errorf("re-checking network %q: %w", id, err)
+	}
+	for _, n := range nets {
+		if n.ID == id {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // RemoveConfig deletes one config by id.

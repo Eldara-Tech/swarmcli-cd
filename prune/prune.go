@@ -109,9 +109,22 @@ type Engine interface {
 	List(ctx context.Context) ([]charts.Release, error)
 }
 
-// How long Release waits for a volume to be released by the tasks that were
-// using it, and how often it retries. Variables rather than constants so a test
-// does not spend the real interval discovering that the retry works.
+// How long Release waits for **one** volume to be released by the tasks that
+// were using it, and how often it retries. Variables rather than constants so a
+// test does not spend the real interval discovering that the retry works.
+//
+// Per volume and not per release, because the thing being waited for is per
+// volume: each one is held by its own containers, which shut down in their own
+// time. A whole-release budget makes the last volume of a large stack inherit
+// whatever the first few spent, so the same stack passes or fails depending on
+// how many volumes it happens to declare.
+//
+// Thirty seconds is a guess at "the containers have gone", and it is not
+// derived from stop_grace_period — the daemon waits that long before killing a
+// container, so a stack declaring `stop_grace_period: 60s` will still be
+// holding its volumes when this gives up. That is survivable rather than
+// correct: the release records are still there, so the next sweep tries again
+// and the second pass succeeds. It is only survivable because of that ordering.
 var (
 	volumeSettleTimeout  = 30 * time.Second
 	volumeSettleInterval = 2 * time.Second
@@ -131,12 +144,16 @@ var (
 //
 // This is shared with the per-application prune in reconcile, which faces the
 // same hazard for the same reason.
-func Release(ctx context.Context, backend charts.Backend, engine Uninstaller, release string, volumes bool) (*charts.UninstallResult, error) {
+//
+// log is taken rather than returned-to, because what a volume purge managed is
+// not a value the two callers would do anything different with — it is a thing
+// an operator has to be told, and only this knows what was and was not covered.
+func Release(ctx context.Context, log *slog.Logger, backend charts.Backend, engine Uninstaller, release string, volumes bool) (*charts.UninstallResult, error) {
 	if err := backend.RemoveStack(release); err != nil {
 		return nil, fmt.Errorf("removing the stack: %w", err)
 	}
 	if volumes {
-		if err := purgeVolumes(ctx, backend, release); err != nil {
+		if err := purgeVolumes(ctx, log, backend, release); err != nil {
 			return nil, err
 		}
 	}
@@ -144,8 +161,9 @@ func Release(ctx context.Context, backend charts.Backend, engine Uninstaller, re
 	return engine.Uninstall(ctx, release, false)
 }
 
-// purgeVolumes deletes the stack's named volumes, waiting for the tasks that
-// mounted them to let go.
+// purgeVolumes deletes the stack's named volumes that this node can see,
+// waiting for the tasks that mounted them to let go, and says plainly when that
+// was not all of them.
 //
 // The services were removed a moment ago and Swarm does not wait for their
 // containers to die, so the first attempt routinely fails with "volume is in
@@ -156,14 +174,42 @@ func Release(ctx context.Context, backend charts.Backend, engine Uninstaller, re
 // A volume that never frees is returned as an error and, because the caller
 // has not yet deleted the release records, is retried by the next sweep rather
 // than left as an untracked volume nobody knows to remove.
-func purgeVolumes(ctx context.Context, backend charts.Backend, release string) error {
+//
+// # What this cannot do
+//
+// The listing is node-local — see backend.StackVolumes for the daemon's own
+// code path — so on a swarm of more than one node this removes the volumes of
+// the node the controller talks to and nothing else. Nothing in the OSS build
+// can reach the others: swarms.Registry resolves one swarm as one daemon (D2),
+// and there is no swarm-wide listing of named volumes to ask for instead.
+//
+// It does not stop and it does not refuse. Stopping would make --prune-volumes
+// permanently fail on every multi-node swarm, including for the great majority
+// of releases that declare no named volume at all — this cannot tell that case
+// apart from the dangerous one, so refusing would trade silent data retention
+// for a prune that never completes and an application that is never done. It
+// deletes what it can reach and reports exactly that, with the label filter
+// that finds the rest, because a cleanup an operator can finish is worth more
+// than one they believe is complete.
+//
+// Nor does it hold the release records back. The records are what lets a *later
+// sweep* find a release again, and a later sweep on this node would see the same
+// node-local listing and be no better off — keeping them buys an operator
+// nothing and costs an application that can never finish being pruned. The
+// volumes themselves keep the stack's namespace label, which is a durable
+// marker `docker volume ls` finds on each node, and that is the thread the
+// warning below hands over.
+func purgeVolumes(ctx context.Context, log *slog.Logger, backend charts.Backend, release string) error {
 	names, err := backend.StackVolumes(ctx, release)
 	if err != nil {
 		return fmt.Errorf("listing the stack's volumes: %w", err)
 	}
 
-	deadline := time.Now().Add(volumeSettleTimeout)
 	for _, name := range names {
+		// Per volume. Each is held by its own containers and drains on its own
+		// schedule, so sharing one budget across a stack makes the last volume
+		// answer for the first.
+		deadline := time.Now().Add(volumeSettleTimeout)
 		for {
 			err := backend.RemoveVolume(ctx, name)
 			if err == nil {
@@ -182,7 +228,44 @@ func purgeVolumes(ctx context.Context, backend charts.Backend, release string) e
 			}
 		}
 	}
+
+	if swarmWideVolumes(ctx, backend) {
+		// Warn, like every other deletion here — this is data going — but only
+		// when there was some. A release that declared no volume has nothing to
+		// report, and on a one-node swarm an empty listing really does say so.
+		if len(names) > 0 {
+			log.Warn("deleted the release's volumes", "release", release, "volumes", names)
+		}
+		return nil
+	}
+	// Warn whether or not anything was removed here, and especially when
+	// nothing was: an empty node-local listing on a multi-node swarm is not
+	// evidence that the release had no volumes, and reporting it as a completed
+	// purge is exactly the claim this must not make.
+	log.Warn("deleted only this node's volumes for the release: the daemon's volume list is node-local "+
+		"and this swarm has more than one node, so any volumes the release left on another node are still there",
+		"release", release, "volumes", names,
+		"remedy", "docker volume ls --filter label=com.docker.stack.namespace="+release+", on each node")
 	return nil
+}
+
+// swarmSizer counts the swarm's nodes. *backend.Backend implements it; a
+// backend that does not cannot say whether its volume listing was the whole
+// swarm's, which for a deletion has to mean the same as knowing it was not.
+type swarmSizer interface {
+	SwarmNodes(ctx context.Context) (int, error)
+}
+
+// swarmWideVolumes reports whether a node-local volume listing was in fact the
+// whole swarm's — which is exactly the single-node case, and nothing weaker
+// will do. A count that could not be read is not one node.
+func swarmWideVolumes(ctx context.Context, backend charts.Backend) bool {
+	s, ok := backend.(swarmSizer)
+	if !ok {
+		return false
+	}
+	n, err := s.SwarmNodes(ctx)
+	return err == nil && n == 1
 }
 
 // Options configures a Pruner. Everything has a working default.
@@ -348,15 +431,20 @@ func (p *Pruner) stillListed(ctx context.Context, engine Engine, failed []failur
 }
 
 func (p *Pruner) uninstall(ctx context.Context, backend charts.Backend, engine Engine, app, release string) error {
-	result, err := Release(ctx, backend, engine, release, p.volumes)
+	result, err := Release(ctx, p.log, backend, engine, release, p.volumes)
 	if err != nil {
 		return fmt.Errorf("pruning release %q of departed application %q: %w", release, app, err)
 	}
 	// Warn rather than Info, like the departure itself: this is the controller
 	// deleting somebody's running stack, and it is the log line an operator
 	// goes looking for afterwards.
+	//
+	// It says nothing about volumes. It used to carry the setting, which reads
+	// as a claim that the data went with the stack — and on a swarm of more
+	// than one node that claim is only ever partly true. purgeVolumes reports
+	// what actually happened, because it is the only thing that knows.
 	p.log.Warn("pruned the release of an application that left the app set",
-		"application", app, "release", release, "volumes", p.volumes)
+		"application", app, "release", release)
 
 	// The chart engine leaves the networks it auto-created — they may be shared
 	// with another stack — and reports them instead. Passing that on is the

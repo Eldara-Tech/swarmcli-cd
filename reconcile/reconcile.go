@@ -59,6 +59,37 @@ const (
 	maxBackoffShift = 8
 )
 
+// maxPruneAttempts bounds how many consecutive reconciles will try to delete
+// the same network, config or secret before this controller stops trying.
+//
+// Swarm refuses to remove anything still in use, and while a release's tasks
+// drain that refusal is the ordinary answer rather than a fault — which is why
+// the sweep retries at all. But some refusals never clear: a chart that drops a
+// network another stack is still attached to gets swarmkit's FailedPrecondition
+// (manager/controlapi/network.go:205), rendered as HTTP 400
+// (api/server/httpstatus/status.go:87), on this reconcile and on every one
+// after it. The two are indistinguishable from here — same code, same message
+// shape — so the only thing that separates "draining" from "never" is how long
+// it has been going on.
+//
+// Retrying for ever is not free, which is what the sweep's own docstring used
+// to claim. Each pass costs a full observe including a walk of the release's
+// history, an apply that deploys nothing because the gate was opened by a
+// deletion that will not happen, a warning, a PruneFailed event, and — because
+// an orphan marks the release as drifted — an application that reports out of
+// sync until somebody intervenes, for ever. The escape the design assumed,
+// history trimming past the revision that proves the claim, never arrives:
+// pruneHistory only runs after a deploy that records a revision, and nothing
+// here records one.
+//
+// Three, because two is within the range a slow drain genuinely takes and the
+// cost of a fourth attempt is another whole interval of the above. Giving up is
+// not forgetting: the resource is warned about on every reconcile that still
+// finds it, which is how an operator finds a condition that needs a human — the
+// same choice appset.Loop makes for a held prune. A variable so a test does not
+// need to run three reconciles to observe the fourth.
+var maxPruneAttempts = 3
+
 // Fetcher brings an application's repository to a revision. *git.Sourcer
 // implements it.
 type Fetcher interface {
@@ -133,6 +164,18 @@ type appEntry struct {
 	// ever; see checkReproducible.
 	unstable         string
 	unstableReleases []string
+
+	// pruneFailures counts consecutive failed deletions of one resource, keyed
+	// by pruneKey, and is the whole of what makes maxPruneAttempts possible: a
+	// sweep re-derives its candidates from the swarm on every pass and so
+	// cannot otherwise tell the first refusal from the hundredth.
+	//
+	// Kept in memory rather than on the swarm deliberately. It is a judgement
+	// about how long this controller has been trying, not a fact about the
+	// deployment, and a restart is a reasonable moment to try again — the
+	// operator may well have restarted it *because* they cleared whatever was
+	// holding the resource.
+	pruneFailures map[string]int
 
 	// cancel stops this application's loop; done is closed when that goroutine
 	// has returned. Both are nil until the loop is started — before Run, or for
@@ -621,14 +664,75 @@ type departedResource struct {
 	id   string
 }
 
-// doomedSet is everything one release has that a sweep may delete.
+// doomedSet is everything one release has that a sweep may delete, plus what it
+// has stopped trying to.
 //
-// The two halves travel together because they are proved together, and are kept
-// apart because they are written at different moments: pruneFirst orders the
-// services, and the other three kinds always go after the apply.
+// The first two halves travel together because they are proved together, and are
+// kept apart because they are written at different moments: pruneFirst orders
+// the services, and the other three kinds always go after the apply.
+//
+// retained is proved in exactly the same way and is not acted on: see
+// maxPruneAttempts. It is carried here rather than dropped so that the pass can
+// report it and carry its failure count forward — a set with nothing but
+// retained in it is a release with nothing left to do.
 type doomedSet struct {
 	services  []departedService
 	resources []departedResource
+	retained  []departedResource
+}
+
+// empty reports a set that will not delete anything, which is not the same as a
+// set with nothing in it: everything in it may have been retained.
+func (d doomedSet) empty() bool {
+	return len(d.services) == 0 && len(d.resources) == 0
+}
+
+// actionable counts the releases a sweep would actually delete something from.
+//
+// It is what the apply gate asks, rather than the size of the map, because a
+// release whose every candidate has been retained has nothing for an apply to
+// do — and opening the gate for it would deploy a plan of unchanged releases,
+// re-plan to confirm it, and find the same nothing on the next interval and for
+// ever.
+func actionable(doomed map[string]doomedSet) int {
+	var n int
+	for _, set := range doomed {
+		if !set.empty() {
+			n++
+		}
+	}
+	return n
+}
+
+// pruneKey identifies one resource across reconciles, for the failure count.
+// Release, kind and name together, because the four kinds share one namespace
+// of scoped names and a name alone is not evidence about which one it is.
+func pruneKey(release string, res departedResource) string {
+	return release + "/" + string(res.kind) + "/" + res.name
+}
+
+// failedPrunes is a copy of an application's consecutive-failure counts, so the
+// caller can work on it without holding the lock. An application that has been
+// removed from the set has none, which is what a fresh map means.
+func (r *Reconciler) failedPrunes(app string) map[string]int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if e, ok := r.apps[app]; ok {
+		return maps.Clone(e.pruneFailures)
+	}
+	return nil
+}
+
+// recordPruneFailures replaces an application's counts. Replaces rather than
+// merges: the caller has just re-derived the whole candidate set, so a key it
+// left out is a resource that is no longer there — deleted, re-declared by a
+// commit, or removed by hand — and its history is over.
+func (r *Reconciler) recordPruneFailures(app string, counts map[string]int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.apps[app]; ok {
+		e.pruneFailures = counts
+	}
 }
 
 // resourceNames is one release's scoped names, by kind.
@@ -827,6 +931,14 @@ func (r *Reconciler) networkNames(ctx context.Context, spec application.Spec, ld
 // history.
 func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, plan *charts.Plan, views map[string]releaseView) map[string]doomedSet {
 	var out map[string]doomedSet
+	// The counts as they stand, and the counts this pass leaves behind. Only a
+	// resource that is still a candidate is carried over, which is what keeps
+	// the map from growing a key per resource this application has ever
+	// dropped — and what lets a resource somebody removed by hand start again
+	// from nothing if its name ever comes back.
+	was, still := r.failedPrunes(spec.Name), map[string]int{}
+	defer func() { r.recordPruneFailures(spec.Name, still) }()
+
 	for _, rp := range plan.Releases {
 		v, ok := views[rp.Name]
 		if !ok || v.err != nil {
@@ -860,19 +972,56 @@ func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb li
 		// Configs, then secrets, then networks: the order RemoveStack removes
 		// them in, which is the order they stop being referenced in.
 		for _, name := range claimed.configs {
-			set.resources = append(set.resources, departedResource{application.ResourceConfig, name, v.configs[name]})
+			set.add(departedResource{application.ResourceConfig, name, v.configs[name]}, rp.Name, was, still)
 		}
 		for _, name := range claimed.secrets {
-			set.resources = append(set.resources, departedResource{application.ResourceSecret, name, v.secrets[name]})
+			set.add(departedResource{application.ResourceSecret, name, v.secrets[name]}, rp.Name, was, still)
 		}
 		for _, name := range claimed.networks {
-			set.resources = append(set.resources, departedResource{application.ResourceNetwork, name, v.networks[name]})
+			set.add(departedResource{application.ResourceNetwork, name, v.networks[name]}, rp.Name, was, still)
+		}
+		if len(set.retained) > 0 {
+			// Every pass it is still there, not once when it was given up on.
+			// This is a condition an operator has to be able to find rather than
+			// one that scrolled past hours ago, and the sweep has no other way
+			// to say so — it is deliberately absent from the status, which
+			// reports what a sync will do and no longer intends to do anything
+			// about these.
+			r.log.Warn("resources the release no longer declares could not be removed and will not be tried again; "+
+				"remove them by hand once whatever still references them is gone",
+				"application", spec.Name, "release", rp.Name,
+				"resources", resourceLabels(set.retained), "attempts", maxPruneAttempts)
 		}
 
 		if out == nil {
 			out = make(map[string]doomedSet, len(plan.Releases))
 		}
 		out[rp.Name] = set
+	}
+	return out
+}
+
+// add files one proved resource under whichever of the two lists its history
+// puts it in, and carries that history into the next pass.
+func (d *doomedSet) add(res departedResource, release string, was, still map[string]int) {
+	key := pruneKey(release, res)
+	n := was[key]
+	if n > 0 {
+		still[key] = n
+	}
+	if n >= maxPruneAttempts {
+		d.retained = append(d.retained, res)
+		return
+	}
+	d.resources = append(d.resources, res)
+}
+
+// resourceLabels renders resources for a log line, kind included: the name
+// alone does not say which of the three to go and look at.
+func resourceLabels(res []departedResource) []string {
+	out := make([]string, 0, len(res))
+	for _, r := range res {
+		out = append(out, string(r.kind)+" "+r.name)
 	}
 	return out
 }
@@ -944,8 +1093,16 @@ func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liv
 // is the one place this feature adds a drift axis where manifest mode had none,
 // and it is deliberate — deleting a service with no record of it anywhere but a
 // log line would be worse.
+//
+// A release whose every candidate has been retained is skipped entirely, and
+// with it the DriftStateDetected that record folds through to SyncOutOfSync.
+// Both mean "the next sync puts this right", and for a resource this controller
+// has stopped trying to delete that is false — saying it anyway is what leaves
+// an application permanently out of sync over something nothing here will ever
+// do. The record of it is the warning departed raises on every pass, which is
+// the honest shape for a finding whose remedy is a person.
 func withOrphans(drifts map[string]*application.ReleaseDrift, doomed map[string]doomedSet) map[string]*application.ReleaseDrift {
-	if len(doomed) == 0 {
+	if actionable(doomed) == 0 {
 		return drifts
 	}
 	if drifts == nil {
@@ -953,6 +1110,9 @@ func withOrphans(drifts map[string]*application.ReleaseDrift, doomed map[string]
 	}
 
 	for release, set := range doomed {
+		if set.empty() {
+			continue
+		}
 		rd := drifts[release]
 		if rd == nil {
 			rd = &application.ReleaseDrift{}
@@ -1319,7 +1479,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		// since settled at.
 		r.setUnstable(spec.Name, "", nil)
 	}
-	if install+upgrade+len(fixable)+len(doomed) == 0 {
+	if install+upgrade+len(fixable)+actionable(doomed) == 0 {
 		return nil
 	}
 	if !spec.SyncPolicy.Automated && !force {
@@ -1724,14 +1884,17 @@ func (r *Reconciler) prune(ctx context.Context, spec application.Spec, backend c
 	var errs []error
 	var pruned []string
 	for _, release := range orphaned {
-		result, err := prune.Release(ctx, backend, engine, release, spec.SyncPolicy.PruneVolumes)
+		result, err := prune.Release(ctx, r.log, backend, engine, release, spec.SyncPolicy.PruneVolumes)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("pruning release %q: %w", release, err))
 			continue
 		}
 		pruned = append(pruned, release)
+		// Nothing about volumes here: prune.Release reports what its purge
+		// actually reached, which on a multi-node swarm is not the same as what
+		// the setting asked for.
 		r.log.Warn("pruned a release the application no longer declares",
-			"application", spec.Name, "release", release, "volumes", spec.SyncPolicy.PruneVolumes)
+			"application", spec.Name, "release", release)
 		if result != nil && len(result.OrphanedNetworks) > 0 {
 			// Left in place by the chart engine because they may be shared.
 			// Reported, or an operator believes the cleanup was complete.
@@ -1850,8 +2013,13 @@ func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, b
 // drain. That refusal is the ordinary case, not a fault: failing the reconcile
 // on it would report an error on every interval for something that is working
 // exactly as intended. So a failure is warned and raised as an event, and the
-// next interval tries again — which costs nothing, because the evidence is an
-// immutable revision record that is still there.
+// next interval tries again.
+//
+// It does not try for ever, though, which the sweep used to and which is not
+// the same thing as costing nothing — see maxPruneAttempts for what a permanent
+// refusal costs in aggregate and why three passes is where this stops. The
+// count is kept per resource here and read back in departed, which is what
+// decides whether the resource arrives in resources or in retained.
 //
 // This is also why there is no retry loop here, unlike prune.purgeVolumes. That
 // one has to settle within the pass because the uninstall around it is about to
@@ -1864,6 +2032,11 @@ func (r *Reconciler) pruneResources(ctx context.Context, spec application.Spec, 
 	remover, ok := backend.(resourceRemover)
 	if !ok {
 		return // pruneServices has already said so.
+	}
+
+	counts := r.failedPrunes(spec.Name)
+	if counts == nil {
+		counts = map[string]int{}
 	}
 
 	var errs []error
@@ -1880,20 +2053,30 @@ func (r *Reconciler) pruneResources(ctx context.Context, spec application.Spec, 
 				err = remover.RemoveNetwork(ctx, res.id)
 			}
 			if err != nil {
+				counts[pruneKey(release, res)]++
 				// Warn, not error: still in use is the expected answer while the
-				// services that referenced it are shutting down.
-				r.log.Warn("could not prune a resource the release no longer declares; it will be tried again",
+				// services that referenced it are shutting down. The attempt and
+				// the limit say where this one stands rather than the line
+				// promising another go — it may have just used its last, and
+				// departed says so on the next pass.
+				r.log.Warn("could not prune a resource the release no longer declares",
 					"application", spec.Name, "release", release,
-					"kind", string(res.kind), "resource", res.name, "error", err)
+					"kind", string(res.kind), "resource", res.name, "error", err,
+					"attempt", counts[pruneKey(release, res)], "limit", maxPruneAttempts)
 				errs = append(errs, fmt.Errorf("pruning %s %q of release %q: %w", res.kind, res.name, release, err))
 				continue
 			}
+			// Cleared, not merely left alone: a resource that went on the fourth
+			// attempt after three refusals must not carry those three into a
+			// name that comes back.
+			delete(counts, pruneKey(release, res))
 			removed = append(removed, string(res.kind)+" "+res.name)
 			r.log.Warn("pruned a resource the release no longer declares",
 				"application", spec.Name, "release", release,
 				"kind", string(res.kind), "resource", res.name)
 		}
 	}
+	r.recordPruneFailures(spec.Name, counts)
 
 	if len(removed) > 0 {
 		notify.Dispatch(ctx, notify.Event{

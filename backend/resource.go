@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"time"
 
@@ -25,6 +26,66 @@ import (
 // defaultNetworkDriver matches what `docker stack deploy` assumes when a
 // manifest names no driver.
 const defaultNetworkDriver = "overlay"
+
+// createdLabel marks a config or secret this controller created, as opposed to
+// one it found already there and adopted.
+//
+// The two are indistinguishable afterwards and the difference decides whether
+// the sweep may delete it. applySecrets and applyConfigs below take an existing
+// object of the declared name and relabel it into the stack's namespace — the
+// same thing `docker stack deploy` does — and that namespace label is exactly
+// what makes it a prune candidate. So the pre-seed pattern, an operator running
+// `docker secret create web_db_password` before a chart declares
+// `db_password`, would end with this controller deleting material it never held
+// a copy of, on the strength of a revision that merely *declared* the name.
+//
+// A stored revision proves the repository asked for a name. This proves this
+// controller made the object. LiveConfigs and LiveSecrets require both, because
+// neither on its own is ownership.
+//
+// **Two kinds and not three, because only two of them adopt.** applyNetworks
+// leaves an existing network entirely alone — it does not relabel one into the
+// stack's namespace — so a network can only be a candidate if it already
+// carried this stack's namespace label, which means either this controller
+// created it or somebody deliberately labelled it as this release's. There is
+// no adoption to catch, and requiring a marker there would instead stop the
+// sweep touching every network created before this label existed, silently.
+//
+// Written only on creation, and carried across an update rather than
+// re-derived: a config or secret update replaces the whole annotation set, so
+// an object this controller did create would otherwise lose its marker on the
+// next reconcile. An object that has never carried one never gains one, which
+// is the deliberate part — an adopted object and one created by an older build
+// of this controller read identically from here, and what they have in common
+// is that ownership cannot be proved. Both are reported and neither is deleted,
+// the same answer Claim gives a candidate older than the retained history.
+const createdLabel = "com.swarmcli.cd.created"
+
+// stampCreated returns labels plus the creation marker.
+//
+// A copy, never a mutation: the map belongs to the converted stack, which is
+// read again after this — DeployStack applies the unresolved conversion and
+// then converts a second time — and a label written into it here would travel
+// into specs this never saw.
+func (b *Backend) stampCreated(labels map[string]string) map[string]string {
+	out := make(map[string]string, len(labels)+1)
+	maps.Copy(out, labels)
+	out[createdLabel] = b.now().UTC().Format(time.RFC3339)
+	return out
+}
+
+// keepCreated carries an existing creation marker onto the labels that are
+// about to replace it, and leaves them alone when there is none to carry.
+func keepCreated(labels, current map[string]string) map[string]string {
+	v, ok := current[createdLabel]
+	if !ok {
+		return labels
+	}
+	out := make(map[string]string, len(labels)+1)
+	maps.Copy(out, labels)
+	out[createdLabel] = v
+	return out
+}
 
 // stackFilter selects the resources carrying one stack's namespace label. A
 // stack is that label plus a name prefix and nothing else — there is no /stacks
@@ -98,6 +159,7 @@ func (b *Backend) applySecrets(ctx context.Context, secrets []swarm.SecretSpec) 
 		cur, _, err := b.api.SecretInspectWithRaw(ctx, spec.Name)
 		switch {
 		case errdefs.IsNotFound(err):
+			spec.Labels = b.stampCreated(spec.Labels)
 			if _, err := b.api.SecretCreate(ctx, spec); err != nil {
 				return fmt.Errorf("creating secret %q: %w", spec.Name, err)
 			}
@@ -110,7 +172,13 @@ func (b *Backend) applySecrets(ctx context.Context, secrets []swarm.SecretSpec) 
 			// against. Only the labels can be updated, and that is all this
 			// does. Content changes have to arrive as a new name, which is why
 			// a chart hashes content into it.
+			//
+			// This is also the adoption path: a secret of the declared name that
+			// somebody else created is relabelled into the stack's namespace
+			// here. It does not gain a creation marker, and that is what keeps
+			// the sweep off it.
 			spec.Data = nil
+			spec.Labels = keepCreated(spec.Labels, cur.Spec.Labels)
 			if err := b.api.SecretUpdate(ctx, cur.ID, cur.Version, spec); err != nil {
 				return fmt.Errorf("updating secret %q: %w", spec.Name, err)
 			}
@@ -125,6 +193,7 @@ func (b *Backend) applyConfigs(ctx context.Context, configs []swarm.ConfigSpec) 
 		cur, _, err := b.api.ConfigInspectWithRaw(ctx, spec.Name)
 		switch {
 		case errdefs.IsNotFound(err):
+			spec.Labels = b.stampCreated(spec.Labels)
 			if _, err := b.api.ConfigCreate(ctx, spec); err != nil {
 				return fmt.Errorf("creating config %q: %w", spec.Name, err)
 			}
@@ -141,8 +210,13 @@ func (b *Backend) applyConfigs(ctx context.Context, configs []swarm.ConfigSpec) 
 				"changes with its content — a version suffix or a content hash — so that a new one is "+
 				"created and the services referencing it are updated to it", spec.Name)
 		default:
+			// The adoption path, as in applySecrets: a config of the declared
+			// name that already carries exactly this content is relabelled into
+			// the stack's namespace rather than refused. It does not gain a
+			// creation marker either.
 			data := spec.Data
 			spec.Data = nil
+			spec.Labels = keepCreated(spec.Labels, cur.Spec.Labels)
 			if err := b.api.ConfigUpdate(ctx, cur.ID, cur.Version, spec); err != nil {
 				return fmt.Errorf("updating config %q: %w", spec.Name, err)
 			}
@@ -236,7 +310,22 @@ func (b *Backend) DeleteConfig(ctx context.Context, name string) error {
 
 // --- pre-flight and cleanup for external resources ---
 
-// StackVolumes names the volumes carrying this stack's namespace label.
+// StackVolumes names the volumes carrying this stack's namespace label **on the
+// node this controller talks to**, which on a swarm of more than one node is
+// not the same question as "this stack's volumes".
+//
+// GET /volumes answers from the node-local volume store
+// (api/server/router/volume/volume_routes.go:35 →
+// volume/service/service.go:265): the daemon lists what this engine has, and
+// only CSI *cluster* volumes are added from swarm, and only on a manager
+// (volume_routes.go:41). An ordinary named volume is created by the engine that
+// runs the task that mounts it, so a stack's volumes live on whichever nodes
+// scheduled its tasks and are invisible from everywhere else.
+//
+// There is no swarm-wide named-volume listing to ask instead, and swarms.Registry
+// resolves one swarm rather than one node, so this is the whole of what the OSS
+// build can see. SwarmNodes below is how a caller finds out whether that is
+// everything.
 //
 // Guarded like RemoveStack, and not only for symmetry: this is the list a purge
 // deletes from, and the chart engine's own Uninstall reaches it even when the
@@ -260,8 +349,38 @@ func (b *Backend) StackVolumes(ctx context.Context, name string) ([]string, erro
 	return out, nil
 }
 
+// SwarmNodes counts the swarm's nodes, which is the only thing that says
+// whether StackVolumes could have seen everything: on a single-node swarm the
+// node-local volume store *is* the swarm's, and on any larger one it is a
+// fraction of unknown size.
+//
+// A node that is not a manager cannot list nodes, and that failure is not
+// smoothed over here — the caller decides what an unanswerable question means,
+// and for a deletion it has to mean "assume not".
+func (b *Backend) SwarmNodes(ctx context.Context) (int, error) {
+	nodes, err := b.api.NodeList(ctx, swarm.NodeListOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("listing the swarm's nodes: %w", err)
+	}
+	return len(nodes), nil
+}
+
+// RemoveVolume deletes one volume by name.
+//
+// A volume that is already gone is not an error, as it is not for the four
+// removals in live.go. The caller retries this for as long as the volume is
+// still held by a container that has not finished shutting down, so a volume
+// that vanished in between — another sweep, an operator, a `docker volume
+// prune` — would otherwise burn the whole settle budget and then fail the prune
+// naming "still in use" for something that had reached the asked-for state on
+// the first attempt.
+//
+// The classification is reliable here in a way it is not for a network: a
+// missing volume is answered by the local volume store, or on a manager by
+// getVolume, and both wrap in a not-found the client recognises
+// (daemon/cluster/helpers.go:274).
 func (b *Backend) RemoveVolume(ctx context.Context, name string) error {
-	if err := b.api.VolumeRemove(ctx, name, false); err != nil {
+	if err := b.api.VolumeRemove(ctx, name, false); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("removing volume %q: %w", name, err)
 	}
 	return nil

@@ -47,7 +47,21 @@ type fakeBackend struct {
 	// volInUse counts, per volume, how many removal attempts still fail before
 	// it frees — the "container has not let go yet" case.
 	volInUse map[string]int
+	// volDelay is how long one volume's removal takes, so that a test can spend
+	// a settle budget rather than assert about one.
+	volDelay map[string]time.Duration
 }
+
+// sizedBackend is a backend that can say how big the swarm is. Separate from
+// fakeBackend rather than a field on it, because "cannot answer" is one of the
+// three cases under test and a method cannot be un-declared.
+type sizedBackend struct {
+	*fakeBackend
+	nodes int
+	err   error
+}
+
+func (b sizedBackend) SwarmNodes(context.Context) (int, error) { return b.nodes, b.err }
 
 func (b *fakeBackend) RemoveStack(name string) error {
 	b.mu.Lock()
@@ -69,6 +83,7 @@ func (b *fakeBackend) RemoveVolume(_ context.Context, name string) error {
 		b.volInUse[name] = n - 1
 		return errors.New("volume is in use")
 	}
+	time.Sleep(b.volDelay[name])
 	b.removedVol = append(b.removedVol, name)
 	return nil
 }
@@ -128,12 +143,17 @@ func testPruner(t *testing.T, e *fakeEngine, volumes bool) *Pruner {
 
 func prunerWith(t *testing.T, e *fakeEngine, b charts.Backend, volumes bool) *Pruner {
 	t.Helper()
+	return prunerLogging(t, e, b, volumes, io.Discard)
+}
+
+func prunerLogging(t *testing.T, e *fakeEngine, b charts.Backend, volumes bool, w io.Writer) *Pruner {
+	t.Helper()
 	return New(Options{
 		Swarms:       fakeSwarms{backend: b},
 		Engine:       func(charts.Backend) Engine { return e },
 		Volumes:      volumes,
 		ControllerID: testController,
-		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Log:          slog.New(slog.NewTextHandler(w, nil)),
 	})
 }
 
@@ -594,5 +614,126 @@ func TestClaimWithNoCandidatesDoesNothing(t *testing.T) {
 	claimed, rest := Claim(nil, []string{"web_app"})
 	if claimed != nil || rest != nil {
 		t.Errorf("Claim(nil, …) = %v, %v; want nil, nil", claimed, rest)
+	}
+}
+
+// ------------------------------------- volumes this node cannot see (#108)
+
+// GET /volumes answers from the node-local volume store, so on a swarm of more
+// than one node an empty listing is not evidence that the release had no
+// volumes — and reporting it as a completed purge is the claim this must not
+// make. The stack's data survives on whichever nodes ran its tasks, and the
+// only honest thing left is to say so and hand over the filter that finds it.
+func TestAMultiNodeSwarmDoesNotClaimToHavePrunedVolumesItCannotSee(t *testing.T) {
+	var buf bytes.Buffer
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	// Nothing under this stack's label on the node the controller talks to,
+	// which is what a stack scheduled elsewhere looks like from here.
+	b := sizedBackend{fakeBackend: &fakeBackend{}, nodes: 3}
+
+	got, err := prunerLogging(t, e, b, true, &buf).Departed(t.Context(), []string{"kept"}, nil)
+	if err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+
+	log := buf.String()
+	if !strings.Contains(log, "node-local") {
+		t.Errorf("log %q does not say the listing was node-local", log)
+	}
+	if !strings.Contains(log, "label=com.docker.stack.namespace=api") {
+		t.Errorf("log %q does not hand over the filter that finds what is left", log)
+	}
+	if strings.Contains(log, "deleted the release's volumes") {
+		t.Errorf("log %q claims a completed purge on a multi-node swarm", log)
+	}
+	// What is deliberately *not* done: the sweep still finishes. The release
+	// records are what a later sweep finds a release by, and a later sweep on
+	// this node would read the same node-local listing and be no better off, so
+	// holding them back would only leave an application that can never finish
+	// being pruned. See purgeVolumes.
+	if want := []string{"api"}; !reflect.DeepEqual(e.pruned(), want) {
+		t.Errorf("uninstalled %v, want %v — the records go, and the warning is what carries the rest", e.pruned(), want)
+	}
+	if want := []string{"gone"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("pruned applications = %v, want %v", got, want)
+	}
+}
+
+// The one case where the node-local listing really is the swarm's.
+func TestASingleNodeSwarmReportsThePurgeAsComplete(t *testing.T) {
+	var buf bytes.Buffer
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	b := sizedBackend{
+		fakeBackend: &fakeBackend{volumes: map[string][]string{"api": {"api_data"}}},
+		nodes:       1,
+	}
+
+	if _, err := prunerLogging(t, e, b, true, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+
+	log := buf.String()
+	if !strings.Contains(log, "deleted the release's volumes") || !strings.Contains(log, "api_data") {
+		t.Errorf("log %q does not report the purge that did cover the swarm", log)
+	}
+	if strings.Contains(log, "node-local") {
+		t.Errorf("log %q warns about other nodes on a one-node swarm", log)
+	}
+}
+
+// A count that could not be read is not one node. Both shapes of "cannot
+// answer" have to land on the cautious side, because the alternative is
+// claiming a purge covered a swarm nothing checked.
+func TestAnUnanswerableNodeCountIsNotOneNode(t *testing.T) {
+	for name, b := range map[string]charts.Backend{
+		"a backend without the seam": &fakeBackend{volumes: map[string][]string{"api": {"api_data"}}},
+		"a listing that failed": sizedBackend{
+			fakeBackend: &fakeBackend{volumes: map[string][]string{"api": {"api_data"}}},
+			err:         errors.New("this node is not a swarm manager"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+
+			if _, err := prunerLogging(t, e, b, true, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+				t.Fatalf("Departed = %v, want nil", err)
+			}
+			if !strings.Contains(buf.String(), "node-local") {
+				t.Errorf("log %q claims a swarm-wide purge without having established one", buf.String())
+			}
+		})
+	}
+}
+
+// The settle budget is per volume, because the thing being waited for is per
+// volume: each is held by its own containers and drains on its own schedule.
+// Shared, the last volume of a stack answers for however long the first ones
+// took, and the same stack passes or fails on how many volumes it declares.
+func TestEachVolumeGetsItsOwnSettleBudget(t *testing.T) {
+	restoreTimeout, restoreInterval := volumeSettleTimeout, volumeSettleInterval
+	volumeSettleTimeout, volumeSettleInterval = 100*time.Millisecond, 0
+	t.Cleanup(func() { volumeSettleTimeout, volumeSettleInterval = restoreTimeout, restoreInterval })
+
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	b := &fakeBackend{
+		volumes: map[string][]string{"api": {"api_slow", "api_data"}},
+		// The first spends more than a whole budget, as a stack whose
+		// stop_grace_period outlasts the timeout does.
+		volDelay: map[string]time.Duration{"api_slow": 150 * time.Millisecond},
+		// The second needs one retry, which a shared deadline can no longer
+		// afford by the time it is reached.
+		volInUse: map[string]int{"api_data": 1},
+	}
+
+	got, err := prunerWith(t, e, b, true).Departed(t.Context(), []string{"kept"}, nil)
+	if err != nil {
+		t.Fatalf("Departed = %v, want nil — the second volume has its own budget", err)
+	}
+	if want := []string{"api_slow", "api_data"}; !slices.Equal(b.removedVol, want) {
+		t.Errorf("removed volumes %v, want %v", b.removedVol, want)
+	}
+	if want := []string{"gone"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("pruned applications = %v, want %v", got, want)
 	}
 }

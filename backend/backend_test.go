@@ -999,10 +999,23 @@ func TestRemoveStackStillFailsOnARealError(t *testing.T) {
 	}
 }
 
-// stackScoped is a resource as a real deploy leaves it: carrying the namespace
-// label, which is the whole of "this belongs to that stack" and the only thing
-// RemoveStack has to find it by.
+// stackScoped is a config or secret as a real deploy by this controller leaves
+// it: carrying the namespace label, which is the whole of "this belongs to that
+// stack" and the only thing RemoveStack has to find it by, and the creation
+// marker that says this controller made it rather than adopted it.
+//
+// adopted below is the same resource without that second half, which is what an
+// operator's own secret looks like once a chart has declared its name.
 func stackScoped(name, stack string) swarm.Annotations {
+	a := adopted(name, stack)
+	a.Labels[createdLabel] = "2026-01-01T00:00:00Z"
+	return a
+}
+
+// adopted is a resource carrying the stack's namespace label and nothing that
+// says who created it — either because somebody else did, or because a build of
+// this controller from before the marker existed did.
+func adopted(name, stack string) swarm.Annotations {
 	return swarm.Annotations{
 		Name:   name,
 		Labels: map[string]string{convert.LabelNamespace: stack},
@@ -1010,7 +1023,8 @@ func stackScoped(name, stack string) swarm.Annotations {
 }
 
 // stackNetwork is the same thing for a network, which carries its labels on the
-// summary rather than in annotations.
+// summary rather than in annotations — and no creation marker, because
+// applyNetworks never adopts and so LiveNetworks never asks for one.
 func stackNetwork(id, name, stack string) network.Summary {
 	return network.Summary{
 		ID:     id,
@@ -1558,6 +1572,166 @@ func TestAContainerThisDaemonDoesNotKnowIsAnAnswer(t *testing.T) {
 	}
 	if api.selfInspects != 1 {
 		t.Errorf("asked about this controller %d times, want 1", api.selfInspects)
+	}
+}
+
+// -------------------------------------------- the creation marker (#108)
+
+// What the marker is for: a config or secret this controller made carries it,
+// so the sweep can tell it from one of the same name it merely adopted.
+func TestCreatedConfigsAndSecretsCarryTheCreationMarker(t *testing.T) {
+	api := &fakeAPI{}
+	b := testBackend(t, api, nil)
+	ctx := context.Background()
+
+	if err := b.applyConfigs(ctx, []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "s_site"}}}); err != nil {
+		t.Fatalf("applyConfigs = %v, want nil", err)
+	}
+	if err := b.applySecrets(ctx, []swarm.SecretSpec{{Annotations: swarm.Annotations{Name: "s_key"}}}); err != nil {
+		t.Fatalf("applySecrets = %v, want nil", err)
+	}
+	if _, ok := api.createdConfigs[0].Labels[createdLabel]; !ok {
+		t.Errorf("config created with %v, want the creation marker", api.createdConfigs[0].Labels)
+	}
+	if _, ok := api.createdSecrets[0].Labels[createdLabel]; !ok {
+		t.Errorf("secret created with %v, want the creation marker", api.createdSecrets[0].Labels)
+	}
+}
+
+// The pre-seed pattern, which is the whole of issue #108's fourth item: an
+// operator ran `docker secret create s_apikey`, and a chart then declared it.
+// The apply adopts it — relabels it into the stack's namespace, which is what
+// makes it a sweep candidate — and must not claim to have created it.
+func TestAnAdoptedConfigOrSecretNeverGainsTheCreationMarker(t *testing.T) {
+	api := &fakeAPI{
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "s_site"}, Data: []byte("same"),
+		}}},
+		secrets: []swarm.Secret{{ID: "k", Spec: swarm.SecretSpec{
+			Annotations: swarm.Annotations{Name: "s_apikey"},
+		}}},
+	}
+	b := testBackend(t, api, nil)
+	ctx := context.Background()
+
+	if err := b.applyConfigs(ctx, []swarm.ConfigSpec{{
+		Annotations: swarm.Annotations{Name: "s_site", Labels: map[string]string{convert.LabelNamespace: "s"}},
+		Data:        []byte("same"),
+	}}); err != nil {
+		t.Fatalf("applyConfigs = %v, want nil", err)
+	}
+	if err := b.applySecrets(ctx, []swarm.SecretSpec{{
+		Annotations: swarm.Annotations{Name: "s_apikey", Labels: map[string]string{convert.LabelNamespace: "s"}},
+	}}); err != nil {
+		t.Fatalf("applySecrets = %v, want nil", err)
+	}
+
+	if _, ok := api.updatedConfigs[0].Labels[createdLabel]; ok {
+		t.Errorf("an adopted config was marked as created: %v", api.updatedConfigs[0].Labels)
+	}
+	if _, ok := api.updatedSecrets[0].Labels[createdLabel]; ok {
+		t.Errorf("an adopted secret was marked as created: %v", api.updatedSecrets[0].Labels)
+	}
+	// The adoption itself is unchanged: the namespace label still goes on, which
+	// is what lets `docker stack rm` and RemoveStack find it.
+	if api.updatedSecrets[0].Labels[convert.LabelNamespace] != "s" {
+		t.Errorf("adopted secret labels = %v, want it still relabelled into the stack", api.updatedSecrets[0].Labels)
+	}
+}
+
+// A config or secret update replaces the whole annotation set, so a resource
+// this controller did create would lose its marker on the next reconcile — and
+// with it the sweep's only proof, silently, one deploy after it was written.
+func TestAnUpdateCarriesTheCreationMarkerForward(t *testing.T) {
+	api := &fakeAPI{
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{
+			Annotations: stackScoped("s_site", "s"), Data: []byte("same"),
+		}}},
+		secrets: []swarm.Secret{{ID: "k", Spec: swarm.SecretSpec{
+			Annotations: stackScoped("s_apikey", "s"),
+		}}},
+	}
+	b := testBackend(t, api, nil)
+	ctx := context.Background()
+
+	if err := b.applyConfigs(ctx, []swarm.ConfigSpec{{
+		Annotations: swarm.Annotations{Name: "s_site", Labels: map[string]string{convert.LabelNamespace: "s"}},
+		Data:        []byte("same"),
+	}}); err != nil {
+		t.Fatalf("applyConfigs = %v, want nil", err)
+	}
+	if err := b.applySecrets(ctx, []swarm.SecretSpec{{
+		Annotations: swarm.Annotations{Name: "s_apikey", Labels: map[string]string{convert.LabelNamespace: "s"}},
+	}}); err != nil {
+		t.Fatalf("applySecrets = %v, want nil", err)
+	}
+
+	if _, ok := api.updatedConfigs[0].Labels[createdLabel]; !ok {
+		t.Errorf("config update dropped the creation marker: %v", api.updatedConfigs[0].Labels)
+	}
+	if _, ok := api.updatedSecrets[0].Labels[createdLabel]; !ok {
+		t.Errorf("secret update dropped the creation marker: %v", api.updatedSecrets[0].Labels)
+	}
+}
+
+// The map belongs to the converted stack, which DeployStack reads again after
+// applying the unresolved half — a label written into it here would travel into
+// specs this never saw.
+func TestStampingTheCreationMarkerDoesNotMutateTheCallersLabels(t *testing.T) {
+	labels := map[string]string{convert.LabelNamespace: "s"}
+	specs := []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "s_site", Labels: labels}}}
+
+	if err := testBackend(t, &fakeAPI{}, nil).applyConfigs(context.Background(), specs); err != nil {
+		t.Fatalf("applyConfigs = %v, want nil", err)
+	}
+	if len(labels) != 1 {
+		t.Errorf("the caller's labels became %v, want them untouched", labels)
+	}
+}
+
+// -------------------------------------------------- volumes (#108)
+
+// A volume that went between the list and the delete has reached the state this
+// was asking for. Alone among the five removals this reported it as a failure,
+// and the caller retries — so the loss was the whole settle budget spent on a
+// volume that had already gone, and then a prune failed naming "still in use".
+func TestRemoveVolumeToleratesOneAlreadyGone(t *testing.T) {
+	api := &fakeAPI{removeErr: map[string]error{"volume:s_data": errdefs.ErrNotFound}}
+
+	if err := testBackend(t, api, nil).RemoveVolume(context.Background(), "s_data"); err != nil {
+		t.Errorf("RemoveVolume = %v, want nil for one already gone", err)
+	}
+}
+
+func TestRemoveVolumeSurfacesARefusal(t *testing.T) {
+	api := &fakeAPI{removeErr: map[string]error{"volume:s_data": errors.New("volume is in use")}}
+
+	err := testBackend(t, api, nil).RemoveVolume(context.Background(), "s_data")
+	if err == nil || !strings.Contains(err.Error(), "in use") {
+		t.Fatalf("RemoveVolume = %v, want the daemon's refusal surfaced", err)
+	}
+}
+
+// The count that says whether a node-local volume listing was the whole swarm's.
+func TestSwarmNodesCountsTheSwarm(t *testing.T) {
+	api := &fakeAPI{nodes: []swarm.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+
+	n, err := testBackend(t, api, nil).SwarmNodes(context.Background())
+	if err != nil {
+		t.Fatalf("SwarmNodes = %v, want nil", err)
+	}
+	if n != 3 {
+		t.Errorf("SwarmNodes = %d, want 3", n)
+	}
+}
+
+// A worker cannot enumerate the swarm, and that unanswerable question must
+// arrive as one rather than as "one node".
+func TestSwarmNodesSurfacesAFailureRatherThanCountingZero(t *testing.T) {
+	api := &fakeAPI{nodeErr: errors.New("this node is not a swarm manager")}
+
+	if _, err := testBackend(t, api, nil).SwarmNodes(context.Background()); err == nil {
+		t.Fatal("SwarmNodes = nil, want the listing failure surfaced")
 	}
 }
 
