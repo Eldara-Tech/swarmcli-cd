@@ -123,6 +123,10 @@ func (a *allowAll) Authorize(_ context.Context, _ authz.Subject, act authz.Actio
 	return nil
 }
 
+func (a *allowAll) Visible(_ context.Context, _ authz.Subject, _ authz.Action, apps []string) ([]string, error) {
+	return apps, nil
+}
+
 type denyAuthn struct{ authz.Authorizer }
 
 func (denyAuthn) Authenticate(*http.Request) (authz.Subject, error) {

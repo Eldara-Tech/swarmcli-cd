@@ -172,3 +172,6 @@ func (stubAuthorizer) Authenticate(*http.Request) (Subject, error) { return Subj
 func (stubAuthorizer) Authorize(context.Context, Subject, Action, string) error {
 	return nil
 }
+func (stubAuthorizer) Visible(_ context.Context, _ Subject, _ Action, apps []string) ([]string, error) {
+	return apps, nil
+}

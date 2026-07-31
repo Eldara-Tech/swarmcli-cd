@@ -209,12 +209,17 @@ func valuesReader(ctx context.Context, app string, co git.Checkout, rf *charts.R
 		}
 
 		// The provider is given the path as the repository sees it, so it can
-		// decide by name or extension.
+		// decide by name or extension, and the application it belongs to, so
+		// one holding per-application key material can pick one.
 		relative, err := filepath.Rel(co.Dir, resolved)
 		if err != nil {
 			relative = filepath.Base(resolved)
 		}
-		out, err := provider.Resolve(ctx, secrets.Request{Path: filepath.ToSlash(relative), Data: data})
+		out, err := provider.Resolve(ctx, secrets.Request{
+			Application: app,
+			Path:        filepath.ToSlash(relative),
+			Data:        data,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("resolving %s: %w", relative, err)
 		}

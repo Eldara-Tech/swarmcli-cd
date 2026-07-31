@@ -1698,7 +1698,7 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 		return fmt.Errorf("reading source: %w", err)
 	}
 
-	backend, err := r.swarms.Backend(ctx, spec.Destination.Swarm)
+	backend, err := r.swarms.Backend(ctx, swarms.Target{Swarm: spec.Destination.Swarm})
 	if err != nil {
 		return fmt.Errorf("resolving destination: %w", err)
 	}
@@ -2250,7 +2250,11 @@ func (r *Reconciler) prune(ctx context.Context, spec application.Spec, backend c
 	var errs []error
 	var pruned []string
 	for _, release := range orphaned {
-		result, err := prune.Release(ctx, r.log, backend, engine, release, spec.SyncPolicy.PruneVolumes)
+		result, err := prune.Release(ctx, r.log, backend, engine, release, prune.VolumePurge{
+			Enabled:  spec.SyncPolicy.PruneVolumes,
+			Registry: r.swarms,
+			Target:   swarms.Target{Swarm: spec.Destination.Swarm},
+		})
 		if err != nil {
 			errs = append(errs, fmt.Errorf("pruning release %q: %w", release, err))
 			continue
@@ -2724,7 +2728,7 @@ func (r *Reconciler) History(ctx context.Context, app string) (application.Histo
 		return application.History{}, ErrNotPlanned
 	}
 
-	backend, err := r.swarms.Backend(ctx, spec.Destination.Swarm)
+	backend, err := r.swarms.Backend(ctx, swarms.Target{Swarm: spec.Destination.Swarm})
 	if err != nil {
 		return application.History{}, fmt.Errorf("resolving destination: %w", err)
 	}
