@@ -256,6 +256,14 @@ func (r *recorder) Notify(_ context.Context, e notify.Event) {
 	r.got = append(r.got, e)
 }
 
+// events is every event as it was dispatched, for the assertions that are about
+// a field rather than about which events were raised.
+func (r *recorder) events() []notify.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.got)
+}
+
 func (r *recorder) types() []notify.EventType {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2566,7 +2574,7 @@ func TestOutOfBandWriteIsReported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scoped := r.withOutOfBandNotifier(context.Background(), b, "edge")
+	scoped := r.withOutOfBandNotifier(context.Background(), b, spec("edge", true))
 	if err := scoped.DeployStack(t.Context(), "edge", "", ""); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
@@ -4060,5 +4068,195 @@ func TestViewsHandOutSnapshotsOfTheStore(t *testing.T) {
 
 	if second := r.Views(); second[0].Status.Releases[0].Name == "rewritten" {
 		t.Error("one caller's write changed what the next caller is given")
+	}
+}
+
+// ------------------------------------------ every event names its swarm (#131)
+
+// notify.Event.Swarm shipped declared, documented and never written: all
+// thirteen dispatch sites filled Application and Type and left the destination
+// empty, so a Business Edition notifier routing production alerts to one channel
+// and staging to another saw every event arrive from the default destination.
+//
+// Asserted over whatever the run raises rather than over a fixed list, because
+// what this has to survive is a *fourteenth* dispatch site: the bug was never
+// that one literal was wrong, it was that each of them had to remember a field
+// only a multi-swarm build could miss. The spread below is the load-bearing
+// part — one event type would pass this while twelve sites stayed empty.
+func TestEveryEventNamesTheDestinationItConcerns(t *testing.T) {
+	rec := listen(t)
+	spec := sweepingSpec("edge", application.DriftLive)
+	spec.Destination.Swarm = "production"
+
+	// Drifted, so the run also corrects and announces the correction; the sweep
+	// on top of it removes one service and is refused three resources. Six event
+	// types out of one sync, across six different dispatch sites.
+	backend := refusingSweep()
+	backend.live["whoami"]["whoami_app"] = swarm.Service{ID: "id-app", Spec: serviceSpec("whoami_app", 3)}
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{spec}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	events := rec.events()
+	seen := map[notify.EventType]struct{}{}
+	for _, e := range events {
+		seen[e.Type] = struct{}{}
+		if e.Swarm != "production" {
+			t.Errorf("event %s carries swarm %q, want the application's destination", e.Type, e.Swarm)
+		}
+		if e.Application != "edge" {
+			t.Errorf("event %s carries application %q, want edge", e.Type, e.Application)
+		}
+	}
+	if len(seen) < 5 {
+		t.Errorf("saw %d event types (%v), want the spread this test is built to cover — "+
+			"a run that stopped raising events would pass every assertion above", len(seen), rec.types())
+	}
+}
+
+// ------------------------- a rollback that is already history (#130)
+
+// rolledBackTo is the "whoami" release running a service that Swarm rolled back,
+// with the spec that survived the rollback and the state StackServices reports.
+//
+// The two reads are set separately on purpose, because that is the shape of the
+// bug: the live spec is what the comparison judges, and the update state is what
+// the health rollup judges, and the whole of #130 is those two answering
+// differently about one service for ever.
+func rolledBackTo(live swarm.ServiceSpec) *driftBackend {
+	b := &driftBackend{
+		stubBackend: stubBackend{states: map[string][]charts.ServiceState{
+			"whoami": {{
+				Name: "whoami_app", Running: 1, Desired: 1,
+				UpdateState: "rollback_completed", NewestTaskAge: time.Hour,
+			}},
+		}},
+		desired: map[string]*compose.Stack{
+			"whoami": {Services: []compose.Service{{Name: "app", Spec: serviceSpec("whoami_app", 1)}}},
+		},
+		live: map[string]map[string]swarm.Service{
+			"whoami": {"whoami_app": {
+				ID:           "id",
+				Spec:         live,
+				UpdateStatus: &swarm.UpdateStatus{State: swarm.UpdateStateRollbackCompleted, Message: "update paused due to failure"},
+			}},
+		},
+	}
+	return b
+}
+
+// Swarm's UpdateStatus persists until a service's *next* update. drift/live.go
+// already reads a rollback that restored the repository's own spec as history
+// rather than a finding — correctly, there is nothing to correct — and after the
+// CE pin moved past Eldara-Tech/swarmcli#530 the health axis read the same
+// status as wedged. Nothing could ever clear it: no drift, so no redeploy, so no
+// ServiceUpdate, so the service reported Degraded for ever over an operator's
+// rollback from weeks ago.
+func TestARollbackThatRestoredWhatTheRepositoryWantsIsNotDegraded(t *testing.T) {
+	backend := rolledBackTo(serviceSpec("whoami_app", 1))
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthHealthy {
+		t.Errorf("health = %q (%s), want healthy — the spec that survived the rollback is the one git asks for",
+			view.Status.Health.State, view.Status.Health.Message)
+	}
+	// The verdict changed; the fact did not. An operator still sees what swarm
+	// did to the service, which is the only record of it there is.
+	svc := view.Status.Releases[0].Services[0]
+	if svc.UpdateState != "rollback_completed" {
+		t.Errorf("updateState = %q, want the daemon's own", svc.UpdateState)
+	}
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("sync = %q, want synced", view.Status.Sync.State)
+	}
+}
+
+// The other rollback, and the signal that must survive the fix. Swarm reverted
+// the service to a spec the repository does *not* declare, so the comparison
+// reports it — which both vetoes the correction (#90) and leaves the status a
+// verdict on something outstanding rather than history.
+func TestARollbackThatDidNotRestoreWhatTheRepositoryWantsIsStillDegraded(t *testing.T) {
+	backend := rolledBackTo(serviceSpec("whoami_app", 3))
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthDegraded {
+		t.Errorf("health = %q, want degraded — the running spec is not the one the repository declares",
+			view.Status.Health.State)
+	}
+	if len(backend.converged()) != 0 {
+		t.Errorf("redeployed %v, want nothing — swarm already rejected that spec", backend.converged())
+	}
+}
+
+// The limit, stated so that nobody closes it by clearing the status outright.
+// Manifest mode never reads a running ServiceSpec, so there is no evidence that
+// the rollback restored anything, and a status with nothing against it is taken
+// at face value.
+func TestARollbackIsTakenAtFaceValueWhenNothingComparedIt(t *testing.T) {
+	backend := rolledBackTo(serviceSpec("whoami_app", 1))
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthDegraded {
+		t.Errorf("health = %q, want degraded — nothing here compared the running spec to anything",
+			view.Status.Health.State)
+	}
+}
+
+// The other half of #130, and the one that reaches a release nobody has touched.
+// StackServices answers for everything carrying the namespace label, so a
+// service the manifest does not declare — attached by hand, or dropped from the
+// chart and retained by the sweep (maxPruneAttempts) — was rolled up into the
+// verdict on a write that never touched it. Carrying a rollback it will never
+// lose, that made every correction of the release report "did not converge", for
+// ever.
+func TestASiblingTheCorrectionDidNotWriteDoesNotHoldTheRelease(t *testing.T) {
+	fastPolling(t)
+	rec := listen(t)
+	backend := converging([]charts.ServiceState{
+		{Name: "whoami_app", Running: 1, Desired: 1, NewestTaskAge: time.Hour},
+		{Name: "whoami_sidecar", Running: 1, Desired: 1, UpdateState: "rollback_completed", NewestTaskAge: time.Hour},
+	})
+	// Under the release's namespace label and declared by nothing, which is what
+	// makes it unwritable by a deploy: applying deletes nothing and writes only
+	// what the manifest declares.
+	backend.live["whoami"]["whoami_sidecar"] = swarm.Service{ID: "id-sidecar", Spec: serviceSpec("whoami_sidecar", 1)}
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{waitingSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil — the correction landed on the service it was written for", err)
+	}
+	if got := backend.converged(); len(got) != 1 {
+		t.Errorf("redeployed %v, want the drifted release", got)
+	}
+	if !slices.Contains(rec.types(), notify.DriftConverged) {
+		t.Errorf("events = %v, want the correction announced", rec.types())
+	}
+	// Not silenced, only disqualified from judging somebody else's write: the
+	// sidecar is still read, still reported, and still degraded.
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthDegraded {
+		t.Errorf("health = %q, want degraded — the wedged sidecar is still there", view.Status.Health.State)
 	}
 }

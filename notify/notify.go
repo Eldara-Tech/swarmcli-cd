@@ -76,11 +76,11 @@ type Event struct {
 	// Deciding where an alert goes by matching on a sentence is a notifier that
 	// breaks when somebody improves the wording.
 	//
-	// **The reconciler does not set it yet (#131.)** Every event it dispatches
-	// leaves it empty, which is exactly right for a build that resolves one
-	// swarm and exactly wrong for one that does not. The field is here anyway
-	// because Event is a struct: it costs nothing now and the alternative is a
-	// second change to the same type later.
+	// Empty is the ordinary value in an Apache-2.0 build and means the swarm the
+	// controller runs in, because that is the only destination swarms.Registry's
+	// OSS default resolves (D2) and the only one an application can name without
+	// a companion loaded. It is not "unknown": the reconciler stamps every event
+	// it raises with the application's own destination, whatever that is (#131).
 	Swarm string
 }
 
