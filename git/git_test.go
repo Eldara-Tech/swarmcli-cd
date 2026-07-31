@@ -424,3 +424,60 @@ func TestAuthFromEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestFetchSerialisesOneApplicationsWorkingTree is the guard on the invariant
+// this type's own doc comment states: one clone per application.
+//
+// Fetch rewrites that clone in place — Checkout(Force) then Clean(Dir:true) — so
+// two at once interleave one checkout with the other's, and what gets rendered
+// can be a mixture of two commits that never existed together in git. The
+// reconciler's per-application lease is what normally keeps them apart; this is
+// the backstop for when it does not, which is a Remove whose bounded wait ran
+// out while the same name rejoined the set with a new entry and a new lease.
+//
+// The second half matters as much as the first. A single global lock would pass
+// "one application serialises" and quietly turn every application's reconcile
+// into one queue behind the slowest remote — which is the failure this package
+// keeps a clone per application to avoid in the first place.
+func TestFetchSerialisesOneApplicationsWorkingTree(t *testing.T) {
+	repo := newFixture(t)
+	repo.commit("r.yaml", "releases: []")
+
+	s := New(t.TempDir(), Auth{})
+	src := repo.source("master")
+
+	// Held the way a fetch already in progress holds it.
+	s.lockFor("edge").Lock()
+
+	same := make(chan error, 1)
+	go func() {
+		_, err := s.Fetch(context.Background(), "edge", src)
+		same <- err
+	}()
+
+	select {
+	case <-same:
+		t.Fatal("a second Fetch for one application ran while its working tree was being rewritten")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	other := make(chan error, 1)
+	go func() {
+		_, err := s.Fetch(context.Background(), "other", src)
+		other <- err
+	}()
+
+	select {
+	case err := <-other:
+		if err != nil {
+			t.Fatalf("Fetch(other) = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a second application's fetch queued behind the first application's working tree")
+	}
+
+	s.lockFor("edge").Unlock()
+	if err := <-same; err != nil {
+		t.Fatalf("Fetch(edge) = %v, want nil once the tree was free", err)
+	}
+}

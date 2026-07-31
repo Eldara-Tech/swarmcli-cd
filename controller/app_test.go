@@ -528,6 +528,10 @@ func (s *stubReconciler) History(_ context.Context, app string) (application.His
 	return s.history, nil
 }
 
+func (s *stubReconciler) AcceptSync(app string) (func(context.Context) error, error) {
+	return func(ctx context.Context) error { return s.SyncNow(ctx, app) }, nil
+}
+
 func (s *stubReconciler) SyncNow(_ context.Context, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
