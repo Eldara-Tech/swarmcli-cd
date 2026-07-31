@@ -19,6 +19,7 @@ import (
 
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/api/types/volume"
@@ -678,6 +679,13 @@ type errAPI struct {
 
 func (e *errAPI) ClientVersion() string { return "1.51" }
 
+// The read every deploy and every removal now makes about this controller
+// itself. A daemon that will not answer it is not the news that this controller
+// has no stack of its own, so it surfaces here like every other failure.
+func (e *errAPI) ContainerInspect(context.Context, string) (container.InspectResponse, error) {
+	return container.InspectResponse{}, e.err
+}
+
 func (e *errAPI) ServiceList(context.Context, swarm.ServiceListOptions) ([]swarm.Service, error) {
 	return nil, e.err
 }
@@ -871,15 +879,23 @@ func stackNetwork(id, name, stack string) network.Summary {
 
 // ---------------------------------------- the controller's own state (#63)
 
-// controllerService is this controller as Swarm holds it: mounting its own
-// bootstrap config and its admin token, under the names a reference resolves by.
+// controllerService is this controller as Swarm holds it: deployed as the stack
+// the README says to deploy it as, and mounting its own bootstrap config and its
+// admin token under the names a reference resolves by.
 //
 // The target rename on the secret is the point. MountedSecretNames would derive
 // "token" from /run/secrets and never match the "swarmcli-cd-token" a tenant
 // stack would actually name, so the filesystem-derived guard has a hole exactly
 // here — and reading the service spec closes it.
+//
+// The namespace label comes off the same read and is the whole of #102: `docker
+// stack deploy -c stack.yml swarmcli-cd` puts it there, so it is the name no
+// release may claim.
 func controllerService() swarm.ServiceSpec {
-	return swarm.ServiceSpec{TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{
+	return swarm.ServiceSpec{Annotations: swarm.Annotations{
+		Name:   "swarmcli-cd_controller",
+		Labels: map[string]string{convert.LabelNamespace: "swarmcli-cd"},
+	}, TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{
 		Configs: []*swarm.ConfigReference{{
 			ConfigName: "swarmcli-cd-applications",
 			File:       &swarm.ConfigReferenceFileTarget{Name: "/etc/swarmcli-cd/applications.yaml"},
@@ -1148,8 +1164,14 @@ func TestDeployStackAllowsAnOrdinaryExternalConfig(t *testing.T) {
 }
 
 // A stack that declares everything it uses reaches outside itself for nothing,
-// so the guard must cost it no daemon calls at all.
-func TestAStackThatReachesForNothingCostsNoLookup(t *testing.T) {
+// so the guard must cost it no reading of the swarm's release records — the one
+// listing here that grows with every release ever deployed.
+//
+// The read about this controller itself is no longer conditional and cannot be:
+// a release name is compared against the controller's own namespace whatever the
+// manifest declares (#102). It costs one pair of round trips for the life of the
+// process, which is what TestTheControllersOwnMountsAreReadOnce pins.
+func TestAStackThatReachesForNothingCostsNoReleaseLookup(t *testing.T) {
 	const selfContained = `
 services:
   web:
@@ -1159,8 +1181,13 @@ services:
 	if err := testBackend(t, api, nil).DeployStack("s", selfContained, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
-	if api.selfInspects != 0 {
-		t.Errorf("asked about this controller %d times, want 0", api.selfInspects)
+	for _, f := range api.labelFilters {
+		if strings.HasPrefix(f, "com.swarmcli.") {
+			t.Errorf("listed by %q; a stack that reaches for nothing must not cost a release-record read", f)
+		}
+	}
+	if api.selfInspects != 1 {
+		t.Errorf("asked about this controller %d times, want 1", api.selfInspects)
 	}
 }
 
@@ -1353,5 +1380,143 @@ func TestAContainerThisDaemonDoesNotKnowIsAnAnswer(t *testing.T) {
 	}
 	if api.selfInspects != 1 {
 		t.Errorf("asked about this controller %d times, want 1", api.selfInspects)
+	}
+}
+
+// ------------------------- a release named for the controller's own stack (#102)
+
+// takesOverTheController is the shape the report was filed with: a release named
+// after the controller's stack, with a service named after the controller's, and
+// the socket the controller itself is mounted with.
+//
+// It does not have to be this exact manifest to be dangerous — any spec written
+// over the controller is a controller running somebody else's image — but this is
+// the one that makes the escalation obvious.
+const takesOverTheController = `
+services:
+  controller:
+    image: attacker/evil
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+`
+
+// controllerStack is the swarm as it stands with a controller deployed on it:
+// its service, its overlay network and the volume holding every application's
+// clone and chart cache, all carrying its namespace.
+func controllerStack() *fakeAPI {
+	return asController(&fakeAPI{
+		existing: []swarm.Service{{
+			ID:   "ctl",
+			Spec: swarm.ServiceSpec{Annotations: stackScoped("swarmcli-cd_controller", "swarmcli-cd")},
+		}},
+		networks: []network.Summary{stackNetwork("net", "swarmcli-cd_default", "swarmcli-cd")},
+		volumes: []volume.Volume{{
+			Name:   "swarmcli-cd_swarmcli-cd-data",
+			Labels: map[string]string{convert.LabelNamespace: "swarmcli-cd"},
+		}},
+	})
+}
+
+// The takeover direction. A release name is the stack namespace, and the
+// controller's own service carries that label like anything else Swarm deployed —
+// so a release called "swarmcli-cd" with a service called "controller" scopes to
+// swarmcli-cd_controller, the controller's exact service name, and the write path
+// hands the daemon this chart's spec for it.
+func TestDeployStackRefusesTheControllersOwnStackName(t *testing.T) {
+	api := controllerStack()
+
+	err := testBackend(t, api, nil).DeployStack("swarmcli-cd", takesOverTheController, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a release claiming the controller's own stack refused")
+	}
+	// The name, and this refusal rather than the ownership one below it: a
+	// release claiming the controller's own stack is refused for being that name
+	// and not because the services under it happen to be unaccounted for.
+	if !strings.Contains(err.Error(), "swarmcli-cd") || !strings.Contains(err.Error(), "this controller itself") {
+		t.Errorf("error %q does not say which name was refused and why", err)
+	}
+	if len(api.created) != 0 || len(api.updated) != 0 || len(api.order) != 0 {
+		t.Errorf("the controller was written to: created=%d updated=%d order=%v",
+			len(api.created), len(api.updated), api.order)
+	}
+}
+
+// The destruction direction, which needs no chart at all. RemoveStack deletes
+// everything carrying the namespace label and checks no ownership — deliberately,
+// because that is what `docker stack rm` does — so its only protection is that the
+// name is not the controller's.
+func TestRemoveStackRefusesTheControllersOwnStackName(t *testing.T) {
+	api := controllerStack()
+
+	err := testBackend(t, api, nil).RemoveStack("swarmcli-cd")
+	if err == nil {
+		t.Fatal("RemoveStack = nil, want the controller's own stack refused")
+	}
+	if len(api.removed) != 0 {
+		t.Errorf("removed %v; the controller deleted itself", api.removed)
+	}
+}
+
+// And the volumes, which is what makes the destruction permanent: the controller
+// comes back from git, the git clone and chart cache in its volume do not, and
+// nothing reconverges because the thing that would have has been deleted.
+//
+// Guarded on the listing rather than only on the removal because the chart
+// engine's Uninstall purges volumes even when the stack removal before it failed:
+// it collects that error and carries on.
+func TestStackVolumesRefusesTheControllersOwnStackName(t *testing.T) {
+	api := controllerStack()
+
+	vols, err := testBackend(t, api, nil).StackVolumes(context.Background(), "swarmcli-cd")
+	if err == nil {
+		t.Fatal("StackVolumes = nil, want the controller's own volumes refused")
+	}
+	if vols != nil {
+		t.Errorf("StackVolumes = %v, want nothing for a purge to delete", vols)
+	}
+}
+
+// The guard is one name, not a mode. Everything else on the swarm deploys and is
+// removed exactly as before, including on a controller that is itself a stack.
+func TestAnyOtherReleaseIsDeployedAndRemovedAsBefore(t *testing.T) {
+	api := installed(asController(&fakeAPI{
+		existing: []swarm.Service{{
+			ID:   "svc",
+			Spec: swarm.ServiceSpec{Annotations: stackScoped("s_web", "s")},
+		}},
+	}), "s")
+	b := testBackend(t, api, nil)
+
+	if err := b.DeployStack("s", "services:\n  web:\n    image: nginx\n", ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want an ordinary release deployed", err)
+	}
+	if err := b.RemoveStack("s"); err != nil {
+		t.Fatalf("RemoveStack = %v, want an ordinary release removed", err)
+	}
+	if !slices.Contains(api.removed, "service:svc") {
+		t.Errorf("removed %v, want the release's own service", api.removed)
+	}
+}
+
+// A controller that is not a swarm service has no stack of its own, so there is
+// no name to protect and the guard says nothing. Refusing "swarmcli-cd" here
+// would be inventing a rule from a string rather than reading one off the swarm —
+// and it would break every development run against a swarm that happens to have a
+// release by that name.
+func TestOutsideASwarmTheNamespaceGuardIsInert(t *testing.T) {
+	api := &fakeAPI{existing: []swarm.Service{{
+		ID:   "ctl",
+		Spec: swarm.ServiceSpec{Annotations: stackScoped("swarmcli-cd_controller", "swarmcli-cd")},
+	}}}
+	b := testBackend(t, api, nil)
+
+	if err := b.RemoveStack("swarmcli-cd"); err != nil {
+		t.Fatalf("RemoveStack = %v, want no guard for a controller that has no stack", err)
+	}
+	if !slices.Contains(api.removed, "service:ctl") {
+		t.Errorf("removed %v, want the stack removed as it always was", api.removed)
+	}
+	if _, err := b.StackVolumes(context.Background(), "swarmcli-cd"); err != nil {
+		t.Fatalf("StackVolumes = %v, want no guard for a controller that has no stack", err)
 	}
 }
