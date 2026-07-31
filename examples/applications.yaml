@@ -39,6 +39,34 @@ applications:
       repoURL: https://github.com/your-org/infra.git
       revision: main                                # branch, tag or SHA — pin it; an unpinned source deploys whatever the branch happens to point at
       releaseFile: swarm/prod/swarmcli-release.yaml  # path within the repo
+    # allow is what this application's charts may reach OUTSIDE the releases they
+    # install. It is an allowlist: omit it and a chart can declare and mount its
+    # own resources and nothing else, because everything a release owns is scoped
+    # to `<release>_<name>` and needs no entry.
+    #
+    # It lives here and nowhere a chart author can write, so that being able to
+    # change an app's chart is not the same permission as being able to add an
+    # app. See ../docs/configuration.md#allow-optional.
+    allow:
+      # Paths on the nodes this application's services run on. Each permits
+      # itself and everything under it, because that is what a bind of a
+      # directory already is — so `/var/run` would grant the socket below and
+      # then some, and `/` would grant the node.
+      #
+      # This one line is what makes Traefik's swarm provider, a Portainer agent
+      # or an autoheal sidecar reconcilable at all: they bind the daemon by
+      # design. Understand what it grants — a chart chooses where its services
+      # run, so with a manager placement that socket is the swarm's control
+      # plane. Grant it only to a chart repository you trust as much as this file.
+      hostPaths: [/var/run/docker.sock]
+      # And the cluster-global names it may reference. Exact names, as the swarm
+      # holds them: a secret or config an operator created, a volume another
+      # stack owns, a shared network. Joining a network is being on it with
+      # everything else that is.
+      networks: [traefik-public]
+      # secrets: [shared-apikey]
+      # configs: [shared-site]
+      # volumes: [shared-cache]
     syncPolicy:
       automated: true    # reconcile AND apply on a schedule; false = report drift but apply only on an explicit `app sync`
       interval: 3m        # how often to reconcile this application; omit to use the controller default (3m)

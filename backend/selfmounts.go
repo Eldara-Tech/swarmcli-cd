@@ -195,8 +195,9 @@ func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 	}
 	// Only the named volumes. A bind's source is a path on the node rather than a
 	// cluster-wide name, so nothing a tenant manifest writes resolves *to* it —
-	// naming the same path is the host-path question compose.reachesDockerSocket
-	// leaves open, not this one. An anonymous volume has no source at all.
+	// naming the same path is the host-path question compose.checkBindSources
+	// answers from the application's own allowlist, not this one. An anonymous
+	// volume has no source at all.
 	for _, m := range cs.Mounts {
 		if m.Type == mount.TypeVolume && m.Source != "" {
 			out.volumes[m.Source] = struct{}{}

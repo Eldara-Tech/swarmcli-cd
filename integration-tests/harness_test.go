@@ -474,6 +474,26 @@ func liveDriftApp(name, repoDir string, automated bool) application.Spec {
 	return app
 }
 
+// richApp is the application a chart from richChartFiles is reconciled under: a
+// live-drift application that permits the three things that chart reaches outside
+// its own release for.
+//
+// They are the only three anything in this suite does, and each is what the real
+// thing looks like — a config and a secret an operator created on the swarm
+// beside the chart (createExternalConfigAndSecret), and a host path on the node.
+// So under #64 the app set has to name them, and every one of these tests is
+// therefore also the end-to-end proof that an application permitted a reference
+// can make it: without these entries, none of them would deploy at all.
+func richApp(name, repoDir, release string, automated bool) application.Spec {
+	app := liveDriftApp(name, repoDir, automated)
+	app.Allow = application.Allow{
+		HostPaths: []string{"/etc/hostname"},
+		Configs:   []string{externalConfigName(release)},
+		Secrets:   []string{externalSecretName(release)},
+	}
+	return app
+}
+
 // richChartFiles exercises every field the live comparison looks at, on a real
 // daemon.
 //

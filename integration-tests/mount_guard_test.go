@@ -9,6 +9,12 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/swarm"
+	dockerclient "github.com/docker/docker/client"
+
+	"github.com/Eldara-Tech/swarmcli-cd/application"
 )
 
 // thiefChartFiles is a chart that mounts a config it did not create, by name.
@@ -139,7 +145,28 @@ func TestAStackMayNotMountAReleaseRecord(t *testing.T) {
 	}
 }
 
-// A chart may not bind the docker daemon's socket.
+// socketChartFiles is the chart the whole of #64 is about: a service that binds
+// the daemon's socket and asks to run on a manager, which is what Traefik's swarm
+// provider, a Portainer agent and an autoheal sidecar all are.
+func socketChartFiles(release string) map[string]string {
+	files := chartFiles(release, 1)
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    volumes:\n" +
+		"      - /var/run/docker.sock:/var/run/docker.sock:ro\n" +
+		"    deploy:\n" +
+		"      placement:\n" +
+		"        constraints: [\"node.role == manager\"]\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n"
+	return files
+}
+
+// A chart may not bind the docker daemon's socket unless its application says so.
 //
 // It is the channel that decides whether any of the others matter. A chart
 // chooses where its services run, so `node.role == manager` plus that socket is
@@ -165,32 +192,67 @@ func TestAChartMayNotBindTheDockerSocket(t *testing.T) {
 	const release = "e2e-guard-socket"
 	t.Cleanup(func() { removeStack(t, release) })
 
-	files := chartFiles(release, 1)
-	files["charts/app/templates/stack.yaml"] = "" +
-		"version: \"3.9\"\n" +
-		"services:\n" +
-		"  app:\n" +
-		"    image: busybox:1.36\n" +
-		"    command: [\"sleep\", \"3600\"]\n" +
-		"    volumes:\n" +
-		"      - /var/run/docker.sock:/var/run/docker.sock:ro\n" +
-		"    deploy:\n" +
-		"      placement:\n" +
-		"        constraints: [\"node.role == manager\"]\n" +
-		"      labels:\n" +
-		"        com.swarmcli.release: {{ .Release.Name }}\n"
-
-	rec := reconciler(t, releaseApp("socket", gitRepo(t, files), true))
+	rec := reconciler(t, releaseApp("socket", gitRepo(t, socketChartFiles(release)), true))
 	err := rec.SyncNow(context.Background(), "socket")
 	if err == nil {
 		t.Fatal("SyncNow(socket) = nil, want the deploy refused for binding the docker socket")
 	}
-	if !strings.Contains(err.Error(), "docker daemon's socket") {
+	if !strings.Contains(err.Error(), "allow.hostPaths") {
 		t.Fatalf("SyncNow(socket) = %v, want it refused by the bind guard", err)
 	}
 	if names := serviceNamesOf(t, cli, release); len(names) != 0 {
 		t.Errorf("services = %v, want none created by a refused deploy", names)
 	}
+}
+
+// And the capability #64 gives back: the same chart, under an application whose
+// app-set entry permits that path, deploys.
+//
+// It is the one half of this feature that only a real swarm proves. The unit
+// tests establish that the manifest converts and that the applier does not refuse
+// it; what they cannot say is that the spec the daemon is then handed is one it
+// accepts — a bind mount is a field Swarm validates on its own terms, and a guard
+// that let the manifest through only to produce a service that never starts would
+// have given nothing back. So this waits for the release to converge rather than
+// merely for the deploy to return.
+//
+// The gate is the app set's, so nothing in the chart differs between this test
+// and the one above. That is the property: the same chart is deployable or not
+// depending on a file the chart author cannot write to.
+func TestAChartMayBindTheDockerSocketWhenPermitted(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-gate-socket"
+	t.Cleanup(func() { removeStack(t, release) })
+
+	app := releaseApp("socket", gitRepo(t, socketChartFiles(release)), true)
+	app.Allow = application.Allow{HostPaths: []string{"/var/run/docker.sock"}}
+
+	rec := reconciler(t, app)
+	if err := rec.SyncNow(context.Background(), "socket"); err != nil {
+		t.Fatalf("SyncNow(socket) = %v, want the permitted bind deployed", err)
+	}
+	if names := serviceNamesOf(t, cli, release); len(names) != 1 {
+		t.Fatalf("services = %v, want the one the chart declares", names)
+	}
+
+	// The mount as the daemon holds it, which is the whole point of asking a real
+	// swarm: a permission that produced a service Swarm would not run is not a
+	// capability restored.
+	mounts := mountsOf(t, cli, release+"_app")
+	if len(mounts) != 1 || mounts[0].Source != "/var/run/docker.sock" || !mounts[0].ReadOnly {
+		t.Fatalf("mounts = %+v, want the socket bound read-only", mounts)
+	}
+}
+
+// mountsOf reads a service's mounts back off the daemon, which is the only place
+// that says what Swarm accepted rather than what was asked for.
+func mountsOf(t *testing.T, cli *dockerclient.Client, name string) []mount.Mount {
+	t.Helper()
+	svc, _, err := cli.ServiceInspectWithRaw(context.Background(), name, swarm.ServiceInspectOptions{})
+	if err != nil {
+		t.Fatalf("inspecting service %q: %v", name, err)
+	}
+	return svc.Spec.TaskTemplate.ContainerSpec.Mounts
 }
 
 // The other way to get at a name — the config is one of the stack's **own**, no

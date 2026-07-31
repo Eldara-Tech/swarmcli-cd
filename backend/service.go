@@ -22,6 +22,7 @@ import (
 
 	"github.com/Eldara-Tech/swarmcli/charts"
 
+	"github.com/Eldara-Tech/swarmcli-cd/application"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 )
@@ -71,6 +72,13 @@ type Backend struct {
 	// token, git token or another application's registry credential. Set
 	// controller-wide by WithForbiddenSecrets; empty disables the check.
 	forbiddenSecrets map[string]struct{}
+	// allow is what the application deploying through this backend may reach
+	// outside the releases it installs: host paths on the nodes, and the names of
+	// secrets, configs, volumes and networks some other stack owns. It is an
+	// allowlist, so the zero value permits nothing beyond what a release owns —
+	// which is what a backend nobody scoped to an application enforces, and the
+	// safe direction for one. Set per application by WithAllowedReferences.
+	allow application.Allow
 	// self is what Swarm reports it has mounted into this controller, read from
 	// its own service spec on the first deploy that needs it. It covers the
 	// controller's configs, which have no /run/secrets equivalent to list, and

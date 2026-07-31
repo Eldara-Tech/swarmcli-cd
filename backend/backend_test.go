@@ -28,6 +28,7 @@ import (
 
 	"github.com/Eldara-Tech/swarmcli/charts"
 
+	"github.com/Eldara-Tech/swarmcli-cd/application"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
 
@@ -180,6 +181,10 @@ func TestRejectForbiddenSecretMounts(t *testing.T) {
 		}}}
 	}
 	forbidden := map[string]struct{}{"swarmcli-cd-token": {}}
+	// Permitted by the application, so that the only thing that can refuse these
+	// is the forbidden set this test is about. "s_apikey" needs no entry: it is
+	// scoped to the release being deployed, which is nobody's permission to give.
+	permitted := application.Allow{Secrets: []string{"swarmcli-cd-token"}}
 
 	for name, tc := range map[string]struct {
 		forbidden map[string]struct{}
@@ -194,6 +199,7 @@ func TestRejectForbiddenSecretMounts(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			b := testBackend(t, &fakeAPI{}, nil)
 			b.forbiddenSecrets = tc.forbidden
+			b.allow = permitted
 			st := stack("s", cdService{"svc", tc.svc})
 
 			err := b.rejectForbiddenResources(t.Context(), st)
@@ -1109,6 +1115,14 @@ func controllerService() swarm.ServiceSpec {
 
 // asController makes the fake answer as though this process is that service's
 // task, which is what SelfMounts reads.
+// allowing is a backend scoped to one application's permissions, the way the
+// reconciler scopes it — through the exported upgrade rather than by setting the
+// field, so what these tests exercise is what reconcile calls.
+func allowing(t *testing.T, api client.APIClient, allow application.Allow) charts.Backend {
+	t.Helper()
+	return testBackend(t, api, nil).WithAllowedReferences(allow)
+}
+
 func asController(api *fakeAPI) *fakeAPI {
 	api.selfServiceID = "controller-svc"
 	api.selfSpec = controllerService()
@@ -1971,20 +1985,61 @@ func TestDeployStackRefusesMountingTheControllersOwnVolume(t *testing.T) {
 	}
 }
 
-// The false-positive half. Sharing a volume between stacks is what `external:`
-// is for, and a chart's own volume is namespace-scoped and nobody else's — only
-// the controller's own is off limits.
-func TestAStackMayMountAnyOtherVolume(t *testing.T) {
-	for _, tc := range []struct{ name, manifest string }{
-		{"an operator's shared volume", mountsAVolume("shared-cache", true)},
-		{"the chart's own", "services:\n  app:\n    image: busybox\n    volumes: [\"data:/data\"]\nvolumes:\n  data: {}\n"},
+// The false-positive half, which is now the application's to decide. Sharing a
+// volume between stacks is what `external:` is for and remains available; what
+// changed with #64 is that the app set has to say so, because a volume another
+// tenant owns is that tenant's data and the reference is a bare name.
+//
+// A chart's own volume needs no entry: it is scoped to the release, so it is
+// nobody else's and nobody's to permit.
+func TestAStackMayMountAVolumeItsApplicationPermits(t *testing.T) {
+	for _, tc := range []struct {
+		name, manifest string
+		allow          application.Allow
+	}{
+		{"an operator's shared volume", mountsAVolume("shared-cache", true), application.Allow{Volumes: []string{"shared-cache"}}},
+		{"the chart's own", "services:\n  app:\n    image: busybox\n    volumes: [\"data:/data\"]\nvolumes:\n  data: {}\n", application.Allow{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// A fake of its own per case: this one records what it creates, so a
 			// second deploy through the same one sees the first's services under a
 			// namespace with no release record and is refused for that instead (#105).
-			if err := testBackend(t, asController(&fakeAPI{}), nil).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
+			if err := allowing(t, asController(&fakeAPI{}), tc.allow).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
 				t.Fatalf("DeployStack = %v, want the volume allowed", err)
+			}
+		})
+	}
+}
+
+// And the two ways the same chart is refused: an application that permitted
+// nothing, and one that permitted something else. The second is what makes this
+// an allowlist rather than a switch.
+func TestAStackMayNotMountAVolumeItsApplicationDoesNotPermit(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		allow application.Allow
+	}{
+		{"permitted nothing", application.Allow{}},
+		{"permitted another volume", application.Allow{Volumes: []string{"some-other-cache"}}},
+		// The kinds are separate lists on purpose: a name is a volume or a
+		// secret, and one entry must not answer for both.
+		{"permitted it as a secret", application.Allow{Secrets: []string{"shared-cache"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+
+			err := allowing(t, api, tc.allow).DeployStack(t.Context(), "tenant",
+				mountsAVolume("shared-cache", true), ResolveNever)
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the volume refused")
+			}
+			for _, want := range []string{"thief", "shared-cache", "allow.volumes"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
 			}
 		})
 	}
@@ -2050,17 +2105,57 @@ func TestDeployStackRefusesANetworkNamedForTheControllersStack(t *testing.T) {
 // namespace rather than every network it is attached to: a shared external
 // network is the ordinary way to put a stack behind an ingress proxy, and a
 // chart's own network is scoped to its release.
-func TestAStackMayJoinAnyOtherNetwork(t *testing.T) {
-	for _, tc := range []struct{ name, release, manifest string }{
-		{"an operator's shared network", "tenant", joinsANetwork("traefik-public", true)},
-		{"the chart's own", "tenant", "services:\n  app:\n    image: busybox\n"},
+//
+// The shared one now needs the app set's permission, which is #64 — a network is
+// every service already on it, so which ones an application may join is the
+// operator's answer rather than the chart's. The other two need none: both are
+// the release's own `<release>_default`.
+func TestAStackMayJoinANetworkItsApplicationPermits(t *testing.T) {
+	for _, tc := range []struct {
+		name, release, manifest string
+		allow                   application.Allow
+	}{
+		{"an operator's shared network", "tenant", joinsANetwork("traefik-public", true), application.Allow{Networks: []string{"traefik-public"}}},
+		{"the chart's own", "tenant", "services:\n  app:\n    image: busybox\n", application.Allow{}},
 		// "swarmcli-cd-apps_default" starts with the controller's namespace and is
 		// not scoped under it. A prefix test without the separator would refuse it.
-		{"a release named like ours", "swarmcli-cd-apps", "services:\n  app:\n    image: busybox\n"},
+		{"a release named like ours", "swarmcli-cd-apps", "services:\n  app:\n    image: busybox\n", application.Allow{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := testBackend(t, asController(&fakeAPI{}), nil).DeployStack(t.Context(), tc.release, tc.manifest, ResolveNever); err != nil {
+			if err := allowing(t, asController(&fakeAPI{}), tc.allow).DeployStack(t.Context(), tc.release, tc.manifest, ResolveNever); err != nil {
 				t.Fatalf("DeployStack = %v, want the network allowed", err)
+			}
+		})
+	}
+}
+
+// Both forms of naming somebody else's network, refused by an application that
+// did not ask for it — and by one that asked for a different one.
+func TestAStackMayNotJoinANetworkItsApplicationDoesNotPermit(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		external bool
+		allow    application.Allow
+	}{
+		{"external, permitted nothing", true, application.Allow{}},
+		{"declared, permitted nothing", false, application.Allow{}},
+		{"permitted another network", true, application.Allow{Networks: []string{"some-other-public"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+
+			err := allowing(t, api, tc.allow).DeployStack(t.Context(), "tenant",
+				joinsANetwork("traefik-public", tc.external), ResolveNever)
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the network refused")
+			}
+			for _, want := range []string{"traefik-public", "allow.networks"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
 			}
 		})
 	}
@@ -2071,13 +2166,22 @@ func TestAStackMayJoinAnyOtherNetwork(t *testing.T) {
 // the same answer the secret and config halves give, for the same reason. A
 // development run against a swarm that happens to hold a volume or a network by
 // these names must deploy exactly as before.
+//
+// The application permits the names, so the only thing that could refuse here is
+// the controller guard — which is the one being asserted inert. That the entry
+// works at all is the other half of the statement: with no controller of its own
+// on the swarm, "swarmcli-cd_swarmcli-cd-data" is an ordinary name an operator
+// may grant like any other.
 func TestOutsideASwarmTheVolumeAndNetworkGuardsAreInert(t *testing.T) {
-	for _, tc := range []struct{ name, manifest string }{
-		{"volume", mountsAVolume("swarmcli-cd_swarmcli-cd-data", true)},
-		{"network", joinsANetwork("swarmcli-cd_default", true)},
+	for _, tc := range []struct {
+		name, manifest string
+		allow          application.Allow
+	}{
+		{"volume", mountsAVolume("swarmcli-cd_swarmcli-cd-data", true), application.Allow{Volumes: []string{"swarmcli-cd_swarmcli-cd-data"}}},
+		{"network", joinsANetwork("swarmcli-cd_default", true), application.Allow{Networks: []string{"swarmcli-cd_default"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := testBackend(t, &fakeAPI{}, nil).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
+			if err := allowing(t, &fakeAPI{}, tc.allow).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
 				t.Fatalf("DeployStack = %v, want no guard for a controller with no stack of its own", err)
 			}
 		})
@@ -2157,5 +2261,227 @@ func TestReadStacksAsksTheSwarmOnce(t *testing.T) {
 	// One ServiceList is one snapshot: the fake records a filter per call.
 	if n := len(api.labelFilters); n != 1 {
 		t.Errorf("listed services %d times for three releases, want 1", n)
+	}
+}
+
+// -------------------------------- the per-application gate (#64)
+
+// mountsASecret and mountsAConfig are the ordinary way a chart names something
+// an operator created on the swarm: `external: true`, and a bare name that
+// resolves against the cluster-wide store with no namespace on the reference.
+//
+// That reference is what #64 was filed about. Nothing scoped which of them an
+// application could make, so every application on a swarm could name every other
+// application's secrets — and a Swarm secret is the shape a database password, a
+// registry credential and a signing key all arrive in.
+func mountsASecret(name string) string {
+	return "services:\n  app:\n    image: busybox\n    secrets: [" + name + "]\n" +
+		"secrets:\n  " + name + ":\n    external: true\n"
+}
+
+func mountsAConfig(name string) string {
+	return "services:\n  app:\n    image: busybox\n    configs: [" + name + "]\n" +
+		"configs:\n  " + name + ":\n    external: true\n"
+}
+
+// The three cases per kind: permitted deploys, unpermitted is refused, and an
+// entry naming something else does not help.
+//
+// The declared form is here as its own case because it is a different code path
+// and #86 is the proof that it has to be: a manifest can put any name it likes
+// on a resource it declares, conversion resolves the reference to that name, and
+// the reference check then correctly sees a stack minding its own business while
+// applySecrets adopts the real thing.
+func TestAStackMayReferenceOnlyWhatItsApplicationPermits(t *testing.T) {
+	for _, tc := range []struct {
+		name, manifest, field string
+		permitted, wrong      application.Allow
+	}{
+		{
+			"a secret it references", mountsASecret("shared-apikey"), "allow.secrets",
+			application.Allow{Secrets: []string{"shared-apikey"}},
+			application.Allow{Secrets: []string{"another-apikey"}},
+		},
+		{
+			"a config it references", mountsAConfig("shared-site"), "allow.configs",
+			application.Allow{Configs: []string{"shared-site"}},
+			application.Allow{Configs: []string{"another-site"}},
+		},
+		{
+			"a secret it declares under another stack's name", stealsByDeclaring("shared-apikey", true), "allow.secrets",
+			application.Allow{Secrets: []string{"shared-apikey"}},
+			application.Allow{Secrets: []string{"another-apikey"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The referenced resource exists, because the conversion that is
+			// applied resolves it to an id. The declared case creates its own.
+			existing := func() *fakeAPI {
+				return asController(&fakeAPI{
+					secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "shared-apikey"}}}},
+					configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "shared-site"}}}},
+				})
+			}
+
+			if err := allowing(t, existing(), tc.permitted).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
+				t.Fatalf("DeployStack = %v, want the permitted reference deployed", err)
+			}
+
+			for _, refused := range []struct {
+				why   string
+				allow application.Allow
+			}{
+				{"permitted nothing", application.Allow{}},
+				{"permitted another name", tc.wrong},
+			} {
+				t.Run(refused.why, func(t *testing.T) {
+					api := existing()
+
+					err := allowing(t, api, refused.allow).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever)
+					if err == nil {
+						t.Fatal("DeployStack = nil, want the reference refused")
+					}
+					if !strings.Contains(err.Error(), tc.field) {
+						t.Errorf("error %q does not name the field the permission would go in", err)
+					}
+					if len(api.created) != 0 || len(api.order) != 0 {
+						t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+					}
+				})
+			}
+		})
+	}
+}
+
+// What the release owns needs no entry at all, which is what keeps the gate from
+// being a per-chart inventory: conversion scopes everything a stack declares to
+// "<release>_<name>", so a chart's own secrets, configs, volumes and networks are
+// nobody else's and nobody's to permit.
+//
+// The external references here are scoped names too — the shape oneOfEach uses —
+// because a reference to something inside your own release is still your own.
+func TestAStackNeedsNoPermissionForWhatItOwns(t *testing.T) {
+	api := asController(&fakeAPI{
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
+	})
+
+	if err := allowing(t, api, application.Allow{}).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want a release's own resources to need no permission", err)
+	}
+}
+
+// The invariant that makes the whole design hold: an allowlist cannot reach the
+// controller's own. The app-set author is the highest privilege there is here,
+// and this is not a thing they may lend — permitting one is not granting an
+// application something of the operator's, it is handing whoever writes the
+// chart the controller's credentials and with them the app set.
+//
+// So each entry below names exactly what the chart asks for, and each deploy is
+// still refused, with the flat guard's reason rather than the gate's.
+func TestNoAllowlistReachesTheControllersOwn(t *testing.T) {
+	for _, tc := range []struct {
+		name, manifest, why string
+		allow               application.Allow
+		api                 *fakeAPI
+	}{
+		{
+			"its token", mountsControllerSecret, "controller",
+			application.Allow{Secrets: []string{"swarmcli-cd-token"}},
+			asController(&fakeAPI{secrets: []swarm.Secret{{ID: "tok", Spec: swarm.SecretSpec{
+				Annotations: swarm.Annotations{Name: "swarmcli-cd-token"},
+			}}}}),
+		},
+		{
+			"its application set", mountsControllerConfig, "application set",
+			application.Allow{Configs: []string{"swarmcli-cd-applications"}},
+			asController(&fakeAPI{configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{
+				Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"},
+			}}}}),
+		},
+		{
+			"its volume", mountsAVolume("swarmcli-cd_swarmcli-cd-data", true), "chart cache",
+			application.Allow{Volumes: []string{"swarmcli-cd_swarmcli-cd-data"}},
+			asController(&fakeAPI{}),
+		},
+		{
+			"its network", joinsANetwork("swarmcli-cd_default", true), "this controller itself",
+			application.Allow{Networks: []string{"swarmcli-cd_default"}},
+			asController(&fakeAPI{}),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := allowing(t, tc.api, tc.allow).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever)
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the controller's own refused whatever the app set says")
+			}
+			if !strings.Contains(err.Error(), tc.why) {
+				t.Errorf("error %q is not the flat guard refusing it", err)
+			}
+			if len(tc.api.created) != 0 || len(tc.api.order) != 0 {
+				t.Errorf("resources were created despite the refusal: order=%v created=%d", tc.api.order, len(tc.api.created))
+			}
+		})
+	}
+}
+
+// A release record is the same invariant one layer along: it is the engine's,
+// not the controller's, and it holds the rendered manifest of every release on
+// the swarm.
+func TestNoAllowlistReachesAReleaseRecord(t *testing.T) {
+	api := asController(&fakeAPI{configs: []swarm.Config{{
+		ID:   "rec",
+		Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "swarmcli.release.victim.v1"}},
+	}}})
+	api.configs[0].Spec.Labels = map[string]string{charts.LabelType: charts.TypeRelease}
+
+	err := allowing(t, api, application.Allow{Configs: []string{"swarmcli.release.victim.v1"}}).
+		DeployStack(t.Context(), "tenant", mountsAConfig("swarmcli.release.victim.v1"), ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a release record refused whatever the app set says")
+	}
+	if !strings.Contains(err.Error(), "release record") {
+		t.Errorf("error %q is not the flat guard refusing it", err)
+	}
+}
+
+// The permissions are per application, so they must not leak onto the per-swarm
+// backend every application shares — the same copy-not-mutate discipline as
+// WithRegistryAuth, and here it is the difference between two tenants.
+func TestWithAllowedReferencesDoesNotMutate(t *testing.T) {
+	shared := testBackend(t, &fakeAPI{}, nil)
+	scoped, ok := shared.WithAllowedReferences(application.Allow{Secrets: []string{"shared-apikey"}}).(*Backend)
+	if !ok {
+		t.Fatal("WithAllowedReferences did not return a *Backend")
+	}
+	if len(shared.allow.Secrets) != 0 {
+		t.Error("WithAllowedReferences mutated the shared backend; a per-swarm backend must permit nothing")
+	}
+	if len(scoped.allow.Secrets) != 1 {
+		t.Errorf("scoped.allow = %+v, want the application's own", scoped.allow)
+	}
+}
+
+// The backend nobody scoped to an application, which is what the swarms seam
+// hands back and what the prune sweep resolves for itself: it permits nothing.
+//
+// Fail-closed is the property that makes the sweep safe to leave undecorated. A
+// sweep removes rather than deploys, so it reaches neither place the allowlist is
+// read — but "it never gets there" is a claim about today's call graph, and this
+// is the claim about the value itself. If a sweep ever did convert a manifest it
+// would refuse rather than wave one through.
+func TestAnUndecoratedBackendPermitsNothing(t *testing.T) {
+	b := testBackend(t, asController(&fakeAPI{}), nil)
+
+	if err := b.DeployStack(t.Context(), "tenant", mountsAVolume("shared-cache", true), ResolveNever); err == nil {
+		t.Fatal("DeployStack = nil, want a backend nobody scoped to permit nothing")
+	}
+	// And what a release owns still needs nothing, so "permits nothing" does not
+	// mean "refuses everything": an undecorated backend still deploys an ordinary
+	// chart.
+	if err := b.DeployStack(t.Context(), "tenant",
+		"services:\n  app:\n    image: busybox\n    volumes: [\"data:/data\"]\nvolumes:\n  data: {}\n",
+		ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want a chart that owns everything it names deployed", err)
 	}
 }

@@ -122,6 +122,7 @@ type recordingBackend struct {
 	charts.Backend
 	forbidden map[string]struct{}
 	auth      regauth.Resolver
+	allow     application.Allow
 }
 
 func (b recordingBackend) StackServices(context.Context, string) []charts.ServiceState { return nil }
@@ -133,6 +134,11 @@ func (b recordingBackend) WithForbiddenSecrets(names map[string]struct{}) charts
 
 func (b recordingBackend) WithRegistryAuth(auth regauth.Resolver) charts.Backend {
 	b.auth = auth
+	return b
+}
+
+func (b recordingBackend) WithAllowedReferences(allow application.Allow) charts.Backend {
+	b.allow = allow
 	return b
 }
 
@@ -333,18 +339,29 @@ func TestSyncedApplicationDeploysNothing(t *testing.T) {
 	}
 }
 
-// The reconciler must apply both the controller-wide forbidden-secret check and
-// the application's registry resolver to the backend the engine deploys through.
-// Every other test injects an engine that ignores the backend it is handed, so
-// only this one would catch a regression that dropped the wiring — which would
-// silently reopen the controller-secret exfiltration (#46) or the private-registry
-// pull failure (#30) while the rest of the suite stayed green.
+// The reconciler must apply the controller-wide forbidden-secret check, the
+// application's registry resolver and the application's own allowlist to the
+// backend the engine deploys through. Every other test injects an engine that
+// ignores the backend it is handed, so only this one would catch a regression
+// that dropped the wiring — which would silently reopen the controller-secret
+// exfiltration (#46) or the private-registry pull failure (#30) while the rest of
+// the suite stayed green.
+//
+// The allowlist is the one that is per application rather than per controller,
+// and it is the only per-application fact the applier gets at all: everything
+// else it refuses is the same answer for every application and is derived where
+// it is enforced (#102, #103). Dropping this wiring would not open a hole — an
+// unscoped backend permits nothing — it would refuse every chart that references
+// anything outside its own release, silently and for every application at once.
 func TestReconcileScopesTheBackendItDeploysWith(t *testing.T) {
 	var deployed charts.Backend
 	forbidden := map[string]struct{}{"swarmcli-cd-token": {}}
 	resolver := regauth.Resolver(func(string) (string, error) { return "auth", nil })
 
-	r := New([]application.Spec{spec("edge", true)}, Options{
+	edge := spec("edge", true)
+	edge.Allow = application.Allow{HostPaths: []string{"/var/run/docker.sock"}}
+
+	r := New([]application.Spec{edge}, Options{
 		Fetcher:               &fakeFetcher{revision: strings.Repeat("a", 40)},
 		Builder:               &fakeBuilder{},
 		Swarms:                fakeRegistry{backend: recordingBackend{}},
@@ -368,6 +385,9 @@ func TestReconcileScopesTheBackendItDeploysWith(t *testing.T) {
 	}
 	if rb.auth == nil {
 		t.Error("the application's registry resolver was not applied to the backend the engine deploys with")
+	}
+	if !reflect.DeepEqual(rb.allow, edge.Allow) {
+		t.Errorf("allow = %+v, want the application's own %+v", rb.allow, edge.Allow)
 	}
 }
 
