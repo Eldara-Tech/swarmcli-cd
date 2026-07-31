@@ -4116,3 +4116,147 @@ func TestEveryEventNamesTheDestinationItConcerns(t *testing.T) {
 			"a run that stopped raising events would pass every assertion above", len(seen), rec.types())
 	}
 }
+
+// ------------------------- a rollback that is already history (#130)
+
+// rolledBackTo is the "whoami" release running a service that Swarm rolled back,
+// with the spec that survived the rollback and the state StackServices reports.
+//
+// The two reads are set separately on purpose, because that is the shape of the
+// bug: the live spec is what the comparison judges, and the update state is what
+// the health rollup judges, and the whole of #130 is those two answering
+// differently about one service for ever.
+func rolledBackTo(live swarm.ServiceSpec) *driftBackend {
+	b := &driftBackend{
+		stubBackend: stubBackend{states: map[string][]charts.ServiceState{
+			"whoami": {{
+				Name: "whoami_app", Running: 1, Desired: 1,
+				UpdateState: "rollback_completed", NewestTaskAge: time.Hour,
+			}},
+		}},
+		desired: map[string]*compose.Stack{
+			"whoami": {Services: []compose.Service{{Name: "app", Spec: serviceSpec("whoami_app", 1)}}},
+		},
+		live: map[string]map[string]swarm.Service{
+			"whoami": {"whoami_app": {
+				ID:           "id",
+				Spec:         live,
+				UpdateStatus: &swarm.UpdateStatus{State: swarm.UpdateStateRollbackCompleted, Message: "update paused due to failure"},
+			}},
+		},
+	}
+	return b
+}
+
+// Swarm's UpdateStatus persists until a service's *next* update. drift/live.go
+// already reads a rollback that restored the repository's own spec as history
+// rather than a finding — correctly, there is nothing to correct — and after the
+// CE pin moved past Eldara-Tech/swarmcli#530 the health axis read the same
+// status as wedged. Nothing could ever clear it: no drift, so no redeploy, so no
+// ServiceUpdate, so the service reported Degraded for ever over an operator's
+// rollback from weeks ago.
+func TestARollbackThatRestoredWhatTheRepositoryWantsIsNotDegraded(t *testing.T) {
+	backend := rolledBackTo(serviceSpec("whoami_app", 1))
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthHealthy {
+		t.Errorf("health = %q (%s), want healthy — the spec that survived the rollback is the one git asks for",
+			view.Status.Health.State, view.Status.Health.Message)
+	}
+	// The verdict changed; the fact did not. An operator still sees what swarm
+	// did to the service, which is the only record of it there is.
+	svc := view.Status.Releases[0].Services[0]
+	if svc.UpdateState != "rollback_completed" {
+		t.Errorf("updateState = %q, want the daemon's own", svc.UpdateState)
+	}
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("sync = %q, want synced", view.Status.Sync.State)
+	}
+}
+
+// The other rollback, and the signal that must survive the fix. Swarm reverted
+// the service to a spec the repository does *not* declare, so the comparison
+// reports it — which both vetoes the correction (#90) and leaves the status a
+// verdict on something outstanding rather than history.
+func TestARollbackThatDidNotRestoreWhatTheRepositoryWantsIsStillDegraded(t *testing.T) {
+	backend := rolledBackTo(serviceSpec("whoami_app", 3))
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthDegraded {
+		t.Errorf("health = %q, want degraded — the running spec is not the one the repository declares",
+			view.Status.Health.State)
+	}
+	if len(backend.converged()) != 0 {
+		t.Errorf("redeployed %v, want nothing — swarm already rejected that spec", backend.converged())
+	}
+}
+
+// The limit, stated so that nobody closes it by clearing the status outright.
+// Manifest mode never reads a running ServiceSpec, so there is no evidence that
+// the rollback restored anything, and a status with nothing against it is taken
+// at face value.
+func TestARollbackIsTakenAtFaceValueWhenNothingComparedIt(t *testing.T) {
+	backend := rolledBackTo(serviceSpec("whoami_app", 1))
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthDegraded {
+		t.Errorf("health = %q, want degraded — nothing here compared the running spec to anything",
+			view.Status.Health.State)
+	}
+}
+
+// The other half of #130, and the one that reaches a release nobody has touched.
+// StackServices answers for everything carrying the namespace label, so a
+// service the manifest does not declare — attached by hand, or dropped from the
+// chart and retained by the sweep (maxPruneAttempts) — was rolled up into the
+// verdict on a write that never touched it. Carrying a rollback it will never
+// lose, that made every correction of the release report "did not converge", for
+// ever.
+func TestASiblingTheCorrectionDidNotWriteDoesNotHoldTheRelease(t *testing.T) {
+	fastPolling(t)
+	rec := listen(t)
+	backend := converging([]charts.ServiceState{
+		{Name: "whoami_app", Running: 1, Desired: 1, NewestTaskAge: time.Hour},
+		{Name: "whoami_sidecar", Running: 1, Desired: 1, UpdateState: "rollback_completed", NewestTaskAge: time.Hour},
+	})
+	// Under the release's namespace label and declared by nothing, which is what
+	// makes it unwritable by a deploy: applying deletes nothing and writes only
+	// what the manifest declares.
+	backend.live["whoami"]["whoami_sidecar"] = swarm.Service{ID: "id-sidecar", Spec: serviceSpec("whoami_sidecar", 1)}
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{waitingSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil — the correction landed on the service it was written for", err)
+	}
+	if got := backend.converged(); len(got) != 1 {
+		t.Errorf("redeployed %v, want the drifted release", got)
+	}
+	if !slices.Contains(rec.types(), notify.DriftConverged) {
+		t.Errorf("events = %v, want the correction announced", rec.types())
+	}
+	// Not silenced, only disqualified from judging somebody else's write: the
+	// sidecar is still read, still reported, and still degraded.
+	view, _ := r.View("edge")
+	if view.Status.Health.State != application.HealthDegraded {
+		t.Errorf("health = %q, want degraded — the wedged sidecar is still there", view.Status.Health.State)
+	}
+}

@@ -115,6 +115,60 @@ func TestReleaseHealthPerService(t *testing.T) {
 	}
 }
 
+// Swarm keeps UpdateStatus on a service until its *next* update, so a rollback
+// that ended with the repository's own spec running stays on the service for
+// ever — and nothing is coming to clear it, because there is no drift, so
+// nothing redeploys it. Read as wedged, that made the release Degraded
+// permanently over a deploy that had already been undone and put right (#130).
+//
+// AsDeclared is the evidence that says so, and it overturns exactly one verdict:
+// the paused pair is swarm stopped part-way, which a comparison of specs says
+// nothing about, and stays degraded whatever the comparison found.
+func TestACompletedRollbackIsHistoryOnceItsSpecIsWhatTheRepositoryDeclares(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state string
+		want  application.HealthState
+	}{
+		{"a finished rollback", "rollback_completed", application.HealthHealthy},
+		{"a rollback swarm stopped part-way", "rollback_paused", application.HealthDegraded},
+		{"an update swarm stopped part-way", "paused", application.HealthDegraded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := charts.ServiceState{
+				Name: "api", Running: 2, Desired: 2, UpdateState: tc.state, NewestTaskAge: stableAge,
+			}
+			h, services := Release(Input{
+				States: []charts.ServiceState{state}, Installed: true, AsDeclared: []string{"api"},
+			})
+			if h.State != tc.want {
+				t.Errorf("release health = %q, want %q", h.State, tc.want)
+			}
+			// The fact is still reported either way: what changed is the verdict
+			// on it, not whether an operator can see what swarm did.
+			if services[0].UpdateState != tc.state {
+				t.Errorf("updateState = %q, want the daemon's own %q", services[0].UpdateState, tc.state)
+			}
+		})
+	}
+}
+
+// Naming a service is not enough on its own. AsDeclared says the comparison
+// found this spec equal to the repository's, and a service that is not at parity
+// or is still inside its stability window is a live question the comparison
+// never asked — so the rest of the engine's predicate still decides.
+func TestAServiceRunningWhatIsDeclaredIsStillJudgedOnItsTasks(t *testing.T) {
+	h, _ := Release(Input{
+		States: []charts.ServiceState{
+			{Name: "api", Running: 0, Desired: 3, UpdateState: "rollback_completed"},
+		},
+		Installed: true, AsDeclared: []string{"api"},
+	})
+	if h.State != application.HealthProgressing {
+		t.Errorf("health = %q, want progressing — 0/3 tasks is not healthy however settled the rollout is", h.State)
+	}
+}
+
 // A release the plan would install is declared and not deployed. Missing rather
 // than Degraded: a UI has to tell "not there" from "there and broken", and this
 // is also the ordinary state of a newly declared release before its first sync.

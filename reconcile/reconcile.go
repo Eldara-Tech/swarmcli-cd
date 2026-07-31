@@ -1519,6 +1519,63 @@ func convergeable(d *application.ReleaseDrift) bool {
 	return false
 }
 
+// correcting names the services a redeploy of the release is being made for:
+// the ones the comparison found modified or missing, and nothing else.
+//
+// It is what a correction may be judged by. An unexpected service — running
+// under the release's namespace label and declared by nothing — is not in the
+// deploy at all, because applying deletes nothing and writes only what the
+// manifest declares. Judging the write by one of those means judging it by
+// something it never touched.
+func correcting(d *application.ReleaseDrift) []string {
+	if d == nil {
+		return nil
+	}
+	var out []string
+	for _, svc := range d.Services {
+		if svc.Reason == application.DriftModified || svc.Reason == application.DriftMissing {
+			out = append(out, svc.Name)
+		}
+	}
+	return out
+}
+
+// asDeclared names the services of a release the live comparison found running
+// exactly what the repository declares: everything it read and did not report.
+//
+// It is this half of the reading that health needs and never had. drift/live.go
+// already decides that a rollback which restored what git wants is history
+// rather than a finding — that is what makes it not drift — and the health axis
+// took the opposite view of the same service, because CE's Convergence reads
+// rollback_completed as wedged. That is right for its own caller, waitReady
+// polling a service it has just written. It is wrong here, where the polling
+// never stops and the status can be weeks old: no drift, so no redeploy, so no
+// ServiceUpdate, so nothing ever clears it and the release reads Degraded for
+// ever (#130). What health does with this is health's; all this says is what was
+// compared and found equal.
+//
+// A service the comparison reported at all is left out, unexpected ones
+// included: one it found running nothing the repository declares is not one it
+// found running what the repository declares.
+//
+// Nil whenever nothing was compared. Manifest mode makes no live comparison, and
+// a release whose live state could not be read reports Unknown; neither proves
+// anything about any service. "Equal" also means equal in the fields drift
+// compares, which is an allowlist — the same evidence the whole mode acts on,
+// and no weaker here than it is there.
+func asDeclared(states []charts.ServiceState, rd *application.ReleaseDrift) []string {
+	if rd == nil || rd.State == application.DriftStateUnknown {
+		return nil
+	}
+	out := make([]string, 0, len(states))
+	for _, s := range states {
+		if !slices.ContainsFunc(rd.Services, func(sd application.ServiceDrift) bool { return sd.Name == s.Name }) {
+			out = append(out, s.Name)
+		}
+	}
+	return out
+}
+
 // loop reconciles one application on its own schedule, reading its current spec
 // each tick so a Replace is picked up without the loop being restarted.
 //
@@ -1843,7 +1900,7 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	if err := checkCompat(plan); err != nil {
 		return err
 	}
-	return r.apply(ctx, e, spec, backend, engine, plan, built, checkout, fixable, doomed)
+	return r.apply(ctx, e, spec, backend, engine, plan, built, checkout, live, doomed)
 }
 
 // checkCompat refuses a plan containing a release this build's chart engine is
@@ -1945,7 +2002,7 @@ func (r *Reconciler) checkReproducible(e *appEntry, revision string) error {
 // also surfaces a chart whose render is not deterministic — one that would
 // otherwise sit permanently out of sync, deploying on every single tick — on
 // the first sync rather than never.
-func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, drifted []string, doomed map[string]doomedSet) error {
+func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, live map[string]*application.ReleaseDrift, doomed map[string]doomedSet) error {
 	started := r.now()
 	dispatch(ctx, spec, notify.Event{
 		Type:     notify.SyncStarted,
@@ -2003,7 +2060,7 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 	// install or upgrade is never one this compared — and because a failed
 	// apply is the wrong moment to start correcting something else.
 	if applyErr == nil {
-		applyErr = r.converge(ctx, spec, backend, plan, drifted)
+		applyErr = r.converge(ctx, spec, backend, plan, live)
 	}
 
 	// A cancelled context is not an outcome and is dispatched as neither. The
@@ -2170,7 +2227,14 @@ func (r *Reconciler) failSync(ctx context.Context, e *appEntry, spec application
 // Failures are collected rather than returned at the first: one release that
 // will not converge is no reason to leave the others drifted, and the caller
 // fails the sync on whatever comes back.
-func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backend charts.Backend, plan *charts.Plan, drifted []string) error {
+//
+// It takes the whole comparison rather than the list of releases derived from
+// it, and re-derives that list here, because the wait below needs the other half
+// of the same reading: which *services* each correction is for. Deriving the
+// releases from the report and passing the services beside them would be two
+// parameters that must agree, for a walk over the plan that costs nothing.
+func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backend charts.Backend, plan *charts.Plan, live map[string]*application.ReleaseDrift) error {
+	drifted := driftedReleases(plan, live, convergeable)
 	if len(drifted) == 0 {
 		return nil
 	}
@@ -2190,7 +2254,7 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
 			continue
 		}
-		if err := r.awaitConverged(ctx, spec, backend, release); err != nil {
+		if err := r.awaitConverged(ctx, spec, backend, release, correcting(live[release])); err != nil {
 			// Deployed but not settled. Not counted as converged: the write
 			// landed, the correction did not finish, and the sync says so.
 			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
@@ -2245,7 +2309,24 @@ const defaultConvergeTimeout = 5 * time.Minute
 // rather than desired state, the target over active nodes, a completed one-shot
 // job, the stability window measured from task creation — and a reimplementation
 // would diverge silently in both directions.
-func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, backend charts.Backend, release string) error {
+//
+// What it is asked about is this correction's own work, which is the one thing
+// this differs from waitReady in. StackServices answers for everything carrying
+// the release's namespace label, and a correction writes only what the manifest
+// declares — so a service somebody attached by hand, or one the chart dropped
+// and the sweep has given up on (maxPruneAttempts), was rolled up into the
+// verdict on a write that never touched it. The permanent version of that is
+// Swarm's UpdateStatus, which persists until a service's *next* update: an
+// undeclared service that was once rolled back carries rollback_completed for
+// ever, so every correction of that release reported "did not converge" over
+// somebody else's history (#130). A service the deploy does write has its status
+// cleared by that write (manager/controlapi.UpdateService resets it), so nothing
+// here can hide a rollback of our own.
+//
+// An empty scope rolls up everything, which is the state before a comparison
+// narrowed it and cannot arise from convergeable: a release is only corrected
+// when something was found modified or missing on it.
+func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, backend charts.Backend, release string, wrote []string) error {
 	if !spec.SyncPolicy.Wait {
 		return nil
 	}
@@ -2257,7 +2338,7 @@ func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, 
 	deadline := r.now().Add(timeout)
 
 	for {
-		switch c := charts.Rollup(backend.StackServices(ctx, release)); c.Phase {
+		switch c := charts.Rollup(scopedTo(backend.StackServices(ctx, release), wrote)); c.Phase {
 		case charts.PhaseWedged:
 			// Swarm has given up and will not continue on its own, so waiting
 			// out the deadline would only delay the same answer.
@@ -2274,6 +2355,26 @@ func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, 
 		case <-time.After(convergePollInterval):
 		}
 	}
+}
+
+// scopedTo keeps the states of the named services, so a rollup answers about
+// them and not about everything sharing their namespace label.
+//
+// A name the swarm has nothing under is simply absent, and that is the answer
+// rather than a gap: a service the comparison found missing has not been created
+// yet, and a rollup of nothing is progressing — which is the correct verdict on
+// a deploy whose service has not appeared.
+func scopedTo(states []charts.ServiceState, names []string) []charts.ServiceState {
+	if len(names) == 0 {
+		return states
+	}
+	out := make([]charts.ServiceState, 0, len(names))
+	for _, s := range states {
+		if slices.Contains(names, s.Name) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // prune deletes the releases this application used to declare and no longer
@@ -2617,6 +2718,11 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 			// all-or-nothing, so a release that was asked about and is absent
 			// from the answer was not read at all.
 			ReadFailed: readErr != nil && rel.Action != application.ActionInstall,
+			// The live comparison's other answer: what it read and did not
+			// report. It is folded into the sync axis below, and this is the
+			// one thing it settles on the health axis — whether a rollback a
+			// service is still carrying is about anything outstanding.
+			AsDeclared: asDeclared(states[rel.Name], live[rel.Name]),
 		})
 
 		// Fold the live comparison into the sync axis. A release whose running

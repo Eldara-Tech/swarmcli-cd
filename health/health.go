@@ -24,6 +24,9 @@ package health
 
 import (
 	"fmt"
+	"slices"
+
+	"github.com/docker/docker/api/types/swarm"
 
 	"github.com/Eldara-Tech/swarmcli/charts"
 
@@ -53,6 +56,21 @@ type Input struct {
 	// briefly unreachable flipped every release of an application to Missing and
 	// paged whoever was listening, for a stack running perfectly (#107).
 	ReadFailed bool
+	// AsDeclared names the services a live comparison found running exactly what
+	// the repository declares.
+	//
+	// It exists for one judgement, below: whether a rollback a service is still
+	// carrying is about anything outstanding. Swarm keeps UpdateStatus on a
+	// service until its *next* update, so a rollback that restored the spec git
+	// asks for stays there indefinitely — and no next update is coming, because
+	// there is no drift, so nothing redeploys it, so nothing clears it. The
+	// release read Degraded for ever over an event that had already put the
+	// service back where it belongs (#130).
+	//
+	// Empty is the ordinary value and asserts nothing. Drift detection is a
+	// per-application setting, so most callers made no comparison at all, and a
+	// status with no evidence against it is taken at face value.
+	AsDeclared []string
 }
 
 // Release rolls one release's services up to a health state, and returns the
@@ -89,7 +107,7 @@ func Release(in Input) (application.Health, []application.ServiceStatus) {
 	healthy := 0
 
 	for _, s := range in.States {
-		state, message := serviceHealth(s, in.SyncFailed)
+		state, message := serviceHealth(s, in)
 		if state == application.HealthHealthy {
 			healthy++
 		}
@@ -129,15 +147,40 @@ func Release(in Input) (application.Health, []application.ServiceStatus) {
 // application that does not wait never produces that signal, and its slow
 // release keeps reading progressing; that is a known limit, and preferable to a
 // threshold that calls a slow first image pull broken.
-func serviceHealth(s charts.ServiceState, syncFailed bool) (application.HealthState, string) {
+//
+// One wedged verdict can be overturned, and only one. A *completed* rollback is
+// swarm finished: it restored the previous spec and stopped, so the service is
+// running one spec and nothing more is going to happen to it. If that spec is
+// what the repository declares, the deploy the status records is over and put
+// right, and reporting it is reporting history — which for this caller never
+// ends, because UpdateStatus survives until the next update and there is no next
+// update for a service nothing is drifting (#130). `paused` and
+// `rollback_paused` are swarm stopped part-way with its tasks in two
+// generations, which a comparison of specs says nothing about, so both stay
+// degraded whatever AsDeclared says.
+//
+// It is overturned by asking the engine again with the field the verdict came
+// from cleared, rather than by substituting an answer. Every other rule then
+// still decides — parity from the actual running count, a job's completed task,
+// the stability window measured from task creation — and none of it is copied
+// here. Clearing UpdateState puts the service on the arm a fresh install takes,
+// which is what a service with no rollout outstanding is.
+func serviceHealth(s charts.ServiceState, in Input) (application.HealthState, string) {
 	c := s.Convergence()
+	if c.Phase == charts.PhaseWedged &&
+		s.UpdateState == string(swarm.UpdateStateRollbackCompleted) &&
+		slices.Contains(in.AsDeclared, s.Name) {
+		settled := s
+		settled.UpdateState = ""
+		c = settled.Convergence()
+	}
 	switch c.Phase {
 	case charts.PhaseConverged:
 		return application.HealthHealthy, ""
 	case charts.PhaseWedged:
 		return application.HealthDegraded, c.Reason
 	default:
-		if syncFailed {
+		if in.SyncFailed {
 			return application.HealthDegraded, c.Reason + " (the last sync did not succeed)"
 		}
 		return application.HealthProgressing, c.Reason

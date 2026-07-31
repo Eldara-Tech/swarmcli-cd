@@ -474,6 +474,20 @@ spec beside it. A manual `app sync` does not override it either; the remedy is a
 commit, which arrives as an upgrade rather than as drift and clears the state with
 it.
 
+The other rollback is the one that ended with the repository's own spec running —
+somebody's hand edit that Swarm rejected. It is not drift, because there is
+nothing left to correct, and it is not degraded either: Swarm keeps a service's
+update status until its *next* update, and no next update is coming for a service
+nothing is drifting, so reading a finished rollback as a failure would report it
+for ever. Once the comparison finds the service running exactly what the
+repository declares, the rollback is history — the service reports `healthy`, and
+its `updateState` still says `rollback_completed` so the event itself is not lost.
+The same evidence is what a correction is judged by, so a service under the
+release's namespace label that the manifest does not declare — attached by hand,
+or retained by a sweep that gave up on it — no longer holds up a correction of the
+services beside it. Under `driftDetection: manifest` no running spec is ever read,
+so there is no such evidence and a lingering rollback keeps reporting `degraded`.
+
 #### Which releases are compared
 
 Only those the plan calls **unchanged**. A release that would be installed has
