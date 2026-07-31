@@ -50,9 +50,10 @@ services:
     # the app set stops being reconciled and its stack is left running, reported
     # as orphaned. With it the stack is deleted, so removing an entry to park
     # something is an outage rather than a pause. --prune-volumes extends that
-    # to named volumes, which is the one part no reconcile can put back.
-    #           "--prune"
-    #           "--prune-volumes"
+    # to named volumes, which is the one part no reconcile can put back. Added
+    # to mode 1, the whole command reads:
+    # command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml",
+    #           "--prune", "--prune-volumes"]
 
     healthcheck:
       # The image carries no curl and needs none: the binary probes itself.
@@ -85,8 +86,13 @@ services:
       # the raft log and delivered in memory, and never appears in
       # `docker service inspect`.
       SWARMCLI_CD_ADMIN_TOKEN_FILE: /run/secrets/swarmcli-cd-token
-      # Uncomment for a private repository. The username is often ignored by
-      # the forge, but GitHub wants a non-empty one.
+      # For a private repository, uncomment the two lines below — and with them
+      # the two swarmcli-cd-git-token entries further down, in the service's
+      # `secrets:` list and in the top-level block. TOKEN_FILE only says where
+      # the controller expects the file; mounting the secret is what puts one
+      # there, and given the path alone the controller exits before the listener
+      # binds, which from the outside looks exactly like a bad token. The
+      # username is often ignored by the forge, but GitHub wants a non-empty one.
       # SWARMCLI_CD_GIT_USERNAME: x-access-token
       # SWARMCLI_CD_GIT_TOKEN_FILE: /run/secrets/swarmcli-cd-git-token
       #
@@ -96,7 +102,7 @@ services:
       # under `secrets:` below. One application uses only the secret it names,
       # so it cannot pull another's private images. Create it from a login:
       #   docker --config /tmp/rc login ghcr.io -u <user> -p <pat>
-      #   docker secret create swarmcli-cd-regauth-team-a /tmp/rc/config.json
+      #   docker secret create swarmcli-cd-regauth-edge /tmp/rc/config.json
       # Static credentials only: the image ships no credential helpers, so a
       # config.json using credsStore/credHelpers is refused at startup, and
       # short-lived ECR/GCR tokens must be refreshed out of band.
@@ -119,10 +125,13 @@ services:
         target: /etc/swarmcli-cd/applications.yaml
     secrets:
       - swarmcli-cd-token
+      # The git credential, for a private repository. Create it first:
+      #   printf '%s' "$YOUR_GIT_TOKEN" | docker secret create swarmcli-cd-git-token -
+      # - swarmcli-cd-git-token
       # One per application that pulls from a private registry. The name must
       # match that application's `registryAuth:`, and the default mount path
       # /run/secrets/<name> is where the controller reads it.
-      # - swarmcli-cd-regauth-team-a
+      # - swarmcli-cd-regauth-edge
 
 configs:
   swarmcli-cd-applications:
@@ -131,7 +140,9 @@ configs:
 secrets:
   swarmcli-cd-token:
     external: true
-  # swarmcli-cd-regauth-team-a:
+  # swarmcli-cd-git-token:
+  #   external: true
+  # swarmcli-cd-regauth-edge:
   #   external: true
 
 volumes:

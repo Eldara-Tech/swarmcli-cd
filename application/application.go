@@ -189,7 +189,8 @@ type SyncPolicy struct {
 	// cannot tolerate that at all needs an external guard — a remote signer
 	// with an anti-slashing record, or a lease.
 	//
-	// Means nothing without Prune, and is refused rather than ignored.
+	// Means nothing without Prune or PruneResources — it orders whichever of
+	// them is on — and is refused rather than ignored.
 	PruneFirst bool `json:"pruneFirst,omitempty" yaml:"pruneFirst,omitempty"`
 }
 

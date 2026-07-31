@@ -3,14 +3,15 @@
 
 // Package drift decides whether an application matches git.
 //
-// Phase 1 implements one mode, driftDetection: manifest. Diffing the desired
-// ServiceSpec against the running one is Phase 2 and answers a different
-// question — this one compares what the repository renders to against what was
-// last applied, which catches a changed chart version, changed values and a
-// changed template, but not an operator running `docker service update` behind
-// the controller's back.
+// There are two modes and they answer different questions. driftDetection:
+// manifest compares what the repository renders to against what was last
+// applied, which catches a changed chart version, changed values and a changed
+// template, but says nothing about an operator running `docker service update`
+// behind the controller's back. driftDetection: live is what sees that one, by
+// comparing each settled release's running ServiceSpec against the manifest;
+// it is in live.go, which also says what it does and does not compare.
 //
-// The whole decision comes out of the chart engine's plan. The engine already
+// The manifest decision comes out of the chart engine's plan. The engine already
 // canonicalises values through a YAML round trip and compares the rendered
 // manifest string, so asking it to plan is exactly as authoritative as its own
 // apply — and it is the same work the sync would do, rather than an

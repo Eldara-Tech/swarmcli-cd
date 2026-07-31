@@ -177,11 +177,18 @@ list view must not drag whole manifests along.
 ### History — `GET /api/v1/applications/{app}/history`
 
 ```json
-{ "releases": [ { "name": "traefik", "revisions": [ { "revision": 4, "chart": "...", "version": "0.1.1", "status": "deployed", "owner": "cd/edge" } ] } ] }
+{ "releases": [ { "name": "traefik", "revisions": [ { "revision": 4, "chart": "...", "version": "0.1.1", "status": "deployed", "owner": "cd/default/edge:release/traefik" } ] } ] }
 ```
 
 A release declared but never deployed has an empty `revisions` rather than being
 absent — a real state, and a different one from "no such release".
+
+`owner` is the stamp the chart engine stored: this controller's owner id,
+`cd/<controller-id>/<application>` — so `cd/default/edge` for application `edge`
+on a controller given no `--controller-id` — followed by the release it was
+written for. A revision carrying anything else was installed by something that
+is not this controller, which is what stops prune touching it; see
+[concepts § ownership](concepts.md#ownership).
 
 ### Sync — `POST /api/v1/applications/{app}/sync`
 
@@ -196,10 +203,18 @@ Server-Sent Events, so a UI gets live updates without polling. Each event is an
 SSE frame whose `data` is a small JSON object:
 
 ```
-event: sync
-data: {"application":"edge","type":"sync","revision":"9f3c1ab","message":"...","at":"2026-07-22T09:41:10Z"}
+event: sync-succeeded
+data: {"application":"edge","type":"sync-succeeded","revision":"9f3c1ab","message":"...","at":"2026-07-22T09:41:10Z"}
 
 ```
+
+The event name is the `type` verbatim, because that is what an `EventSource`
+listener binds to. There are eight of them and no others: `sync-started`,
+`sync-succeeded`, `sync-failed`, `drift-detected`, `live-drift-detected`,
+`drift-converged`, `resources-pruned` and `prune-failed`. Live drift is its own
+type rather than a `drift-detected` with a different message — one is a commit
+to review and the other a change nobody recorded, and a client routing on the
+name must be able to tell them apart without reading prose.
 
 The stream is fed by the same notifier seam that writes the controller's log,
 which is why a companion adding Slack *appends* a notifier rather than replacing

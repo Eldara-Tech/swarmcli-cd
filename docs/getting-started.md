@@ -95,12 +95,19 @@ printf '%s' "$(openssl rand -hex 32)" | docker secret create swarmcli-cd-token -
 docker stack deploy -c stack.yml swarmcli-cd
 ```
 
-For a **private** repository, also create a git-token secret and uncomment the
-`SWARMCLI_CD_GIT_*` lines in `stack.yml`:
+For a **private** repository, create a git-token secret as well:
 
 ```bash
 printf '%s' "$YOUR_GIT_TOKEN" | docker secret create swarmcli-cd-git-token -
 ```
+
+Then uncomment three things in `stack.yml`, all of which are needed: the
+`SWARMCLI_CD_GIT_*` lines under `environment:`, the `swarmcli-cd-git-token`
+entry in the service's `secrets:` list, and its declaration in the top-level
+`secrets:` block. The environment line says where the controller expects the
+file; the other two are what put one there. Uncomment the first alone and it
+starts, finds nothing at that path, and exits before the API is listening —
+the one failure it has no way to report.
 
 Confirm the controller is up:
 

@@ -19,8 +19,9 @@ import (
 var healthcheckUsage = `Usage: swarmcli-cd healthcheck [options]
 
 Probes a controller's liveness endpoint and exits 0 when it answers. This is
-what the container's HEALTHCHECK runs, which is why it is a subcommand rather
-than a curl: the image carries this binary and need carry nothing else.
+what stack.yml's healthcheck runs — the image declares no HEALTHCHECK of its
+own, so the deployment chooses its own timings — and it is a subcommand rather
+than a curl because the image carries this binary and need carry nothing else.
 
 Options:
   --server <url>       Controller to probe (default $` + client.EnvServer + `,

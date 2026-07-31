@@ -98,7 +98,7 @@ module github.com/Eldara-Tech/swarmcli-cd-be
 
 go 1.26
 
-require github.com/Eldara-Tech/swarmcli-cd v0.1.0
+require github.com/Eldara-Tech/swarmcli-cd v1.0.0-rc2
 ```
 
 **Nothing here may live under `internal/`.** Go's internal rule is per-module,

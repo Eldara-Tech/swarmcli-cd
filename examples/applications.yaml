@@ -26,7 +26,7 @@ applications:
   # https://github.com/Eldara-Tech/swarmcli/blob/main/charts/README.md#declarative-releases-gitops
   #
   # Do not set `owner:` in that file: swarmcli-cd stamps every release it applies
-  # with its own owner, cd/edge, and ignores the file's — see
+  # with its own owner, cd/<controller-id>/edge, and ignores the file's — see
   # ../docs/concepts.md#ownership.
   - name: edge
     # registryAuth names a Docker secret holding a docker config.json for the
@@ -71,7 +71,7 @@ applications:
           - name: swarmcli-charts
             url: https://eldara-tech.github.io/swarmcli-charts
         # Instead of ref + version + repositories, a chart committed to the repo:
-        #   path: ./charts/hello           # resolved against the repo root; omit `version`
+        # path: ./charts/hello             # resolved against the repo root; omit `version`
     destination:
       swarm: ""          # "" or omitted = the swarm the controller runs in (the only one the OSS build can resolve)
     syncPolicy:
@@ -79,7 +79,7 @@ applications:
     # driftDetection defaults to "manifest": compare the rendered manifest to
     # what was last applied, which catches git moving and nothing else.
     #
-    #   driftDetection: live
+    # driftDetection: live
     #
     # also compares each settled release's running ServiceSpec against what the
     # repository renders to, which is the only way a `docker service update` made

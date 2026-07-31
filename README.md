@@ -3,12 +3,16 @@
 GitOps continuous delivery for Docker Swarm — reconcile your swarm from Git, the
 way Argo CD does for Kubernetes.
 
-> **Status: Phase 1, pre-release.** The pull loop works end to end — fetch,
-> render, plan, diff, apply, drift detection and health — and is exercised
-> against a real swarm by the integration tests. There is **no tagged release**
-> yet, so build from source (below) and expect rough edges. Live-drift against
-> the running `ServiceSpec` (Phase 2) and the licensed companion (Phase 3) are
-> still to come. The design, decisions and phase plan live in
+> **Status: Phase 2, release candidates.** The pull loop works end to end —
+> fetch, render, plan, diff, apply, prune, drift detection and health — and is
+> exercised against a real swarm by the integration tests. `driftDetection:
+> live` has landed: a `docker service update` made behind the controller's back
+> is seen, and on an automated application corrected. So has app-of-apps, which
+> puts the application set itself in git. Webhook triggers and sync waves are
+> the rest of Phase 2; the licensed companion is Phase 3. Everything tagged so
+> far is a **release candidate**, so expect rough edges and pin the tag you
+> deploy: `:latest` never moves to a prerelease, so no such image tag exists
+> yet. The design, decisions and phase plan live in
 > [issue #1](https://github.com/Eldara-Tech/swarmcli-cd/issues/1).
 >
 > **New here?** Start with the [getting-started guide](docs/getting-started.md).
@@ -170,6 +174,8 @@ output and in argv.
 | `--prune` | off | delete the resources of an application that has left the application set, instead of leaving the stack running and reporting it as orphaned |
 | `--prune-volumes` | off | extend `--prune` to named volumes, the one part nothing can restore; requires `--prune` |
 | `--controller-id` | `default` | this controller's identity, stamped on every release it installs. Two controllers on one swarm **must** differ, or each treats the other's applications as departed |
+| `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
+| `--log-format` | `text` | `text` or `json`; everything goes to stderr through one handler either way |
 
 | Environment | |
 |---|---|

@@ -63,9 +63,9 @@ type File struct {
 }
 
 // nameRE is what an application may be called. It becomes a URL path segment
-// and half of an owner stamp — "cd/<name>:release/<release>" — and the chart
-// engine rejects an owner id containing a colon, so the charset is narrow on
-// purpose rather than by convention.
+// and part of an owner stamp — "cd/<controller>/<name>:release/<release>" —
+// and the chart engine rejects an owner id containing a colon, so the charset
+// is narrow on purpose rather than by convention.
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 // secretNameRE is what registryAuth may name. It is a Docker secret name, and

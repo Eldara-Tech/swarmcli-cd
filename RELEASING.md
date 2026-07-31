@@ -65,6 +65,12 @@ An `unstamped` chart engine in that output means the ldflag did not take, and
 every chart declaring a `swarmcliVersion` floor would be deployed unchecked —
 treat it as a failed release rather than a cosmetic problem.
 
+A binary out of an archive prints the same release **without** the leading `v`:
+GoReleaser stamps `{{.Version}}`, which is the tag with its `v` stripped, while
+the image is built with `github.ref_name` verbatim. So `swarmcli-cd version`
+says `v0.1.0` from the image and `0.1.0` from an archive — one tag, two
+renderings, not a sign that the wrong thing was built.
+
 ## Locally, without publishing
 
 ```bash
