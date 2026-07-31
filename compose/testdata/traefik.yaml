@@ -67,12 +67,13 @@ services:
         published: 443
         target: 443
     volumes:
-      # The published chart binds /var/run/docker.sock here, for the swarm
-      # provider two dozen lines up. It is the one line of this fixture that is
-      # not the chart as rendered: checkBindSources refuses that bind outright,
-      # so keeping it would make every test below assert nothing but the refusal
-      # — which TestABindReachingTheDockerSocketIsRefused asserts on its own, on
-      # this exact shape. See that test for what the refusal costs.
+      # The bind the published chart carries, for the swarm provider two dozen
+      # lines up. #103 removed it, because it was refused outright and keeping it
+      # would have made every test over this fixture assert nothing but the
+      # refusal; #64 gives it back under an allow.hostPaths entry, so the fixture
+      # is the chart as rendered again. The tests convert it under an application
+      # permitted this path.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - traefik-public-certificates:/certificates
 volumes:
   traefik-public-certificates: {}

@@ -181,11 +181,11 @@ the raft log and is never injected into a deployed container or returned by
 Swarm secrets and configs are **cluster-global objects referenced by name**, and
 a named volume is the same thing on whichever node runs the task. There is no
 namespace on that reference: a stack declaring one as `external:` gets whatever
-exists under that name, whoever created it. So the controller refuses to deploy a
-stack that reaches for anything of its own, and refuses it whole — before any
-network, config, secret or service is created, so nothing is left half-deployed.
-A bind mount of the docker socket is refused on the same terms and for a larger
-reason; that is [below](#the-docker-socket-which-a-chart-may-not-bind).
+exists under that name, whoever created it. So a chart may reach outside its own
+release only for what its application's [`allow`](#allow-optional) names — and
+there are five things no `allow` can name, listed below, which the controller
+refuses whole before any network, config, secret or service is created, so
+nothing is left half-deployed.
 
 Reaching for a name is not the only way to get at it. A manifest can also put
 that name on a resource it declares as **its own**, which is not an `external:`
@@ -205,7 +205,10 @@ against the same sets as referenced ones, whether or not any service mounts them
 (swarmcli-cd#86). A chart's own config or secret is unaffected: its name is
 namespace-scoped to `<release>_<name>`, so it is nobody else's.
 
-Five things are off limits:
+Five things are off limits **whatever the app set says**. They are not a
+permission an operator withholds and could grant; permitting one would not be
+lending an application something of yours, it would be handing whoever writes
+that chart the controller's own credentials and, with them, the app set:
 
 | | |
 |---|---|
@@ -227,76 +230,136 @@ spec has all of them under the names a reference actually resolves by.
 Networks are the exception, and deliberately: a service spec names its networks
 by **id**, so the same read cannot yield a name to compare. The rule is instead
 the controller's own stack namespace — `swarmcli-cd` and anything scoped under it
-— which needs no second lookup and refuses nothing an operator chose. What that
-leaves open is exactly the operator's own choice: a shared network you attached
-the controller to is reachable by everything else already on it, which is a
-topology decision rather than a stack reaching for something.
+— which needs no second lookup. What it leaves open is exactly the operator's own
+choice: a shared network you attached the controller to is reachable by
+everything else already on it, and an application permitted that name in
+[`allow.networks`](#allow-optional) is on it too. Attach the controller to a
+shared network only if you would grant every application on it the same.
 
 The release records cannot come from a set read once at startup, because a new
 one is written on every deploy. They are matched by their label at deploy time.
 
-Nothing here needs configuring, and there is no flag to forget. A controller that
-is **not** running as a Swarm service — a development run — has nothing mounted
+None of these five needs configuring, and there is no flag to forget. A
+controller that is **not** running as a Swarm service — a development run — has
+nothing mounted
 by Swarm and nothing of its own to protect, so this is inert rather than broken.
 If that read does not get through — the daemon unreachable, or reachable and
 answering with an error — the deploy **fails** rather than proceeding unguarded,
 and the next one tries again. A failure is never remembered as "nothing is
 mounted": only an answer is.
 
-An ordinary `external:` reference to a config, secret, volume or network an
-operator created for their own stacks is unaffected, and so is a chart declaring
-and mounting its own. Only the controller's own and the engine's own are refused.
-
-##### The docker socket, which a chart may not bind
-
-None of the above means anything on its own, because a bind mount of the daemon's
-socket is root on the node the task lands on — and a chart chooses where its
-services run:
-
-```yaml
-services:
-  x:
-    image: alpine
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock   # refused
-    deploy:
-      placement:
-        constraints: [node.role == manager]
-```
-
-On a manager that socket **is** the swarm's control plane: the stack can read the
-controller's secrets out of its own service spec, write any spec over any
-service, or delete the controller. So a bind whose source reaches the socket is
-refused — the socket itself under either of its names (`/run/docker.sock` and
-`/var/run/docker.sock` are the same file on a systemd host), and any directory it
-sits in, because `- /var/run:/var/run` is the same socket one directory further
-in.
-
-This is the guard that makes the app-set boundary meaningful. Committing to the
-app-set repository is root-equivalent and is meant to be protected as such,
-[separately from an application's own chart](#the-trust-boundary); a chart that
-can reach the daemon collapses the two.
-
-**The refusal is flat, and it has a cost.** There is no allowlist and no
-per-application policy, so a workload that genuinely wants the daemon — Traefik's
-swarm provider, a Portainer agent, an autoheal sidecar — cannot be reconciled by
-this controller and has to be deployed beside it, by hand or by whatever deploys
-the controller. That is the trade this controller makes to be a multi-tenant one.
-
-**What is not refused: any other host path.** The rule is the socket, not a
-host-path policy. A bind of the daemon's data root (`/var/lib/docker`) still
-reaches the contents of every named volume on that node, the controller's
-included, so the volume rule above is a guard on a *name* rather than on the
-bytes. Closing that means deciding per application which host paths a chart may
-name at all, which is [swarmcli-cd#64](https://github.com/Eldara-Tech/swarmcli-cd/issues/64)
-and is not in this build. Until it is, **treat every chart repository a controller
-reconciles as trusted with the nodes its applications run on.**
+Everything else a chart reaches outside its own release for — an operator's
+shared config, secret, volume or network, and any path on a node — is refused
+unless the application's [`allow`](#allow-optional) names it. A chart declaring
+and mounting its own is unaffected, and needs no entry: its name is
+namespace-scoped to `<release>_<name>`, so it is nobody else's and nobody's to
+permit.
 
 **Static credentials only.** The controller image ships no docker credential
 helpers, so a `config.json` using `credsStore` or `credHelpers` is refused at
 startup. Registries with static credentials (Docker Hub, GHCR, Harbor, GitLab,
 self-hosted) work; short-lived cloud-registry tokens (ECR, GCR) are not
 refreshed and must be rotated out of band for now.
+
+### `allow` (optional)
+
+```yaml
+allow:
+  hostPaths: [/var/run/docker.sock]
+  secrets:   [shared-apikey]
+  configs:   [shared-site]
+  volumes:   [shared-cache]
+  networks:  [traefik-public]
+```
+
+What this application's charts may reach **outside the releases they install**:
+paths on the nodes those releases run on, and the cluster-global names of
+resources some other stack owns.
+
+It is an **allowlist**. Anything not named here is refused, so an application
+that omits the field entirely — every application written before this build —
+can install a chart that declares and mounts its own resources, and nothing else.
+A chart's own are namespace-scoped to `<release>_<name>` and need no entry.
+
+#### Deploying Traefik, Portainer or an autoheal sidecar
+
+That one line is the whole of it:
+
+```yaml
+- name: edge
+  source:
+    repoURL: https://github.com/your-org/infra.git
+    revision: main
+    releaseFile: swarm/edge/swarmcli-release.yaml
+  allow:
+    hostPaths: [/var/run/docker.sock]
+    networks:  [traefik-public]
+```
+
+Charts whose entire job is to watch the daemon — Traefik's swarm provider, a
+Portainer agent, autoheal, watchtower — bind `/var/run/docker.sock` by design.
+Before this field they could not be reconciled by this controller at all and had
+to be deployed beside it.
+
+**Understand what you are granting.** A chart chooses where its services run, so
+`deploy.placement.constraints: [node.role == manager]` puts the task on a
+manager, where that socket **is** the swarm's control plane: the stack can read
+the controller's secrets out of its own service spec, write any spec over any
+service, or delete the controller. Granting it is granting the swarm. Grant it to
+applications whose chart repository you trust exactly as much as the app-set
+repository, and to no others.
+
+#### `hostPaths`
+
+Absolute paths, written in their simplest form (no trailing slash, no `..`), each
+permitting **itself and everything under it** — because that is what a bind of a
+directory already is. So:
+
+| entry | permits | does not permit |
+|---|---|---|
+| `/srv/app` | `/srv/app`, `/srv/app/data` | `/srv`, `/`, `/srv/application` |
+| `/var/run` | `/var/run/docker.sock`, `/var/run` | `/var`, `/run/docker.sock` |
+| `/` | everything | — |
+
+Two consequences worth stating. Permitting a directory permits the socket in it,
+so `/var/run` is the same grant as `/var/run/docker.sock` and then some. And the
+two spellings of the socket are different entries: `/run/docker.sock` and
+`/var/run/docker.sock` are the same file on a systemd host, but this compares
+what you wrote, so name the one your charts write.
+
+A bind is still refused outright, whatever this says, if its source is
+**relative**. That is not a permission: a swarm bind mount names a path on
+whichever node runs the task, so there is nothing for a relative source to
+resolve against.
+
+#### `secrets`, `configs`, `volumes` and `networks`
+
+Exact names, as the swarm holds them. Four lists rather than one because a bare
+name does not say what kind of thing it is, and the answer differs.
+
+They cover both ways a manifest can reach a name: an `external:` reference, and a
+declaration of its own carrying a `name:` that points at something already there
+— which is not an `external:` reference at all, and is
+[swarmcli-cd#86](https://github.com/Eldara-Tech/swarmcli-cd/issues/86).
+
+What each grant is worth:
+
+| | |
+|---|---|
+| `secrets` | the bytes. A Swarm secret is the shape a database password, a registry credential and a signing key all arrive in |
+| `configs` | the bytes, and they are readable — a config is not encrypted at rest the way a secret is |
+| `volumes` | another stack's data, read **and written**, on whichever node the task lands on |
+| `networks` | everything already on that network. Joining `traefik-public` is being on it with every other stack that is |
+
+#### Why it lives here and not in the chart
+
+The app-set repository is root-equivalent and is meant to be protected as such,
+[separately from an application's own chart](#the-trust-boundary), so that being
+able to change an app's chart is not the same permission as being able to add an
+app. A chart that could widen its own permissions — a field in a release file, a
+value in `values.yaml` — collapses those two into one. So there is no equivalent
+of this field anywhere a chart author can write, deliberately, and there will not
+be one.
 
 ### `destination` (optional)
 
@@ -1052,6 +1115,13 @@ In the OSS build, protecting that repository is the deployment's responsibility:
 
 Per-user identity and RBAC over who may change what are a licensed capability;
 see [extensibility.md](extensibility.md).
+
+It is also where an application's permissions live. [`allow`](#allow-optional)
+says what each application's charts may reach outside their own releases — host
+paths on the nodes, and another stack's secrets, configs, volumes and networks —
+and it is deliberately a field of the app set and of nowhere else. A chart author
+who could widen their own permissions would collapse the two privileges above
+into one, which is the whole of what this boundary is for.
 
 One thing a commit **cannot** do: deliver a new secret. An application that names
 a `registryAuth:` needs that Docker secret mounted into the controller in

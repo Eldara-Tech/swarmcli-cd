@@ -36,6 +36,12 @@
 # names a `registryAuth:` still needs that Docker secret mounted into the
 # controller in stack.yml, so private-registry credentials remain a deploy-time
 # act. Adding an application that uses an already-mounted one is just a commit.
+#
+# It is also where each application's permissions live. `allow:` says what an
+# application's charts may reach outside their own releases — host paths on the
+# nodes, and another stack's secrets, configs, volumes and networks — and there
+# is no equivalent field anywhere a chart author can write. That is the point of
+# the separation above: widening an application's reach is a commit here.
 # ---------------------------------------------------------------------------
 apiVersion: v1
 

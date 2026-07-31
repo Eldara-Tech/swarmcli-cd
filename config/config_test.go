@@ -6,6 +6,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -361,5 +362,91 @@ func TestHistoryMaxDistinguishesUnsetFromZero(t *testing.T) {
 		t.Fatalf("historyMax = %v, want an explicit 0", got.HistoryMax)
 	} else if got.Retention() != 0 {
 		t.Errorf("Retention() = %d, want 0 — an explicit zero still means keep all", got.Retention())
+	}
+}
+
+// The gate as an operator writes it, and the shape it decodes to. Five lists
+// rather than one, because a bare name says nothing about which kind of thing it
+// is and the answer differs: a path matches by containment on a node, a secret by
+// equality across the cluster.
+func TestAllowDecodes(t *testing.T) {
+	f, err := Parse([]byte(`
+applications:
+  - name: edge
+    source:
+      repoURL: https://x/y.git
+      revision: main
+      releaseFile: r.yaml
+    allow:
+      hostPaths: [/var/run/docker.sock]
+      secrets: [shared-apikey]
+      configs: [shared-site]
+      volumes: [shared-cache]
+      networks: [traefik-public]
+`), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	got := f.Applications[0].Allow
+	want := application.Allow{
+		HostPaths: []string{"/var/run/docker.sock"},
+		Secrets:   []string{"shared-apikey"},
+		Configs:   []string{"shared-site"},
+		Volumes:   []string{"shared-cache"},
+		Networks:  []string{"traefik-public"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("allow = %+v, want %+v", got, want)
+	}
+}
+
+// An application that says nothing permits nothing, and that is a decode result
+// rather than a default anything applies. Every app set written before this field
+// existed reads this way.
+func TestAnApplicationWithoutAllowPermitsNothing(t *testing.T) {
+	f, err := Parse([]byte(valid), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if got := f.Applications[0].Allow; !reflect.DeepEqual(got, application.Allow{}) {
+		t.Errorf("allow = %+v, want the zero value", got)
+	}
+}
+
+// The entries that cannot match anything, refused at startup rather than at the
+// deploy they were meant to permit. An allowlist fails silently in the direction
+// that is hardest to spot: a mistyped entry permits nothing, and the deploy is
+// then refused with a message about the chart.
+func TestAllowIsValidated(t *testing.T) {
+	for _, tc := range []struct{ name, allow, want string }{
+		{"a relative host path", "hostPaths: [srv/app]", "must be absolute"},
+		{"a host path with a trailing slash", "hostPaths: [/srv/app/]", "simplest form"},
+		{"a host path with a traversal", "hostPaths: [/srv/app/../..]", "simplest form"},
+		{"an empty host path", `hostPaths: [""]`, "is empty"},
+		{"a secret with a slash", "secrets: [team-b/creds]", "allow.secrets[0]"},
+		{"a config with a space", `configs: ["my config"]`, "allow.configs[0]"},
+		{"a volume starting with a dot", "volumes: [.hidden]", "allow.volumes[0]"},
+		{"an empty network name", `networks: [""]`, "allow.networks[0]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte("applications:\n  - name: edge\n    source:\n      repoURL: https://x/y.git\n"+
+				"      revision: main\n      releaseFile: r.yaml\n    allow:\n      "+tc.allow+"\n"), "applications.yaml")
+			if err == nil {
+				t.Fatal("Parse = nil, want the entry refused")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not say what is wrong", err)
+			}
+		})
+	}
+}
+
+// The entry an operator writes when they mean the node. It is not refused: they
+// are the highest privilege there is here, and a rule that second-guessed them
+// would be a policy this file is deliberately not.
+func TestTheWholeNodeIsAValidHostPath(t *testing.T) {
+	if _, err := Parse([]byte("applications:\n  - name: edge\n    source:\n      repoURL: https://x/y.git\n"+
+		"      revision: main\n      releaseFile: r.yaml\n    allow:\n      hostPaths: [/]\n"), "applications.yaml"); err != nil {
+		t.Fatalf("Parse = %v, want an operator able to say what they mean", err)
 	}
 }

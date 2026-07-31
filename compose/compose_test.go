@@ -13,6 +13,8 @@ import (
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/client"
 	"gopkg.in/yaml.v3"
+
+	"github.com/Eldara-Tech/swarmcli-cd/application"
 )
 
 // fakeAPI is everything conversion needs from a daemon, which is only the three
@@ -39,12 +41,25 @@ func (f fakeAPI) ConfigList(context.Context, swarm.ConfigListOptions) ([]swarm.C
 	return f.configs, nil
 }
 
+// convertOK converts under an application permitted nothing, which is what an
+// application that says nothing is permitted (#64). Most manifests here need no
+// permission at all: everything a stack owns is scoped to its own release.
 func convertOK(t *testing.T, manifest, stack string, api client.APIClient) *Stack {
+	t.Helper()
+	return convertAllowing(t, manifest, stack, api, application.Allow{})
+}
+
+// traefikAllow is what an operator writes to reconcile the traefik fixture: the
+// chart's swarm provider talks to the daemon, and that one line is the whole of
+// what #64 restores.
+var traefikAllow = application.Allow{HostPaths: []string{"/var/run/docker.sock"}}
+
+func convertAllowing(t *testing.T, manifest, stack string, api client.APIClient, allow application.Allow) *Stack {
 	t.Helper()
 	if api == nil {
 		api = fakeAPI{}
 	}
-	got, err := Convert(context.Background(), manifest, stack, api)
+	got, err := Convert(context.Background(), manifest, stack, api, allow)
 	if err != nil {
 		t.Fatalf("Convert = %v, want nil", err)
 	}
@@ -130,9 +145,9 @@ secrets:
 func TestConvertIsDeterministic(t *testing.T) {
 	manifest := mustRead(t, "testdata/traefik.yaml")
 
-	first := convertOK(t, manifest, "edge", nil)
+	first := convertAllowing(t, manifest, "edge", nil, traefikAllow)
 	for i := range 5 {
-		again := convertOK(t, manifest, "edge", nil)
+		again := convertAllowing(t, manifest, "edge", nil, traefikAllow)
 		if !reflect.DeepEqual(first, again) {
 			t.Fatalf("run %d differed from the first", i+2)
 		}
@@ -167,7 +182,7 @@ services:
 // something to conjure. Creating one would silently produce an empty overlay
 // where the operator meant an existing shared network.
 func TestExternalNetworksAreReportedNotCreated(t *testing.T) {
-	got := convertOK(t, mustRead(t, "testdata/traefik.yaml"), "edge", nil)
+	got := convertAllowing(t, mustRead(t, "testdata/traefik.yaml"), "edge", nil, traefikAllow)
 
 	if !reflect.DeepEqual(got.ExternalNetworks, []string{"traefik-public"}) {
 		t.Errorf("external = %v, want [traefik-public]", got.ExternalNetworks)
@@ -218,7 +233,7 @@ func TestRelativeBindSourceIsRejected(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Convert(context.Background(),
-				"services:\n  app:\n    image: x\n    volumes: "+tc.volumes+"\n", "s", fakeAPI{})
+				"services:\n  app:\n    image: x\n    volumes: "+tc.volumes+"\n", "s", fakeAPI{}, application.Allow{})
 			if err == nil {
 				t.Fatal("Convert = nil, want a relative bind source to be refused")
 			}
@@ -232,49 +247,47 @@ func TestRelativeBindSourceIsRejected(t *testing.T) {
 	}
 }
 
-// The shapes that do have a meaning on a worker node must still pass. An
-// over-eager check here — anything reaching for a host-path policy rather than
-// for the socket — would reject most charts that persist anything.
-func TestAbsoluteBindsAndNamedVolumesAreAccepted(t *testing.T) {
-	got := convertOK(t, `
+// The shapes a bind can take, all of them permitted by one entry, and every
+// other kind of volume passing untouched. The host paths are under /srv and
+// nothing else here is a host path at all: a named volume, an anonymous one and
+// a long-form volume have no host side, so a check that treated them as one
+// would refuse most charts that persist anything.
+func TestPermittedBindsAndNamedVolumesAreAccepted(t *testing.T) {
+	got := convertAllowing(t, `
 services:
   app:
     image: x
     volumes:
       - /srv/app/data:/data:ro
-      - /var/lib/app:/state
-      - /var/run/app.sock:/run/app.sock
+      - /srv/app/state:/state
       - data:/data2
       - /anonymous
       - {type: volume, source: named, target: /named}
-      - {type: bind, source: /etc/app.conf, target: /etc/app.conf}
+      - {type: bind, source: /srv/app/app.conf, target: /etc/app.conf}
 volumes:
   data: {}
   named: {}
-`, "s", nil)
+`, "s", nil, application.Allow{HostPaths: []string{"/srv/app"}})
 
-	if n := len(got.Services[0].Spec.TaskTemplate.ContainerSpec.Mounts); n != 7 {
-		t.Errorf("got %d mounts, want 7", n)
+	if n := len(got.Services[0].Spec.TaskTemplate.ContainerSpec.Mounts); n != 6 {
+		t.Errorf("got %d mounts, want 6", n)
 	}
 }
 
-// A chart binding the daemon's socket is root on the node it lands on, and a
-// chart chooses where its services run — so this is the bind that makes every
-// other guard in this package and in backend decoration. It is refused before
-// anything else looks at the manifest.
+// The refusal, in the ways a manifest can write a host path.
 //
-// The cases are the ways of writing it, not the ways of meaning it. Both spellings
-// of the socket, because /var/run is a symlink to /run on every systemd host and
-// this cannot resolve a symlink on a node it has never seen; any directory holding
-// it, because a bind of /var/run is the same socket one `ls` further in; and a path
-// that only Clean tells apart from the literal.
+// Every one of these is refused for the same reason and it is not the reason
+// #103 gave: not "this is the docker socket" but "this application named no host
+// paths", so an ordinary /srv/app is here beside the socket. That is the
+// allowlist — an entry is what makes a path bindable, and nothing else is.
 //
-// The traefik case is the real one. It is the fixture's own manifest with the
-// bind the published chart actually carries, and it is what this refusal costs:
-// the swarm provider needs the daemon, so that chart cannot be reconciled by this
-// controller at all and has to be deployed beside it. That is deliberate and
-// deliberately not configurable — see checkBindSources.
-func TestABindReachingTheDockerSocketIsRefused(t *testing.T) {
+// The socket cases are kept because they are the ones with teeth: a chart
+// chooses where its services run, so `node.role == manager` plus that socket is
+// the swarm's control plane. Both spellings are here, and so is every directory
+// containing one, because under a denylist each was a rule that had to be
+// remembered — under this one they are refused by saying nothing, which is what
+// makes the direction worth having.
+func TestAnUnpermittedHostPathIsRefused(t *testing.T) {
 	for _, tc := range []struct{ name, volumes string }{
 		{"the socket", `["/var/run/docker.sock:/var/run/docker.sock"]`},
 		{"read only", `["/var/run/docker.sock:/var/run/docker.sock:ro"]`},
@@ -290,17 +303,23 @@ func TestABindReachingTheDockerSocketIsRefused(t *testing.T) {
 		// in this package would notice, and the manifest converts without
 		// complaint — see bindSource.
 		{"long syntax as a named pipe", `[{type: npipe, source: /var/run/docker.sock, target: /var/run/docker.sock}]`},
+		// The daemon's data root, which #103 named as what its socket rule
+		// deliberately left open: it holds the contents of every named volume on
+		// the node, this controller's own included.
+		{"the daemon's data root", `["/var/lib/docker:/host/docker"]`},
+		// And an ordinary one, which was allowed before this and is not now.
+		{"an ordinary host path", `["/srv/app/data:/data"]`},
 		{"traefik", `["/var/run/docker.sock:/var/run/docker.sock:ro", "certs:/certificates"]`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Convert(context.Background(),
 				"services:\n  app:\n    image: traefik:v3.7.1\n    volumes: "+tc.volumes+"\n"+
-					"volumes:\n  certs: {}\n", "s", fakeAPI{})
+					"volumes:\n  certs: {}\n", "s", fakeAPI{}, application.Allow{})
 			if err == nil {
-				t.Fatal("Convert = nil, want a bind reaching the docker socket refused")
+				t.Fatal("Convert = nil, want a host path this application may not bind refused")
 			}
-			if !strings.Contains(err.Error(), "docker daemon's socket") {
-				t.Errorf("error %q does not say why", err)
+			if !strings.Contains(err.Error(), "allow.hostPaths") {
+				t.Errorf("error %q does not say where the permission would go", err)
 			}
 			if !strings.Contains(err.Error(), `service "app"`) {
 				t.Errorf("error %q does not name the service", err)
@@ -309,24 +328,49 @@ func TestABindReachingTheDockerSocketIsRefused(t *testing.T) {
 	}
 }
 
-// The rule is "a path from which docker.sock is reachable by name" and stops
-// there. A check that matched on a substring, or that reached for a general
-// host-path policy, would refuse every one of these — and a host-path policy is a
-// design of its own (#64) rather than something to arrive at by accident here.
-func TestAnOrdinaryHostPathIsNotTheDockerSocket(t *testing.T) {
-	for _, source := range []string{
-		"/var/run/app.sock",
-		"/var/run/docker.sock.bak",
-		"/var/lib/docker",
-		"/var/lib/docker/volumes",
-		"/srv/docker.sock",
-		"/etc/docker",
-		"/runtime",
-		"/var/runtime",
+// The capability #64 exists to give back. Traefik's swarm provider needs the
+// daemon and #103 could only refuse it, so this chart could not be reconciled by
+// this controller at all — it is the manifest of the fixture beside this file,
+// with the bind the published chart actually carries.
+//
+// The third case is the one that makes the gate a gate rather than a switch: an
+// application permitted a different path is refused exactly as one permitted
+// nothing is.
+func TestAPermittedHostPathIsBound(t *testing.T) {
+	const traefik = "services:\n  app:\n    image: traefik:v3.7.1\n" +
+		"    volumes: [\"/var/run/docker.sock:/var/run/docker.sock:ro\", \"certs:/certificates\"]\n" +
+		"volumes:\n  certs: {}\n"
+
+	for _, tc := range []struct {
+		name    string
+		allow   application.Allow
+		refused bool
+	}{
+		{"the socket itself", application.Allow{HostPaths: []string{"/var/run/docker.sock"}}, false},
+		// A bind of a directory is everything under it, so permitting the
+		// directory permits the socket in it. Written down because it is the
+		// footgun of the containment rule as much as its convenience.
+		{"the directory holding it", application.Allow{HostPaths: []string{"/var/run"}}, false},
+		{"somewhere else entirely", application.Allow{HostPaths: []string{"/srv/app"}}, true},
+		// The one-directional half. Permitting a path below the bind does not
+		// permit the bind, which would otherwise be a way to write "/var/run"
+		// without meaning to.
+		{"a path under it", application.Allow{HostPaths: []string{"/var/run/docker.sock/deeper"}}, true},
 	} {
-		t.Run(source, func(t *testing.T) {
-			if sock, reaches := reachesDockerSocket(source); reaches {
-				t.Errorf("reachesDockerSocket(%q) = %q, want it accepted", source, sock)
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Convert(context.Background(), traefik, "edge", fakeAPI{}, tc.allow)
+			if tc.refused {
+				if err == nil {
+					t.Fatal("Convert = nil, want a bind no entry covers refused")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Convert = %v, want the permitted bind converted", err)
+			}
+			mounts := got.Services[0].Spec.TaskTemplate.ContainerSpec.Mounts
+			if len(mounts) != 2 || mounts[0].Source != "/var/run/docker.sock" {
+				t.Errorf("mounts = %+v, want the socket bound", mounts)
 			}
 		})
 	}
@@ -358,7 +402,7 @@ func TestFileSourcesAreRefused(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Convert(context.Background(), tc.manifest, "s", fakeAPI{})
+			_, err := Convert(context.Background(), tc.manifest, "s", fakeAPI{}, application.Allow{})
 			if err == nil {
 				t.Fatal("Convert = nil, want a manifest reading the controller's filesystem to be refused")
 			}
@@ -376,7 +420,7 @@ func TestFileSourcesAreRefused(t *testing.T) {
 // manifest that names no path at all. An over-eager version of this check would
 // refuse most charts there are.
 func TestAManifestWithoutFileSourcesIsUntouched(t *testing.T) {
-	got := convertOK(t, `
+	got := convertAllowing(t, `
 services:
   web:
     image: nginx
@@ -387,7 +431,7 @@ services:
     networks: [front]
 networks:
   front: {}
-`, "s", nil)
+`, "s", nil, application.Allow{HostPaths: []string{"/srv/www"}})
 
 	if len(got.Services) != 1 || len(got.Networks) != 1 {
 		t.Errorf("got %+v, want the manifest converted untouched", got)
@@ -461,7 +505,7 @@ secrets:
 // config does not exist until this controller creates it. So Convert refuses
 // this manifest, and ConvertUnresolved is what the mount guard reads instead.
 func TestConvertUnresolvedNeedsNothingToExistYet(t *testing.T) {
-	_, err := Convert(context.Background(), declaresAndMounts, "rel", fakeAPI{})
+	_, err := Convert(context.Background(), declaresAndMounts, "rel", fakeAPI{}, application.Allow{})
 	if err == nil {
 		t.Fatal("Convert = nil, want a reference to a resource that does not exist yet to fail")
 	}
@@ -469,7 +513,7 @@ func TestConvertUnresolvedNeedsNothingToExistYet(t *testing.T) {
 		t.Errorf("error %q is not the unresolvable reference", err)
 	}
 
-	got, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", fakeAPI{})
+	got, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", fakeAPI{}, application.Allow{})
 	if err != nil {
 		t.Fatalf("ConvertUnresolved = %v, want nil", err)
 	}
@@ -501,7 +545,7 @@ func TestConvertUnresolvedDiffersOnlyByTheIds(t *testing.T) {
 	}
 
 	resolved := convertOK(t, declaresAndMounts, "rel", api)
-	unresolved, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", api)
+	unresolved, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", api, application.Allow{})
 	if err != nil {
 		t.Fatalf("ConvertUnresolved = %v, want nil", err)
 	}
@@ -522,7 +566,7 @@ func TestConvertUnresolvedDiffersOnlyByTheIds(t *testing.T) {
 // the loader's, not the daemon's — so it survives the substitution.
 func TestConvertUnresolvedStillNeedsTheReferenceDeclared(t *testing.T) {
 	_, err := ConvertUnresolved(context.Background(),
-		"services:\n  web:\n    image: nginx\n    secrets: [absent]\n", "s", fakeAPI{})
+		"services:\n  web:\n    image: nginx\n    secrets: [absent]\n", "s", fakeAPI{}, application.Allow{})
 	if err == nil {
 		t.Fatal("ConvertUnresolved = nil, want a reference the manifest never declared to be refused")
 	}
@@ -540,7 +584,7 @@ func TestInvalidManifestFails(t *testing.T) {
 		{"undefined secret", "services:\n  web:\n    image: nginx\n    secrets: [absent]\n", "converting services"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Convert(context.Background(), tc.manifest, "s", fakeAPI{})
+			_, err := Convert(context.Background(), tc.manifest, "s", fakeAPI{}, application.Allow{})
 			if err == nil {
 				t.Fatal("Convert = nil, want an error")
 			}
@@ -556,7 +600,7 @@ func TestInvalidManifestFails(t *testing.T) {
 // a docker/cli bump that changes conversion shows up here as a diff rather than
 // as a surprise on somebody's swarm.
 func TestTraefikChartGolden(t *testing.T) {
-	got := convertOK(t, mustRead(t, "testdata/traefik.yaml"), "edge", nil)
+	got := convertAllowing(t, mustRead(t, "testdata/traefik.yaml"), "edge", nil, traefikAllow)
 
 	golden := "testdata/traefik.golden"
 	dump := describe(got)

@@ -74,6 +74,16 @@ var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 // slash, and a leading dot (hence "..") is rejected.
 var secretNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
+// allowNameRE is what an `allow` entry may name. It is the charset Docker holds
+// a secret, config, volume or network name to, so a name outside it can never
+// match anything on the swarm.
+//
+// Checked rather than shrugged at because an allowlist fails silently in the one
+// direction that is hard to notice: a mistyped entry does not permit something
+// wrong, it permits nothing, and the deploy is then refused with a message about
+// the name in the chart rather than about the typo in the app set.
+var allowNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
 // Load reads and validates the applications file at path.
 func Load(path string) (*File, error) {
 	data, err := os.ReadFile(path)
@@ -149,6 +159,9 @@ func validateApplication(app application.Spec) error {
 	if app.RegistryAuth != "" && !secretNameRE.MatchString(app.RegistryAuth) {
 		return fmt.Errorf("%q: invalid registryAuth %q: it names a Docker secret, so letters, digits, dot, dash and underscore only", app.Name, app.RegistryAuth)
 	}
+	if err := validateAllow(app.Allow); err != nil {
+		return fmt.Errorf("%q: %w", app.Name, err)
+	}
 	if err := validateSource(app.Source); err != nil {
 		return fmt.Errorf("%q: %w", app.Name, err)
 	}
@@ -172,6 +185,50 @@ func validateApplication(app application.Spec) error {
 	// its own: it is a sibling of prune rather than an extension of it.
 	if app.SyncPolicy.PruneFirst && !app.SyncPolicy.Prune && !app.SyncPolicy.PruneResources {
 		return fmt.Errorf("%q: syncPolicy pruneFirst means nothing without prune or pruneResources", app.Name)
+	}
+	return nil
+}
+
+// validateAllow holds an application's allowlist to the shapes that can match
+// anything, so that an entry which will never permit what its author meant is a
+// startup failure rather than a refused deploy weeks later.
+//
+// A host path is held to being absolute and already clean. Absolute because it
+// names a path on whichever node runs the task and there is nothing else for a
+// relative one to be resolved against; clean because the comparison cleans the
+// bind source but reports the entry as written, and "/srv/app/" silently
+// permitting "/srv/app" is the kind of near-miss that teaches an operator the
+// wrong rule. Both are one edit to fix and the message says which.
+//
+// Nothing here can tell whether an entry names something that exists, or
+// something the operator should not have granted. It is a charset and a shape,
+// not a policy: the policy is the operator's, which is the whole point of the
+// field.
+func validateAllow(a application.Allow) error {
+	for i, p := range a.HostPaths {
+		switch {
+		case p == "":
+			return fmt.Errorf("allow.hostPaths[%d] is empty", i)
+		case !path.IsAbs(p):
+			return fmt.Errorf("allow.hostPaths[%d] %q must be absolute: it names a path on whichever node runs the task, so there is nothing for a relative one to resolve against", i, p)
+		case path.Clean(p) != p:
+			return fmt.Errorf("allow.hostPaths[%d] %q is not written in its simplest form; use %q", i, p, path.Clean(p))
+		}
+	}
+	for _, kind := range []struct {
+		field string
+		names []string
+	}{
+		{"allow.secrets", a.Secrets},
+		{"allow.configs", a.Configs},
+		{"allow.volumes", a.Volumes},
+		{"allow.networks", a.Networks},
+	} {
+		for i, name := range kind.names {
+			if !allowNameRE.MatchString(name) {
+				return fmt.Errorf("%s[%d]: invalid name %q: it is compared against a name on the swarm, so letters, digits, dot, dash and underscore only, starting with a letter or digit", kind.field, i, name)
+			}
+		}
 	}
 	return nil
 }

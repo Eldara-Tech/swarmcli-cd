@@ -474,3 +474,73 @@ func TestAnUnsetHistoryMaxIsAbsentFromTheWire(t *testing.T) {
 		t.Errorf("got %s, want an explicit zero on the wire", data)
 	}
 }
+
+// The containment rule, in both directions and on the shapes a manifest can
+// vary a path by.
+//
+// Down is what makes an entry usable: an operator names the directory their
+// charts write under, not every file in it. Up is what makes it a permission at
+// all — if permitting /srv/app also permitted /srv, or /, then every entry would
+// be an entry for the node, and the socket that #103 refused flat would come back
+// through the first chart that persisted anything.
+func TestPermitsPath(t *testing.T) {
+	allow := Allow{HostPaths: []string{"/srv/app", "/var/run/docker.sock"}}
+
+	for _, tc := range []struct {
+		source  string
+		permits bool
+	}{
+		{"/srv/app", true},
+		{"/srv/app/data", true},
+		{"/srv/app/data/nested", true},
+		// Clean folds what a manifest can write without naming somewhere else.
+		{"/srv/app/", true},
+		{"/srv//app", true},
+		{"/srv/app/../app/data", true},
+		// The exact entry, which is the Traefik case.
+		{"/var/run/docker.sock", true},
+
+		// Upwards, which would be the whole node one way or another.
+		{"/srv", false},
+		{"/", false},
+		{"/var/run", false},
+		{"/var", false},
+		// A sibling whose name merely starts the same. Without the separator in
+		// the prefix test this would pass, and "/srv/apples" is not "/srv/app".
+		{"/srv/application", false},
+		{"/srv/app-other", false},
+		// The other spelling of the socket. #103 listed both because it was
+		// detecting the socket; this is matching what an operator wrote, so the
+		// answer is theirs and failing closed is right.
+		{"/run/docker.sock", false},
+		{"/etc/passwd", false},
+	} {
+		t.Run(tc.source, func(t *testing.T) {
+			if got := allow.PermitsPath(tc.source); got != tc.permits {
+				t.Errorf("PermitsPath(%q) = %v, want %v", tc.source, got, tc.permits)
+			}
+		})
+	}
+}
+
+// An application that named no paths permits none, which is what an allowlist
+// means and is the answer for every application written before this field
+// existed.
+func TestAnEmptyAllowPermitsNoPath(t *testing.T) {
+	for _, source := range []string{"/srv/app", "/", "/var/run/docker.sock"} {
+		if (Allow{}).PermitsPath(source) {
+			t.Errorf("PermitsPath(%q) = true on an empty allowlist", source)
+		}
+	}
+}
+
+// The entry an operator writes when they mean it. It is not special-cased and it
+// does not need to be: everything is under "/".
+func TestTheWholeNodeIsAnEntryLikeAnyOther(t *testing.T) {
+	allow := Allow{HostPaths: []string{"/"}}
+	for _, source := range []string{"/", "/var/run/docker.sock", "/srv/app/data"} {
+		if !allow.PermitsPath(source) {
+			t.Errorf("PermitsPath(%q) = false, want the whole node permitted", source)
+		}
+	}
+}

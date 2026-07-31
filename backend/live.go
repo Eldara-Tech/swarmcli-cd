@@ -40,7 +40,7 @@ import (
 // compares against is what a sync would write, rather than a second reading of
 // the manifest that could disagree with it.
 func (b *Backend) DesiredServices(ctx context.Context, manifest, stack string) (*cdcompose.Stack, error) {
-	return cdcompose.Convert(ctx, manifest, stack, b.api)
+	return cdcompose.Convert(ctx, manifest, stack, b.api, b.allow)
 }
 
 // DeclaredResources converts a rendered manifest to the specs it declares,
@@ -57,7 +57,7 @@ func (b *Backend) DesiredServices(ctx context.Context, manifest, stack string) (
 // returns, so the config and secret references in it carry a placeholder id and
 // nothing may be applied from it.
 func (b *Backend) DeclaredResources(ctx context.Context, manifest, stack string) (*cdcompose.Stack, error) {
-	return cdcompose.ConvertUnresolved(ctx, manifest, stack, b.api)
+	return cdcompose.ConvertUnresolved(ctx, manifest, stack, b.api, b.allow)
 }
 
 // LiveServices returns the stack's running services with their full specs, by

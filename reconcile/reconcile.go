@@ -543,6 +543,39 @@ func withForbiddenSecrets(b charts.Backend, names map[string]struct{}) charts.Ba
 	return b
 }
 
+// allowedRefsBackend is the optional interface a backend implements to take one
+// application's allowlist of what its charts may reach outside their own
+// releases. *backend.Backend satisfies it.
+type allowedRefsBackend interface {
+	WithAllowedReferences(application.Allow) charts.Backend
+}
+
+// withAllowedReferences scopes a backend to one application's permissions.
+//
+// Applied unconditionally, unlike its two neighbours above, and the difference is
+// the point: an empty allowlist is not "no policy", it is the policy that permits
+// nothing, so there is no empty case to short-circuit past. Skipping it would
+// leave whichever application deployed last through this per-swarm backend having
+// set the permissions for the next one.
+//
+// It is the only per-application fact the applier gets. Everything else it
+// refuses — the controller's own secrets, configs, volume, network, and the
+// engine's release records — is the same answer for every application and is
+// derived where it is enforced, which is why #102 and #103 needed no wiring at
+// all. This one cannot be: which application a deploy belongs to is knowledge
+// that exists here and nowhere below.
+//
+// A backend that does not support the upgrade — a Phase 3 remote one — enforces
+// its own, which is also why this is not a check the reconciler makes for itself:
+// the manifest is refused where the specs are, so nothing can reach the swarm
+// past a layer that did not look.
+func withAllowedReferences(b charts.Backend, allow application.Allow) charts.Backend {
+	if ab, ok := b.(allowedRefsBackend); ok {
+		return ab.WithAllowedReferences(allow)
+	}
+	return b
+}
+
 // outOfBandBackend is the optional interface a backend implements to report a
 // mutation that lost its compare-and-swap. *backend.Backend satisfies it.
 type outOfBandBackend interface {
@@ -1704,6 +1737,7 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	}
 	backend = withRegistryAuth(backend, r.registryAuth(spec.Name))
 	backend = withForbiddenSecrets(backend, r.forbidden)
+	backend = withAllowedReferences(backend, spec.Allow)
 	backend = r.withOutOfBandNotifier(ctx, backend, spec.Name)
 	engine := r.newEngine(backend)
 

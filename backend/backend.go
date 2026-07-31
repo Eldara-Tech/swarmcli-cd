@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/containerd/errdefs"
@@ -19,6 +20,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/charts"
 	"github.com/Eldara-Tech/swarmcli/docker"
 
+	"github.com/Eldara-Tech/swarmcli-cd/application"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 )
@@ -60,6 +62,28 @@ func (b *Backend) WithRegistryAuth(auth regauth.Resolver) charts.Backend {
 func (b *Backend) WithForbiddenSecrets(names map[string]struct{}) charts.Backend {
 	c := *b
 	c.forbiddenSecrets = names
+	return &c
+}
+
+// WithAllowedReferences returns a copy of the backend that permits one
+// application's charts to reach what allow enumerates — host paths on the nodes,
+// and the secrets, configs, volumes and networks of some other stack.
+//
+// Per application, unlike WithForbiddenSecrets, and applied through the same
+// optional-interface upgrade as WithRegistryAuth so the reconciler need not
+// depend on this concrete type. It is the only thing that carries an
+// application's identity into this package: the guards here are name
+// comparisons, and until now every set they compared against was the
+// controller's own, which needed no caller to say who was deploying.
+//
+// A backend nobody scoped this way permits nothing beyond what the release being
+// deployed owns. That is the safe direction and it is what the sweep in package
+// prune resolves for itself — a sweep removes rather than deploys, so it reaches
+// neither this value's readers, but if it ever did it would refuse rather than
+// wave something through.
+func (b *Backend) WithAllowedReferences(allow application.Allow) charts.Backend {
+	c := *b
+	c.allow = allow
 	return &c
 }
 
@@ -122,9 +146,26 @@ const (
 )
 
 // rejectForbiddenResources refuses a stack that reaches outside itself for one of
-// the controller's own secrets, configs, volumes or networks, or for the chart
-// engine's release history — and a stack that declares one of those names as its
-// own.
+// the controller's own secrets, configs, volumes or networks, for the chart
+// engine's release history, or for anything else its application was not
+// permitted — and a stack that declares one of those names as its own.
+//
+// Two rules in one pass, in an order that is the whole of what they mean.
+//
+// The controller's own is refused first and unconditionally: no allowlist reaches
+// it, because permitting one is not an operator lending an application something
+// of the operator's, it is handing whoever writes the chart the controller's
+// credentials and with them the app set (see application.Allow). Everything else
+// outside the release is refused unless the application's allowlist names it,
+// which is the per-application half — #64. A name scoped to the release being
+// deployed is the release's own and asks nobody: conversion produces
+// "<release>_<name>" for everything a stack owns.
+//
+// The direction matters more than the sets do. It is an allowlist because the
+// other way round leaves whatever nobody thought of permitted, and the family
+// this guard grew out of — an external secret (#63), a renamed declaration (#86),
+// a release record, a volume, a network, a socket bind (#103) — was exactly that
+// in each case until somebody found it.
 //
 // Secrets, configs and volumes are cluster-global objects addressed by name, so
 // each check is a name comparison. The declared half is not redundant, and #86 is
@@ -177,6 +218,10 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		return history, nil
 	}
 
+	// The release's own namespace, which is what "outside the stack" is measured
+	// against below.
+	ns := stack.Namespace.Name()
+
 	// What a service reaches outside the stack for.
 	for _, svc := range stack.Services {
 		secrets, configs := externalRefs(stack, svc)
@@ -185,6 +230,9 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			_, mounted := mine.secrets[name]
 			if wired || mounted {
 				return mountsForbidden(svc.Name, "secret", name, whatControllerSecret)
+			}
+			if !scopedUnder(ns, name) && !permits(b.allow.Secrets, name) {
+				return mountsUnpermitted(svc.Name, "secret", name, "allow.secrets")
 			}
 		}
 		for _, name := range configs {
@@ -198,10 +246,16 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			if _, forbidden := known[name]; forbidden {
 				return mountsForbidden(svc.Name, "config", name, whatReleaseRecord)
 			}
+			if !scopedUnder(ns, name) && !permits(b.allow.Configs, name) {
+				return mountsUnpermitted(svc.Name, "config", name, "allow.configs")
+			}
 		}
 		for _, name := range volumeSources(svc) {
 			if _, forbidden := mine.volumes[name]; forbidden {
 				return mountsForbidden(svc.Name, "volume", name, whatControllerVolume)
+			}
+			if !scopedUnder(ns, name) && !permits(b.allow.Volumes, name) {
+				return mountsUnpermitted(svc.Name, "volume", name, "allow.volumes")
 			}
 		}
 	}
@@ -216,6 +270,9 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if wired || mounted {
 			return declaresForbidden("secret", spec.Name, whatControllerSecret)
 		}
+		if !scopedUnder(ns, spec.Name) && !permits(b.allow.Secrets, spec.Name) {
+			return declaresUnpermitted("secret", spec.Name, "allow.secrets")
+		}
 	}
 	for _, spec := range stack.Configs {
 		if _, forbidden := mine.configs[spec.Name]; forbidden {
@@ -228,6 +285,9 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if _, forbidden := known[spec.Name]; forbidden {
 			return declaresForbidden("config", spec.Name, whatReleaseRecord)
 		}
+		if !scopedUnder(ns, spec.Name) && !permits(b.allow.Configs, spec.Name) {
+			return declaresUnpermitted("config", spec.Name, "allow.configs")
+		}
 	}
 
 	// And the networks, which are neither reached for nor claimed so much as
@@ -239,13 +299,39 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if inControllersStack(mine.namespace, name) {
 			return joinsForbidden(name, mine.namespace)
 		}
+		if !scopedUnder(ns, name) && !permits(b.allow.Networks, name) {
+			return joinsUnpermitted(name)
+		}
 	}
 	for _, nw := range stack.Networks {
 		if inControllersStack(mine.namespace, nw.Name) {
 			return joinsForbidden(nw.Name, mine.namespace)
 		}
+		if !scopedUnder(ns, nw.Name) && !permits(b.allow.Networks, nw.Name) {
+			return joinsUnpermitted(nw.Name)
+		}
 	}
 	return nil
+}
+
+// permits reports whether an allowlist names name.
+//
+// Exact, unlike the containment Allow.PermitsPath does for a host path, because
+// these are cluster-global names Swarm resolves by equality: there is no
+// hierarchy among them for a looser match to follow, so anything looser would
+// permit a name the operator did not write.
+func permits(allowed []string, name string) bool {
+	return slices.Contains(allowed, name)
+}
+
+// scopedUnder reports whether name belongs to the stack deployed as namespace.
+//
+// Conversion scopes everything a stack owns to "<namespace>_<name>"
+// (convert.Namespace.Scope), so the prefix is the whole of "this is that stack's
+// own" — for the release being deployed, whose resources need no permission, and
+// for the controller's own stack, whose do not exist.
+func scopedUnder(namespace, name string) bool {
+	return namespace != "" && strings.HasPrefix(name, namespace+"_")
 }
 
 // inControllersStack reports whether a network name belongs to the stack this
@@ -264,7 +350,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 // the same answer rejectOwnNamespace gives, for the same reason: there is nothing
 // of ours there to join.
 func inControllersStack(namespace, name string) bool {
-	return namespace != "" && (name == namespace || strings.HasPrefix(name, namespace+"_"))
+	return namespace != "" && (name == namespace || scopedUnder(namespace, name))
 }
 
 func mountsForbidden(service, kind, name, what string) error {
@@ -276,6 +362,30 @@ func declaresForbidden(kind, name, what string) error {
 	return fmt.Errorf("this stack declares %s %q, which is %s; a reconciled stack may not declare "+
 		"one of those names as its own, because Swarm addresses a %s by name — the existing one "+
 		"would be handed to this stack's services and relabelled as this stack's", kind, name, what, kind)
+}
+
+// The refusals the application's own allowlist makes, as against the flat ones
+// above. Each names the field to add the name to, because the operator reading
+// this is the one who can, and because an allowlist whose message does not say
+// where it lives is indistinguishable from a bug.
+func mountsUnpermitted(service, kind, name, field string) error {
+	return fmt.Errorf("service %q mounts %s %q, which this release does not own and this application is "+
+		"not permitted to reference. A %s is addressed by name with no namespace on the reference, so "+
+		"naming another stack's is being handed it — add it to %s in the app set if that is what is meant",
+		service, kind, name, kind, field)
+}
+
+func declaresUnpermitted(kind, name, field string) error {
+	return fmt.Errorf("this stack declares %s %q, which is not scoped to this release and which this "+
+		"application is not permitted to reference. A declaration carrying a name that already exists is "+
+		"handed the existing %s and relabels it as this stack's, so declaring one is not owning it — add "+
+		"the name to %s in the app set if that is what is meant", kind, name, kind, field)
+}
+
+func joinsUnpermitted(name string) error {
+	return fmt.Errorf("this stack joins network %q, which is not scoped to this release and which this "+
+		"application is not permitted to join. Everything already on a shared network is reachable from "+
+		"it — add the name to allow.networks in the app set if that is what is meant", name)
 }
 
 func joinsForbidden(name, namespace string) error {
@@ -335,8 +445,9 @@ func externalRefs(stack *cdcompose.Stack, svc cdcompose.Service) (secrets, confi
 // a declaration no service mounts reaches nothing.
 //
 // Binds are not here. A bind names a path rather than a cluster-wide name, so
-// there is nothing for it to collide with — and the reason it is not a hole in
-// this guard but a known gap beside it is in compose.reachesDockerSocket.
+// there is nothing for it to collide with, and the question it does raise — which
+// paths on a node this application may reach at all — is answered one step
+// earlier, in compose.checkBindSources, against the same allowlist.
 func volumeSources(svc cdcompose.Service) []string {
 	cs := svc.Spec.TaskTemplate.ContainerSpec
 	if cs == nil {
@@ -440,7 +551,7 @@ func (b *Backend) DeployStack(ctx context.Context, name, manifest, resolve strin
 		return err
 	}
 
-	unresolved, err := cdcompose.ConvertUnresolved(ctx, manifest, name, b.api)
+	unresolved, err := cdcompose.ConvertUnresolved(ctx, manifest, name, b.api, b.allow)
 	if err != nil {
 		return err
 	}
@@ -468,7 +579,7 @@ func (b *Backend) DeployStack(ctx context.Context, name, manifest, resolve strin
 		return err
 	}
 
-	stack, err := cdcompose.Convert(ctx, manifest, name, b.api)
+	stack, err := cdcompose.Convert(ctx, manifest, name, b.api, b.allow)
 	if err != nil {
 		return err
 	}

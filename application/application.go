@@ -20,7 +20,9 @@
 package application
 
 import (
+	"path"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -41,6 +43,11 @@ type Spec struct {
 	// mount /run/secrets/<name>, so the secret must be mounted there — the
 	// short form `secrets: [<name>]` in stack.yml does exactly that.
 	RegistryAuth string `json:"registryAuth,omitempty" yaml:"registryAuth,omitempty"`
+
+	// Allow is what this application's charts may reach outside the releases
+	// they install. Absent means nothing, which is the safe reading of a field
+	// nobody wrote.
+	Allow Allow `json:"allow" yaml:"allow,omitempty"`
 
 	Destination    Destination    `json:"destination" yaml:"destination"`
 	SyncPolicy     SyncPolicy     `json:"syncPolicy" yaml:"syncPolicy"`
@@ -106,6 +113,95 @@ var repoNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 // permits a leading '.', '-' or '_' — and it is the one this repository owns,
 // which is what makes the guarantee independent of a version in go.mod.
 func ValidRepositoryName(name string) bool { return repoNameRE.MatchString(name) }
+
+// Allow is what an operator permits one application's charts to reach outside
+// the releases they install: paths on the nodes those releases run on, and the
+// cluster-global names of resources some other stack owns.
+//
+// # An allowlist, and why it is not a denylist
+//
+// Anything not named here is refused. The other direction leaves whatever
+// nobody thought of permitted, and the family of holes swarmcli-cd#103 closed —
+// a bind of the docker socket, a mount of the controller's own volume, a join of
+// its network — was "nobody thought of it" in each case until somebody did. The
+// compose language keeps growing and the swarm's namespace of names is shared by
+// every tenant on it, so the set of things worth forbidding is not one anybody
+// can finish enumerating; the set an application actually needs is.
+//
+// # Why it lives in the app set
+//
+// The app-set repository is root-equivalent and is meant to be protected as
+// such, separately from any application's own chart repository, "so that being
+// able to change an app's chart is not the same permission as being able to add
+// an app" (docs/configuration.md). A chart author who could widen their own
+// permissions — a field in a release file, a value in a chart — would collapse
+// those two into one, which is the boundary the whole design rests on. So this
+// is a field of Spec and there is deliberately no equivalent anywhere a chart
+// can write.
+//
+// # What it cannot say
+//
+// It cannot name the controller's own secrets, configs, volume or network, or
+// the chart engine's release records. Those are refused before this is consulted
+// (backend.rejectForbiddenResources), and no entry here changes that. Permitting
+// one would not be an operator granting an application something of the
+// operator's; it would be handing the chart author the controller's own
+// credentials and, with them, the app set — the boundary above, approached from
+// the other side. An operator who wants an application on the controller's
+// network attaches the controller to a shared network instead, which is a
+// topology decision and was never refused.
+type Allow struct {
+	// HostPaths are the paths on a node that this application's charts may bind.
+	//
+	// A listed path permits itself and everything under it, because that is what
+	// a bind of a directory already is: a container given /srv/app has
+	// /srv/app/data. So "/var/run" grants the docker socket and "/" grants the
+	// node, both of which are the operator having said so.
+	//
+	// This is the one entry that gives a capability back rather than only
+	// narrowing one. A bind of /var/run/docker.sock is what Traefik's swarm
+	// provider, a Portainer agent and an autoheal sidecar *are*, and #103 had to
+	// refuse all three flat because there was nowhere to say otherwise.
+	HostPaths []string `json:"hostPaths,omitempty" yaml:"hostPaths,omitempty"`
+
+	// Secrets are the Docker secrets a chart may reference without declaring.
+	Secrets []string `json:"secrets,omitempty" yaml:"secrets,omitempty"`
+	// Configs are the Docker configs a chart may reference without declaring.
+	Configs []string `json:"configs,omitempty" yaml:"configs,omitempty"`
+	// Volumes are the named volumes a chart may mount that are not its own.
+	Volumes []string `json:"volumes,omitempty" yaml:"volumes,omitempty"`
+	// Networks are the networks a chart may join that it does not create.
+	Networks []string `json:"networks,omitempty" yaml:"networks,omitempty"`
+}
+
+// PermitsPath reports whether source is a host path this application's charts
+// may bind.
+//
+// Containment rather than equality, in one direction only: a listed path permits
+// everything under it, and nothing above it. Permitting /srv/app therefore does
+// not permit /srv or /, which contain it — the entry an operator wrote is a
+// ceiling, not a hint.
+//
+// Lexical, and on the path package rather than path/filepath deliberately: the
+// string names a filesystem on whichever node runs the task, which is the one
+// filesystem this controller cannot read, so there is no symlink to resolve and
+// no separator but "/" that could apply. Clean folds "..", doubled separators
+// and a trailing slash, which is the whole of what a manifest can vary without
+// naming somewhere else.
+//
+// It takes an absolute source, which is what the caller has already established:
+// a relative bind source is refused before this, because it has no referent at
+// all rather than an impermissible one.
+func (a Allow) PermitsPath(source string) bool {
+	clean := path.Clean(source)
+	for _, allowed := range a.HostPaths {
+		root := path.Clean(allowed)
+		if root == "/" || clean == root || strings.HasPrefix(clean, root+"/") {
+			return true
+		}
+	}
+	return false
+}
 
 // Destination names the swarm, resolved through the SwarmRegistry seam. Empty
 // means the local swarm, which is the only one Phase 1 can resolve.

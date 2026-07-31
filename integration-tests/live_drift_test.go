@@ -37,7 +37,7 @@ func TestLiveDriftIsNotReportedOnAnUntouchedStack(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 2))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("clean", repo, true))
+	rec := reconciler(t, richApp("clean", repo, release, true))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "clean"); err != nil {
@@ -288,7 +288,7 @@ func TestLiveDriftDetectsAnOutOfBandPublishedPort(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("ports", repo, false))
+	rec := reconciler(t, richApp("ports", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "ports"); err != nil {
@@ -356,7 +356,7 @@ func TestLiveDriftDetectsAndRestoresADetachedNetwork(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("network", repo, false))
+	rec := reconciler(t, richApp("network", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "network"); err != nil {
@@ -410,7 +410,7 @@ func TestLiveDriftDetectsAndRestoresTheEndpointMode(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("endpoint", repo, false))
+	rec := reconciler(t, richApp("endpoint", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "endpoint"); err != nil {
@@ -471,7 +471,7 @@ func TestLiveDriftReportsAnAttachmentOutsideTheStack(t *testing.T) {
 	}
 	t.Cleanup(func() { removeNetworkWhenReleased(t, cli, shared) })
 
-	rec := reconciler(t, liveDriftApp("extra", repo, false))
+	rec := reconciler(t, richApp("extra", repo, release, false))
 	if err := rec.SyncNow(ctx, "extra"); err != nil {
 		t.Fatalf("SyncNow = %v, want nil", err)
 	}
@@ -550,7 +550,7 @@ func TestLiveDriftDetectsAnOutOfBandMountRemoval(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("mount", repo, false))
+	rec := reconciler(t, richApp("mount", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "mount"); err != nil {
@@ -606,7 +606,7 @@ func TestLiveDriftDetectsAnOutOfBandSecretRemoval(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("secret", repo, false))
+	rec := reconciler(t, richApp("secret", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "secret"); err != nil {
@@ -663,7 +663,7 @@ func TestLiveDriftDetectsAnOutOfBandUpdateConfig(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("update", repo, false))
+	rec := reconciler(t, richApp("update", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "update"); err != nil {
@@ -714,7 +714,7 @@ func TestLiveDriftDetectsAnOutOfBandHealthcheck(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("health", repo, false))
+	rec := reconciler(t, richApp("health", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "health"); err != nil {
@@ -765,7 +765,7 @@ func TestLiveDriftDetectsOutOfBandLiteralFields(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("literal", repo, false))
+	rec := reconciler(t, richApp("literal", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "literal"); err != nil {
@@ -826,7 +826,7 @@ func TestLiveDriftDetectsOutOfBandContainerFields(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("surface", repo, false))
+	rec := reconciler(t, richApp("surface", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "surface"); err != nil {
@@ -925,7 +925,7 @@ func TestLiveDriftDetectsAndRestoresADeletedService(t *testing.T) {
 	repo := gitRepo(t, richChartFiles(t, release, 1))
 	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
 
-	rec := reconciler(t, liveDriftApp("missing", repo, false))
+	rec := reconciler(t, richApp("missing", repo, release, false))
 	ctx := context.Background()
 
 	if err := rec.SyncNow(ctx, "missing"); err != nil {
