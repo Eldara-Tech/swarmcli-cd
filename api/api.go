@@ -267,6 +267,11 @@ func (s *Server) detach(_ string, run func(context.Context)) {
 	go run(context.WithoutCancel(context.Background()))
 }
 
+// Drain ends every connected event stream. The caller registers it with
+// http.Server.RegisterOnShutdown; see stream.closeAll for why Shutdown cannot
+// do it on its own.
+func (s *Server) Drain() { s.events.closeAll() }
+
 // Notify feeds the event stream. It is the notify.Notifier implementation; the
 // caller registers it.
 func (s *Server) Notify(ctx context.Context, e notifyEvent) { s.events.publish(ctx, e) }

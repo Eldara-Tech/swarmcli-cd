@@ -3960,3 +3960,35 @@ func TestMountedVolumesToleratesAServiceWithNoContainerSpec(t *testing.T) {
 		t.Errorf("mountedVolumes = %v, want nil", got)
 	}
 }
+
+// The runtime half of the floor. An app set is reconciled from git, so
+// syncPolicy.interval is chosen by whoever can commit to that repository, and
+// `interval: 1ms` made one application monopolise the reconciler and starve
+// every other one.
+//
+// Clamped and not refused: refusing would stop the whole file from being
+// applied. `validate` is where it is refused, with somebody present to fix it.
+func TestAnIntervalBelowTheFloorIsClamped(t *testing.T) {
+	r := newTest(t, nil, &fakeEngine{}, nil)
+
+	fast := spec("edge", true)
+	fast.SyncPolicy.Interval = application.Duration(time.Millisecond)
+	if got := r.intervalFor(fast); got != application.MinInterval {
+		t.Errorf("intervalFor(1ms) = %s, want the %s floor", got, application.MinInterval)
+	}
+
+	// Above the floor is left exactly as declared: this is a floor, not a
+	// rounding.
+	slow := spec("edge", true)
+	slow.SyncPolicy.Interval = application.Duration(90 * time.Second)
+	if got := r.intervalFor(slow); got != 90*time.Second {
+		t.Errorf("intervalFor(90s) = %s, want it untouched", got)
+	}
+
+	// And the controller-wide interval is not floored, because it is not the
+	// untrusted one — it is set by whoever runs the controller.
+	r.interval = time.Millisecond
+	if got := r.intervalFor(spec("edge", true)); got != time.Millisecond {
+		t.Errorf("intervalFor(no policy) = %s, want the controller-wide interval untouched", got)
+	}
+}

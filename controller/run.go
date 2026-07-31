@@ -59,9 +59,15 @@ const (
 const defaultAppSetFile = "applications.yaml"
 
 // shutdownTimeout bounds how long in-flight requests have to finish once a
-// signal has arrived. Swarm sends SIGKILL ten seconds after SIGTERM by default,
-// so anything longer would be cut off mid-drain.
-const shutdownTimeout = 5 * time.Second
+// signal has arrived.
+//
+// Swarm sends SIGKILL ten seconds after SIGTERM by default, and that budget is
+// now shared: the listener drains first and the reconciler drains after it, so
+// this is the smaller half rather than the whole. Three seconds is enough
+// because the one thing that used to sit here for the full timeout — an event
+// stream, which never goes idle — is ended by RegisterOnShutdown instead of
+// waited out.
+const shutdownTimeout = 3 * time.Second
 
 var controllerUsage = `Usage: swarmcli-cd controller [options]
 
@@ -393,6 +399,11 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// Shutdown waits for connections to go idle and an event stream never does,
+	// so without this every shutdown with a UI attached burned the whole timeout
+	// and then reported a failure that had not happened.
+	httpSrv.RegisterOnShutdown(srv.Drain)
+
 	log.Info("starting",
 		"applications", len(cfg.Applications), "listen", o.listen,
 		"mode", mode, "appSet", sourceDesc,
@@ -502,30 +513,46 @@ func appSetSource(o options, auth git.Auth, root string) (*appset.Loader, string
 // others: a listener that cannot bind must not leave a controller reconciling
 // with no way to observe it, and a reconciler that returns must not leave an API
 // serving views that will never update.
+// The two are stopped in that order and not together, which is the whole of the
+// shutdown fix. One context used to cancel the reconciler the moment the signal
+// arrived and only then drain the listener, so the gap between them was a window
+// in which a POST /sync was still accepted, spawned a detached deploy, and ran
+// on after the reconciler had provably stopped — with Shutdown seeing nothing in
+// flight and reporting a clean exit over a process leaving mid-apply.
+//
+// So the listener goes down first: it is the only thing that can create new
+// work, and once it is drained the reconciler cannot be given anything more to
+// do. Then the reconciler is cancelled and drains what it already had.
 func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, loop *appset.Loop, httpSrv *http.Server, log *slog.Logger) error {
-	ctx, stop := context.WithCancel(ctx)
-	defer stop()
+	// stopping is the "something ended" signal, whichever peer ends first.
+	stopping, stopAll := context.WithCancel(ctx)
+	defer stopAll()
+
+	// The reconcile side outlives it deliberately, so it is not cancelled by the
+	// same signal that starts the listener's drain.
+	recCtx, stopReconciling := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopReconciling()
 
 	errs := make(chan error, 3)
 
 	go func() {
-		err := rec.Run(ctx)
+		err := rec.Run(recCtx)
 		// The loop returns ctx.Err() when it was asked to stop. That is how it
 		// reports a clean shutdown, not a failure — treating it as one would
 		// make every SIGTERM a non-zero exit and, under Swarm, a restart loop.
 		if errors.Is(err, context.Canceled) {
 			err = nil
 		}
-		stop()
+		stopAll()
 		errs <- err
 	}()
 
 	go func() {
-		err := loop.Run(ctx)
+		err := loop.Run(recCtx)
 		if errors.Is(err, context.Canceled) {
 			err = nil
 		}
-		stop()
+		stopAll()
 		errs <- err
 	}()
 
@@ -534,20 +561,23 @@ func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, loop *appse
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
-		stop()
+		stopAll()
 		errs <- err
 	}()
 
-	<-ctx.Done()
+	<-stopping.Done()
 	log.Info("stopping")
 
-	// Not ctx: it is already cancelled, and Shutdown given a cancelled context
-	// returns immediately without draining anything.
+	// Not the signal context: it is already cancelled, and Shutdown given a
+	// cancelled context returns immediately without draining anything.
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("the API did not shut down cleanly", "error", err)
 	}
+
+	// Only now, with nothing able to ask for more.
+	stopReconciling()
 
 	return errors.Join(<-errs, <-errs, <-errs)
 }
