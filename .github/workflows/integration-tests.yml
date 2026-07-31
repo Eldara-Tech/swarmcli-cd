@@ -63,10 +63,15 @@ jobs:
           docker node ls
           go version
 
-      # Pre-pull the fixture image so the first deploy's convergence wait is not
-      # racing a cold pull on a slow runner.
-      - name: Pre-pull the fixture image
-        run: docker pull busybox:1.36
+      # Pre-pull the fixture images so the first deploy's convergence wait is not
+      # racing a cold pull on a slow runner. Two references, not one: every chart
+      # but bareImageChartFiles names busybox:1.36, and that one names busybox
+      # bare precisely because no other fixture can show what the client does to
+      # an untagged reference — which is a different image to fetch.
+      - name: Pre-pull the fixture images
+        run: |
+          docker pull busybox:1.36
+          docker pull busybox
 
       # 25m against a suite that takes about 15 on a healthy runner. Each of these
       # tests deploys a real stack and waits for it to converge, so the total

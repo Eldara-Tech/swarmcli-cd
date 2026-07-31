@@ -358,6 +358,44 @@ func TestExistingNetworkIsNotRecreatedButIsReported(t *testing.T) {
 	}
 }
 
+// Every option the diff compares, one at a time.
+//
+// The warning above is the only signal there is. Swarm cannot update a network
+// in place, so a live network that no longer matches its manifest is never
+// corrected and never will be — an operator reading this log line is the whole
+// remedy. An option the diff quietly stopped comparing is therefore a manifest
+// that says one thing while the swarm does another, permanently and silently,
+// which is the failure `docker stack deploy` was faulted for in #1.
+//
+// Only attachable was ever exercised, so driver and internal could each be
+// deleted with the suite green.
+func TestNetworkDiffNamesEveryOptionItCompares(t *testing.T) {
+	want := network.CreateOptions{Driver: "overlay", Attachable: true, Internal: true}
+	match := network.Summary{Driver: "overlay", Attachable: true, Internal: true}
+
+	for _, tc := range []struct {
+		option string
+		got    network.Summary
+	}{
+		{"driver", network.Summary{Driver: "macvlan", Attachable: true, Internal: true}},
+		{"attachable", network.Summary{Driver: "overlay", Attachable: false, Internal: true}},
+		{"internal", network.Summary{Driver: "overlay", Attachable: true, Internal: false}},
+	} {
+		t.Run(tc.option, func(t *testing.T) {
+			diff := networkDiff(want, tc.got)
+			if len(diff) != 1 || !strings.HasPrefix(diff[0], tc.option+"(") {
+				t.Fatalf("networkDiff = %v, want only %s reported", diff, tc.option)
+			}
+		})
+	}
+
+	// And nothing at all when they agree: a warning on every reconcile of a
+	// correct network is a warning nobody reads.
+	if diff := networkDiff(want, match); len(diff) != 0 {
+		t.Errorf("networkDiff = %v, want nothing for a network that matches", diff)
+	}
+}
+
 // A network the manifest names but the swarm lacks is created, with the driver
 // `docker stack deploy` would have assumed.
 func TestMissingNetworkIsCreatedWithTheDefaultDriver(t *testing.T) {
@@ -825,13 +863,24 @@ func TestRemoveStackAcceptsAFailureThatLeftNothingBehind(t *testing.T) {
 
 // Release-history configs stay behind on purpose, so the re-check must not read
 // them as "the stack is still here" and turn every removal into a failure.
+//
+// The namespace label on the record is what makes this test the test it is
+// named for. Without it the re-check's own ConfigList filters the record out
+// before the skip is reached, so the loop never runs and the case is asserted
+// only by coincidence — the same mislabelled record
+// TestRemoveStackNeverDeletesReleaseRecords uses, and the same reason: the skip
+// is the second line of defence, and only a record the filter lets through
+// exercises it.
 func TestRemoveStackIgnoresReleaseRecordsWhenRechecking(t *testing.T) {
 	api := &fakeAPI{
 		networks: []network.Summary{stackNetwork("net", "s_front", "s")},
 		configs: []swarm.Config{{ID: "rel", Spec: swarm.ConfigSpec{
 			Annotations: swarm.Annotations{
-				Name:   "swarmcli.release.s.v1",
-				Labels: map[string]string{charts.LabelType: charts.TypeRelease},
+				Name: "swarmcli.release.s.v1",
+				Labels: map[string]string{
+					charts.LabelType:       charts.TypeRelease,
+					convert.LabelNamespace: "s",
+				},
 			},
 		}}},
 		removeErr:  map[string]error{"network:net": errors.New("network net not found")},
@@ -840,6 +889,54 @@ func TestRemoveStackIgnoresReleaseRecordsWhenRechecking(t *testing.T) {
 
 	if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
 		t.Fatalf("RemoveStack = %v, want nil; the release record is not the stack", err)
+	}
+	// And it is still there to be read, which is the whole point of leaving it.
+	if slices.Contains(api.removed, "config:rel") {
+		t.Error("the release record was deleted by the removal it was meant to survive")
+	}
+}
+
+// The other side of that re-check, one kind at a time.
+//
+// stackRemains asks about services, then configs, then secrets, then networks,
+// and returns at the first that answers "still here" — so a check that was
+// deleted is only caught by a case in which its kind is the *only* thing left.
+// Each case below refuses one removal and leaves nothing else behind.
+//
+// What it decides is not cosmetic. A "false" here is RemoveStack reporting
+// success, which lets prune.Release call engine.Uninstall and delete the
+// owner-stamped release records — the evidence that these resources were ever
+// ours. Doing that with the stack still up strands them permanently, invisible
+// to every future prune.
+//
+// The network case is TestRemoveStackStillFailsOnARealError above.
+func TestRemoveStackReportsWhicheverKindIsStillThere(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		api  *fakeAPI
+	}{
+		{"service", &fakeAPI{
+			existing:  []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{Name: "s_web"}}}},
+			removeErr: map[string]error{"service:svc": errors.New("service is being updated")},
+		}},
+		{"config", &fakeAPI{
+			configs:   []swarm.Config{{ID: "cfg", Spec: swarm.ConfigSpec{Annotations: stackScoped("s_site", "s")}}},
+			removeErr: map[string]error{"config:cfg": errors.New("config is in use")},
+		}},
+		{"secret", &fakeAPI{
+			secrets:   []swarm.Secret{{ID: "sec", Spec: swarm.SecretSpec{Annotations: stackScoped("s_key", "s")}}},
+			removeErr: map[string]error{"secret:sec": errors.New("secret is in use")},
+		}},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			err := testBackend(t, tc.api, nil).RemoveStack("s")
+			if err == nil {
+				t.Fatalf("RemoveStack = nil, but the %s is still on the swarm; reporting success here deletes the release history that proves it is ours", tc.kind)
+			}
+			if !strings.Contains(err.Error(), "in use") && !strings.Contains(err.Error(), "being updated") {
+				t.Errorf("RemoveStack = %v, want the daemon's refusal surfaced", err)
+			}
+		})
 	}
 }
 
@@ -962,6 +1059,34 @@ func TestDeployStackRefusesMountingTheControllersOwnConfig(t *testing.T) {
 	// Refused whole: nothing was created before the reject.
 	if len(api.order) != 0 || len(api.created) != 0 {
 		t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+	}
+}
+
+// Which container the guard asks about, which is the premise everything above
+// rests on and the one thing none of it asserts.
+//
+// In a container the hostname is the container id unless somebody overrode it,
+// and that is what makes this process resolvable from the inside. Ask about
+// anything else and a real daemon answers not-found — which readSelfMounts reads
+// as "not a swarm task", correctly, and so returns empty sets. The guard is then
+// off: every stack may mount the controller's own configs and secrets, on a
+// healthy daemon, silently, with the whole suite green.
+func TestTheSelfGuardIdentifiesThisContainerByItsHostname(t *testing.T) {
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := asController(&fakeAPI{
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"},
+		}}},
+	})
+
+	if err := testBackend(t, api, nil).DeployStack("tenant", mountsControllerConfig, ResolveNever); err == nil {
+		t.Fatal("DeployStack = nil; the guard did not recognise this process as the controller")
+	}
+	if !reflect.DeepEqual(api.inspectedIDs, []string{host}) {
+		t.Errorf("inspected %v, want this process's hostname %q — no other id resolves to this container", api.inspectedIDs, host)
 	}
 }
 
@@ -1212,6 +1337,10 @@ func TestTheControllersOwnMountsAreReadOnce(t *testing.T) {
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	})
+	// The fake now records service creates, so the second deploy sees the first's
+	// services. A real DeployStack writes a release record on the way through;
+	// the fake does not, so stand one in or the ownership guard refuses (#102).
+	installed(api, "s")
 	b := testBackend(t, api, nil)
 
 	for range 3 {
@@ -1382,6 +1511,10 @@ func TestAContainerThisDaemonDoesNotKnowIsAnAnswer(t *testing.T) {
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	}
+	// The fake now records service creates, so the second deploy sees the first's
+	// services. A real DeployStack writes a release record on the way through;
+	// the fake does not, so stand one in or the ownership guard refuses (#102).
+	installed(api, "s")
 	b := testBackend(t, api, nil)
 
 	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {

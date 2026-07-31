@@ -7,10 +7,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -356,17 +363,117 @@ func TestTriggeredSyncOutlivesTheRequest(t *testing.T) {
 	}
 }
 
+// openRoutes are the patterns that are deliberately not behind the guard. One,
+// and it is argued for where it is registered: a container healthcheck runs
+// beside the process and cannot carry a credential.
+//
+// Anything else added to Handler() is guarded or this test fails, which is the
+// whole point of deriving the list rather than writing it down.
+var openRoutes = map[string]bool{"GET /healthz": true}
+
+// registeredRoutes reads the routes Handler() registers out of this package's
+// own source, so that adding one to the mux adds it to this test too.
+//
+// A hardcoded list cannot do that. It is the list that stays as it was while
+// Handler() grows, and a route missing from it is a route serving the docker
+// socket to anyone who can reach the port — the one failure this package exists
+// to prevent, passing CI green.
+//
+// net/http will not answer the question directly. ServeMux keeps its patterns
+// unexported and offers no way to walk them; Handler(r) names the pattern that
+// matched a request, which is a request the caller already had to know how to
+// build. The alternatives were exporting a route table from api.go purely so a
+// test could read it, or writing the list twice. Reading the registrations costs
+// neither and fails closed in both directions: a call this cannot see is a route
+// that is not registered, and a source tree it cannot parse fails outright below
+// rather than silently yielding nothing to check.
+func registeredRoutes(t *testing.T) []string {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parsing this package: %v", err)
+	}
+
+	var out []string
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok || len(call.Args) == 0 {
+					return true
+				}
+				// Any x.Handle / x.HandleFunc, not just one named receiver: a
+				// second mux, or a route registered from another file in this
+				// package, is exactly what must not slip past.
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || (sel.Sel.Name != "Handle" && sel.Sel.Name != "HandleFunc") {
+					return true
+				}
+				lit, ok := call.Args[0].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				pattern, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					return true
+				}
+				out = append(out, pattern)
+				return true
+			})
+		}
+	}
+
+	// A parse that found nothing, or found something other than the routes, is
+	// a broken test rather than a passing one.
+	if len(out) == 0 {
+		t.Fatal("no routes found in this package's source; the registrations moved and this test stopped checking anything")
+	}
+	for pattern := range openRoutes {
+		if !slices.Contains(out, pattern) {
+			t.Fatalf("routes %v do not include the exempted %q; either it is gone or these are not the registrations", out, pattern)
+		}
+	}
+	return out
+}
+
+// wildcard fills a pattern's {app} — or any other wildcard a later route
+// introduces — with the application the fakes hold, so that a request reaches
+// the guard rather than the router's own 404.
+var wildcard = regexp.MustCompile(`\{[^}]*\}`)
+
+// route is one request to send at the router.
+type route struct{ method, path string }
+
+// request turns a registered pattern into the request to send at it.
+func request(pattern string) route {
+	method, path, ok := strings.Cut(pattern, " ")
+	if !ok {
+		// A pattern with no method matches every method; GET will do.
+		return route{"GET", wildcard.ReplaceAllString(pattern, "edge")}
+	}
+	return route{method, wildcard.ReplaceAllString(path, "edge")}
+}
+
 // The controller holds write access to the swarm, so an unauthenticated API is
 // a root shell. Nothing behind the guard runs until both checks pass.
+//
+// The routes come from Handler()'s own registrations rather than from a list
+// kept beside them, so a route added without a guard fails here instead of
+// shipping.
 func TestEveryApiEndpointIsGuarded(t *testing.T) {
-	paths := []struct{ method, path string }{
-		{"GET", "/api/v1/status"},
-		{"GET", "/api/v1/applications"},
-		{"GET", "/api/v1/applications/edge"},
-		{"GET", "/api/v1/applications/edge/diff"},
-		{"GET", "/api/v1/applications/edge/history"},
-		{"POST", "/api/v1/applications/edge/sync"},
-		{"GET", "/api/v1/events"},
+	var paths []route
+	for _, pattern := range registeredRoutes(t) {
+		if openRoutes[pattern] {
+			continue
+		}
+		paths = append(paths, request(pattern))
+	}
+	if len(paths) == 0 {
+		t.Fatal("every registered route is exempted; this test checks nothing")
 	}
 
 	t.Run("authentication", func(t *testing.T) {

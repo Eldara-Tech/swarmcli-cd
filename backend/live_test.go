@@ -260,8 +260,14 @@ func TestResourceRemovalsGoByID(t *testing.T) {
 // Already gone is the outcome the caller wanted. It is also routine for a
 // network: Swarm garbage-collects an overlay once its last task leaves, which
 // happens while the services that used it are still shutting down.
+//
+// Services included, and they are the reason this matters most: RemoveService
+// is the whole of the applier's delete surface, and a sweep that raced another
+// deletion has still got the outcome it wanted. Treating that as a failure would
+// make every retry of a part-failed sweep fail forever.
 func TestResourceRemovalsTolerateSomethingAlreadyGone(t *testing.T) {
 	api := &fakeAPI{removeErr: map[string]error{
+		"service:s1": errdefs.ErrNotFound,
 		"network:n1": errdefs.ErrNotFound,
 		"config:c1":  errdefs.ErrNotFound,
 		"secret:k1":  errdefs.ErrNotFound,
@@ -269,6 +275,9 @@ func TestResourceRemovalsTolerateSomethingAlreadyGone(t *testing.T) {
 	b := testBackend(t, api, nil)
 	ctx := context.Background()
 
+	if err := b.RemoveService(ctx, "s1"); err != nil {
+		t.Errorf("RemoveService = %v, want nil for one already gone", err)
+	}
 	if err := b.RemoveNetwork(ctx, "n1"); err != nil {
 		t.Errorf("RemoveNetwork = %v, want nil for one already gone", err)
 	}
@@ -278,18 +287,36 @@ func TestResourceRemovalsTolerateSomethingAlreadyGone(t *testing.T) {
 	if err := b.RemoveSecret(ctx, "k1"); err != nil {
 		t.Errorf("RemoveSecret = %v, want nil for one already gone", err)
 	}
+	// Each was still attempted, by the id it was given: tolerating a not-found
+	// must not become skipping the call.
+	want := []string{"service:s1", "network:n1", "config:c1", "secret:k1"}
+	if !slices.Equal(api.removed, want) {
+		t.Errorf("removed %v, want %v", api.removed, want)
+	}
 }
 
 // A refusal is not a not-found. Swarm refuses to remove anything still in use,
 // and that has to reach the caller so it can report it and try again.
 func TestResourceRemovalSurfacesARefusal(t *testing.T) {
 	api := &fakeAPI{removeErr: map[string]error{
-		"config:c1": errors.New("config c1 is in use by service s_web"),
+		"config:c1":  errors.New("config c1 is in use by service s_web"),
+		"service:s1": errors.New("rpc error: code = Unknown desc = update out of sequence"),
 	}}
+	b := testBackend(t, api, nil)
 
-	err := testBackend(t, api, nil).RemoveConfig(context.Background(), "c1")
+	err := b.RemoveConfig(context.Background(), "c1")
 	if err == nil || !strings.Contains(err.Error(), "in use") {
 		t.Fatalf("RemoveConfig = %v, want the daemon's refusal surfaced", err)
+	}
+	// The service half. A delete that failed for any reason other than "it is
+	// already gone" leaves the service running, and the sweep has to hear that:
+	// it is what stops prune recording the release as departed.
+	err = b.RemoveService(context.Background(), "s1")
+	if err == nil || !strings.Contains(err.Error(), "out of sequence") {
+		t.Fatalf("RemoveService = %v, want the daemon's refusal surfaced", err)
+	}
+	if !strings.Contains(err.Error(), "s1") {
+		t.Errorf("error %q does not name the service that would not go", err)
 	}
 }
 
