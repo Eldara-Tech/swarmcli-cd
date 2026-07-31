@@ -216,6 +216,66 @@ func hasTag(image, tag string) bool {
 	return len(image) > len(tag) && image[:len(tag)] == tag && image[len(tag)] == '@'
 }
 
+// The other image case, and the one nothing in this suite could previously see:
+// a reference the *client* rewrites before the daemon is ever asked to store it.
+//
+// Every other chart here names `busybox:1.36`, which is already what the client
+// would send — so the clean test above, whose entire job is to prove that an
+// untouched stack reports nothing, was blind to the whole normalisation. That is
+// how swarmcli-cd#104 shipped, and this is the test that would have caught it.
+//
+// Two assertions, and the first is what keeps the second honest. Asserting only
+// "no drift" would go on passing if the daemon stopped rewriting anything at
+// all, proving nothing about a comparison that would then be normalising against
+// a premise no longer true — the failure the #54 and #62 retrospectives are
+// about. So what the daemon actually stored is read first, and it must be the
+// rewritten reference.
+func TestLiveDriftIsNotReportedOnAnUnnormalisedImage(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-live-bare-image"
+	repo := gitRepo(t, bareImageChartFiles(release))
+	t.Cleanup(func() { removeStack(t, release) })
+
+	rec := reconciler(t, liveDriftApp("bare", repo, true))
+	ctx := context.Background()
+
+	if err := rec.SyncNow(ctx, "bare"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
+
+	// The premise, against a real daemon: neither reference is stored as the
+	// manifest wrote it. hasTag rather than equality because a deploy that
+	// resolved the tag would append a digest, which is a separate normalisation
+	// and not the one under test.
+	for service, stored := range map[string]string{
+		release + "_bare":      "busybox:latest",
+		release + "_qualified": "busybox:1.36",
+	} {
+		if img := serviceOf(t, cli, service).Spec.TaskTemplate.ContainerSpec.Image; !hasTag(img, stored) {
+			t.Fatalf("%s: stored image = %q, want the client's rewrite %q — if this is no longer "+
+				"what the daemon does, the desired side is being normalised to match nothing",
+				service, img, stored)
+		}
+	}
+
+	// Twice, like the clean test: the first reconcile follows the deploy that
+	// wrote the spec, the second sees it only as the daemon returns it.
+	for _, pass := range []string{"after the deploy", "on the next reconcile"} {
+		if err := rec.Sync(ctx, "bare"); err != nil {
+			t.Fatalf("Sync %s = %v, want nil", pass, err)
+		}
+		d := driftOf(t, rec, "bare")
+		if d == nil {
+			t.Fatalf("%s: no drift axis at all on a live-mode application", pass)
+		}
+		if d.State != application.DriftStateNone {
+			t.Errorf("%s: drift = %q with %+v, want none — nothing was touched",
+				pass, d.State, d.Services)
+		}
+	}
+}
+
 // A published port moved by hand.
 //
 // A port has no stable key — two publishes can share a target, a protocol and a

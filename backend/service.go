@@ -218,9 +218,11 @@ func (b *Backend) updateService(ctx context.Context, name string, cur swarm.Serv
 func prepareUpdate(cur swarm.Service, spec swarm.ServiceSpec, resolve string) (swarm.ServiceSpec, swarm.ServiceUpdateOptions) {
 	var opts swarm.ServiceUpdateOptions
 
-	// The image the manifest asked for last time, before the daemon resolved it
-	// to a digest. Comparing against the live spec's image would compare a tag
-	// with a digest and never match.
+	// The image the manifest asked for last time, exactly as it was written:
+	// convert.Service copies the manifest's own string into the label and neither
+	// tags nor familiarises it. The live spec's image has had both done to it —
+	// the client's, on the way out, and the daemon's resolved digest on top — so
+	// the two are only comparable through cdcompose.SameImage below.
 	deployed := cur.Spec.Labels[convert.LabelImage]
 
 	// Neither container spec is guaranteed. A swarm.TaskSpec carries a
@@ -250,19 +252,19 @@ func prepareUpdate(cur swarm.Service, spec swarm.ServiceSpec, resolve string) (s
 		opts.QueryRegistry = true
 	case resolve == ResolveChanged && wanted != deployed:
 		opts.QueryRegistry = true
-	case want != nil && live != nil && wanted == deployed && sameImageTag(live.Image, deployed):
+	case want != nil && live != nil && wanted == deployed && cdcompose.SameImage(live.Image, deployed):
 		// Same tag as last time, so keep the digest the daemon resolved it to.
 		// Writing the bare tag back would differ from the live spec and
 		// redeploy every task for no reason.
 		//
-		// The second condition is what makes that reasoning true. Keeping the
-		// live image is only right while it *is* the digest our tag resolved
-		// to, and an out-of-band `docker service update --image` breaks that:
-		// it rewrites ContainerSpec.Image and leaves the stack label alone, so
-		// the label still names our tag and this case still matches. Without
-		// the check, correcting an image someone changed by hand would write
-		// their image straight back — the one kind of drift a converge would
-		// silently fail to undo.
+		// SameImage is what makes that reasoning true. Keeping the live image
+		// is only right while it *is* the digest our tag resolved to, and an
+		// out-of-band `docker service update --image` breaks that: it rewrites
+		// ContainerSpec.Image and leaves the stack label alone, so the label
+		// still names our tag and `wanted == deployed` still holds. Without the
+		// check, correcting an image someone changed by hand would write their
+		// image straight back — the one kind of drift a converge would silently
+		// fail to undo.
 		want.Image = live.Image
 	}
 
@@ -272,23 +274,6 @@ func prepareUpdate(cur swarm.Service, spec swarm.ServiceSpec, resolve string) (s
 	spec.TaskTemplate.ForceUpdate = cur.Spec.TaskTemplate.ForceUpdate
 
 	return spec, opts
-}
-
-// sameImageTag reports whether a live image is still the one the stack label
-// names, ignoring the digest the daemon appends when it resolves a tag.
-//
-// It is the test for "nobody has changed this image behind us". We write the
-// tag to both the spec and the label; the daemon only ever appends to the
-// former, so the two agree for as long as nothing else has written.
-func sameImageTag(live, label string) bool { return imageTag(live) == label }
-
-// imageTag strips a digest suffix. LastIndex rather than Cut so that a
-// reference containing more than one "@" loses only the digest.
-func imageTag(image string) string {
-	if i := strings.LastIndex(image, "@"); i >= 0 {
-		return image[:i]
-	}
-	return image
 }
 
 // isVersionConflict reports the "someone else wrote this first" failure.

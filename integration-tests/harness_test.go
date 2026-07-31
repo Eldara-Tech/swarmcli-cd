@@ -682,6 +682,48 @@ func jobApp(name, repoDir string) application.Spec {
 	return app
 }
 
+// bareImageChartFiles declares the two image references a manifest can write
+// that the daemon does not store as written.
+//
+// It gets its own chart for the reason jobChartFiles does, and the reason is the
+// finding: every other fixture here names `busybox:1.36`, which is already
+// exactly the reference docker's client would send, so not one of them — the
+// clean test included — could observe the client's own rewrite at all. That is
+// how swarmcli-cd#104 shipped. imageWithTagString runs
+// FamiliarString(TagNameOnly(ref)) over ContainerSpec.Image on the way into
+// every ServiceCreate and ServiceUpdate, unconditionally, so:
+//
+//   - `busybox` is stored as `busybox:latest`, and
+//   - `docker.io/library/busybox:1.36` is stored as `busybox:1.36`.
+//
+// Either one leaves the desired side saying one thing and the live side another
+// on a stack nobody has touched, which on an automated application is a redeploy
+// every tick for ever. Both are here because they are separate halves of the
+// rewrite and only the first needs anything pulled that the runner does not
+// already have — the second names the very image every other fixture uses, so it
+// exercises the registry-stripping half at no cost.
+func bareImageChartFiles(release string) map[string]string {
+	files := chartFiles(release, 1)
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  bare:\n" +
+		"    image: busybox\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    deploy:\n" +
+		"      replicas: {{ .Values.replicas }}\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"  qualified:\n" +
+		"    image: docker.io/library/busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    deploy:\n" +
+		"      replicas: {{ .Values.replicas }}\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n"
+	return files
+}
+
 // serviceOf finds one of a stack's services by its scoped name.
 func serviceOf(t *testing.T, cli *dockerclient.Client, name string) swarm.Service {
 	t.Helper()
