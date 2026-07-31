@@ -224,6 +224,42 @@ func TestUnreachableChartRepository(t *testing.T) {
 	}
 }
 
+// A release file is repository content, so the repositories it declares are
+// controlled by anyone who can land a commit — and the engine turns a repository
+// name into a path by concatenating it into the cache's "index-<name>.yaml".
+// The name below cleans back out to <root>/<app>/escaped.yaml, so without the
+// check the index this server serves is written there, and a name carrying more
+// "../" reaches the app set the controller deploys from (#100).
+//
+// The applications file never sees any of this: these names are not the
+// operator's, which is why the config loader's check cannot be the only one.
+func TestReleaseFileRepositoryNameEscapingTheCacheIsRefused(t *testing.T) {
+	index := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "apiVersion: v1\nentries: {}\n")
+	}))
+	defer index.Close()
+
+	co := tree(t, map[string]string{
+		"swarm/prod/swarmcli-release.yaml": "apiVersion: v1\nrepositories:\n" +
+			"  - name: ../../../../escaped\n    url: " + index.URL + "\n" +
+			"releases:\n  - name: hello\n    chart: ./charts/hello\n",
+		"swarm/prod/charts/hello/Chart.yaml": "apiVersion: v1\nname: hello\nversion: 0.1.0\n",
+	})
+
+	root := t.TempDir()
+	_, err := NewBuilder(root, nil).Build(context.Background(), "edge", application.Source{
+		ReleaseFile: "swarm/prod/swarmcli-release.yaml",
+	}, co)
+	if err == nil {
+		t.Error("Build = nil, want the traversing repository name to be refused")
+	} else if !strings.Contains(err.Error(), "edge") || !strings.Contains(err.Error(), "escaped") {
+		t.Errorf("error %q names neither the application nor the repository", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "edge", "escaped.yaml")); !os.IsNotExist(err) {
+		t.Errorf("an index was written outside the repository store: %v", err)
+	}
+}
+
 func TestMalformedReleaseFile(t *testing.T) {
 	co := tree(t, map[string]string{"r.yaml": "releases: [{name: hello, chart: ./c, nonsense: 1}]\n"})
 

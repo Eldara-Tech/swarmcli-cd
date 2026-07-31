@@ -173,6 +173,29 @@ driftDetection: manifest
 	}
 }
 
+// The charset has two jobs at once: narrow enough that a name cannot become a
+// path outside the chart engine's cache, wide enough to leave the naming real
+// chart repositories use alone.
+func TestValidRepositoryName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"swarmcli-charts":             true,
+		"swarmcli_charts.v2":          true,
+		"0charts":                     true,
+		"":                            false,
+		"..":                          false,
+		".hidden":                     false,
+		"has/slash":                   false,
+		`has\backslash`:               false,
+		"../../var/lib/swarmcli-cd/x": false,
+		"has space":                   false,
+		"-dash-first":                 false,
+	} {
+		if got := ValidRepositoryName(name); got != want {
+			t.Errorf("ValidRepositoryName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
 func TestSyncPolicyPruneFromYAML(t *testing.T) {
 	const src = `
 automated: true

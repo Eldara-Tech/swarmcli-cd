@@ -142,6 +142,9 @@ func TestValidationErrors(t *testing.T) {
 		"ref without ver":    {base("      chart: {release: h, ref: repo/chart}\n"), "version is required with a ref"},
 		"malformed ref":      {base("      chart: {release: h, ref: chart, version: \"1\"}\n"), "want repository/chart"},
 		"ref without repos":  {base("      chart: {release: h, ref: repo/chart, version: \"1\"}\n"), "needs source.chart.repositories"},
+		"traversal repo":     {base("      chart: {release: h, ref: repo/chart, version: \"1\", repositories: [{name: \"../../../../var/lib/swarmcli-cd/appset/applications\", url: https://x/}]}\n"), "repositories[0]: invalid name"},
+		"slash repo":         {base("      chart: {release: h, ref: repo/chart, version: \"1\", repositories: [{name: \"has/slash\", url: https://x/}]}\n"), "repositories[0]: invalid name"},
+		"leading dot repo":   {base("      chart: {release: h, ref: repo/chart, version: \"1\", repositories: [{name: \".hidden\", url: https://x/}]}\n"), "repositories[0]: invalid name"},
 		"escaping values":    {base("      chart: {release: h, path: ./c, values: [../../secrets.yaml]}\n"), "escapes the repository"},
 		"escaping chart":     {base("      chart: {release: h, path: ../../../charts/evil}\n"), "escapes the repository"},
 		"empty values entry": {base("      chart: {release: h, path: ./c, values: [\"\"]}\n"), "values[0] is required"},
@@ -232,6 +235,31 @@ applications:
 	_, err := Parse([]byte(src), "applications.yaml")
 	if err == nil || !strings.Contains(err.Error(), "needs both name and url") {
 		t.Errorf("Parse = %v, want an incomplete-repository error", err)
+	}
+}
+
+// The charset a chart repository name is held to has to leave the naming people
+// actually use alone: the refusals above are worth nothing if they also refuse
+// "swarmcli-charts_v2.1".
+func TestValidRepositoryNameAccepted(t *testing.T) {
+	const src = `
+applications:
+  - name: edge
+    source:
+      repoURL: https://x/y.git
+      revision: main
+      chart:
+        release: h
+        ref: swarmcli-charts_v2.1/whoami
+        version: "1"
+        repositories: [{name: swarmcli-charts_v2.1, url: "https://x/"}]
+`
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if got := f.Applications[0].Source.Chart.Repositories[0].Name; got != "swarmcli-charts_v2.1" {
+		t.Errorf("repository name = %q, want swarmcli-charts_v2.1", got)
 	}
 }
 

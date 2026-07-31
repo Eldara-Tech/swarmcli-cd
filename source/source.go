@@ -67,6 +67,23 @@ func (b *Builder) Build(ctx context.Context, app string, spec application.Source
 		return nil, err
 	}
 
+	// A repository name is a filesystem path before it is an identifier: the
+	// store below caches each index as "index-<name>.yaml", concatenated, so a
+	// name beginning "../" walks out of the cache and writes repository-supplied
+	// YAML wherever this process can — the app set included, which would then
+	// name the repositories the controller deploys from (#100).
+	//
+	// Checked here rather than in the config loader because a release file
+	// committed to the repository carries repositories of its own and never
+	// passes through it, and that is the copy anyone who can land a commit
+	// controls. Both source types have converged on a release file by this
+	// point, so neither can reach EnsureRepos without passing.
+	for _, r := range rf.Repositories {
+		if !application.ValidRepositoryName(r.Name) {
+			return nil, fmt.Errorf("application %q: %s declares chart repository %q: the name becomes a file in the chart cache, so letters, digits, dot, dash and underscore only, starting with a letter or digit", app, rf.Path, r.Name)
+		}
+	}
+
 	// A repository store per application, rather than the process-wide XDG
 	// default: two applications naming the same repository with different URLs
 	// would otherwise collide, and the engine refuses to repoint an existing
