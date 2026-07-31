@@ -237,7 +237,17 @@ func (b *Backend) DeleteConfig(ctx context.Context, name string) error {
 // --- pre-flight and cleanup for external resources ---
 
 // StackVolumes names the volumes carrying this stack's namespace label.
+//
+// Guarded like RemoveStack, and not only for symmetry: this is the list a purge
+// deletes from, and the chart engine's own Uninstall reaches it even when the
+// stack removal before it failed — it collects that error and carries on. A
+// release named for the controller's stack would name the volume holding every
+// application's git clone and chart cache, so the refusal has to be on the read
+// that produces the list rather than only on the removal that precedes it (#102).
 func (b *Backend) StackVolumes(ctx context.Context, name string) ([]string, error) {
+	if err := b.rejectOwnNamespace(ctx, name); err != nil {
+		return nil, err
+	}
 	resp, err := b.api.VolumeList(ctx, volume.ListOptions{Filters: stackFilter(name)})
 	if err != nil {
 		return nil, fmt.Errorf("listing the stack's volumes: %w", err)

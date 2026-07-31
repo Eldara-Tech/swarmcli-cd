@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/containerd/errdefs"
+	"github.com/docker/cli/cli/compose/convert"
 	"github.com/docker/docker/api/types/swarm"
 )
 
@@ -19,10 +20,21 @@ import (
 const serviceIDLabel = "com.docker.swarm.service.id"
 
 // selfMounts is what Swarm has mounted into this controller, by the names a
-// reference resolves by.
+// reference resolves by, and the stack it mounted them for.
 type selfMounts struct {
-	secrets map[string]struct{}
-	configs map[string]struct{}
+	// namespace is the stack this controller was deployed as — the
+	// com.docker.stack.namespace label on its own service, which for the shipped
+	// stack.yml is "swarmcli-cd". Empty for a controller that is not a swarm
+	// service.
+	//
+	// It is not a mount, and it is here because it comes off the same read: the
+	// service spec below already has to be fetched for the configs, and a release
+	// name is compared against this on every deploy and every removal. A second
+	// round trip for a label sitting beside one this already reads would be two
+	// caches to keep honest instead of one (#102).
+	namespace string
+	secrets   map[string]struct{}
+	configs   map[string]struct{}
 }
 
 // selfMountCache holds that answer for the life of the process.
@@ -46,7 +58,8 @@ type selfMountCache struct {
 }
 
 // mounts names the secrets and configs Swarm has mounted into this controller,
-// reading its own service spec the first time it is asked.
+// and the stack namespace it deployed it under, reading its own service spec the
+// first time it is asked.
 //
 // # Why the daemon rather than the filesystem
 //
@@ -81,8 +94,10 @@ type selfMountCache struct {
 // # When it answers nothing
 //
 // A controller that is not a swarm service — a `go run` during development, a
-// plain `docker run` — has nothing mounted by Swarm and gets empty sets and no
-// error. That is the true answer rather than a failure, and it is cached as one.
+// plain `docker run` — has nothing mounted by Swarm and no stack of its own, and
+// gets empty sets, an empty namespace and no error. That is the true answer
+// rather than a failure, and it is cached as one: both guards built on it go
+// quiet, because there is nothing there for a release to claim.
 //
 // A daemon that could not be asked is not that answer. It arrives here as an
 // error, is not cached, and fails the deploy that needed it — the two are easy to
@@ -147,14 +162,18 @@ func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 		return selfMounts{}, fmt.Errorf("inspecting this controller's own service: %w", err)
 	}
 
+	// Read before the container spec is looked at, and kept whatever that turns
+	// out to be: the namespace is a label on the service, so a controller running
+	// under a runtime this applier does not model still gets the name that must
+	// not be deployed or removed.
+	out := selfMounts{namespace: svc.Spec.Labels[convert.LabelNamespace]}
+
 	cs := svc.Spec.TaskTemplate.ContainerSpec
 	if cs == nil {
-		return selfMounts{}, nil
+		return out, nil
 	}
-	out := selfMounts{
-		secrets: make(map[string]struct{}, len(cs.Secrets)),
-		configs: make(map[string]struct{}, len(cs.Configs)),
-	}
+	out.secrets = make(map[string]struct{}, len(cs.Secrets))
+	out.configs = make(map[string]struct{}, len(cs.Configs))
 	for _, ref := range cs.Secrets {
 		out.secrets[ref.SecretName] = struct{}{}
 	}

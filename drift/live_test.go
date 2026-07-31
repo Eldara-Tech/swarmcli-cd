@@ -104,6 +104,32 @@ func TestNormalisedDifferencesAreNotDrift(t *testing.T) {
 		"image resolved to a digest": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.ContainerSpec.Image = "nginx:1.2@sha256:aaaa"
 		},
+		// The client's own rewrite, which happens to every spec that reaches a
+		// daemon and to none that does not: imageWithTagString runs
+		// FamiliarString(TagNameOnly(ref)) before the request is built, whatever
+		// resolve mode the deploy asked for. `image: nginx` therefore reads back
+		// as `nginx:latest` for ever, on a service nobody has touched.
+		"image tagged latest by the client": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Image = "nginx"
+			live.TaskTemplate.ContainerSpec.Image = "nginx:latest"
+		},
+		// The other half of the same rewrite: the default registry and the
+		// library namespace are dropped on the way out.
+		"image familiarised by the client": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Image = "docker.io/library/nginx:1.25"
+			live.TaskTemplate.ContainerSpec.Image = "nginx:1.25"
+		},
+		"image tagged by the client and then resolved to a digest": func(want, live *swarm.ServiceSpec) {
+			want.TaskTemplate.ContainerSpec.Image = "myreg.io/foo/bar"
+			live.TaskTemplate.ContainerSpec.Image = "myreg.io/foo/bar:latest@sha256:aaaa"
+		},
+		// A manifest that pins its own digest is already what the daemon stores,
+		// registry prefix aside: TagNameOnly leaves a canonical reference alone.
+		"image pinned by digest in the manifest": func(want, live *swarm.ServiceSpec) {
+			const pinned = "nginx@sha256:0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff"
+			want.TaskTemplate.ContainerSpec.Image = "docker.io/library/" + pinned
+			live.TaskTemplate.ContainerSpec.Image = pinned
+		},
 		"force update counter advanced": func(_, live *swarm.ServiceSpec) {
 			live.TaskTemplate.ForceUpdate = 3
 		},
@@ -353,6 +379,33 @@ func TestLiveReportsEachComparedField(t *testing.T) {
 				live.TaskTemplate.ContainerSpec.Image = "nginx:9.9@sha256:bbbb"
 			},
 			application.FieldDrift{Field: "image", Desired: "nginx:1.2", Live: "nginx:9.9@sha256:bbbb"},
+		},
+		// The normalisation the desired side needs must not become blindness. A
+		// manifest naming no tag is compared as `nginx:latest`, and an image
+		// somebody swapped underneath it is still a different image.
+		"image changed behind a tag the manifest left unstated": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Image = "nginx"
+				live.TaskTemplate.ContainerSpec.Image = "nginx:9.9@sha256:bbbb"
+			},
+			application.FieldDrift{Field: "image", Desired: "nginx", Live: "nginx:9.9@sha256:bbbb"},
+		},
+		// The case that makes normalising only the desired side load-bearing.
+		// `docker service update --image nginx@sha256:…` leaves the live spec
+		// untagged, so stripping its digest gives `nginx` — which is the string
+		// the manifest wrote, and would match if the live side were normalised
+		// too. The image would then be the one change a converge could not see.
+		"image repinned by hand to a bare digest": {
+			func(want, live *swarm.ServiceSpec) {
+				want.TaskTemplate.ContainerSpec.Image = "nginx"
+				live.TaskTemplate.ContainerSpec.Image =
+					"nginx@sha256:0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff"
+			},
+			application.FieldDrift{
+				Field:   "image",
+				Desired: "nginx",
+				Live:    "nginx@sha256:0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff",
+			},
 		},
 		"cpu limit": {
 			func(want, live *swarm.ServiceSpec) {
@@ -886,14 +939,49 @@ func TestJobCountsAreCompared(t *testing.T) {
 	}
 
 	t.Run("a count the manifest left unstated", func(t *testing.T) {
-		// serviceSpecFromGRPC addresses the stored value unconditionally, so the
-		// live side is a pointer to zero where the manifest left nil.
+		// `deploy: {mode: replicated-job}` with no `replicas:`. Compose leaves
+		// both pointers nil; ServiceSpecToGRPC stores 1 for a nil MaxConcurrent
+		// and MaxConcurrent for a nil TotalCompletions, and serviceSpecFromGRPC
+		// addresses both stored values unconditionally — so the live side is a
+		// pointer to one, never to zero.
 		want, live := freshPair()
 		want.Mode = job(nil, nil)
-		live.Mode = job(uint64p(0), uint64p(0))
+		live.Mode = job(uint64p(1), uint64p(1))
 
 		if got := Live(stackOf(want), liveOf(live), swarmNets); got.State != application.DriftStateNone {
 			t.Errorf("got %+v, want none — an unstated count is not a difference", got.Services)
+		}
+	})
+
+	// The daemon's second default is not "one": a job told to run four at a time
+	// and nothing else completes four. A spec that states only the concurrency
+	// cannot come out of compose — convertDeployMode fills both counts from the
+	// one `replicas:` pointer — but it is what the API accepts and what the
+	// daemon then stores, so the desired side has to read it the daemon's way.
+	t.Run("a total completions the daemon defaulted to the concurrency", func(t *testing.T) {
+		want, live := freshPair()
+		want.Mode = job(uint64p(4), nil)
+		live.Mode = job(uint64p(4), uint64p(4))
+
+		if got := Live(stackOf(want), liveOf(live), swarmNets); got.State != application.DriftStateNone {
+			t.Errorf("got %+v, want none — an unstated total is the concurrency", got.Services)
+		}
+	})
+
+	// The other half of the same default: an unstated count is one, so a job
+	// somebody scaled by hand is still a difference rather than a flattened zero.
+	t.Run("a count raised by hand against an unstated default", func(t *testing.T) {
+		want, live := freshPair()
+		want.Mode = job(nil, nil)
+		live.Mode = job(uint64p(4), uint64p(9))
+
+		fields := Live(stackOf(want), liveOf(live), swarmNets).Services[0].Fields
+		want1 := []application.FieldDrift{
+			{Field: "maxConcurrent", Desired: "1", Live: "4"},
+			{Field: "totalCompletions", Desired: "1", Live: "9"},
+		}
+		if !reflect.DeepEqual(fields, want1) {
+			t.Errorf("fields = %+v, want %+v", fields, want1)
 		}
 	})
 
@@ -1033,9 +1121,15 @@ func rolledBackTo(spec swarm.ServiceSpec, state swarm.UpdateState, message strin
 // way for ever (#90).
 func TestARolledBackServiceIsReportedAsSuch(t *testing.T) {
 	const why = "update paused due to failure or early termination of task 9xk2"
+	// `started` included, which reads like a rollout still deciding and is not
+	// one: Updater.rollbackUpdate sets the state and swaps the previous spec back
+	// in the same store transaction, so a spec that differs under it has already
+	// been reverted. Missing it re-pushed the rejected spec, and that update
+	// resets UpdateStatus — losing the evidence and starting the cycle again.
 	for _, state := range []swarm.UpdateState{
-		swarm.UpdateStateRollbackCompleted,
+		swarm.UpdateStateRollbackStarted,
 		swarm.UpdateStateRollbackPaused,
+		swarm.UpdateStateRollbackCompleted,
 	} {
 		t.Run(string(state), func(t *testing.T) {
 			want := desiredSpec("web", "nginx:1.3")
@@ -1076,7 +1170,6 @@ func TestOnlyARollbackStateIsARollback(t *testing.T) {
 		swarm.UpdateStateUpdating,
 		swarm.UpdateStatePaused,
 		swarm.UpdateStateCompleted,
-		swarm.UpdateStateRollbackStarted,
 	} {
 		t.Run(string(state), func(t *testing.T) {
 			want := desiredSpec("web", "nginx:1.3")
