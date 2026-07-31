@@ -234,15 +234,42 @@ func declaredNetworks(services []composetypes.ServiceConfig) map[string]struct{}
 	return out
 }
 
-// checkBindSources refuses a relative bind mount before the loader can make one
-// absolute.
+// checkBindSources refuses the two bind mounts a reconciled stack may not have:
+// a relative source, and one that reaches the docker daemon's own socket.
+//
+// # A relative source
 //
 // A swarm bind mount names a path on whichever node runs the task, so a
 // relative source has no referent at all: there is no manifest file to resolve
 // it against, and the controller's own filesystem is not where the container
 // runs. The loader would quietly resolve it against WorkingDir and produce a
 // bind to a directory nobody named, discovered only when the container starts
-// with the wrong contents.
+// with the wrong contents. Refused before the loader runs, because making it
+// absolute is what the loader does.
+//
+// # The daemon socket
+//
+// A bind of /var/run/docker.sock is root on the node it lands on, and a chart
+// chooses where its services run: `deploy.placement.constraints: [node.role ==
+// manager]` puts the task on a manager, where that socket is the swarm's control
+// plane. From there every other refusal in this package and in backend is
+// decoration — the stack can read the controller's secrets straight out of its
+// own service spec, write any spec it likes over any service, or delete the
+// controller.
+//
+// It is refused because **a chart author is a lower privilege than an app-set
+// author**, deliberately: the app-set repository is root-equivalent and is meant
+// to be protected as such, so that "being able to change an app's chart is not
+// the same permission as being able to add an app" (docs/configuration.md). A
+// socket bind collapses the two, and collapsing them is also what would have made
+// #99 pointless — a chart that can reach the daemon has no need to read the
+// controller's filesystem for a credential it can ask the daemon for.
+//
+// The refusal is flat, with no allowlist and no per-application policy. The cost
+// is real and worth naming: the charts that genuinely want the socket — Traefik's
+// swarm provider, a Portainer agent, an autoheal sidecar — cannot be reconciled
+// by this controller and have to be deployed beside it. A mixed-workload policy
+// is a design of its own (#64) rather than a flag on this one.
 //
 // This reads the parsed document rather than the loaded config because that is
 // the last point at which the source is still what the manifest said.
@@ -262,19 +289,78 @@ func checkBindSources(dict map[string]any) error {
 		volumes, _ := svc["volumes"].([]any)
 		for _, v := range volumes {
 			source, ok := bindSource(v)
-			if !ok || source == "" || filepath.IsAbs(source) {
+			if !ok || source == "" {
 				continue
 			}
-			return fmt.Errorf("service %q: bind source %q is relative; a swarm bind mount names a path "+
-				"on the node that runs the task, so it must be absolute (or use a named volume)", name, source)
+			if !filepath.IsAbs(source) {
+				return fmt.Errorf("service %q: bind source %q is relative; a swarm bind mount names a path "+
+					"on the node that runs the task, so it must be absolute (or use a named volume)", name, source)
+			}
+			if sock, reaches := reachesDockerSocket(source); reaches {
+				return fmt.Errorf("service %q: bind source %q reaches the docker daemon's socket (%s); a "+
+					"reconciled stack may not mount it. A chart chooses where its services run, so with a "+
+					"manager placement that socket is root over the whole swarm — this controller's own "+
+					"credentials, every other application's services, and the controller itself. A workload "+
+					"that genuinely needs the daemon has to be deployed beside this controller rather than "+
+					"reconciled by it", name, source, sock)
+			}
 		}
 	}
 	return nil
 }
 
-// bindSource returns the host side of a volume entry, and whether that entry is
-// a bind at all. A short-syntax entry is a bind when its source looks like a
-// path; anything else is a named volume, which has no host side to check.
+// dockerSockets is where the daemon listens, by both names it answers to.
+//
+// Two spellings rather than one because /var/run is a symlink to /run on every
+// systemd host, so both name the same file — and the resolution that would
+// collapse them cannot happen here: the path names a filesystem on whichever node
+// runs the task, which is the one filesystem this controller cannot read. A
+// rootless daemon's socket under $XDG_RUNTIME_DIR is deliberately absent; a
+// rootless swarm manager is not a deployment this repository supports, and
+// guessing at the path would be a host-path policy rather than a fact.
+var dockerSockets = []string{"/run/docker.sock", "/var/run/docker.sock"}
+
+// reachesDockerSocket reports whether binding source into a container puts the
+// daemon's socket inside it, and which socket that is.
+//
+// The socket's own path is the obvious case. A directory holding it is the same
+// thing one `ls` further in, so `- /var/run:/var/run` is refused too, and so is
+// `/`. The rule is exactly "a path from which docker.sock is reachable by name",
+// and it stops there on purpose: /var/lib/docker is root-equivalent by a
+// different route — it holds the contents of every named volume on the node —
+// and refusing it would be the general host-path policy this is deliberately not.
+// Which means the volume guard in backend is a guard on a *name*: a stack that
+// binds the daemon's data root still reaches the bytes. Closing that is the same
+// deferred design (#64).
+//
+// Lexical only. filepath.Clean folds `..`, doubled separators and a trailing
+// slash, which is the whole of what a manifest can vary without naming something
+// on a node this controller cannot see — a symlink there is answered by listing
+// both spellings above, not by resolving anything here.
+func reachesDockerSocket(source string) (string, bool) {
+	dir := filepath.Clean(source)
+	for _, sock := range dockerSockets {
+		if dir == sock || dir == "/" || strings.HasPrefix(sock, dir+"/") {
+			return sock, true
+		}
+	}
+	return "", false
+}
+
+// bindSource returns the host side of a volume entry, and whether that entry
+// names a host path at all. A short-syntax entry does when its source looks like
+// a path; anything else is a named volume, which has no host side to check.
+//
+// The long form is read by its `type:`, and two of the six types name a path:
+// bind, and npipe. npipe is here because it is what the check would otherwise be
+// one word away from missing — `{type: npipe, source: /var/run/docker.sock}`
+// converts without complaint (convert.convertVolumeToMount), and while a Linux
+// daemon then refuses the mount when the task starts, "the node happens to reject
+// it" is not a guard. The other four name no host path: volume and cluster take a
+// volume name, image an image reference, and tmpfs no source at all.
+//
+// A long-form entry with no `type:` needs no case. The schema makes it required,
+// so loader.Load refuses one a few lines after this runs.
 func bindSource(v any) (string, bool) {
 	switch entry := v.(type) {
 	case string:
@@ -288,11 +374,13 @@ func bindSource(v any) (string, bool) {
 		}
 		return source, true
 	case map[string]any:
-		if t, _ := entry["type"].(string); t != "bind" {
+		switch t, _ := entry["type"].(string); t {
+		case "bind", "npipe":
+			source, _ := entry["source"].(string)
+			return source, true
+		default:
 			return "", false
 		}
-		source, _ := entry["source"].(string)
-		return source, true
 	default:
 		return "", false
 	}

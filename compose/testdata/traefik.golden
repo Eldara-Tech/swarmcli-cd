@@ -71,16 +71,6 @@ services:
                 openstdin: false
                 readonly: false
                 mounts:
-                    - type: bind
-                      source: /var/run/docker.sock
-                      target: /var/run/docker.sock
-                      readonly: true
-                      consistency: ""
-                      bindoptions: null
-                      volumeoptions: null
-                      imageoptions: null
-                      tmpfsoptions: null
-                      clusteroptions: null
                     - type: volume
                       source: edge_traefik-public-certificates
                       target: /certificates

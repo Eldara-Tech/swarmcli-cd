@@ -139,6 +139,60 @@ func TestAStackMayNotMountAReleaseRecord(t *testing.T) {
 	}
 }
 
+// A chart may not bind the docker daemon's socket.
+//
+// It is the channel that decides whether any of the others matter. A chart
+// chooses where its services run, so `node.role == manager` plus that socket is
+// root over the swarm — the controller's credentials read straight out of its own
+// service spec, any service overwritten, the controller deleted — and every guard
+// that compares names is decoration beside it (#103).
+//
+// Here as well as in compose's unit tests because the claim is about the whole
+// chain: CE renders the chart, plans the release, pre-flights its external
+// references, and hands the manifest to this applier. Nothing upstream inspects a
+// bind, so this is the proof that the refusal is the applier's and that a refused
+// chart leaves nothing running.
+//
+// The volume and network halves of #103 have no test here and cannot have one.
+// Both turn on what Swarm has mounted into the **controller**, and this harness
+// runs the reconciler in-process, where readSelfMounts correctly finds no swarm
+// task and both guards go quiet — which is the same reason the guard above is
+// reachable at all, since a release record is read off the swarm rather than off
+// the controller. They are unit-tested in backend against a fake that answers as
+// a deployed controller does.
+func TestAChartMayNotBindTheDockerSocket(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-guard-socket"
+	t.Cleanup(func() { removeStack(t, release) })
+
+	files := chartFiles(release, 1)
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    volumes:\n" +
+		"      - /var/run/docker.sock:/var/run/docker.sock:ro\n" +
+		"    deploy:\n" +
+		"      placement:\n" +
+		"        constraints: [\"node.role == manager\"]\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n"
+
+	rec := reconciler(t, releaseApp("socket", gitRepo(t, files), true))
+	err := rec.SyncNow(context.Background(), "socket")
+	if err == nil {
+		t.Fatal("SyncNow(socket) = nil, want the deploy refused for binding the docker socket")
+	}
+	if !strings.Contains(err.Error(), "docker daemon's socket") {
+		t.Fatalf("SyncNow(socket) = %v, want it refused by the bind guard", err)
+	}
+	if names := serviceNamesOf(t, cli, release); len(names) != 0 {
+		t.Errorf("services = %v, want none created by a refused deploy", names)
+	}
+}
+
 // The other way to get at a name — the config is one of the stack's **own**, no
 // `external:` anywhere, and `name:` points it at something that already exists —
 // used to be covered here by TestAStackMayNotClaimAReleaseRecordAsItsOwn.
