@@ -1631,7 +1631,11 @@ func TestPruneFirstFailureIsReportedAsAFailedSync(t *testing.T) {
 	// A sync that worked, so that "the status still shows the last one" is a
 	// thing this test can actually catch rather than infer from a nil.
 	previous := &application.SyncResult{Revision: strings.Repeat("b", 40), Succeeded: true}
-	r.recordResult("edge", previous)
+	e, err := r.entry("edge")
+	if err != nil {
+		t.Fatalf("entry: %v", err)
+	}
+	r.recordResult(e, previous)
 
 	if err := r.Sync(context.Background(), "edge"); err == nil {
 		t.Fatal("Sync = nil, want the sweep failure")

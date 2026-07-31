@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"reflect"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -36,6 +37,10 @@ type Reconciler interface {
 	Replace(spec application.Spec) error
 	Remove(name string) error
 	SetRegistryAuth(app string, resolver regauth.Resolver)
+	// Draining names applications that have left the set but whose work has not
+	// stopped. Remove's wait is bounded, so "removed" and "quiescent" are two
+	// questions and this is the second one. Only the sweep needs it.
+	Draining() []string
 }
 
 // LoopOptions tunes a Loop. Everything has a working default.
@@ -170,7 +175,24 @@ func (l *Loop) Run(ctx context.Context) error {
 // that only acted on changes would have recorded it as added once and never
 // mentioned it again. Diffing an unchanged set costs a map and a comparison per
 // application and almost always decides to do nothing.
-func (l *Loop) Once(ctx context.Context) error {
+//
+// A panic becomes this pass's error rather than the process's death. That is the
+// same judgement the load path already makes and for the same reason: what is
+// running is a last-good set, and a controller that keeps reconciling it while
+// reporting why the newest one could not be applied is more useful than one that
+// exits. It also matches the per-application recover in reconcile — one bad
+// application must not take the others down — since a panic here would be
+// reached through exactly such an application's spec.
+func (l *Loop) Once(ctx context.Context) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic reconciling the app set: %v", p)
+			l.log.Error("recovered a panic reconciling the app set",
+				"panic", p, "stack", string(debug.Stack()))
+			l.record(err, l.src.Current() != nil)
+		}
+	}()
+
 	file, changed, err := l.src.Load(ctx)
 	if err != nil {
 		// Stale means what is running is a last-good set. A controller that has
@@ -244,6 +266,19 @@ func (l *Loop) pruneDeparted(ctx context.Context, desired []application.Spec) er
 		// holds the sweep indefinitely, and that is a condition an operator has
 		// to be able to find rather than one that scrolled past at startup.
 		l.log.Info("prune held: an application has not reconciled yet, so what it declares is not known",
+			"applications", held)
+		return nil
+	}
+
+	// The same guard from the other side. The gate above covers applications
+	// still in the set; this covers one that has left it and whose sync has not
+	// stopped — Remove's wait is bounded, so that is a real state. It is still
+	// deploying services and writing revision records, so a sweep now would
+	// delete resources something is actively recreating, which is the exact
+	// interleaving Remove exists to prevent, one pass later.
+	if held := l.rec.Draining(); len(held) > 0 {
+		l.recordPruneHeld(held)
+		l.log.Info("prune held: an application has left the set but is still syncing",
 			"applications", held)
 		return nil
 	}

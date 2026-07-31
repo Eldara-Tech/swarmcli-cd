@@ -47,6 +47,14 @@ type fakeReconciler struct {
 
 	// failAdd names an application whose Add fails, for the best-effort case.
 	failAdd string
+
+	// draining names applications that have left the set and whose work has not
+	// stopped, which holds the sweep exactly as an unreconciled one does.
+	draining []string
+
+	// panicOnViews makes the reconciler blow up once, where the loop reads it,
+	// for the case that used to take the whole controller down.
+	panicOnViews bool
 }
 
 func newFakeReconciler(apps ...application.Spec) *fakeReconciler {
@@ -57,6 +65,13 @@ func newFakeReconciler(apps ...application.Spec) *fakeReconciler {
 }
 
 func (f *fakeReconciler) Views() []application.View {
+	if f.panicOnViews {
+		// Once: the assertions afterwards read the status, which comes through
+		// here too, and a fake that never stopped panicking would be testing
+		// the test rather than the recover.
+		f.panicOnViews = false
+		panic("a nil dereference somewhere under the set")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]application.View, 0, len(f.apps))
@@ -138,6 +153,21 @@ func (f *fakeReconciler) Remove(name string) error {
 	f.removed = append(f.removed, name)
 	f.ops = append(f.ops, "remove:"+name)
 	return nil
+}
+
+// Draining reports applications removed but still syncing, which holds the
+// sweep exactly as an unreconciled one does.
+func (f *fakeReconciler) Draining() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.draining...)
+}
+
+// stillSyncing sets what Draining reports; no arguments clears it.
+func (f *fakeReconciler) stillSyncing(names ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.draining = names
 }
 
 func (f *fakeReconciler) SetRegistryAuth(app string, resolver regauth.Resolver) {
@@ -1031,5 +1061,61 @@ func TestAReturningApplicationLeavesThePrunedList(t *testing.T) {
 
 	if got := loop.Status().AppSet.Pruned; len(got) != 0 {
 		t.Errorf("pruned = %v, want empty once the application is back", got)
+	}
+}
+
+// The fifth guard, and the other side of the fourth. Remove's wait for a
+// departing application's work is bounded — cancellation does not reach every
+// daemon call, and removals run first, so an unbounded wait would hold up every
+// other membership change behind one application. That makes "removed" and
+// "quiescent" two different questions.
+//
+// A departed application whose sync is still running is still deploying services
+// and still writing revision records, so sweeping now deletes resources
+// something is actively recreating: the exact interleaving Remove exists to
+// prevent, one pass later.
+func TestASweepWaitsForADepartedApplicationToStopSyncing(t *testing.T) {
+	p := &fakePruner{}
+	loop, rec, publish := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+
+	rec.stillSyncing("core")
+	publish(oneApp)
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if p.called() != 0 {
+		t.Fatalf("swept while core was still syncing (%d calls); that deletes what it is deploying", p.called())
+	}
+	if want := []string{"core"}; !slices.Equal(loop.Status().AppSet.PruneHeldBy, want) {
+		t.Errorf("pruneHeldBy = %v, want %v", loop.Status().AppSet.PruneHeldBy, want)
+	}
+
+	rec.stillSyncing()
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if p.called() != 1 {
+		t.Fatalf("calls = %d, want 1 once the departed application had stopped", p.called())
+	}
+}
+
+// A panic must not take the controller down with it. What is running is a
+// last-good set, and a controller that keeps reconciling it while reporting why
+// the newest one could not be applied is more useful than one that exits — the
+// same judgement this loop already makes about a load that fails.
+func TestAPanicFailsThePassRatherThanTheController(t *testing.T) {
+	loop, rec, _ := newPruningLoop(t, oneApp, nil, spec("edge", "releases/edge.yaml"))
+	rec.panicOnViews = true
+
+	err := loop.Once(t.Context())
+	if err == nil {
+		t.Fatal("Once = nil, want the recovered panic reported as this pass's failure")
+	}
+	if !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("error = %q, want it to say a panic was recovered", err)
+	}
+	if got := loop.Status().AppSet.Error; !strings.Contains(got, "panic") {
+		t.Fatalf("status error = %q, want the panic reported where an operator looks", got)
 	}
 }
