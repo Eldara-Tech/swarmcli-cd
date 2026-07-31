@@ -839,6 +839,72 @@ func TestOutOfBandImageIsNotPreserved(t *testing.T) {
 	}
 }
 
+// A live service that is not a container service at all. swarm.TaskSpec holds a
+// ContainerSpec, a PluginSpec and a NetworkAttachmentSpec, of which one is set,
+// so a service under this stack's namespace label can arrive with no container
+// spec — and anything that can reach the socket this controller holds can create
+// one. Reading its image panicked, and nothing in this repository recovers, so
+// that took the controller down for as long as the service existed.
+func TestLiveServiceWithoutAContainerSpecDoesNotPanic(t *testing.T) {
+	cur := deployed("s_web", "nginx:1.2", "nginx:1.2@sha256:aaaa", 1)
+	cur.Spec.TaskTemplate.ContainerSpec = nil
+	cur.Spec.TaskTemplate.NetworkAttachmentSpec = &swarm.NetworkAttachmentSpec{ContainerID: "abc"}
+	api := &fakeAPI{existing: []swarm.Service{cur}}
+	st := stack("s", cdService{"web", spec("nginx:1.2")})
+
+	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever); err != nil {
+		t.Fatalf("ApplyServices = %v, want nil", err)
+	}
+	if len(api.updated) != 1 {
+		t.Fatalf("updated %d services, want the update attempted", len(api.updated))
+	}
+	// There is no live image to preserve, so the manifest's own is written and
+	// the daemon is left to answer for the runtime change.
+	if got := api.updated[0].spec.TaskTemplate.ContainerSpec.Image; got != "nginx:1.2" {
+		t.Errorf("image = %q, want the manifest's own tag", got)
+	}
+}
+
+// The same guard from below the client, covering the desired side too and
+// pinning the case both guards exist to protect: with both specs present and the
+// tag unchanged, the digest the daemon resolved to is still kept.
+func TestPrepareUpdateGuardsBothContainerSpecs(t *testing.T) {
+	const digest = "nginx:1.2@sha256:aaaa"
+	cur := deployed("s_web", "nginx:1.2", digest, 1)
+
+	t.Run("both present", func(t *testing.T) {
+		got, opts := prepareUpdate(cur, spec("nginx:1.2"), ResolveChanged)
+		if img := got.TaskTemplate.ContainerSpec.Image; img != digest {
+			t.Errorf("image = %q, want the resolved digest %q kept", img, digest)
+		}
+		if opts.QueryRegistry {
+			t.Error("QueryRegistry set for an image that did not change")
+		}
+	})
+
+	t.Run("live has none", func(t *testing.T) {
+		other := cur
+		other.Spec.TaskTemplate.ContainerSpec = nil
+		got, _ := prepareUpdate(other, spec("nginx:1.2"), ResolveChanged)
+		if img := got.TaskTemplate.ContainerSpec.Image; img != "nginx:1.2" {
+			t.Errorf("image = %q, want the manifest's own tag", img)
+		}
+	})
+
+	// Conversion always produces a container spec, so this half of the guard is
+	// the cheap one — but prepareUpdate reads the field before anything has
+	// established that.
+	t.Run("desired has none", func(t *testing.T) {
+		got, opts := prepareUpdate(cur, swarm.ServiceSpec{Annotations: swarm.Annotations{Name: "s_web"}}, ResolveNever)
+		if got.TaskTemplate.ContainerSpec != nil {
+			t.Error("a container spec was invented for a desired spec that had none")
+		}
+		if opts.QueryRegistry {
+			t.Error("QueryRegistry set despite resolve=never")
+		}
+	})
+}
+
 func TestImageTagStripsTheDigest(t *testing.T) {
 	for in, want := range map[string]string{
 		"nginx":                        "nginx",

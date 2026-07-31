@@ -222,14 +222,35 @@ func prepareUpdate(cur swarm.Service, spec swarm.ServiceSpec, resolve string) (s
 	// to a digest. Comparing against the live spec's image would compare a tag
 	// with a digest and never match.
 	deployed := cur.Spec.Labels[convert.LabelImage]
-	wanted := spec.TaskTemplate.ContainerSpec.Image
+
+	// Neither container spec is guaranteed. A swarm.TaskSpec carries a
+	// PluginSpec and a NetworkAttachmentSpec alongside it, and only one of the
+	// three is ever set — so a service running a different runtime has none.
+	// That matters most for the live side: cur is whatever the daemon returned
+	// for a service carrying this stack's namespace label, and anything that can
+	// reach the socket this controller itself holds can create one under that
+	// name with a non-container runtime. Dereferencing it took the whole process
+	// down, since nothing here recovers.
+	//
+	// Nil means there is no image to reason about, so the reasoning below is
+	// skipped and the desired spec is written as it stands — the same "flatten it
+	// and carry on" drift.containerSpec takes. Refusing instead would be this
+	// applier inventing a verdict about a runtime it does not model; letting the
+	// update go leaves the daemon to accept or reject the change and to say why,
+	// which is the answer an operator can act on. encodedAuth further down
+	// guards the same expression for the same reason.
+	want, live := spec.TaskTemplate.ContainerSpec, cur.Spec.TaskTemplate.ContainerSpec
+	var wanted string
+	if want != nil {
+		wanted = want.Image
+	}
 
 	switch {
 	case resolve == ResolveAlways:
 		opts.QueryRegistry = true
 	case resolve == ResolveChanged && wanted != deployed:
 		opts.QueryRegistry = true
-	case wanted == deployed && sameImageTag(cur.Spec.TaskTemplate.ContainerSpec.Image, deployed):
+	case want != nil && live != nil && wanted == deployed && sameImageTag(live.Image, deployed):
 		// Same tag as last time, so keep the digest the daemon resolved it to.
 		// Writing the bare tag back would differ from the live spec and
 		// redeploy every task for no reason.
@@ -242,7 +263,7 @@ func prepareUpdate(cur swarm.Service, spec swarm.ServiceSpec, resolve string) (s
 		// the check, correcting an image someone changed by hand would write
 		// their image straight back — the one kind of drift a converge would
 		// silently fail to undo.
-		spec.TaskTemplate.ContainerSpec.Image = cur.Spec.TaskTemplate.ContainerSpec.Image
+		want.Image = live.Image
 	}
 
 	// There is no --force here, and there should not be: carrying the existing
