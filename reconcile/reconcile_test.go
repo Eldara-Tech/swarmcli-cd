@@ -23,6 +23,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	"github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
@@ -667,8 +668,8 @@ func TestDiffsComeFromTheLastPlan(t *testing.T) {
 	engine := &fakeEngine{plans: []*charts.Plan{outOfSync()}}
 	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
 
-	if _, err := r.Diffs("edge"); !errors.Is(err, ErrNotPlanned) {
-		t.Errorf("Diffs before any reconcile = %v, want ErrNotPlanned", err)
+	if _, err := r.Diffs("edge"); !errors.Is(err, application.ErrNotPlanned) {
+		t.Errorf("Diffs before any reconcile = %v, want application.ErrNotPlanned", err)
 	}
 
 	if err := r.Sync(context.Background(), "edge"); err != nil {
@@ -1074,8 +1075,8 @@ func TestHistoryFailureForADeployedReleaseIsAnError(t *testing.T) {
 
 func TestHistoryBeforeAnyReconcile(t *testing.T) {
 	r := newTest(t, []application.Spec{spec("edge", false)}, &fakeEngine{}, nil)
-	if _, err := r.History(context.Background(), "edge"); !errors.Is(err, ErrNotPlanned) {
-		t.Errorf("err = %v, want ErrNotPlanned", err)
+	if _, err := r.History(context.Background(), "edge"); !errors.Is(err, application.ErrNotPlanned) {
+		t.Errorf("err = %v, want application.ErrNotPlanned", err)
 	}
 	if _, err := r.History(context.Background(), "absent"); err == nil {
 		t.Error("History of an unknown application = nil, want an error")
@@ -1830,14 +1831,14 @@ type driftBackend struct {
 	appliedAt      func() int
 	removedAtApply []int
 
-	// The swarm's networks by id, as the networkNamer seam returns them, and the
-	// failure of that listing. Nil names with no error is a swarm with no
+	// The swarm's networks by id, as capability.NetworkNamer returns them, and
+	// the failure of that listing. Nil names with no error is a swarm with no
 	// networks, which is not the same as a backend that could not look.
 	networkNames map[string]string
 	namesErr     error
 
 	// The other three kinds, by release and then scoped name to id — the shape
-	// the resourceLister seam returns.
+	// capability.ResourceLister returns.
 	liveNetworks map[string]map[string]string
 	liveConfigs  map[string]map[string]string
 	liveSecrets  map[string]map[string]string
@@ -2166,8 +2167,8 @@ func TestANamingFailureCostsTheAttachmentsAndNothingElse(t *testing.T) {
 // one: the same degradation, decided one step earlier.
 func TestABackendThatCannotNameNetworksComparesEverythingElse(t *testing.T) {
 	ldb := oldSeamBackend{}
-	if _, ok := any(ldb).(networkNamer); ok {
-		t.Fatal("oldSeamBackend implements networkNamer; it is meant to be the backend that does not")
+	if _, ok := any(ldb).(capability.NetworkNamer); ok {
+		t.Fatal("oldSeamBackend implements capability.NetworkNamer; it is meant to be the backend that does not")
 	}
 
 	r := newTest(t, []application.Spec{liveSpec("edge", false)}, &fakeEngine{plans: []*charts.Plan{synced()}}, nil)
@@ -3057,10 +3058,11 @@ func TestAnUnresolvableSettledReleaseLosesItsComparisonAndNotItsSweep(t *testing
 	}
 }
 
-// oldSeamBackend implements liveDriftBackend and nothing else: a backend written
-// against the seam as it stood before #87, or a Phase 3 remote one that answers
-// what it can. It is the fallback path in claimed, which must be the behaviour
-// that preceded declaredLister rather than no history walk at all.
+// oldSeamBackend implements capability.LiveDrift and nothing else: a backend
+// written against the contract as it stood before #87, or a Phase 3 remote one
+// that answers what it can. It is the fallback path in claimed, which must be the
+// behaviour that preceded capability.DeclaredLister rather than no history walk
+// at all.
 type oldSeamBackend struct{ stack *compose.Stack }
 
 func (o oldSeamBackend) DesiredServices(context.Context, string, string) (*compose.Stack, error) {
@@ -3081,8 +3083,8 @@ func TestAnOlderBackendStillProvesOwnershipThroughTheResolvingConversion(t *test
 	ldb := oldSeamBackend{stack: &compose.Stack{Services: []compose.Service{
 		{Name: "sidecar", Spec: serviceSpec("whoami_sidecar", 1)},
 	}}}
-	if _, ok := any(ldb).(declaredLister); ok {
-		t.Fatal("oldSeamBackend implements declaredLister; it is meant to be the backend that does not")
+	if _, ok := any(ldb).(capability.DeclaredLister); ok {
+		t.Fatal("oldSeamBackend implements capability.DeclaredLister; it is meant to be the backend that does not")
 	}
 
 	got := r.claimed(context.Background(), sweepingSpec("edge", application.DriftManifest), ldb, engine,

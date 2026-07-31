@@ -21,6 +21,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/docker"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 )
@@ -34,6 +35,30 @@ import (
 // dry-run, --detach returns before convergence, and update order is Go map
 // iteration.
 var _ charts.Backend = (*Backend)(nil)
+
+// And every optional capability its callers look for, asserted here rather than
+// discovered at run time.
+//
+// Each one is reached through a type assertion that falls back silently when it
+// fails, so a method whose signature drifted would not break a build: it would
+// quietly turn a feature off — no live drift, no sweep, no per-application
+// credential — and the first evidence would be a report that had stopped saying
+// anything. That is the failure package capability exists to spare a companion
+// backend, and this one is written against the same names on the same terms.
+var (
+	_ capability.RegistryAuth        = (*Backend)(nil)
+	_ capability.ForbidSecrets       = (*Backend)(nil)
+	_ capability.AllowedReferences   = (*Backend)(nil)
+	_ capability.OutOfBand           = (*Backend)(nil)
+	_ capability.StackServicesReader = (*Backend)(nil)
+	_ capability.StacksReader        = (*Backend)(nil)
+	_ capability.LiveDrift           = (*Backend)(nil)
+	_ capability.NetworkNamer        = (*Backend)(nil)
+	_ capability.DeclaredLister      = (*Backend)(nil)
+	_ capability.ResourceLister      = (*Backend)(nil)
+	_ capability.ResourceRemover     = (*Backend)(nil)
+	_ capability.SwarmSizer          = (*Backend)(nil)
+)
 
 // WithRegistryAuth returns a copy of the backend that authenticates its image
 // pulls with auth. The copy shares the client — one swarm's connection pool is

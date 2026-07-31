@@ -19,7 +19,6 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/client"
-	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 )
 
 // start runs the real API server over rec and returns the arguments that point
@@ -135,7 +134,7 @@ func TestAppGetUnknownApplication(t *testing.T) {
 // Not reconciled yet is neither an error nor an empty diff, and the difference
 // matters to anyone deciding whether to sync.
 func TestAppDiffBeforeTheFirstReconcile(t *testing.T) {
-	server := start(t, &stubReconciler{view: syncedView(), diffErr: reconcile.ErrNotPlanned})
+	server := start(t, &stubReconciler{view: syncedView(), diffErr: application.ErrNotPlanned})
 
 	code, stdout, stderr := cli(t, server, "app", "diff", "edge")
 	if code != 0 {

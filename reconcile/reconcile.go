@@ -40,6 +40,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	"github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/drift"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
@@ -502,14 +503,6 @@ func removeName(order []string, name string) []string {
 	return out
 }
 
-// registryAuthBackend is the optional interface a backend implements to
-// authenticate image pulls with an application's credential. *backend.Backend
-// satisfies it; a Phase 3 remote backend reached through the same swarms seam
-// need not, and authenticates its own way.
-type registryAuthBackend interface {
-	WithRegistryAuth(regauth.Resolver) charts.Backend
-}
-
 // withRegistryAuth scopes a backend to one application's credential. A nil
 // resolver — the application declared no registryAuth — or a backend that does
 // not support the upgrade leaves it unchanged, so public-image applications and
@@ -518,16 +511,10 @@ func withRegistryAuth(b charts.Backend, auth regauth.Resolver) charts.Backend {
 	if auth == nil {
 		return b
 	}
-	if ab, ok := b.(registryAuthBackend); ok {
+	if ab, ok := b.(capability.RegistryAuth); ok {
 		return ab.WithRegistryAuth(auth)
 	}
 	return b
-}
-
-// forbidSecretsBackend is the optional interface a backend implements to refuse
-// a stack mounting the controller's own secrets. *backend.Backend satisfies it.
-type forbidSecretsBackend interface {
-	WithForbiddenSecrets(map[string]struct{}) charts.Backend
 }
 
 // withForbiddenSecrets scopes a backend to the controller's forbidden secret
@@ -537,17 +524,10 @@ func withForbiddenSecrets(b charts.Backend, names map[string]struct{}) charts.Ba
 	if len(names) == 0 {
 		return b
 	}
-	if fb, ok := b.(forbidSecretsBackend); ok {
+	if fb, ok := b.(capability.ForbidSecrets); ok {
 		return fb.WithForbiddenSecrets(names)
 	}
 	return b
-}
-
-// allowedRefsBackend is the optional interface a backend implements to take one
-// application's allowlist of what its charts may reach outside their own
-// releases. *backend.Backend satisfies it.
-type allowedRefsBackend interface {
-	WithAllowedReferences(application.Allow) charts.Backend
 }
 
 // withAllowedReferences scopes a backend to one application's permissions.
@@ -570,7 +550,7 @@ type allowedRefsBackend interface {
 // the manifest is refused where the specs are, so nothing can reach the swarm
 // past a layer that did not look.
 func withAllowedReferences(b charts.Backend, allow application.Allow) charts.Backend {
-	if ab, ok := b.(allowedRefsBackend); ok {
+	if ab, ok := b.(capability.AllowedReferences); ok {
 		return ab.WithAllowedReferences(allow)
 	}
 	return b
@@ -597,12 +577,6 @@ func dispatch(ctx context.Context, spec application.Spec, e notify.Event) {
 	notify.Dispatch(ctx, e)
 }
 
-// outOfBandBackend is the optional interface a backend implements to report a
-// mutation that lost its compare-and-swap. *backend.Backend satisfies it.
-type outOfBandBackend interface {
-	WithOutOfBandNotifier(func(service string)) charts.Backend
-}
-
 // withOutOfBandNotifier makes the backend report a write that raced one of ours.
 //
 // Swarm gives the controller exactly one signal that something else is writing
@@ -619,7 +593,7 @@ type outOfBandBackend interface {
 // loop can fire three times for one conflict, and three identical notifications
 // describe one event.
 func (r *Reconciler) withOutOfBandNotifier(ctx context.Context, b charts.Backend, spec application.Spec) charts.Backend {
-	ob, ok := b.(outOfBandBackend)
+	ob, ok := b.(capability.OutOfBand)
 	if !ok {
 		return b
 	}
@@ -643,43 +617,10 @@ func (r *Reconciler) withOutOfBandNotifier(ctx context.Context, b charts.Backend
 	})
 }
 
-// stackServicesReader is the optional interface a backend implements to report
-// a failed read rather than an empty stack. *backend.Backend satisfies it.
-//
-// charts.Backend.StackServices has no error return, and for its CE caller that
-// is right: it polls, so a daemon that could not be asked is "not converged yet"
-// and the next poll asks again. awaitConverged below is that caller. record is
-// not — it turns the same nil into "deployed, but no services are present on the
-// swarm", the loudest thing the health rollup can say, so one slow daemon
-// flipped every release of an application from healthy to missing (#107).
-//
-// The honest read is an upgrade beside it, in the shape liveDriftBackend and
-// resourceLister already use. A backend that does not implement it reads exactly
-// as before.
-type stackServicesReader interface {
-	ReadStackServices(ctx context.Context, name string) ([]charts.ServiceState, error)
-}
-
-// stacksReader is the optional interface a backend implements to answer for
-// several releases from one look at the swarm. *backend.Backend satisfies it.
-//
-// The read behind StackServices is a whole-swarm snapshot — NodeList,
-// ServiceList, TaskList and Info — which is then filtered by stack name. Asking
-// it once per release therefore fetched the entire swarm once per release and
-// threw away all but one stack's worth each time, so an application declaring
-// ten releases cost ten identical round trips on every single reconcile, on the
-// manager node the controller itself runs on.
-//
-// One request, one answer, filtered per release afterwards, which is what the
-// call already did internally.
-type stacksReader interface {
-	ReadStacks(ctx context.Context, releases []string) (map[string][]charts.ServiceState, error)
-}
-
 // stackServices reads one release's live services, keeping the read failure
 // where the backend can tell one from an empty stack.
 func stackServices(ctx context.Context, b charts.Backend, release string) ([]charts.ServiceState, error) {
-	if sr, ok := b.(stackServicesReader); ok {
+	if sr, ok := b.(capability.StackServicesReader); ok {
 		return sr.ReadStackServices(ctx, release)
 	}
 	return b.StackServices(ctx, release), nil
@@ -702,7 +643,7 @@ func readStacks(ctx context.Context, b charts.Backend, releases []string) (map[s
 	if len(releases) == 0 {
 		return nil, nil
 	}
-	if sr, ok := b.(stacksReader); ok {
+	if sr, ok := b.(capability.StacksReader); ok {
 		return sr.ReadStacks(ctx, releases)
 	}
 
@@ -717,102 +658,16 @@ func readStacks(ctx context.Context, b charts.Backend, releases []string) (map[s
 	return out, nil
 }
 
-// liveDriftBackend is the optional interface a backend implements to expose the
-// two halves of a live drift comparison. *backend.Backend satisfies it.
-//
-// It exists because charts.Backend carries no way to read a ServiceSpec — its
-// StackServices returns a display projection with a running count and no spec —
-// and no Docker client for the reconciler to convert a manifest with. A backend
-// that cannot answer, such as a Phase 3 remote one reached through the same
-// swarms seam, simply does not implement it and its applications report no live
-// drift rather than failing.
-//
-// Only the read half needs a seam. Correcting drift is DeployStack, which is on
-// charts.Backend already.
-type liveDriftBackend interface {
-	DesiredServices(ctx context.Context, manifest, stack string) (*compose.Stack, error)
-	LiveServices(ctx context.Context, stack string) (map[string]swarm.Service, error)
-}
-
-// networkNamer is the optional interface a backend implements to name the
-// networks a service is attached to. *backend.Backend satisfies it.
-//
-// A spec names them by id, because the daemon rewrites each target to one as it
-// writes the service, so without this the attachments cannot be compared at all.
-// Separate from liveDriftBackend for the reason resourceLister is: a backend that
-// can read services but not list networks should lose that one field and keep
-// every other comparison.
-//
-// Not stack-scoped, unlike resourceLister's three. A service may be attached to
-// an external network or a predefined one, neither of which carries the stack's
-// namespace label, and an attachment that could not be named is exactly the one
-// worth reporting.
-type networkNamer interface {
-	LiveNetworkNames(ctx context.Context) (map[string]string, error)
-}
-
-// declaredLister is the optional interface a backend implements to answer what a
-// manifest declares without needing any of it to exist. *backend.Backend
-// satisfies it.
-//
-// DesiredServices cannot answer that question about a *stored* revision.
-// Converting a service resolves every config and secret it mounts to the id Swarm
-// addresses it by, so it asks today's swarm about yesterday's references — and a
-// revision that mounted a config a previous sweep has since deleted no longer
-// converts at all. The sweep then loses that revision's claims and leaves
-// resources behind (#87). Nothing about proving ownership wants an id; the scoped
-// name is the whole of it.
-//
-// Separate from liveDriftBackend rather than added to it, for the reason
-// resourceLister gives: a backend that cannot answer this should lose the sweep's
-// history walk, not its live drift too. And separate from DesiredServices rather
-// than replacing it, because live drift compares whole ServiceSpecs — its field
-// list is an allowlist today, but widening it (#76) must not be the thing that
-// starts diffing against a placeholder id.
-type declaredLister interface {
-	DeclaredResources(ctx context.Context, manifest, stack string) (*compose.Stack, error)
-}
-
 // declaredReader returns the conversion to ask what a manifest declares.
 //
-// A backend that does not implement declaredLister gets the resolving one, which
-// is what both callers used before #87: the same answer, unavailable in the same
-// narrow cases, rather than no sweep at all.
-func declaredReader(ldb liveDriftBackend) func(context.Context, string, string) (*compose.Stack, error) {
-	if dl, ok := ldb.(declaredLister); ok {
+// A backend that does not implement capability.DeclaredLister gets the resolving
+// one, which is what both callers used before #87: the same answer, unavailable
+// in the same narrow cases, rather than no sweep at all.
+func declaredReader(ldb capability.LiveDrift) func(context.Context, string, string) (*compose.Stack, error) {
+	if dl, ok := ldb.(capability.DeclaredLister); ok {
 		return dl.DeclaredResources
 	}
 	return ldb.DesiredServices
-}
-
-// resourceLister is the optional interface a backend implements to read the
-// other three kinds a manifest declares, by scoped name. *backend.Backend
-// satisfies it.
-//
-// Separate from liveDriftBackend because live drift compares services and
-// nothing else: a backend that can answer one and not the other should lose
-// only the half it cannot answer. A backend implementing neither prunes
-// nothing, which is the degradation live drift already has.
-//
-// Name to id is all the sweep needs — it matches on the scoped name, the only
-// key a manifest and a live resource share, and deletes by id.
-type resourceLister interface {
-	LiveNetworks(ctx context.Context, stack string) (map[string]string, error)
-	LiveConfigs(ctx context.Context, stack string) (map[string]string, error)
-	LiveSecrets(ctx context.Context, stack string) (map[string]string, error)
-}
-
-// resourceRemover is the optional interface a backend implements to delete a
-// single resource of each kind. *backend.Backend satisfies it.
-//
-// Separate from the readers rather than folded into them, so that a backend
-// which can read the swarm but not write to it still reports what a sweep would
-// remove instead of losing the report along with the removal.
-type resourceRemover interface {
-	RemoveService(ctx context.Context, id string) error
-	RemoveNetwork(ctx context.Context, id string) error
-	RemoveConfig(ctx context.Context, id string) error
-	RemoveSecret(ctx context.Context, id string) error
 }
 
 // releaseView is what both the live comparison and the service sweep need from
@@ -997,13 +852,13 @@ func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.
 	if !live && !sweep {
 		return nil, nil
 	}
-	ldb, ok := b.(liveDriftBackend)
+	ldb, ok := b.(capability.LiveDrift)
 	if !ok {
 		return nil, nil
 	}
 	// A backend that cannot list the other three kinds still sweeps services.
 	// Losing the half it cannot answer is better than losing both.
-	rl, _ := b.(resourceLister)
+	rl, _ := b.(capability.ResourceLister)
 	readDeclared := declaredReader(ldb)
 	// Per swarm rather than per release, so one read answers every release below.
 	nets := r.networkNames(ctx, spec, ldb, live)
@@ -1111,11 +966,11 @@ func (r *Reconciler) liveDrift(spec application.Spec, plan *charts.Plan, views m
 // yields nil and the attachment comparison is skipped: this is a read for a
 // reporting axis, and losing one field is not a reason to fail a reconcile or to
 // call an otherwise readable release unknown.
-func (r *Reconciler) networkNames(ctx context.Context, spec application.Spec, ldb liveDriftBackend, live bool) drift.NetworkNames {
+func (r *Reconciler) networkNames(ctx context.Context, spec application.Spec, ldb capability.LiveDrift, live bool) drift.NetworkNames {
 	if !live {
 		return nil
 	}
-	nn, ok := ldb.(networkNamer)
+	nn, ok := ldb.(capability.NetworkNamer)
 	if !ok {
 		return nil
 	}
@@ -1145,7 +1000,7 @@ func (r *Reconciler) networkNames(ctx context.Context, spec application.Spec, ld
 // first, converting a revision's manifest only while something is still
 // unaccounted for, so the ordinary case reads one revision rather than a whole
 // history.
-func (r *Reconciler) departed(ctx context.Context, e *appEntry, spec application.Spec, ldb liveDriftBackend, engine Engine, plan *charts.Plan, views map[string]releaseView) map[string]doomedSet {
+func (r *Reconciler) departed(ctx context.Context, e *appEntry, spec application.Spec, ldb capability.LiveDrift, engine Engine, plan *charts.Plan, views map[string]releaseView) map[string]doomedSet {
 	var out map[string]doomedSet
 	// The counts as they stand, and the counts this pass leaves behind. Only a
 	// resource that is still a candidate is carried over, which is what keeps
@@ -1249,12 +1104,12 @@ func resourceLabels(res []departedResource) []string {
 // be converted — it is no evidence either way, and an older one may still claim
 // what it could not.
 //
-// Which conversion answers that matters, and is why declaredLister exists: this
-// asks what a revision from the past declared, so it must not depend on any of it
-// still existing. A backend that cannot answer that falls back to the resolving
-// conversion, which is what this did before #87 — the same claims, lost in the
-// same narrow case, rather than no sweep at all.
-func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, release string, candidates resourceNames) resourceNames {
+// Which conversion answers that matters, and is why capability.DeclaredLister
+// exists: this asks what a revision from the past declared, so it must not depend
+// on any of it still existing. A backend that cannot answer that falls back to
+// the resolving conversion, which is what this did before #87 — the same claims,
+// lost in the same narrow case, rather than no sweep at all.
+func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb capability.LiveDrift, engine Engine, release string, candidates resourceNames) resourceNames {
 	readDeclared := declaredReader(ldb)
 
 	revisions, err := engine.History(ctx, release)
@@ -1425,7 +1280,7 @@ func declaredNames(stack *compose.Stack) resourceNames {
 // All three or none: a partial read cannot be told apart from a release that
 // genuinely has none of that kind, and the difference decides whether something
 // gets deleted.
-func liveResources(ctx context.Context, rl resourceLister, release string) (networks, configs, secrets map[string]string, err error) {
+func liveResources(ctx context.Context, rl capability.ResourceLister, release string) (networks, configs, secrets map[string]string, err error) {
 	if networks, err = rl.LiveNetworks(ctx, release); err != nil {
 		return nil, nil, nil, err
 	}
@@ -1702,10 +1557,10 @@ func (r *Reconciler) Sync(ctx context.Context, app string) error {
 // deploy".
 //
 // Requests that arrive while one is already running collapse onto the single
-// one already queued, and the extras return ErrSyncPending. Without that, N
-// requests all serialised on the lease and redeployed the swarm N times, with
-// the scheduled tick queued behind all of them — at twenty requests under a wait
-// policy the application went unobserved for over an hour.
+// one already queued, and the extras return application.ErrSyncPending. Without
+// that, N requests all serialised on the lease and redeployed the swarm N
+// times, with the scheduled tick queued behind all of them — at twenty requests
+// under a wait policy the application went unobserved for over an hour.
 //
 // The queue slot goes back the moment this sync starts rather than when it
 // finishes. A request arriving while one runs is asking about a repository this
@@ -1720,8 +1575,8 @@ func (r *Reconciler) SyncNow(ctx context.Context, app string) error {
 }
 
 // AcceptSync reserves an application's manual-sync slot and returns the sync to
-// run, or ErrSyncPending if one is already running with another queued behind
-// it.
+// run, or application.ErrSyncPending if one is already running with another
+// queued behind it.
 //
 // The split exists so the caller can detach the work and still answer honestly.
 // The API returns 202 before the sync has done anything, so if the decision to
@@ -1736,7 +1591,7 @@ func (r *Reconciler) AcceptSync(app string) (func(context.Context) error, error)
 	select {
 	case e.pending <- struct{}{}:
 	default:
-		return nil, ErrSyncPending
+		return nil, application.ErrSyncPending
 	}
 
 	return func(ctx context.Context) error {
@@ -2464,7 +2319,7 @@ func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, b
 	if !spec.SyncPolicy.PruneResources || len(doomed) == 0 {
 		return nil
 	}
-	remover, ok := backend.(resourceRemover)
+	remover, ok := backend.(capability.ResourceRemover)
 	if !ok {
 		r.log.Warn("this swarm's backend cannot remove a single resource, so what the chart no longer declares was left in place",
 			"application", spec.Name)
@@ -2548,7 +2403,7 @@ func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec appli
 	if !spec.SyncPolicy.PruneResources || len(doomed) == 0 {
 		return
 	}
-	remover, ok := backend.(resourceRemover)
+	remover, ok := backend.(capability.ResourceRemover)
 	if !ok {
 		return // pruneServices has already said so.
 	}
@@ -2714,9 +2569,9 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 			SyncFailed: syncFailed,
 			// This is the one caller that must not read an unavailable daemon as
 			// an empty swarm: it asks once and publishes the answer, rather than
-			// polling until one arrives. See stackServicesReader. readStacks is
-			// all-or-nothing, so a release that was asked about and is absent
-			// from the answer was not read at all.
+			// polling until one arrives. See capability.StackServicesReader.
+			// readStacks is all-or-nothing, so a release that was asked about
+			// and is absent from the answer was not read at all.
 			ReadFailed: readErr != nil && rel.Action != application.ActionInstall,
 			// The live comparison's other answer: what it read and did not
 			// report. It is folded into the sync axis below, and this is the
@@ -2832,10 +2687,6 @@ func (r *Reconciler) Views() []application.View {
 	return out
 }
 
-// ErrNotPlanned is returned when an application has not been reconciled yet, so
-// there is nothing to diff.
-var ErrNotPlanned = errors.New("no plan yet")
-
 // Diffs returns the manifest changes the last plan found. It does not
 // re-render: what it reports is what the status reports, which is the point.
 func (r *Reconciler) Diffs(app string) ([]application.ReleaseDiff, error) {
@@ -2851,7 +2702,7 @@ func (r *Reconciler) Diffs(app string) ([]application.ReleaseDiff, error) {
 		return nil, fmt.Errorf("no such application %q", app)
 	}
 	if plan == nil {
-		return nil, ErrNotPlanned
+		return nil, application.ErrNotPlanned
 	}
 	return drift.Diffs(plan), nil
 }
@@ -2880,7 +2731,7 @@ func (r *Reconciler) History(ctx context.Context, app string) (application.Histo
 		return application.History{}, fmt.Errorf("no such application %q", app)
 	}
 	if plan == nil {
-		return application.History{}, ErrNotPlanned
+		return application.History{}, application.ErrNotPlanned
 	}
 
 	backend, err := r.swarms.Backend(ctx, swarms.Target{Swarm: spec.Destination.Swarm})

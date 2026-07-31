@@ -108,6 +108,9 @@ compose/           a rendered manifest → Swarm specs; the half of
                    charts.Backend that needs no daemon
 backend/           applies those specs through the moby client — the half that
                    needs one
+capability/        interfaces only — what a backend may optionally implement
+                   beyond charts.Backend, exported so a Phase 3 remote one can
+                   be written and compile-checked against them
 health/            whether what is running actually works — the axis sync does
                    not answer
 drift/             whether the swarm matches git: drift.go is manifest mode,

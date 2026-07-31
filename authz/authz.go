@@ -54,12 +54,37 @@ type Subject struct {
 	Extra any
 }
 
-// Action is what a request is trying to do. Phase 1 has two: read anything, or
-// trigger a sync.
+// Action is what a request is trying to do.
+//
+// A string type rather than an enumeration with a fixed range, so that this list
+// can grow without breaking an authorizer implemented outside this repository —
+// the same rule the seam's structs follow, one level down. The obligation that
+// comes with it is the companion's: an action it does not recognise is a
+// permission it was not written to grant, so it must refuse. Authorisation may
+// only degrade closed.
 type Action string
 
 const (
+	// ActionRead is the list view, the detail view, the controller's own status
+	// and the event stream — the state of things, as the controller holds it.
 	ActionRead Action = "read"
+	// ActionDiff is the manifest change a sync would make.
+	//
+	// Its own action because it is its own disclosure. A list row is a state and
+	// a revision; a diff is the rendered manifest — images, environment, mounts,
+	// command lines — which is the closest thing this API has to reading the
+	// repository. An authorizer has a reason to grant a project's operators the
+	// first and not the second, and while every route passed ActionRead it had no
+	// way to say so.
+	ActionDiff Action = "diff"
+	// ActionHistory is a release's recorded revisions.
+	//
+	// Separate for the same reason as ActionDiff, and for one of its own: it is
+	// the only read that goes to the swarm rather than to the controller's own
+	// cache, so it is the only one whose cost an authorizer might want to gate.
+	ActionHistory Action = "history"
+	// ActionSync triggers a reconcile that applies whatever the plan contains.
+	// The only action that writes.
 	ActionSync Action = "sync"
 )
 

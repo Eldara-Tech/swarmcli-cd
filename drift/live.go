@@ -167,8 +167,8 @@ const maxFields = 20
 //
 // Nil means the backend could not list the swarm's networks, in which case
 // attached networks are not compared. That is the degradation the sweep's
-// resourceLister already takes: lose the one field that needed the read, not the
-// whole comparison.
+// capability.ResourceLister already takes: lose the one field that needed the
+// read, not the whole comparison.
 type NetworkNames map[string]string
 
 // compareService returns the allowlisted fields that differ, and how many more

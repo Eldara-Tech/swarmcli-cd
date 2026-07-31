@@ -84,6 +84,26 @@ Its `NodeBackend` is deliberately not a `charts.Backend`: a worker node's
 daemon cannot deploy or remove a stack, so handing back a deploy-capable handle
 would promise what the node cannot do.
 
+### The backend contract
+
+A `charts.Backend` is the smallest thing that can deploy a stack. Everything the
+reconciler and the sweep ask of a backend beyond that — read a `ServiceSpec`,
+list what a stored revision declared, scope an image pull to one application's
+credential, count the swarm's nodes — is an optional interface they type-assert
+for, and all twelve of them are named in
+[`capability`](../capability/capability.go). A Phase 3 remote backend implements
+whichever it can answer; each one it leaves out costs that one feature and
+nothing else.
+
+They are exported, and in a package of their own, because a companion has to be
+able to name them. Go interfaces are structural, so a backend in another module
+*can* satisfy an interface it cannot name — but it cannot be compile-checked
+against it, and since every one of these is an upgrade that falls back silently
+when the assertion fails, the first evidence of a changed signature would be a
+feature that had quietly stopped working. `backend.Backend` asserts all twelve at
+compile time for exactly that reason, so the OSS backend and a companion one are
+held to the contract the same way.
+
 ### When registration is over
 
 A `Slot` is settled by the end of `init()`. Every replacement arrives by blank
@@ -230,15 +250,8 @@ unauthenticated endpoint to a controller holding the Docker socket is the most
 dangerous thing this mechanism permits, and it has to be visible in a running
 controller's log rather than only in the companion's source.
 
-**Implement an alternative backend.** `backend/live.go` anticipates "a backend
-that cannot answer (a Phase 3 remote one)", and what such a backend has to
-satisfy is nine unexported optional interfaces in `reconcile` plus one in
-`prune` — sixteen methods that cannot be named from outside the module. Go
-interfaces are structural, so a companion *can* satisfy them; it cannot be
-compile-checked against them, and because every one is an optional upgrade that
-falls back silently when the assertion fails, it would learn about a signature
-change by watching a feature quietly stop working.
-
-Both are held behind the reconciler lifecycle work
-([#105](https://github.com/Eldara-Tech/swarmcli-cd/issues/105),
-[#106](https://github.com/Eldara-Tech/swarmcli-cd/issues/106)).
+It is the last open item of
+[#111](https://github.com/Eldara-Tech/swarmcli-cd/issues/111), and deliberately
+not landed with the rest of it: this is a new registration mechanism, and one
+whose worst case is the paragraph above deserves a review of its own rather than
+a corner of a larger change.
