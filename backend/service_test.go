@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -90,16 +91,32 @@ type fakeAPI struct {
 	// for nothing outside itself never asks at all.
 	selfInspects int
 	selfErr      error
+	// inspectedIDs records the id of every container inspect, because the id is
+	// the guard's whole premise rather than a detail of the call.
+	inspectedIDs []string
 }
 
 // ContainerInspect answers for this process's own container. Not-found unless a
 // test says otherwise, so nothing else has to know the guard exists.
-func (f *fakeAPI) ContainerInspect(_ context.Context, _ string) (container.InspectResponse, error) {
+//
+// It answers for that container and no other. The id the guard sends is
+// os.Hostname(), which in a container is the container id — that is the entire
+// reason a controller can find itself from the inside, and a daemon asked about
+// anything else replies not-found, which readSelfMounts reads as "not a swarm
+// task" and therefore as no guard at all. A fake that discarded the id would
+// answer for any string, so the guard would pass its tests while asking about
+// the wrong container, which is the one way it can fail silently and completely.
+func (f *fakeAPI) ContainerInspect(_ context.Context, id string) (container.InspectResponse, error) {
 	f.selfInspects++
+	f.inspectedIDs = append(f.inspectedIDs, id)
 	if f.selfErr != nil {
 		return container.InspectResponse{}, f.selfErr
 	}
-	if f.selfServiceID == "" {
+	host, err := os.Hostname()
+	if err != nil {
+		return container.InspectResponse{}, err
+	}
+	if f.selfServiceID == "" || id != host {
 		return container.InspectResponse{}, errdefs.ErrNotFound
 	}
 	return container.InspectResponse{Config: &container.Config{
@@ -126,10 +143,18 @@ func (f *fakeAPI) ServiceList(_ context.Context, o swarm.ServiceListOptions) ([]
 	return f.existing, nil
 }
 
+// ServiceCreate stores what it created, so a later read finds it — as a daemon
+// would, and for the reason ConfigCreate does. Without it there is no
+// unit-level "deploy, then read back what the daemon holds": every apply starts
+// from an empty swarm, so the create-or-update decision is only ever tested on
+// the branch a fixture hands it, and nothing notices an applier that created the
+// same service twice.
 func (f *fakeAPI) ServiceCreate(_ context.Context, spec swarm.ServiceSpec, opts swarm.ServiceCreateOptions) (swarm.ServiceCreateResponse, error) {
 	f.created = append(f.created, spec)
 	f.createOpt = append(f.createOpt, opts)
-	return swarm.ServiceCreateResponse{ID: "new-" + spec.Name}, nil
+	id := "new-" + spec.Name
+	f.existing = append(f.existing, swarm.Service{ID: id, Spec: spec})
+	return swarm.ServiceCreateResponse{ID: id}, nil
 }
 
 func (f *fakeAPI) ServiceUpdate(_ context.Context, id string, v swarm.Version, spec swarm.ServiceSpec, opts swarm.ServiceUpdateOptions) (swarm.ServiceUpdateResponse, error) {
@@ -230,6 +255,41 @@ func TestCreatesServicesThatDoNotExist(t *testing.T) {
 	// In the order the stack listed them, which is the order conversion sorted.
 	if got := []string{api.created[0].Name, api.created[1].Name}; !reflect.DeepEqual(got, []string{"s_web", "s_db"}) {
 		t.Errorf("created %v, want the stack's own order and scoped names", got)
+	}
+}
+
+// The create-or-update decision made against what the daemon holds, rather than
+// against a fixture that decided the answer in advance.
+//
+// Every other test here starts from an empty swarm or from a hand-written live
+// service, so each exercises one branch with the other's outcome impossible. A
+// second apply against the first one's result is the only shape in which the
+// branch is chosen: an applier that could not find what it had just created
+// would create it again on every reconcile, and the daemon would answer "name
+// conflicts with an existing object" forever.
+func TestASecondApplyUpdatesWhatTheFirstCreated(t *testing.T) {
+	api := &fakeAPI{}
+	b := testBackend(t, api, nil)
+	ctx := context.Background()
+
+	if err := b.ApplyServices(ctx, stack("s", cdService{"web", spec("nginx:1.1")}), ResolveNever); err != nil {
+		t.Fatalf("first ApplyServices = %v, want nil", err)
+	}
+	if err := b.ApplyServices(ctx, stack("s", cdService{"web", spec("nginx:1.2")}), ResolveNever); err != nil {
+		t.Fatalf("second ApplyServices = %v, want nil", err)
+	}
+
+	if len(api.created) != 1 {
+		t.Errorf("created %d services, want the second apply to have found the first's", len(api.created))
+	}
+	if len(api.updated) != 1 {
+		t.Fatalf("updated %d services, want 1", len(api.updated))
+	}
+	if api.updated[0].id != "new-s_web" {
+		t.Errorf("updated %q, want the id the create returned", api.updated[0].id)
+	}
+	if got := api.updated[0].spec.TaskTemplate.ContainerSpec.Image; got != "nginx:1.2" {
+		t.Errorf("image = %q, want the second manifest's", got)
 	}
 }
 
