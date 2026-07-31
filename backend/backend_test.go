@@ -59,7 +59,7 @@ func TestDeployStackCreatesReferencesBeforeServices(t *testing.T) {
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	}
 
-	if err := testBackend(t, api, nil).DeployStack("s", oneOfEach, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 
@@ -98,7 +98,7 @@ secrets:
 func TestDeployStackCreatesASecretItThenMounts(t *testing.T) {
 	api := &fakeAPI{}
 
-	if err := testBackend(t, api, nil).DeployStack("rel", declaresAndMounts, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), "rel", declaresAndMounts, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want a chart to be able to mount what it declares", err)
 	}
 
@@ -122,7 +122,7 @@ func TestDeployStackCreatesASecretItThenMounts(t *testing.T) {
 func TestAnUnconvertibleManifestCreatesNothing(t *testing.T) {
 	api := &fakeAPI{}
 
-	err := testBackend(t, api, nil).DeployStack("s", `
+	err := testBackend(t, api, nil).DeployStack(t.Context(), "s", `
 services:
   web:
     image: nginx
@@ -157,7 +157,7 @@ func TestDeployStackRefusesMountingAControllerSecret(t *testing.T) {
 	}
 	b := testBackend(t, api, nil).WithForbiddenSecrets(map[string]struct{}{"swarmcli-cd-token": {}}).(*Backend)
 
-	err := b.DeployStack("s", mountsControllerSecret, ResolveNever)
+	err := b.DeployStack(t.Context(), "s", mountsControllerSecret, ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for mounting a controller secret")
 	}
@@ -423,7 +423,7 @@ func TestRemoveStackRemovesServicesFirstThenWhatTheyUsed(t *testing.T) {
 		networks: []network.Summary{stackNetwork("net", "s_front", "s")},
 	}
 
-	if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
+	if err := testBackend(t, api, nil).RemoveStack(t.Context(), "s"); err != nil {
 		t.Fatalf("RemoveStack = %v, want nil", err)
 	}
 
@@ -640,7 +640,7 @@ func TestStackServicesReadsThroughTheEngineMapping(t *testing.T) {
 		}},
 	}
 
-	got := testBackend(t, api, nil).StackServices("s")
+	got := testBackend(t, api, nil).StackServices(t.Context(), "s")
 	if len(got) != 1 {
 		t.Fatalf("got %d states, want 1", len(got))
 	}
@@ -652,7 +652,7 @@ func TestStackServicesReadsThroughTheEngineMapping(t *testing.T) {
 // The backend fetches every read, so there is no cache to invalidate — which is
 // what lets one process serve several swarms without them evicting each other.
 func TestRefreshSnapshotIsANoOp(t *testing.T) {
-	if err := testBackend(t, &fakeAPI{}, nil).RefreshSnapshot(); err != nil {
+	if err := testBackend(t, &fakeAPI{}, nil).RefreshSnapshot(t.Context()); err != nil {
 		t.Errorf("RefreshSnapshot = %v, want nil", err)
 	}
 }
@@ -701,8 +701,10 @@ func TestDaemonFailuresSurface(t *testing.T) {
 		name string
 		call func(*Backend) error
 	}{
-		{"DeployStack", func(b *Backend) error { return b.DeployStack("s", "services:\n  web:\n    image: x\n", ResolveNever) }},
-		{"RemoveStack", func(b *Backend) error { return b.RemoveStack("s") }},
+		{"DeployStack", func(b *Backend) error {
+			return b.DeployStack(t.Context(), "s", "services:\n  web:\n    image: x\n", ResolveNever)
+		}},
+		{"RemoveStack", func(b *Backend) error { return b.RemoveStack(t.Context(), "s") }},
 		{"ListConfigs", func(b *Backend) error { _, err := b.ListConfigs(ctx); return err }},
 		{"InspectConfig", func(b *Backend) error { _, err := b.InspectConfig(ctx, "x"); return err }},
 		{"DeleteConfig", func(b *Backend) error { return b.DeleteConfig(ctx, "x") }},
@@ -726,7 +728,7 @@ func TestDaemonFailuresSurface(t *testing.T) {
 // A snapshot that cannot be read reports no services rather than failing: the
 // caller is polling for convergence, so an unavailable daemon is "not yet".
 func TestStackServicesReportsNothingWhenTheSnapshotFails(t *testing.T) {
-	if got := testBackend(t, &errAPI{err: errors.New("daemon unreachable")}, nil).StackServices("s"); got != nil {
+	if got := testBackend(t, &errAPI{err: errors.New("daemon unreachable")}, nil).StackServices(t.Context(), "s"); got != nil {
 		t.Errorf("StackServices = %v, want nil", got)
 	}
 }
@@ -736,7 +738,7 @@ func TestStackServicesReportsNothingWhenTheSnapshotFails(t *testing.T) {
 // reads the first as "deployed, but no services are present on the swarm" — the
 // loudest thing it can say about a stack that is fine (#107).
 func TestReadStackServicesKeepsTheSnapshotFailure(t *testing.T) {
-	states, err := testBackend(t, &errAPI{err: errors.New("daemon unreachable")}, nil).ReadStackServices("s")
+	states, err := testBackend(t, &errAPI{err: errors.New("daemon unreachable")}, nil).ReadStackServices(t.Context(), "s")
 	if err == nil {
 		t.Fatal("ReadStackServices err = nil, want the snapshot failure")
 	}
@@ -751,7 +753,7 @@ func TestReadStackServicesKeepsTheSnapshotFailure(t *testing.T) {
 // And a stack the daemon answered about, with nothing under it, is not an error.
 // That is the case Missing exists for, and it has to survive the fix.
 func TestReadStackServicesReportsAnEmptyStackWithoutAnError(t *testing.T) {
-	states, err := testBackend(t, &fakeAPI{}, nil).ReadStackServices("s")
+	states, err := testBackend(t, &fakeAPI{}, nil).ReadStackServices(t.Context(), "s")
 	if err != nil {
 		t.Fatalf("ReadStackServices err = %v, want nil", err)
 	}
@@ -859,7 +861,7 @@ func TestRemoveStackNeverDeletesReleaseRecords(t *testing.T) {
 		}}},
 	}}
 
-	if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
+	if err := testBackend(t, api, nil).RemoveStack(t.Context(), "s"); err != nil {
 		t.Fatalf("RemoveStack = %v, want nil", err)
 	}
 	for _, r := range api.removed {
@@ -876,7 +878,7 @@ func TestRemoveStackNeverDeletesReleaseRecords(t *testing.T) {
 // what the daemon makes of an empty filter value.
 func TestRemoveStackRefusesAnEmptyName(t *testing.T) {
 	api := &fakeAPI{}
-	if err := testBackend(t, api, nil).RemoveStack(""); err == nil {
+	if err := testBackend(t, api, nil).RemoveStack(t.Context(), ""); err == nil {
 		t.Fatal("RemoveStack = nil, want an unnamed stack refused")
 	}
 	if len(api.removed) != 0 {
@@ -903,7 +905,7 @@ func TestRemoveStackTreatsAnAlreadyDeletedResourceAsDone(t *testing.T) {
 				removeErr: map[string]error{missing: errdefs.ErrNotFound},
 			}
 
-			if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
+			if err := testBackend(t, api, nil).RemoveStack(t.Context(), "s"); err != nil {
 				t.Fatalf("RemoveStack = %v, want nil when %s had already gone", err, missing)
 			}
 			// Everything else is still attempted: one resource vanishing must
@@ -931,7 +933,7 @@ func TestRemoveStackAcceptsAFailureThatLeftNothingBehind(t *testing.T) {
 		removeGone: map[string]bool{"network:net": true},
 	}
 
-	if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
+	if err := testBackend(t, api, nil).RemoveStack(t.Context(), "s"); err != nil {
 		t.Fatalf("RemoveStack = %v, want nil — the stack is gone, whatever the daemon said", err)
 	}
 }
@@ -962,7 +964,7 @@ func TestRemoveStackIgnoresReleaseRecordsWhenRechecking(t *testing.T) {
 		removeGone: map[string]bool{"network:net": true},
 	}
 
-	if err := testBackend(t, api, nil).RemoveStack("s"); err != nil {
+	if err := testBackend(t, api, nil).RemoveStack(t.Context(), "s"); err != nil {
 		t.Fatalf("RemoveStack = %v, want nil; the release record is not the stack", err)
 	}
 	// And it is still there to be read, which is the whole point of leaving it.
@@ -1004,7 +1006,7 @@ func TestRemoveStackReportsWhicheverKindIsStillThere(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
-			err := testBackend(t, tc.api, nil).RemoveStack("s")
+			err := testBackend(t, tc.api, nil).RemoveStack(t.Context(), "s")
 			if err == nil {
 				t.Fatalf("RemoveStack = nil, but the %s is still on the swarm; reporting success here deletes the release history that proves it is ours", tc.kind)
 			}
@@ -1023,7 +1025,7 @@ func TestRemoveStackStillFailsOnARealError(t *testing.T) {
 		removeErr: map[string]error{"network:net": errors.New("has active endpoints")},
 	}
 
-	err := testBackend(t, api, nil).RemoveStack("s")
+	err := testBackend(t, api, nil).RemoveStack(t.Context(), "s")
 	if err == nil || !strings.Contains(err.Error(), "has active endpoints") {
 		t.Fatalf("RemoveStack = %v, want the daemon's refusal surfaced", err)
 	}
@@ -1134,7 +1136,7 @@ func TestDeployStackRefusesMountingTheControllersOwnConfig(t *testing.T) {
 		}}},
 	})
 
-	err := testBackend(t, api, nil).DeployStack("s", mountsControllerConfig, ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), "s", mountsControllerConfig, ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for mounting the controller's config")
 	}
@@ -1169,7 +1171,7 @@ func TestTheSelfGuardIdentifiesThisContainerByItsHostname(t *testing.T) {
 		}}},
 	})
 
-	if err := testBackend(t, api, nil).DeployStack("tenant", mountsControllerConfig, ResolveNever); err == nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant", mountsControllerConfig, ResolveNever); err == nil {
 		t.Fatal("DeployStack = nil; the guard did not recognise this process as the controller")
 	}
 	if !reflect.DeepEqual(api.inspectedIDs, []string{host}) {
@@ -1199,7 +1201,7 @@ func TestDeployStackRefusesMountingAReleaseRecord(t *testing.T) {
 		}}}},
 	})
 
-	err := testBackend(t, api, nil).DeployStack("s", mountsAReleaseRecord, ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), "s", mountsAReleaseRecord, ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for mounting a release record")
 	}
@@ -1219,7 +1221,7 @@ func TestDeployStackRefusesAControllerSecretRenamedOnTheWayIn(t *testing.T) {
 		}}},
 	})
 
-	err := testBackend(t, api, nil).DeployStack("s", mountsControllerSecret, ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), "s", mountsControllerSecret, ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for mounting the controller's token")
 	}
@@ -1266,7 +1268,7 @@ func TestDeployStackRefusesAStackDeclaringAControllerSecret(t *testing.T) {
 	}}})
 	b := testBackend(t, api, nil).WithForbiddenSecrets(map[string]struct{}{"swarmcli-cd-token": {}}).(*Backend)
 
-	err := b.DeployStack("tenant", stealsByDeclaring("swarmcli-cd-token", true), ResolveNever)
+	err := b.DeployStack(t.Context(), "tenant", stealsByDeclaring("swarmcli-cd-token", true), ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for declaring the controller's own secret")
 	}
@@ -1293,7 +1295,7 @@ func TestDeployStackRefusesADeclarationNoServiceMounts(t *testing.T) {
 		Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-token"}},
 	}}})
 
-	err := testBackend(t, api, nil).DeployStack("tenant",
+	err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant",
 		stealsByDeclaring("swarmcli-cd-token", false), ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want a declaration of the controller's secret refused even unmounted")
@@ -1370,7 +1372,7 @@ func TestDeployStackRefusesAStackDeclaringAReleaseRecordName(t *testing.T) {
 func TestAStackDeclaringItsOwnSecretIsAllowed(t *testing.T) {
 	api := asController(&fakeAPI{})
 
-	if err := testBackend(t, api, nil).DeployStack("rel", declaresAndMounts, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), "rel", declaresAndMounts, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want a chart's own secret to be allowed", err)
 	}
 }
@@ -1384,7 +1386,7 @@ func TestDeployStackAllowsAnOrdinaryExternalConfig(t *testing.T) {
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	})
 
-	if err := testBackend(t, api, nil).DeployStack("s", oneOfEach, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 }
@@ -1404,7 +1406,7 @@ services:
     image: nginx
 `
 	api := asController(&fakeAPI{})
-	if err := testBackend(t, api, nil).DeployStack("s", selfContained, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), "s", selfContained, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 	for _, f := range api.labelFilters {
@@ -1431,7 +1433,7 @@ func TestTheControllersOwnMountsAreReadOnce(t *testing.T) {
 	b := testBackend(t, api, nil)
 
 	for range 3 {
-		if err := b.WithRegistryAuth(nil).DeployStack("s", oneOfEach, ResolveNever); err != nil {
+		if err := b.WithRegistryAuth(nil).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
 			t.Fatalf("DeployStack = %v, want nil", err)
 		}
 	}
@@ -1451,7 +1453,7 @@ func TestAFailedSelfReadRefusesTheDeployAndIsRetried(t *testing.T) {
 	}
 	b := testBackend(t, api, nil)
 
-	if err := b.DeployStack("s", oneOfEach, ResolveNever); err == nil {
+	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err == nil {
 		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
 	}
 	if len(api.created) != 0 {
@@ -1459,7 +1461,7 @@ func TestAFailedSelfReadRefusesTheDeployAndIsRetried(t *testing.T) {
 	}
 
 	api.selfErr = nil
-	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
 		t.Fatalf("second DeployStack = %v, want the failure not to have been cached", err)
 	}
 }
@@ -1498,7 +1500,7 @@ func TestAnUnreachableDaemonRefusesTheDeployAndIsRetried(t *testing.T) {
 	})
 	b := testBackend(t, api, nil)
 
-	err := b.DeployStack("s", oneOfEach, ResolveNever)
+	err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
 	}
@@ -1510,7 +1512,7 @@ func TestAnUnreachableDaemonRefusesTheDeployAndIsRetried(t *testing.T) {
 	}
 
 	api.selfErr = nil
-	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
 		t.Fatalf("second DeployStack = %v, want the failure not to have been cached", err)
 	}
 }
@@ -1529,12 +1531,12 @@ func TestAnUnreachableDaemonDoesNotDisableTheGuard(t *testing.T) {
 	})
 	b := testBackend(t, api, nil)
 
-	if err := b.DeployStack("tenant", mountsControllerConfig, ResolveNever); err == nil {
+	if err := b.DeployStack(t.Context(), "tenant", mountsControllerConfig, ResolveNever); err == nil {
 		t.Fatal("DeployStack = nil, want the deploy refused while the guard could not be read")
 	}
 
 	api.selfErr = nil
-	err := b.DeployStack("tenant", mountsControllerConfig, ResolveNever)
+	err := b.DeployStack(t.Context(), "tenant", mountsControllerConfig, ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the guard still on once the daemon answers")
 	}
@@ -1558,7 +1560,7 @@ func TestAnUnreachableDaemonOnTheServiceReadAlsoRefuses(t *testing.T) {
 	})
 	b := testBackend(t, api, nil)
 
-	err := b.DeployStack("tenant", mountsControllerSecret, ResolveNever)
+	err := b.DeployStack(t.Context(), "tenant", mountsControllerSecret, ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
 	}
@@ -1567,7 +1569,7 @@ func TestAnUnreachableDaemonOnTheServiceReadAlsoRefuses(t *testing.T) {
 	}
 
 	api.selfSpecErr = nil
-	if err := b.DeployStack("tenant", mountsControllerSecret, ResolveNever); err == nil {
+	if err := b.DeployStack(t.Context(), "tenant", mountsControllerSecret, ResolveNever); err == nil {
 		t.Fatal("DeployStack = nil, want the guard still on once the daemon answers")
 	}
 	if len(api.created) != 0 {
@@ -1582,7 +1584,7 @@ func TestOutsideASwarmThereIsNothingOfOursToProtect(t *testing.T) {
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	}
-	if err := testBackend(t, api, nil).DeployStack("s", oneOfEach, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 }
@@ -1604,12 +1606,12 @@ func TestAContainerThisDaemonDoesNotKnowIsAnAnswer(t *testing.T) {
 	installed(api, "s")
 	b := testBackend(t, api, nil)
 
-	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want a controller that is not a swarm task to deploy", err)
 	}
 	// Cached, unlike the unreachable case: this one is an answer, and it cannot
 	// change for the life of the process.
-	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
 		t.Fatalf("second DeployStack = %v, want nil", err)
 	}
 	if api.selfInspects != 1 {
@@ -1819,7 +1821,7 @@ func controllerStack() *fakeAPI {
 func TestDeployStackRefusesTheControllersOwnStackName(t *testing.T) {
 	api := controllerStack()
 
-	err := testBackend(t, api, nil).DeployStack("swarmcli-cd", takesOverTheController, ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), "swarmcli-cd", takesOverTheController, ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want a release claiming the controller's own stack refused")
 	}
@@ -1842,7 +1844,7 @@ func TestDeployStackRefusesTheControllersOwnStackName(t *testing.T) {
 func TestRemoveStackRefusesTheControllersOwnStackName(t *testing.T) {
 	api := controllerStack()
 
-	err := testBackend(t, api, nil).RemoveStack("swarmcli-cd")
+	err := testBackend(t, api, nil).RemoveStack(t.Context(), "swarmcli-cd")
 	if err == nil {
 		t.Fatal("RemoveStack = nil, want the controller's own stack refused")
 	}
@@ -1881,10 +1883,10 @@ func TestAnyOtherReleaseIsDeployedAndRemovedAsBefore(t *testing.T) {
 	}), "s")
 	b := testBackend(t, api, nil)
 
-	if err := b.DeployStack("s", "services:\n  web:\n    image: nginx\n", ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), "s", "services:\n  web:\n    image: nginx\n", ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want an ordinary release deployed", err)
 	}
-	if err := b.RemoveStack("s"); err != nil {
+	if err := b.RemoveStack(t.Context(), "s"); err != nil {
 		t.Fatalf("RemoveStack = %v, want an ordinary release removed", err)
 	}
 	if !slices.Contains(api.removed, "service:svc") {
@@ -1904,7 +1906,7 @@ func TestOutsideASwarmTheNamespaceGuardIsInert(t *testing.T) {
 	}}}
 	b := testBackend(t, api, nil)
 
-	if err := b.RemoveStack("swarmcli-cd"); err != nil {
+	if err := b.RemoveStack(t.Context(), "swarmcli-cd"); err != nil {
 		t.Fatalf("RemoveStack = %v, want no guard for a controller that has no stack", err)
 	}
 	if !slices.Contains(api.removed, "service:ctl") {
@@ -1951,7 +1953,7 @@ func TestDeployStackRefusesMountingTheControllersOwnVolume(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
 
-			err := testBackend(t, api, nil).DeployStack("tenant",
+			err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant",
 				mountsAVolume("swarmcli-cd_swarmcli-cd-data", external), ResolveNever)
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the stack refused for mounting the controller's own volume")
@@ -1981,7 +1983,7 @@ func TestAStackMayMountAnyOtherVolume(t *testing.T) {
 			// A fake of its own per case: this one records what it creates, so a
 			// second deploy through the same one sees the first's services under a
 			// namespace with no release record and is refused for that instead (#105).
-			if err := testBackend(t, asController(&fakeAPI{}), nil).DeployStack("tenant", tc.manifest, ResolveNever); err != nil {
+			if err := testBackend(t, asController(&fakeAPI{}), nil).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
 				t.Fatalf("DeployStack = %v, want the volume allowed", err)
 			}
 		})
@@ -2010,7 +2012,7 @@ func TestDeployStackRefusesJoiningTheControllersOwnNetwork(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
 
-			err := testBackend(t, api, nil).DeployStack("tenant",
+			err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant",
 				joinsANetwork("swarmcli-cd_default", external), ResolveNever)
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the stack refused for joining the controller's own network")
@@ -2032,7 +2034,7 @@ func TestDeployStackRefusesJoiningTheControllersOwnNetwork(t *testing.T) {
 func TestDeployStackRefusesANetworkNamedForTheControllersStack(t *testing.T) {
 	api := asController(&fakeAPI{})
 
-	err := testBackend(t, api, nil).DeployStack("tenant", joinsANetwork("swarmcli-cd", true), ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant", joinsANetwork("swarmcli-cd", true), ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the controller's own namespace refused as a network name")
 	}
@@ -2057,7 +2059,7 @@ func TestAStackMayJoinAnyOtherNetwork(t *testing.T) {
 		{"a release named like ours", "swarmcli-cd-apps", "services:\n  app:\n    image: busybox\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := testBackend(t, asController(&fakeAPI{}), nil).DeployStack(tc.release, tc.manifest, ResolveNever); err != nil {
+			if err := testBackend(t, asController(&fakeAPI{}), nil).DeployStack(t.Context(), tc.release, tc.manifest, ResolveNever); err != nil {
 				t.Fatalf("DeployStack = %v, want the network allowed", err)
 			}
 		})
@@ -2075,7 +2077,7 @@ func TestOutsideASwarmTheVolumeAndNetworkGuardsAreInert(t *testing.T) {
 		{"network", joinsANetwork("swarmcli-cd_default", true)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := testBackend(t, &fakeAPI{}, nil).DeployStack("tenant", tc.manifest, ResolveNever); err != nil {
+			if err := testBackend(t, &fakeAPI{}, nil).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
 				t.Fatalf("DeployStack = %v, want no guard for a controller with no stack of its own", err)
 			}
 		})
@@ -2095,7 +2097,7 @@ func TestAnUnreachableDaemonRefusesAVolumeOrNetworkDeploy(t *testing.T) {
 			api := asController(&fakeAPI{selfErr: connectionFailure(t)})
 			b := testBackend(t, api, nil)
 
-			err := b.DeployStack("tenant", tc.manifest, ResolveNever)
+			err := b.DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever)
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
 			}
@@ -2104,12 +2106,56 @@ func TestAnUnreachableDaemonRefusesAVolumeOrNetworkDeploy(t *testing.T) {
 			}
 
 			api.selfErr = nil
-			if err := b.DeployStack("tenant", tc.manifest, ResolveNever); err == nil {
+			if err := b.DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err == nil {
 				t.Fatal("DeployStack = nil, want the guard on once the daemon answers")
 			}
 			if len(api.created) != 0 {
 				t.Errorf("%d services created despite the refusal", len(api.created))
 			}
 		})
+	}
+}
+
+// The swarm read runs under the caller's context and stops when it does.
+//
+// It could not before: charts.Backend declared StackServices with no context, so
+// this backend substituted context.Background() and a reconcile being cancelled
+// had no way to stop a read against an unresponsive daemon. CE widened the
+// interface (Eldara-Tech/swarmcli#532); this is the end of it that matters here.
+//
+// It is a real test only because the API fake honours the context too. One that
+// ignored it would pass whether or not this backend threaded anything.
+func TestTheSwarmReadStopsWithItsContext(t *testing.T) {
+	b := New(&fakeAPI{}, Options{Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if _, err := b.ReadStacks(ctx, []string{"whoami"}); !errors.Is(err, context.Canceled) {
+		t.Errorf("ReadStacks = %v, want context.Canceled in the chain", err)
+	}
+	if _, err := b.ReadStackServices(ctx, "whoami"); !errors.Is(err, context.Canceled) {
+		t.Errorf("ReadStackServices = %v, want context.Canceled in the chain", err)
+	}
+}
+
+// One request for many releases, not one each. The read behind it is a
+// whole-swarm snapshot filtered by stack name afterwards, so asking per release
+// fetched the whole swarm per release and discarded all but one stack's worth
+// each time (#134).
+func TestReadStacksAsksTheSwarmOnce(t *testing.T) {
+	api := &fakeAPI{}
+	b := New(api, Options{Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+
+	states, err := b.ReadStacks(t.Context(), []string{"whoami", "api", "web"})
+	if err != nil {
+		t.Fatalf("ReadStacks = %v, want nil", err)
+	}
+	if len(states) != 3 {
+		t.Fatalf("answered for %d releases, want 3", len(states))
+	}
+	// One ServiceList is one snapshot: the fake records a filter per call.
+	if n := len(api.labelFilters); n != 1 {
+		t.Errorf("listed services %d times for three releases, want 1", n)
 	}
 }

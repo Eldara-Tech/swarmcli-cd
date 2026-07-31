@@ -34,6 +34,10 @@ type stream struct {
 	mu   sync.Mutex
 	next int
 	subs map[int]chan notifyEvent
+	// closed is set once the streams have been ended for shutdown, so a request
+	// already past the listener cannot subscribe to a feed nothing will ever
+	// publish to and then hold the drain open waiting for it.
+	closed bool
 }
 
 func newStream(log *slog.Logger) *stream {
@@ -46,8 +50,31 @@ func (s *stream) subscribe() (int, <-chan notifyEvent) {
 	id := s.next
 	s.next++
 	ch := make(chan notifyEvent, subscriberBuffer)
+	if s.closed {
+		// Already draining. A closed channel ends the handler's loop at once,
+		// which is the same answer it would get a moment later anyway.
+		close(ch)
+		return id, ch
+	}
 	s.subs[id] = ch
 	return id, ch
+}
+
+// closeAll ends every connected stream.
+//
+// http.Server.Shutdown waits for connections to go idle and does not cancel
+// in-flight request contexts, and an event stream never goes idle — so every
+// shutdown with a subscriber attached spent the entire timeout achieving
+// nothing and then logged that the API had not shut down cleanly. Swarm sends
+// SIGKILL ten seconds after SIGTERM, so that was half the budget.
+func (s *stream) closeAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	for id, ch := range s.subs {
+		delete(s.subs, id)
+		close(ch)
+	}
 }
 
 func (s *stream) unsubscribe(id int) {

@@ -113,6 +113,20 @@ type Destination struct {
 	Swarm string `json:"swarm,omitempty" yaml:"swarm,omitempty"`
 }
 
+// MinInterval is the floor under syncPolicy.interval.
+//
+// A tick is a git fetch, a full render of every release the application
+// declares, and a read of that application's release records off the swarm.
+// Below this the controller spends its time asking rather than doing, and one
+// application can starve every other — the app set is reconciled from git, so
+// the number is not necessarily written by whoever runs the controller.
+//
+// Ten seconds rather than something rounder: it is far enough below the
+// three-minute default to leave a demo or a tight feedback loop room, and far
+// enough above zero that the pathological case is bounded. It is a floor, not a
+// default; an application that asks for less is clamped to it and told so.
+const MinInterval = 10 * time.Second
+
 // SyncPolicy governs when and how a plan is applied. Wait, Timeout and
 // HistoryMax map onto charts.InstallOptions; Interval overrides the
 // controller-wide poll interval for one application.

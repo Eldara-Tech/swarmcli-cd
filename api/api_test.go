@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -41,6 +42,10 @@ type fakeReconciler struct {
 	syncErr  error
 	synced   []string
 	histCall int
+	// acceptErr fails the reservation, and pending makes it report that a sync
+	// is already queued.
+	acceptErr error
+	pending   bool
 }
 
 func (f *fakeReconciler) Views() []application.View { return f.views }
@@ -70,6 +75,27 @@ func (f *fakeReconciler) SyncNow(_ context.Context, app string) error {
 	defer f.mu.Unlock()
 	f.synced = append(f.synced, app)
 	return f.syncErr
+}
+
+// AcceptSync is the reservation half: it decides whether a sync is started at
+// all, which is what the handler answers with, and returns the work to run
+// detached.
+func (f *fakeReconciler) AcceptSync(app string) (func(context.Context) error, error) {
+	// Membership first, as the real one does: it resolves the entry before it
+	// reserves anything, so an unknown application never reaches the queue.
+	if _, ok := f.View(app); !ok {
+		return nil, errors.New("no such application")
+	}
+	f.mu.Lock()
+	accept, pending := f.acceptErr, f.pending
+	f.mu.Unlock()
+	if pending {
+		return nil, reconcile.ErrSyncPending
+	}
+	if accept != nil {
+		return nil, accept
+	}
+	return func(ctx context.Context) error { return f.SyncNow(ctx, app) }, nil
 }
 
 func (f *fakeReconciler) syncedApps() []string {
@@ -704,9 +730,11 @@ type ctxCapturingReconciler struct {
 	capture func(context.Context)
 }
 
-func (c *ctxCapturingReconciler) SyncNow(ctx context.Context, app string) error {
-	c.capture(ctx)
-	return c.fakeReconciler.SyncNow(ctx, app)
+func (c *ctxCapturingReconciler) AcceptSync(app string) (func(context.Context) error, error) {
+	return func(ctx context.Context) error {
+		c.capture(ctx)
+		return c.fakeReconciler.SyncNow(ctx, app)
+	}, nil
 }
 
 // fakeController is what the app-set loop is to this package: one call
@@ -765,5 +793,111 @@ func TestStatusWithoutAControllerStillAnswers(t *testing.T) {
 	got := decode[application.ControllerStatus](t, rr)
 	if got.Applications != 1 || got.AppSet.Mode != "" {
 		t.Errorf("got %+v, want the application count and no app-set mode", got)
+	}
+}
+
+// TestShutdownEndsTheEventStreams is why Drain exists.
+//
+// http.Server.Shutdown waits for connections to go idle and does not cancel
+// in-flight request contexts, and an event stream never goes idle — so every
+// shutdown with a UI attached spent the whole timeout achieving nothing and then
+// logged that the API had not shut down cleanly. Swarm sends SIGKILL ten seconds
+// after SIGTERM, so that was half the budget spent on a false alarm.
+func TestShutdownEndsTheEventStreams(t *testing.T) {
+	s, h := testServer(t, &fakeReconciler{}, nil)
+
+	httpSrv := &http.Server{Handler: h, ReadHeaderTimeout: time.Second}
+	httpSrv.RegisterOnShutdown(s.Drain)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = httpSrv.Serve(ln) }()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/api/v1/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	for range 200 {
+		if s.events.count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if s.events.count() != 1 {
+		t.Fatal("the request never subscribed")
+	}
+
+	// A generous timeout that a correct shutdown never comes close to, so the
+	// assertion is about promptness rather than about the number.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown = %v, want nil: the stream should have been ended, not waited out", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Shutdown took %s: the event stream was waited out rather than ended", took)
+	}
+}
+
+// A request that slips past the listener while the streams are being ended must
+// not subscribe to a feed nothing will publish to, and then hold the drain open
+// waiting for it.
+func TestAStreamOpenedDuringShutdownEndsAtOnce(t *testing.T) {
+	s, _ := testServer(t, &fakeReconciler{}, nil)
+	s.Drain()
+
+	id, events := s.events.subscribe()
+	select {
+	case _, ok := <-events:
+		if ok {
+			t.Fatal("a stream opened during shutdown received an event, want a closed channel")
+		}
+	case <-time.After(time.Second):
+		// Not a closed channel and not an event: the handler would sit here
+		// until its request context ended, holding the drain open — which is
+		// the whole thing being prevented.
+		t.Fatal("a stream opened during shutdown was left waiting on a feed nothing will publish to")
+	}
+	if s.events.count() != 0 {
+		t.Fatalf("count = %d, want 0: a late subscriber must not be registered", s.events.count())
+	}
+	s.events.unsubscribe(id) // must not double-close
+}
+
+// A sync requested while one is running with another already queued is
+// coalesced onto that queued one. Still 202, because the state the caller asked
+// to have reconciled will be — by the sync already waiting, which has not read
+// the repository yet — but the response says which of the two happened rather
+// than reporting a sync it did not start.
+//
+// The reservation is made in the request and not in the detached goroutine for
+// exactly this reason: by the time that goroutine runs, the response has gone.
+func TestASyncQueuedBehindAnotherIsReportedAsCoalesced(t *testing.T) {
+	rec := &fakeReconciler{views: []application.View{{Spec: application.Spec{Name: "edge"}}}, pending: true}
+	_, h := testServer(t, rec, nil)
+
+	rr := do(t, h, "POST", "/api/v1/applications/edge/sync")
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: the request is honoured by the sync already queued", rr.Code)
+	}
+
+	var body struct {
+		Accepted  bool `json:"accepted"`
+		Coalesced bool `json:"coalesced"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decoding the response: %v", err)
+	}
+	if !body.Accepted || !body.Coalesced {
+		t.Fatalf("body = %+v, want accepted and coalesced", body)
+	}
+	if got := rec.syncedApps(); len(got) != 0 {
+		t.Fatalf("ran %v, want nothing: a coalesced request must not start a second sync", got)
 	}
 }

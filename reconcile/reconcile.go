@@ -13,6 +13,13 @@
 // Replace start, stop and retune per-application loops under the reconciler's
 // lock. This is what lets the app set itself be reconciled from git (issue #47);
 // the loop that drives those operations from a diff is a separate concern.
+//
+// Every piece of work done for an application goes through that application's
+// entry, and the only way to start any is to take its lease. That is what makes
+// the set safely mutable: the entry knows what is running for it, can cancel all
+// of it at once, and can be waited on until it has stopped — whether the work
+// was started by the loop, by the API, or by anything added later. Keeping those
+// three facts in three separate places is what issue #106 was.
 package reconcile
 
 import (
@@ -21,6 +28,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -140,50 +148,6 @@ type Options struct {
 	ControllerID string
 }
 
-// appEntry is one application's mutable record: the spec it reconciles against,
-// what was last observed of it, and the handle that stops its loop. Every field
-// is guarded by Reconciler.mu except syncing, which is locked directly through
-// the *appEntry so a long reconcile does not hold the map's lock.
-type appEntry struct {
-	// syncing serialises work for this application, so a manual sync and a
-	// scheduled tick cannot render or deploy it at once. Locked via the
-	// *appEntry, independent of mu.
-	syncing sync.Mutex
-
-	spec   application.Spec
-	status application.Status
-	// plan is the last plan for this application so the diff endpoint can be
-	// served without re-rendering. A plan carries whole manifests, which is why
-	// it is kept per application rather than per revision.
-	plan *charts.Plan
-
-	// unstable is the checkout revision at which the confirming re-plan found
-	// releases still out of date immediately after a successful apply, and
-	// unstableReleases names them. Empty means the last apply confirmed. It is
-	// what stops a chart whose render is not reproducible being redeployed for
-	// ever; see checkReproducible.
-	unstable         string
-	unstableReleases []string
-
-	// pruneFailures counts consecutive failed deletions of one resource, keyed
-	// by pruneKey, and is the whole of what makes maxPruneAttempts possible: a
-	// sweep re-derives its candidates from the swarm on every pass and so
-	// cannot otherwise tell the first refusal from the hundredth.
-	//
-	// Kept in memory rather than on the swarm deliberately. It is a judgement
-	// about how long this controller has been trying, not a fact about the
-	// deployment, and a restart is a reasonable moment to try again — the
-	// operator may well have restarted it *because* they cleared whatever was
-	// holding the resource.
-	pruneFailures map[string]int
-
-	// cancel stops this application's loop; done is closed when that goroutine
-	// has returned. Both are nil until the loop is started — before Run, or for
-	// an application added to a not-yet-running reconciler.
-	cancel context.CancelFunc
-	done   chan struct{}
-}
-
 // Reconciler runs the loop and holds what it last observed.
 type Reconciler struct {
 	fetch      Fetcher
@@ -205,9 +169,18 @@ type Reconciler struct {
 	// guarded by mu.
 	apps  map[string]*appEntry
 	order []string
-	// root is the context Run supervises the loops under: every loop's context
-	// derives from it, so cancelling Run cancels them all. It is nil until Run
-	// is called; wg tracks the live loop goroutines so Run can drain them.
+	// retiring holds the entries whose work outlived Remove's bounded wait, so
+	// that Draining can report an application nothing is reconciling but
+	// something is still writing. Guarded by mu; drained by Draining.
+	retiring []*appEntry
+	// root is the context Run supervises the set under. Loops do not derive from
+	// it — each runs on its own entry's context, and startLoopLocked links the
+	// two — so cancelling Run retires every entry, which stops a sync the API
+	// started as well as the loop. It is nil until Run is called.
+	//
+	// wg tracks the live loop goroutines. It is not the whole drain, because a
+	// sync started through the API belongs to no goroutine it counts; the
+	// entries' leases are the other half. See drain.
 	root context.Context
 	wg   sync.WaitGroup
 }
@@ -251,10 +224,8 @@ func New(apps []application.Spec, o Options) *Reconciler {
 	}
 	maps.Copy(r.regAuth, o.RegistryAuth)
 	for _, spec := range apps {
-		r.apps[spec.Name] = &appEntry{
-			spec:   spec,
-			status: application.Status{Sync: application.Sync{State: application.SyncUnknown}},
-		}
+		r.noteInterval(spec)
+		r.apps[spec.Name] = newEntry(spec)
 		r.order = append(r.order, spec.Name)
 	}
 	return r
@@ -277,29 +248,91 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	r.mu.Unlock()
 
 	<-ctx.Done()
-	r.wg.Wait()
+
+	// Taking mu is the happens-before edge between startLoopLocked's wg.Add and
+	// the Wait inside drain. Without it there is none: an Add that had passed
+	// the guard below but not yet reached wg.Add could run concurrently with a
+	// Wait that the last loop goroutine had just released, which is the runtime
+	// panic "WaitGroup misuse: Add called concurrently with Wait". Holding it
+	// once is enough — an Add already past the guard completes its wg.Add before
+	// releasing mu, and one that is not past it finds the run context cancelled
+	// and starts nothing.
+	r.mu.Lock()
+	entries := make([]*appEntry, 0, len(r.order))
+	for _, name := range r.order {
+		entries = append(entries, r.apps[name])
+	}
+	r.mu.Unlock()
+
+	r.drain(entries)
 	return ctx.Err()
 }
 
-// startLoopLocked starts an application's reconcile loop under the run context.
-// The caller holds mu. It is a no-op before Run has set that context — an
-// application added to a not-yet-running reconciler is simply recorded and
-// started when Run is — and once the context is cancelled, so nothing is started
-// into a shutdown that is already draining.
+// drain waits for every loop goroutine and every in-flight sync to stop, bounded
+// by drainTimeout.
+//
+// The loop goroutines are what wg counts. The leases are what covers everything
+// else, and the reason this is not just wg.Wait: a sync started through the API
+// runs detached from any request and is registered with no wait group, so before
+// the lease existed a shutdown could not see it at all.
+//
+// Nothing here cancels: the run context is already done, which retires every
+// entry through the link startLoopLocked made, so this is only the waiting half.
+func (r *Reconciler) drain(entries []*appEntry) {
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		r.wg.Wait()
+		for _, e := range entries {
+			e.held <- struct{}{}
+		}
+	}()
+
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-stopped:
+	case <-timer.C:
+		// The goroutine above is left parked on whichever lease it is waiting
+		// for. That is deliberate: this is the shutdown path, the process is
+		// about to exit, and the alternative — another channel to unwind it —
+		// would only add a way for shutdown itself to go wrong.
+		var busy []string
+		for _, e := range entries {
+			if e.busy() {
+				busy = append(busy, e.name)
+			}
+		}
+		r.log.Warn("gave up waiting for in-flight syncs to stop",
+			"after", drainTimeout, "applications", busy)
+	}
+}
+
+// startLoopLocked starts an application's reconcile loop. The caller holds mu.
+// It is a no-op before Run has set the run context — an application added to a
+// not-yet-running reconciler is simply recorded and started when Run is — and
+// once that context is cancelled, so nothing is started into a shutdown that is
+// already draining.
+//
+// The loop runs on the entry's own context rather than on a child of the run
+// context, and the two are linked instead. That is what gives the application
+// one cancel rather than two: Remove and the controller stopping both go through
+// e.cancel, and so both stop a sync the API started as well as the loop.
 func (r *Reconciler) startLoopLocked(e *appEntry) {
-	if r.root == nil || r.root.Err() != nil || e.cancel != nil {
+	if r.root == nil || r.root.Err() != nil || e.done != nil {
 		return
 	}
-	ctx, cancel := context.WithCancel(r.root)
-	e.cancel = cancel
+	unlink := context.AfterFunc(r.root, e.cancel)
 	e.done = make(chan struct{})
-	name := e.spec.Name
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
 		defer close(e.done)
-		defer cancel()
-		r.loop(ctx, name)
+		// Safe to unregister only because the loop returns when its context is
+		// done, so by here e.cancel has either run or is no longer wanted.
+		defer unlink()
+		r.loop(e)
 	}()
 }
 
@@ -313,10 +346,8 @@ func (r *Reconciler) Add(spec application.Spec) error {
 	if _, ok := r.apps[spec.Name]; ok {
 		return fmt.Errorf("application %q already present", spec.Name)
 	}
-	e := &appEntry{
-		spec:   spec,
-		status: application.Status{Sync: application.Sync{State: application.SyncUnknown}},
-	}
+	r.noteInterval(spec)
+	e := newEntry(spec)
 	r.apps[spec.Name] = e
 	r.order = append(r.order, spec.Name)
 	r.startLoopLocked(e)
@@ -335,6 +366,7 @@ func (r *Reconciler) Replace(spec application.Spec) error {
 	if !ok {
 		return fmt.Errorf("no such application %q", spec.Name)
 	}
+	r.noteInterval(spec)
 	e.spec = spec
 	// A new spec is a new set of inputs — a different chart path, different
 	// values files — so whatever the old one could not render reproducibly is no
@@ -372,10 +404,26 @@ func (r *Reconciler) registryAuth(app string) regauth.Resolver {
 }
 
 // Remove stops reconciling an application and drops what was observed of it. It
-// cancels the application's loop and waits for that goroutine to return before
-// reporting done, so a removed application is provably no longer reconciling —
-// a caller replacing the whole set can rely on that. The deployed stack is left
-// running and becomes unmanaged (D-e); pruning it is separate (issue #54).
+// cancels everything being done for the application — the loop and any sync in
+// flight, whoever started it — and waits for all of it to stop. The deployed
+// stack is left running and becomes unmanaged (D-e); pruning it is separate
+// (issue #54).
+//
+// "Everything" is the change. This used to cancel and wait for the loop
+// goroutine alone, while a sync started through the API ran detached from any
+// context and was tracked by nothing — so the guarantee its comment made was
+// false for precisely the caller relying on it, appset.Loop. With prune enabled
+// the interleaving destroyed data: the sweep found the application gone,
+// uninstalled its releases and volumes, and the sync still running then
+// recreated the whole stack against volumes that were being deleted, writing
+// fresh revision records for something reconciled by nobody.
+//
+// The wait is bounded, because cancellation does not reach every daemon call and
+// removals run first in an app-set pass — an unbounded wait would hold up every
+// other membership change behind one departing application. So this no longer
+// promises quiescence: it promises removal. Whether the application's work has
+// actually stopped is the separate question Draining answers, and a caller that
+// deletes resources must ask it.
 func (r *Reconciler) Remove(name string) error {
 	r.mu.Lock()
 	e, ok := r.apps[name]
@@ -389,16 +437,57 @@ func (r *Reconciler) Remove(name string) error {
 	// inherit a secret the departed one happened to declare.
 	delete(r.regAuth, name)
 	r.order = removeName(r.order, name)
-	cancel, done := e.cancel, e.done
+	done := e.done
 	r.mu.Unlock()
 
-	// Outside the lock: the loop takes mu to read its spec, so waiting for it
-	// while holding mu would deadlock.
-	if cancel != nil {
-		cancel()
+	// Outside the lock: the work being stopped takes mu to read its spec and to
+	// record what it found, so waiting for it while holding mu would deadlock.
+	e.cancel()
+	if done != nil {
 		<-done
 	}
+	if err := e.drain(removeDrain); err != nil {
+		// Warn, not an error return: the removal succeeded and retrying it would
+		// find nothing. What is left is a fact about the departed application
+		// that the prune sweep has to know, so it is recorded where Draining can
+		// report it rather than thrown at a caller that cannot act on it.
+		r.log.Warn("an application left the set while it was still syncing; its resources will not be pruned until that stops",
+			"application", name, "error", err)
+		r.mu.Lock()
+		r.retiring = append(r.retiring, e)
+		r.mu.Unlock()
+	}
 	return nil
+}
+
+// Draining names the applications that have left the set but whose work has not
+// stopped, and forgets the ones that have since finished.
+//
+// It is the gap Remove's bounded wait leaves, made visible. A departed
+// application whose sync is still running is still deploying services and still
+// writing revision records, so deleting its resources is the same interleaving
+// Remove exists to prevent — one pass later. The app-set sweep consults this for
+// the same reason it waits for every application to have planned once: what it
+// is about to delete has to be something nobody is still writing.
+//
+// Sweeping on read rather than on a timer, because the only thing that needs the
+// answer is the caller asking for it.
+func (r *Reconciler) Draining() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var names []string
+	kept := r.retiring[:0]
+	for _, e := range r.retiring {
+		if !e.busy() {
+			continue
+		}
+		kept = append(kept, e)
+		names = append(names, e.name)
+	}
+	clear(r.retiring[len(kept):])
+	r.retiring = kept
+	return names
 }
 
 // removeName returns order without name, leaving the original backing array
@@ -511,20 +600,68 @@ func (r *Reconciler) withOutOfBandNotifier(ctx context.Context, b charts.Backend
 // swarm", the loudest thing the health rollup can say, so one slow daemon
 // flipped every release of an application from healthy to missing (#107).
 //
-// CE's interface is not ours to widen, so the honest read is an upgrade beside
-// it, in the shape liveDriftBackend and resourceLister already use. A backend
-// that does not implement it reads exactly as before.
+// The honest read is an upgrade beside it, in the shape liveDriftBackend and
+// resourceLister already use. A backend that does not implement it reads exactly
+// as before.
 type stackServicesReader interface {
-	ReadStackServices(name string) ([]charts.ServiceState, error)
+	ReadStackServices(ctx context.Context, name string) ([]charts.ServiceState, error)
+}
+
+// stacksReader is the optional interface a backend implements to answer for
+// several releases from one look at the swarm. *backend.Backend satisfies it.
+//
+// The read behind StackServices is a whole-swarm snapshot — NodeList,
+// ServiceList, TaskList and Info — which is then filtered by stack name. Asking
+// it once per release therefore fetched the entire swarm once per release and
+// threw away all but one stack's worth each time, so an application declaring
+// ten releases cost ten identical round trips on every single reconcile, on the
+// manager node the controller itself runs on.
+//
+// One request, one answer, filtered per release afterwards, which is what the
+// call already did internally.
+type stacksReader interface {
+	ReadStacks(ctx context.Context, releases []string) (map[string][]charts.ServiceState, error)
 }
 
 // stackServices reads one release's live services, keeping the read failure
 // where the backend can tell one from an empty stack.
-func stackServices(b charts.Backend, release string) ([]charts.ServiceState, error) {
+func stackServices(ctx context.Context, b charts.Backend, release string) ([]charts.ServiceState, error) {
 	if sr, ok := b.(stackServicesReader); ok {
-		return sr.ReadStackServices(release)
+		return sr.ReadStackServices(ctx, release)
 	}
-	return b.StackServices(release), nil
+	return b.StackServices(ctx, release), nil
+}
+
+// readStacks reads several releases' live services at once.
+//
+// The contract is all-or-nothing, and deliberately so: a nil error means every
+// requested release is in the map, and a non-nil one means the swarm could not
+// be read and none of them are. That is what the underlying call actually does —
+// one snapshot either arrives or does not — and it is the reading #107 settled
+// on, where a daemon that could not be asked must never be published as a swarm
+// with no services on it.
+//
+// The fallback for a backend without the batched seam keeps that contract rather
+// than a weaker one: it stops at the first failure, because every one of its
+// per-release calls is the same whole-swarm read and a failure of one is a
+// failure of all.
+func readStacks(ctx context.Context, b charts.Backend, releases []string) (map[string][]charts.ServiceState, error) {
+	if len(releases) == 0 {
+		return nil, nil
+	}
+	if sr, ok := b.(stacksReader); ok {
+		return sr.ReadStacks(ctx, releases)
+	}
+
+	out := make(map[string][]charts.ServiceState, len(releases))
+	for _, release := range releases {
+		states, err := stackServices(ctx, b, release)
+		if err != nil {
+			return nil, err
+		}
+		out[release] = states
+	}
+	return out, nil
 }
 
 // liveDriftBackend is the optional interface a backend implements to expose the
@@ -740,10 +877,10 @@ func pruneKey(release string, res departedResource) string {
 // failedPrunes is a copy of an application's consecutive-failure counts, so the
 // caller can work on it without holding the lock. An application that has been
 // removed from the set has none, which is what a fresh map means.
-func (r *Reconciler) failedPrunes(app string) map[string]int {
+func (r *Reconciler) failedPrunes(e *appEntry) map[string]int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if e, ok := r.apps[app]; ok {
+	if r.currentLocked(e) {
 		return maps.Clone(e.pruneFailures)
 	}
 	return nil
@@ -753,10 +890,10 @@ func (r *Reconciler) failedPrunes(app string) map[string]int {
 // merges: the caller has just re-derived the whole candidate set, so a key it
 // left out is a resource that is no longer there — deleted, re-declared by a
 // commit, or removed by hand — and its history is over.
-func (r *Reconciler) recordPruneFailures(app string, counts map[string]int) {
+func (r *Reconciler) recordPruneFailures(e *appEntry, counts map[string]int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.apps[app]; ok {
+	if r.currentLocked(e) {
 		e.pruneFailures = counts
 	}
 }
@@ -801,7 +938,7 @@ func (n resourceNames) empty() bool {
 // A release the plan would install is read for neither. Nothing of ours is
 // deployed under that name, so there is nothing to compare against and nothing
 // this controller could prove is its own to delete.
-func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b charts.Backend, engine Engine, plan *charts.Plan) (map[string]*application.ReleaseDrift, map[string]doomedSet) {
+func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.Spec, b charts.Backend, engine Engine, plan *charts.Plan) (map[string]*application.ReleaseDrift, map[string]doomedSet) {
 	live := spec.DriftDetection == application.DriftLive
 	sweep := spec.SyncPolicy.PruneResources
 	if !live && !sweep {
@@ -865,7 +1002,7 @@ func (r *Reconciler) observe(ctx context.Context, spec application.Spec, b chart
 	if !sweep {
 		return drifts, nil
 	}
-	doomed := r.departed(ctx, spec, ldb, engine, plan, views)
+	doomed := r.departed(ctx, e, spec, ldb, engine, plan, views)
 	return withOrphans(drifts, doomed), doomed
 }
 
@@ -955,15 +1092,15 @@ func (r *Reconciler) networkNames(ctx context.Context, spec application.Spec, ld
 // first, converting a revision's manifest only while something is still
 // unaccounted for, so the ordinary case reads one revision rather than a whole
 // history.
-func (r *Reconciler) departed(ctx context.Context, spec application.Spec, ldb liveDriftBackend, engine Engine, plan *charts.Plan, views map[string]releaseView) map[string]doomedSet {
+func (r *Reconciler) departed(ctx context.Context, e *appEntry, spec application.Spec, ldb liveDriftBackend, engine Engine, plan *charts.Plan, views map[string]releaseView) map[string]doomedSet {
 	var out map[string]doomedSet
 	// The counts as they stand, and the counts this pass leaves behind. Only a
 	// resource that is still a candidate is carried over, which is what keeps
 	// the map from growing a key per resource this application has ever
 	// dropped — and what lets a resource somebody removed by hand start again
 	// from nothing if its name ever comes back.
-	was, still := r.failedPrunes(spec.Name), map[string]int{}
-	defer func() { r.recordPruneFailures(spec.Name, still) }()
+	was, still := r.failedPrunes(e), map[string]int{}
+	defer func() { r.recordPruneFailures(e, still) }()
 
 	for _, rp := range plan.Releases {
 		v, ok := views[rp.Name]
@@ -1331,39 +1468,72 @@ func convergeable(d *application.ReleaseDrift) bool {
 
 // loop reconciles one application on its own schedule, reading its current spec
 // each tick so a Replace is picked up without the loop being restarted.
-func (r *Reconciler) loop(ctx context.Context, app string) {
+//
+// It runs on the entry's context, so it stops when the application is removed
+// and when the controller does, through the same cancel.
+func (r *Reconciler) loop(e *appEntry) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
 	failures := 0
 	for {
 		select {
-		case <-ctx.Done():
+		case <-e.ctx.Done():
 			return
 		case <-timer.C:
 		}
 
-		if err := r.Sync(ctx, app); err != nil {
+		if err := r.sync(e.ctx, e, false); err != nil {
 			// A cancelled context is a shutdown, not a failure to back off
 			// from.
-			if ctx.Err() != nil {
+			if e.ctx.Err() != nil {
 				return
 			}
 			failures++
-			r.log.Error("reconcile failed", "application", app, "failures", failures, "error", err)
+			r.log.Error("reconcile failed", "application", e.name, "failures", failures, "error", err)
 		} else {
 			failures = 0
 		}
 
-		timer.Reset(backoff(r.intervalFor(r.currentSpec(app)), failures))
+		timer.Reset(backoff(r.intervalFor(r.currentSpec(e)), failures))
 	}
 }
 
+// intervalFor is how long this application waits between ticks: its own
+// syncPolicy.interval, floored, or the controller-wide one.
+//
+// The floor is on the application's number and not on the controller's, because
+// only one of the two is untrusted. syncPolicy.interval arrives in the app set,
+// which is itself reconciled from git — so whoever can commit to that repository
+// chooses it — while the controller-wide interval is set once by whoever runs
+// the controller, and a deployment that wants to reconcile everything every
+// second is entitled to say so about its own machine.
+//
+// Clamped rather than refused. Refusing at load time would stop the whole file
+// from being applied, so one bad interval would freeze every other application's
+// updates — a worse failure than the one being prevented. The `validate` command
+// refuses it instead, which is where an operator finds out before committing,
+// and noteInterval says so once at the point the spec is adopted so a clamped
+// application is not silently slower than it asked to be.
 func (r *Reconciler) intervalFor(spec application.Spec) time.Duration {
 	if d := time.Duration(spec.SyncPolicy.Interval); d > 0 {
-		return d
+		return max(d, application.MinInterval)
 	}
 	return r.interval
+}
+
+// noteInterval says once that an application asked to reconcile faster than the
+// floor allows.
+//
+// At the three points a spec enters the set rather than in intervalFor, which
+// runs every tick: at the floor a warning there would be several thousand
+// identical lines a day, and the thing an operator needs to know is that the
+// number they wrote is not the number in force.
+func (r *Reconciler) noteInterval(spec application.Spec) {
+	if d := time.Duration(spec.SyncPolicy.Interval); d > 0 && d < application.MinInterval {
+		r.log.Warn("syncPolicy.interval is below the floor and has been clamped",
+			"application", spec.Name, "declared", d, "using", application.MinInterval)
+	}
 }
 
 // backoff doubles the interval per consecutive failure, up to maxBackoff.
@@ -1397,44 +1567,127 @@ func backoff(interval time.Duration, failures int) time.Duration {
 // failure and exactly what syncPolicy.timeout exists to report.
 func cancelled(err error) bool { return errors.Is(err, context.Canceled) }
 
+// entry resolves an application name to the entry that currently holds it.
+func (r *Reconciler) entry(app string) (*appEntry, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if e, ok := r.apps[app]; ok {
+		return e, nil
+	}
+	return nil, fmt.Errorf("no such application %q", app)
+}
+
 // Sync reconciles one application now, applying if its policy allows.
 func (r *Reconciler) Sync(ctx context.Context, app string) error {
-	return r.reconcile(ctx, app, false)
+	e, err := r.entry(app)
+	if err != nil {
+		return err
+	}
+	return r.sync(ctx, e, false)
 }
 
 // SyncNow reconciles one application now and applies whatever the plan
 // contains, whether or not the policy is automated. It is what the API's sync
 // action calls: a manual policy means "do not deploy on a schedule", not "never
 // deploy".
+//
+// Requests that arrive while one is already running collapse onto the single
+// one already queued, and the extras return ErrSyncPending. Without that, N
+// requests all serialised on the lease and redeployed the swarm N times, with
+// the scheduled tick queued behind all of them — at twenty requests under a wait
+// policy the application went unobserved for over an hour.
+//
+// The queue slot goes back the moment this sync starts rather than when it
+// finishes. A request arriving while one runs is asking about a repository this
+// one has already read, so coalescing it there would silently drop a fix
+// somebody had just pushed.
 func (r *Reconciler) SyncNow(ctx context.Context, app string) error {
-	return r.reconcile(ctx, app, true)
-}
-
-func (r *Reconciler) reconcile(ctx context.Context, app string, force bool) error {
-	r.mu.RLock()
-	e, ok := r.apps[app]
-	r.mu.RUnlock()
-	if !ok {
-		return fmt.Errorf("no such application %q", app)
-	}
-
-	e.syncing.Lock()
-	defer e.syncing.Unlock()
-
-	// Read the current spec under the lock: a Replace may have swapped it since
-	// this reconcile was scheduled, and the swapped-in spec is the one to act on.
-	r.mu.RLock()
-	spec := e.spec
-	r.mu.RUnlock()
-
-	err := r.reconcileLocked(ctx, spec, force)
+	run, err := r.AcceptSync(app)
 	if err != nil {
-		r.setError(app, err)
+		return err
 	}
-	return err
+	return run(ctx)
 }
 
-func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec, force bool) error {
+// AcceptSync reserves an application's manual-sync slot and returns the sync to
+// run, or ErrSyncPending if one is already running with another queued behind
+// it.
+//
+// The split exists so the caller can detach the work and still answer honestly.
+// The API returns 202 before the sync has done anything, so if the decision to
+// coalesce were made inside the detached goroutine the response would already
+// have gone out claiming a sync was started that never was.
+func (r *Reconciler) AcceptSync(app string) (func(context.Context) error, error) {
+	e, err := r.entry(app)
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case e.pending <- struct{}{}:
+	default:
+		return nil, ErrSyncPending
+	}
+
+	return func(ctx context.Context) error {
+		work, release, err := e.acquire(ctx)
+		<-e.pending
+		if err != nil {
+			return err
+		}
+		defer release()
+		return r.reconcile(work, e, true)
+	}, nil
+}
+
+// sync takes the application's lease and reconciles it.
+func (r *Reconciler) sync(ctx context.Context, e *appEntry, force bool) error {
+	work, release, err := e.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return r.reconcile(work, e, force)
+}
+
+// reconcile is one pass over one application, with the lease already held.
+//
+// The recover is what keeps one application's panic from being every
+// application's outage. Nothing in this repository recovered anywhere, so a
+// panic in one loop took down the process — every other application's reconcile,
+// the app-set loop, and the API that would have explained it — which is exactly
+// the blast radius this package's own doc comment rejects for an unreachable
+// repository. Under Swarm the task restarts, so the symptom was a controller
+// restart-looping on one bad application with the trace only in the daemon's
+// logs and no per-application attribution.
+//
+// It becomes an ordinary reconcile failure, which needs no new state: setError
+// records it against the application, the loop counts it and backs off, and a
+// deterministic panic therefore settles at one stack trace every thirty minutes
+// on the one application rather than a restart loop. Fixing the cause is picked
+// up on the next tick, with no restart needed.
+func (r *Reconciler) reconcile(ctx context.Context, e *appEntry, force bool) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic reconciling %q: %v", e.name, p)
+			// The stack is the only thing that makes a recovered panic
+			// diagnosable, and it is not in the error because the error is what
+			// the status endpoint publishes.
+			r.log.Error("recovered a panic reconciling an application",
+				"application", e.name, "panic", p, "stack", string(debug.Stack()))
+		}
+		if err != nil {
+			r.setError(e, err)
+		}
+	}()
+
+	// Read the current spec now: a Replace may have swapped it while this
+	// reconcile waited for the lease, and the swapped-in spec is the one to act
+	// on.
+	return r.reconcileHeld(ctx, e, r.currentSpec(e), force)
+}
+
+func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec application.Spec, force bool) error {
 	checkout, err := r.fetch.Fetch(ctx, spec.Name, spec.Source)
 	if err != nil {
 		return fmt.Errorf("fetching source: %w", err)
@@ -1467,7 +1720,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		return fmt.Errorf("planning: %w", err)
 	}
 
-	live, doomed := r.observe(ctx, spec, backend, engine, plan)
+	live, doomed := r.observe(ctx, e, spec, backend, engine, plan)
 	// Two lists, because reporting and acting are not the same set: everything
 	// found is reported, and only what a redeploy could actually put right is
 	// acted on. A third thing is acted on and is not a redeploy at all — doomed
@@ -1479,9 +1732,9 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	// Read before recording: record overwrites the states this compares
 	// against, so asking afterwards would always find them equal and drift
 	// would never look like a transition.
-	was := r.syncState(spec.Name)
-	wasLive := r.driftState(spec.Name)
-	r.record(spec.Name, backend, plan, checkout.Revision, nil, live)
+	was := r.syncState(e)
+	wasLive := r.driftState(e)
+	r.record(ctx, e, backend, plan, checkout.Revision, nil, live)
 
 	// Both notifications come before the gate below, because something found and
 	// not correctable is exactly the case an operator has to be told about: the
@@ -1519,7 +1772,7 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 		// a date rolling over at midnight is the honest version of it — from
 		// staying held, and with it its drift correction, at a revision it has
 		// since settled at.
-		r.setUnstable(spec.Name, "", nil)
+		r.setUnstable(e, "", nil)
 	}
 	if install+upgrade+len(fixable)+actionable(doomed) == 0 {
 		return nil
@@ -1531,14 +1784,14 @@ func (r *Reconciler) reconcileLocked(ctx context.Context, spec application.Spec,
 	// last apply did not settle is held here. A forced sync is not subject to it
 	// — an operator asking explicitly is the way past.
 	if !force {
-		if err := r.checkReproducible(spec.Name, checkout.Revision); err != nil {
+		if err := r.checkReproducible(e, checkout.Revision); err != nil {
 			return err
 		}
 	}
 	if err := checkCompat(plan); err != nil {
 		return err
 	}
-	return r.apply(ctx, spec, backend, engine, plan, built, checkout, fixable, doomed)
+	return r.apply(ctx, e, spec, backend, engine, plan, built, checkout, fixable, doomed)
 }
 
 // checkCompat refuses a plan containing a release this build's chart engine is
@@ -1584,10 +1837,10 @@ func unsettled(plan *charts.Plan) []string {
 
 // setUnstable records — or, with an empty revision, clears — the finding that an
 // application's render is not reproducible.
-func (r *Reconciler) setUnstable(app, revision string, releases []string) {
+func (r *Reconciler) setUnstable(e *appEntry, revision string, releases []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.apps[app]; ok {
+	if r.currentLocked(e) {
 		e.unstable, e.unstableReleases = revision, releases
 	}
 }
@@ -1619,12 +1872,11 @@ func (r *Reconciler) setUnstable(app, revision string, releases []string) {
 // interval per consecutive failure, so returning an error here is what turns a
 // three-minute redeploy loop into a thirty-minute one that deploys nothing while
 // the status and the log say why.
-func (r *Reconciler) checkReproducible(app, revision string) error {
+func (r *Reconciler) checkReproducible(e *appEntry, revision string) error {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	e, ok := r.apps[app]
-	if !ok || e.unstable == "" || e.unstable != revision {
+	if !r.currentLocked(e) || e.unstable == "" || e.unstable != revision {
 		return nil
 	}
 	return fmt.Errorf("refusing to deploy %s again at %s: it was deployed and the very next render planned it as out of date once more, "+
@@ -1641,7 +1893,7 @@ func (r *Reconciler) checkReproducible(app, revision string) error {
 // also surfaces a chart whose render is not deterministic — one that would
 // otherwise sit permanently out of sync, deploying on every single tick — on
 // the first sync rather than never.
-func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, drifted []string, doomed map[string]doomedSet) error {
+func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, drifted []string, doomed map[string]doomedSet) error {
 	started := r.now()
 	notify.Dispatch(ctx, notify.Event{
 		Application: spec.Name,
@@ -1675,7 +1927,7 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 			// stream and a status still showing the *previous* sync's result —
 			// so the one ordering that guarantees nothing is running was also the
 			// one that reported the last time something was (#107).
-			r.failSync(ctx, spec.Name, checkout.Revision, started, err)
+			r.failSync(ctx, e, checkout.Revision, started, err)
 			return err
 		}
 	}
@@ -1737,7 +1989,7 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	notify.Dispatch(ctx, notified)
 
 	if applyErr != nil {
-		r.recordResult(spec.Name, result)
+		r.recordResult(e, result)
 		return fmt.Errorf("applying: %w", applyErr)
 	}
 
@@ -1769,10 +2021,10 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	// after the apply means that under pruneFirst the departing services are
 	// already gone by the time their configs are attempted, which is the best
 	// order available rather than a compromise.
-	r.pruneResources(ctx, spec, backend, doomed)
+	r.pruneResources(ctx, e, spec, backend, doomed)
 
 	if swept != nil {
-		r.recordResult(spec.Name, result)
+		r.recordResult(e, result)
 		return swept
 	}
 
@@ -1784,7 +2036,7 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 		// The deploy landed; only the confirmation failed. Reporting the sync
 		// as failed would be wrong, so the result stands and the error is the
 		// reconcile's.
-		r.recordResult(spec.Name, result)
+		r.recordResult(e, result)
 		return fmt.Errorf("re-planning after apply: %w", err)
 	}
 	// The re-plan's other answer, and the acting half of what its comment above
@@ -1792,11 +2044,11 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	// next render still calls out of date will not be reached by deploying it
 	// again, so it is recorded and the next reconcile at this revision refuses.
 	if stuck := unsettled(after); len(stuck) > 0 {
-		r.setUnstable(spec.Name, checkout.Revision, stuck)
+		r.setUnstable(e, checkout.Revision, stuck)
 		r.log.Warn("a release was deployed and immediately planned as out of date again, so its chart does not render the same twice; it will not be deployed again at this revision",
 			"application", spec.Name, "releases", stuck, "revision", checkout.Revision)
 	} else {
-		r.setUnstable(spec.Name, "", nil)
+		r.setUnstable(e, "", nil)
 	}
 	// Re-observed, not carried forward: the correction and the sweep above are
 	// exactly the things this needs to confirm, and reporting the pre-apply
@@ -1804,8 +2056,8 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 	// showing drifted services and orphans that are already gone. The second
 	// reading is cheap in the case that matters — a sweep that worked leaves no
 	// candidates, so no history is read at all.
-	afterLive, _ := r.observe(ctx, spec, backend, engine, after)
-	r.record(spec.Name, backend, after, checkout.Revision, result, afterLive)
+	afterLive, _ := r.observe(ctx, e, spec, backend, engine, after)
+	r.record(ctx, e, backend, after, checkout.Revision, result, afterLive)
 	return nil
 }
 
@@ -1821,7 +2073,7 @@ func (r *Reconciler) apply(ctx context.Context, spec application.Spec, backend c
 // A cancelled context is not a failure and gets neither event nor result, for
 // the reason apply gives: a shutdown caught mid-sweep is the controller
 // stopping, not the sweep failing.
-func (r *Reconciler) failSync(ctx context.Context, app, revision string, started time.Time, err error) {
+func (r *Reconciler) failSync(ctx context.Context, e *appEntry, revision string, started time.Time, err error) {
 	if cancelled(err) {
 		return
 	}
@@ -1834,19 +2086,19 @@ func (r *Reconciler) failSync(ctx context.Context, app, revision string, started
 		Error:      err.Error(),
 	}
 	notify.Dispatch(ctx, notify.Event{
-		Application: app,
+		Application: e.name,
 		Type:        notify.SyncFailed,
 		Revision:    revision,
 		At:          result.FinishedAt,
 		Message:     err.Error(),
 	})
-	// recordResult and not record: reconcileLocked published this pass's plan,
+	// recordResult and not record: reconcileHeld published this pass's plan,
 	// revision, drift and releases before apply was called, and nothing has been
 	// deployed since, so the outcome is the only thing missing. Re-reading the
 	// swarm would ask about a state that has not moved. Health catches up on the
 	// next reconcile, when record reads this result as SyncFailed — exactly how a
 	// failed apply already behaves.
-	r.recordResult(app, result)
+	r.recordResult(e, result)
 }
 
 // converge redeploys the releases whose running services no longer match the
@@ -1885,7 +2137,7 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := backend.DeployStack(release, manifests[release], ""); err != nil {
+		if err := backend.DeployStack(ctx, release, manifests[release], ""); err != nil {
 			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
 			continue
 		}
@@ -1957,7 +2209,7 @@ func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, 
 	deadline := r.now().Add(timeout)
 
 	for {
-		switch c := charts.Rollup(backend.StackServices(release)); c.Phase {
+		switch c := charts.Rollup(backend.StackServices(ctx, release)); c.Phase {
 		case charts.PhaseWedged:
 			// Swarm has given up and will not continue on its own, so waiting
 			// out the deadline would only delay the same answer.
@@ -2147,7 +2399,7 @@ func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, b
 // one has to settle within the pass because the uninstall around it is about to
 // delete the very records that prove ownership; here nothing is being deleted
 // that a later sweep would need.
-func (r *Reconciler) pruneResources(ctx context.Context, spec application.Spec, backend charts.Backend, doomed map[string]doomedSet) {
+func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec application.Spec, backend charts.Backend, doomed map[string]doomedSet) {
 	if !spec.SyncPolicy.PruneResources || len(doomed) == 0 {
 		return
 	}
@@ -2156,7 +2408,7 @@ func (r *Reconciler) pruneResources(ctx context.Context, spec application.Spec, 
 		return // pruneServices has already said so.
 	}
 
-	counts := r.failedPrunes(spec.Name)
+	counts := r.failedPrunes(e)
 	if counts == nil {
 		counts = map[string]int{}
 	}
@@ -2198,7 +2450,7 @@ func (r *Reconciler) pruneResources(ctx context.Context, spec application.Spec, 
 				"kind", string(res.kind), "resource", res.name)
 		}
 	}
-	r.recordPruneFailures(spec.Name, counts)
+	r.recordPruneFailures(e, counts)
 
 	if len(removed) > 0 {
 		notify.Dispatch(ctx, notify.Event{
@@ -2219,49 +2471,70 @@ func (r *Reconciler) pruneResources(ctx context.Context, spec application.Spec, 
 	}
 }
 
+// currentLocked reports whether e is still the entry the set holds under its
+// name. The caller holds mu.
+//
+// It is the identity check that a name lookup cannot make. A name that leaves
+// the set and returns gets a fresh entry with a fresh lease, so the departed
+// application's sync — which may still be running, having been cancelled but not
+// yet noticed — passes any test of the form "is this name present". It then
+// overwrote the *new* application's status and plan with the departed one's
+// readings. Comparing the pointer covers both cases at once: a name that never
+// returned fails the map lookup, and one that did fails the comparison.
+func (r *Reconciler) currentLocked(e *appEntry) bool { return r.apps[e.name] == e }
+
 // syncState reports what was last observed for an application, or unknown if it
-// has been removed from the set.
-func (r *Reconciler) syncState(app string) application.SyncState {
+// has left the set.
+func (r *Reconciler) syncState(e *appEntry) application.SyncState {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if e, ok := r.apps[app]; ok {
+	if r.currentLocked(e) {
 		return e.status.Sync.State
 	}
 	return application.SyncUnknown
 }
 
 // currentSpec returns an application's spec as it stands now, or the zero spec
-// if it has been removed. The loop reads through it so a Replace takes effect on
+// if it has left the set. The loop reads through it so a Replace takes effect on
 // the next tick.
-func (r *Reconciler) currentSpec(app string) application.Spec {
+func (r *Reconciler) currentSpec(e *appEntry) application.Spec {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if e, ok := r.apps[app]; ok {
+	if r.currentLocked(e) {
 		return e.spec
 	}
 	return application.Spec{}
 }
 
 // record stores the status a plan implies. A nil result leaves whatever the
-// last sync recorded in place. An application removed while its sync was in
-// flight is skipped, so a late write does not resurrect it.
+// last sync recorded in place. An application that has left the set while its
+// sync was in flight is skipped, so a late write does not resurrect it or land
+// on the successor of its name.
 //
 // live is the per-release comparison against what is running, keyed by release
 // name, and is nil for an application not using that mode — which leaves the
 // whole axis absent from the status rather than present and empty.
-func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Plan, revision string, result *application.SyncResult, live map[string]*application.ReleaseDrift) {
+//
+// The swarm is read *before* the lock is taken, and that is the point of the
+// two-phase shape below. This used to hold the exclusive global lock across a
+// live daemon call per release — each one a whole-swarm snapshot on an
+// uncancellable context — so one application whose daemon was slow blocked every
+// API read, every lifecycle mutation and every other application's reconcile,
+// with RWMutex parking later readers behind the waiting writer. /healthz touches
+// none of it and kept answering, so nothing restarted the container. Reading
+// first is safe because the caller holds the application's lease: no other sync
+// for it can be writing the fields this reads.
+func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Backend, plan *charts.Plan, revision string, result *application.SyncResult, live map[string]*application.ReleaseDrift) {
 	sync, releases := drift.FromPlan(plan)
 	sync.Revision = revision
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	e, ok := r.apps[app]
-	if !ok {
+	r.mu.RLock()
+	present := r.currentLocked(e)
+	sync.LastSync = e.status.Sync.LastSync
+	r.mu.RUnlock()
+	if !present {
 		return
 	}
-
-	sync.LastSync = e.status.Sync.LastSync
 	if result != nil {
 		sync.LastSync = result
 	}
@@ -2271,23 +2544,37 @@ func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Pla
 	// health of each release is decided against the outcome recorded above
 	// rather than against the previous tick's.
 	syncFailed := sync.LastSync != nil && !sync.LastSync.Succeeded
+
+	// One read for every release that has one, rather than one read each. A
+	// release the plan would install is declared and not deployed, which is
+	// knowable from the plan, so it is left out of the request rather than asked
+	// about and ignored.
+	deployed := make([]string, 0, len(releases))
+	for i := range releases {
+		if releases[i].Action != application.ActionInstall {
+			deployed = append(deployed, releases[i].Name)
+		}
+	}
+	states, readErr := readStacks(ctx, backend, deployed)
+	if readErr != nil {
+		r.log.Warn("reading the swarm failed; publishing this application's releases as unread",
+			"application", e.name, "error", readErr)
+	}
+
 	for i := range releases {
 		rel := &releases[i]
-		var states []charts.ServiceState
-		var readErr error
-		if rel.Action != application.ActionInstall {
-			states, readErr = stackServices(backend, rel.Name)
-		}
 		rel.Health, rel.Services = health.Release(health.Input{
-			States: states,
+			States: states[rel.Name],
 			// A release the plan would install is declared and not deployed.
 			// That is knowable from the plan, so it costs no call to the swarm.
 			Installed:  rel.Action != application.ActionInstall,
 			SyncFailed: syncFailed,
 			// This is the one caller that must not read an unavailable daemon as
 			// an empty swarm: it asks once and publishes the answer, rather than
-			// polling until one arrives. See stackServicesReader.
-			ReadFailed: readErr != nil,
+			// polling until one arrives. See stackServicesReader. readStacks is
+			// all-or-nothing, so a release that was asked about and is absent
+			// from the answer was not read at all.
+			ReadFailed: readErr != nil && rel.Action != application.ActionInstall,
 		})
 
 		// Fold the live comparison into the sync axis. A release whose running
@@ -2304,33 +2591,41 @@ func (r *Reconciler) record(app string, backend charts.Backend, plan *charts.Pla
 		}
 	}
 
-	e.status = application.Status{
+	status := application.Status{
 		Sync:       sync,
 		Health:     health.Application(releases),
 		Drift:      drift.Application(releases),
 		Releases:   releases,
 		ObservedAt: r.now(),
 	}
+
+	// Re-checked rather than assumed: the reads above are where the time goes,
+	// and an application can leave the set during them.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.currentLocked(e) {
+		return
+	}
+	e.status = status
 	e.plan = plan
 }
 
 // driftState reports the live-drift state last observed for an application.
-// Unknown covers both "not using this mode" and "removed from the set", neither
-// of which is a transition worth reporting.
-func (r *Reconciler) driftState(app string) application.DriftState {
+// Unknown covers both "not using this mode" and "left the set", neither of which
+// is a transition worth reporting.
+func (r *Reconciler) driftState(e *appEntry) application.DriftState {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if e, ok := r.apps[app]; ok && e.status.Drift != nil {
+	if r.currentLocked(e) && e.status.Drift != nil {
 		return e.status.Drift.State
 	}
 	return application.DriftStateUnknown
 }
 
-func (r *Reconciler) recordResult(app string, result *application.SyncResult) {
+func (r *Reconciler) recordResult(e *appEntry, result *application.SyncResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.apps[app]
-	if !ok {
+	if !r.currentLocked(e) {
 		return
 	}
 	e.status.Sync.LastSync = result
@@ -2344,15 +2639,14 @@ func (r *Reconciler) recordResult(app string, result *application.SyncResult) {
 // A cancellation is not one of those and is dropped: the controller stopping,
 // or this application being removed from the set, is not a reason to leave
 // "context canceled" as the last word on every application in the list.
-func (r *Reconciler) setError(app string, err error) {
+func (r *Reconciler) setError(e *appEntry, err error) {
 	if cancelled(err) {
 		return
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.apps[app]
-	if !ok {
+	if !r.currentLocked(e) {
 		return
 	}
 	e.status.Error = err.Error()

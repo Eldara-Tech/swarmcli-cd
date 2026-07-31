@@ -97,9 +97,11 @@ type stubBackend struct {
 	removed *[]string
 }
 
-func (s stubBackend) StackServices(name string) []charts.ServiceState { return s.states[name] }
+func (s stubBackend) StackServices(_ context.Context, name string) []charts.ServiceState {
+	return s.states[name]
+}
 
-func (s stubBackend) RemoveStack(name string) error {
+func (s stubBackend) RemoveStack(_ context.Context, name string) error {
 	if s.removed != nil {
 		*s.removed = append(*s.removed, name)
 	}
@@ -122,7 +124,7 @@ type recordingBackend struct {
 	auth      regauth.Resolver
 }
 
-func (b recordingBackend) StackServices(string) []charts.ServiceState { return nil }
+func (b recordingBackend) StackServices(context.Context, string) []charts.ServiceState { return nil }
 
 func (b recordingBackend) WithForbiddenSecrets(names map[string]struct{}) charts.Backend {
 	b.forbidden = names
@@ -914,7 +916,7 @@ type countingBackend struct {
 	calls int
 }
 
-func (c *countingBackend) StackServices(string) []charts.ServiceState {
+func (c *countingBackend) StackServices(context.Context, string) []charts.ServiceState {
 	c.calls++
 	return nil
 }
@@ -925,7 +927,7 @@ func (c *countingBackend) StackServices(string) []charts.ServiceState {
 // upgrade is that the two answer differently.
 type unreadableBackend struct{ stubBackend }
 
-func (unreadableBackend) ReadStackServices(string) ([]charts.ServiceState, error) {
+func (unreadableBackend) ReadStackServices(context.Context, string) ([]charts.ServiceState, error) {
 	return nil, errors.New("daemon unreachable")
 }
 
@@ -1632,7 +1634,11 @@ func TestPruneFirstFailureIsReportedAsAFailedSync(t *testing.T) {
 	// A sync that worked, so that "the status still shows the last one" is a
 	// thing this test can actually catch rather than infer from a nil.
 	previous := &application.SyncResult{Revision: strings.Repeat("b", 40), Succeeded: true}
-	r.recordResult("edge", previous)
+	e, err := r.entry("edge")
+	if err != nil {
+		t.Fatalf("entry: %v", err)
+	}
+	r.recordResult(e, previous)
 
 	if err := r.Sync(context.Background(), "edge"); err == nil {
 		t.Fatal("Sync = nil, want the sweep failure")
@@ -1978,7 +1984,7 @@ func (b *driftBackend) attempted() []string {
 	return slices.Clone(b.attemptedResources)
 }
 
-func (b *driftBackend) DeployStack(name, manifest, _ string) error {
+func (b *driftBackend) DeployStack(_ context.Context, name, manifest, _ string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.deployed = append(b.deployed, name+"|"+manifest)
@@ -2517,7 +2523,7 @@ func (b *conflictingBackend) WithOutOfBandNotifier(fn func(string)) charts.Backe
 	return &c
 }
 
-func (b *conflictingBackend) DeployStack(string, string, string) error {
+func (b *conflictingBackend) DeployStack(context.Context, string, string, string) error {
 	for range b.fires {
 		b.notify("edge_web")
 	}
@@ -2541,7 +2547,7 @@ func TestOutOfBandWriteIsReported(t *testing.T) {
 		t.Fatal(err)
 	}
 	scoped := r.withOutOfBandNotifier(context.Background(), b, "edge")
-	if err := scoped.DeployStack("edge", "", ""); err != nil {
+	if err := scoped.DeployStack(t.Context(), "edge", "", ""); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 
@@ -2641,7 +2647,7 @@ type convergingBackend struct {
 	calls  int
 }
 
-func (b *convergingBackend) StackServices(string) []charts.ServiceState {
+func (b *convergingBackend) StackServices(context.Context, string) []charts.ServiceState {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.calls++
@@ -3954,5 +3960,37 @@ func TestMountedVolumesNamesOnlyTheNamedVolumes(t *testing.T) {
 func TestMountedVolumesToleratesAServiceWithNoContainerSpec(t *testing.T) {
 	if got := mountedVolumes(swarm.Service{}); got != nil {
 		t.Errorf("mountedVolumes = %v, want nil", got)
+	}
+}
+
+// The runtime half of the floor. An app set is reconciled from git, so
+// syncPolicy.interval is chosen by whoever can commit to that repository, and
+// `interval: 1ms` made one application monopolise the reconciler and starve
+// every other one.
+//
+// Clamped and not refused: refusing would stop the whole file from being
+// applied. `validate` is where it is refused, with somebody present to fix it.
+func TestAnIntervalBelowTheFloorIsClamped(t *testing.T) {
+	r := newTest(t, nil, &fakeEngine{}, nil)
+
+	fast := spec("edge", true)
+	fast.SyncPolicy.Interval = application.Duration(time.Millisecond)
+	if got := r.intervalFor(fast); got != application.MinInterval {
+		t.Errorf("intervalFor(1ms) = %s, want the %s floor", got, application.MinInterval)
+	}
+
+	// Above the floor is left exactly as declared: this is a floor, not a
+	// rounding.
+	slow := spec("edge", true)
+	slow.SyncPolicy.Interval = application.Duration(90 * time.Second)
+	if got := r.intervalFor(slow); got != 90*time.Second {
+		t.Errorf("intervalFor(90s) = %s, want it untouched", got)
+	}
+
+	// And the controller-wide interval is not floored, because it is not the
+	// untrusted one — it is set by whoever runs the controller.
+	r.interval = time.Millisecond
+	if got := r.intervalFor(spec("edge", true)); got != time.Millisecond {
+		t.Errorf("intervalFor(no policy) = %s, want the controller-wide interval untouched", got)
 	}
 }
