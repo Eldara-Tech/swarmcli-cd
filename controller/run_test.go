@@ -569,13 +569,12 @@ func TestTheListenerIsDrainedBeforeTheReconcilerStops(t *testing.T) {
 		_, _ = w.Write([]byte("done"))
 	})
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	httpSrv := &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
-	// Serve the already-open listener, so the test does not race the bind.
-	go func() { _ = httpSrv.Serve(ln) }()
+	// runUntilStopped is what binds — it calls ListenAndServe — so the address
+	// goes on the server rather than the test serving a listener of its own. An
+	// http.Server runs once, and doing both left Addr empty, which means ":80"
+	// and is not bindable on a CI runner.
+	addr := freePort(t)
+	httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: time.Second}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	stopped := make(chan error, 1)
@@ -584,7 +583,7 @@ func TestTheListenerIsDrainedBeforeTheReconcilerStops(t *testing.T) {
 	}()
 
 	go func() {
-		resp, err := http.Get("http://" + ln.Addr().String() + "/hold")
+		resp, err := waitForGet("http://" + addr + "/hold")
 		if err == nil {
 			_ = resp.Body.Close()
 		}
@@ -620,4 +619,35 @@ type failingBuilder struct{}
 
 func (failingBuilder) Build(context.Context, string, application.Source, git.Checkout) (*source.Built, error) {
 	return nil, errors.New("not building anything in this test")
+}
+
+// freePort returns an address nothing is listening on, for a server that has to
+// do its own binding. Closing before handing the address on leaves a window; it
+// is a loopback ephemeral port inside one test process, which is as small as
+// that window gets without changing what is under test.
+func freePort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+// waitForGet retries until the server under test has finished binding, so the
+// request is not racing the listener it is aimed at.
+func waitForGet(url string) (*http.Response, error) {
+	var err error
+	for range 200 {
+		var resp *http.Response
+		if resp, err = http.Get(url); err == nil {
+			return resp, nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil, err
 }
