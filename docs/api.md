@@ -204,9 +204,28 @@ SSE frame whose `data` is a small JSON object:
 
 ```
 event: sync-succeeded
-data: {"application":"edge","type":"sync-succeeded","revision":"9f3c1ab","message":"...","at":"2026-07-22T09:41:10Z"}
+data: {"application":"edge","swarm":"","type":"sync-succeeded","revision":"9f3c1ab","at":"2026-07-22T09:41:10Z"}
 
 ```
+
+`application`, `swarm`, `type` and `at` are always present. `revision` and
+`message` appear only on the events they apply to: a `sync-succeeded` resolved a
+commit and has nothing to say, a `resources-pruned` names what went and has no
+revision of its own.
+
+`swarm` is the destination the event concerns, as the application's
+[`destination.swarm`](configuration.md#destination-optional) names it, and is
+**empty for the swarm the controller runs in**. In this build that is every
+event: no other destination resolves, so an application naming one fails to
+reconcile rather than raising events from somewhere else. A licensed multi-swarm
+build fills it, which is what lets a client tell production events from staging
+ones without parsing prose.
+
+It is present even when empty, where `revision` and `message` are not, for two
+reasons. An absent key would say the event has no destination, and every event
+has one. And a client written against this build would otherwise never see the
+field at all — it would meet it for the first time pointed at a controller that
+fills it, which is exactly the client that must not be surprised.
 
 The event name is the `type` verbatim, because that is what an `EventSource`
 listener binds to. There are eight of them and no others: `sync-started`,
