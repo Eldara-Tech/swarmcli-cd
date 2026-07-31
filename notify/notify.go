@@ -124,6 +124,20 @@ func (logNotifier) Notify(ctx context.Context, e Event) {
 		slog.String("application", e.Application),
 		slog.String("event", string(e.Type)),
 	}
+	// Only when there is one, where the API's wire shape states swarm on every
+	// frame whether or not it is empty. The two are the same field treated
+	// oppositely on purpose, and the reason is who is reading.
+	//
+	// That shape is parsed by a program against a documented contract, so the
+	// key has to be there always: omit it and a client written against this
+	// build never sees the field exist, meeting it for the first time pointed at
+	// a controller that fills it. This line is read by a human who already knows
+	// which controller's log they are in, and swarm="" on every line of a
+	// single-swarm deployment says nothing while crowding out what does — the
+	// same reason revision and message are conditional here.
+	if e.Swarm != "" {
+		attrs = append(attrs, slog.String("swarm", e.Swarm))
+	}
 	if e.Revision != "" {
 		attrs = append(attrs, slog.String("revision", e.Revision))
 	}

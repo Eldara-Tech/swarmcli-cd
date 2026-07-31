@@ -627,6 +627,96 @@ func TestEventStreamDeliversWhatTheNotifierIsGiven(t *testing.T) {
 	}
 }
 
+// The reconciler stamps every event it raises with the application's
+// destination (#131), and until #142 the wire shape dropped it: a consumer was
+// told which application had synced and never where, which is the one question
+// a multi-swarm UI exists to answer.
+//
+// Asserted over the decoded frame rather than over wire, because the frame is
+// what a consumer parses — a field that exists in Go and never reaches the JSON
+// is exactly the gap being closed here, and a test reading the struct would
+// have passed throughout it. The empty case asserts the key is *present*, for
+// the reason the tag carries no omitempty; see wire.
+func TestTheStreamCarriesTheEventsDestination(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		swarm string
+	}{
+		{"a named destination", "production"},
+		{"the swarm the controller runs in", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := firstEventFrame(t, notify.Event{
+				Application: "edge",
+				Type:        notify.SyncSucceeded,
+				Swarm:       tc.swarm,
+				At:          time.Unix(0, 0).UTC(),
+			})
+			got, ok := data["swarm"]
+			if !ok {
+				t.Fatalf("frame %v carries no swarm key", data)
+			}
+			if got != tc.swarm {
+				t.Errorf("swarm = %v, want %q", got, tc.swarm)
+			}
+		})
+	}
+}
+
+// firstEventFrame raises e on a running server's event stream and returns the
+// `data` object of the frame a subscriber receives, decoded into a map.
+//
+// A map rather than wire: decoding into the type under test would let a renamed
+// or dropped JSON tag round-trip cleanly and prove nothing about what a client
+// written against the documented shape actually finds.
+func firstEventFrame(t *testing.T, e notify.Event) map[string]any {
+	t.Helper()
+
+	s, h := testServer(t, &fakeReconciler{}, nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", srv.URL+"/api/v1/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Wait for the subscription rather than sleeping on it.
+	for range 200 {
+		if s.events.count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if s.events.count() != 1 {
+		t.Fatal("the request never subscribed")
+	}
+	s.Notify(context.Background(), e)
+
+	buf := make([]byte, 512)
+	n, err := resp.Body.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("reading the stream: %v", err)
+	}
+	frame := string(buf[:n])
+	_, payload, ok := strings.Cut(frame, "data: ")
+	if !ok {
+		t.Fatalf("frame %q has no data line", frame)
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(payload)), &out); err != nil {
+		t.Fatalf("decoding %q: %v", payload, err)
+	}
+	return out
+}
+
 // A browser that stopped reading must never be able to stall a reconcile.
 // notify.Notifier's contract is that it does not block, so a subscriber that
 // falls behind loses events rather than applying back-pressure — the status

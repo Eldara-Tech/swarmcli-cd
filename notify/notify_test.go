@@ -122,3 +122,43 @@ func TestLogNotifierOmitsEmptyFields(t *testing.T) {
 		t.Errorf("a started event should not be an error: %s", got)
 	}
 }
+
+// Event.Swarm has two consumers and both must carry it: the API's event stream,
+// and this line. The stream states it on every frame because a program parses a
+// contract; this omits it when empty because a human reads a log and swarm="" on
+// every line of a single-swarm deployment is noise. Both directions are asserted
+// here, because the omission is the half that looks like the bug it is not.
+func TestLogNotifierNamesTheDestinationOnlyWhenThereIsOne(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		swarm string
+		want  bool
+	}{
+		{"a named destination", "production", true},
+		{"the swarm the controller runs in", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			restore := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+			t.Cleanup(func() { slog.SetDefault(restore) })
+
+			logNotifier{}.Notify(context.Background(), Event{
+				Application: "edge",
+				Type:        ResourcesPruned,
+				Swarm:       tc.swarm,
+				Message:     "pruned legacy-api",
+			})
+
+			got := buf.String()
+			// The attribute, not the value: a router keys on swarm=, and an
+			// empty one is the attribute being there.
+			if has := strings.Contains(got, "swarm="); has != tc.want {
+				t.Fatalf("log line %q: swarm attribute present = %v, want %v", got, has, tc.want)
+			}
+			if tc.want && !strings.Contains(got, "swarm="+tc.swarm) {
+				t.Errorf("log line %q does not name the destination %q", got, tc.swarm)
+			}
+		})
+	}
+}

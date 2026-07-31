@@ -111,10 +111,31 @@ func (s *stream) count() int {
 // here rather than leaking whatever Go field names happen to be.
 type wire struct {
 	Application string `json:"application"`
-	Type        string `json:"type"`
-	Revision    string `json:"revision,omitempty"`
-	Message     string `json:"message,omitempty"`
-	At          string `json:"at"`
+	// Swarm is deliberately not omitempty, where Revision and Message are.
+	//
+	// Those two are omitted because they do not always apply: a sync-succeeded
+	// has nothing to say, a resources-pruned resolved no commit, and a key
+	// holding "" there would assert an answer where the event has none. A
+	// destination is not like that — every event has one, and notify.Event.Swarm
+	// says so explicitly: empty *is* the answer, "the swarm the controller runs
+	// in", rather than an absence. Omitting it would tell a consumer the
+	// opposite of what is true.
+	//
+	// The cost is one always-empty key in a single-swarm deployment, which is
+	// every Apache-2.0 one. That buys a shape readable off a single frame: with
+	// omitempty, a client written against this controller would never see the
+	// field exist and would meet it for the first time pointed at a multi-swarm
+	// build — which is precisely the client that must not be surprised by it.
+	//
+	// notify's logNotifier omits the same field when it is empty. That is the
+	// deliberate opposite, not an inconsistency: a log line is read by a human
+	// who already knows which controller's log they are in, and it has no
+	// contract for a field to be missing from.
+	Swarm    string `json:"swarm"`
+	Type     string `json:"type"`
+	Revision string `json:"revision,omitempty"`
+	Message  string `json:"message,omitempty"`
+	At       string `json:"at"`
 }
 
 // stream serves server-sent events.
@@ -156,6 +177,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 			}
 			payload, err := json.Marshal(wire{
 				Application: e.Application,
+				Swarm:       e.Swarm,
 				Type:        string(e.Type),
 				Revision:    e.Revision,
 				Message:     e.Message,
