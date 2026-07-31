@@ -82,6 +82,9 @@ type fakeAPI struct {
 	// not about that guard wants and what a development run really is.
 	selfServiceID string
 	selfSpec      swarm.ServiceSpec
+	// selfSpecErr fails the second of those two reads instead. It is a separate
+	// round trip, so the daemon that answered the first one can be gone by it.
+	selfSpecErr error
 	// selfInspects counts the reads about this controller's own container, so a
 	// test can assert both that the answer is cached and that a stack reaching
 	// for nothing outside itself never asks at all.
@@ -139,6 +142,9 @@ func (f *fakeAPI) ServiceUpdate(_ context.Context, id string, v swarm.Version, s
 
 func (f *fakeAPI) ServiceInspectWithRaw(_ context.Context, id string, _ swarm.ServiceInspectOptions) (swarm.Service, []byte, error) {
 	if f.selfServiceID != "" && id == f.selfServiceID {
+		if f.selfSpecErr != nil {
+			return swarm.Service{}, nil, f.selfSpecErr
+		}
 		return swarm.Service{ID: id, Spec: f.selfSpec}, nil, nil
 	}
 	f.inspects++

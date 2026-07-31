@@ -6,6 +6,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -1210,6 +1211,117 @@ func TestAFailedSelfReadRefusesTheDeployAndIsRetried(t *testing.T) {
 	}
 }
 
+// connectionFailure is the error the moby client returns when it could not reach
+// the daemon at all — a dockerd restart, or a socket that was not there for a few
+// hundred milliseconds.
+//
+// It has to come from the client itself: IsErrConnectionFailed matches an
+// unexported type, so no error built here would be recognised as one, and the
+// exported constructor for it is deprecated. Dialling a socket path that does not
+// exist produces the real thing without a daemon or a network.
+func connectionFailure(t *testing.T) error {
+	t.Helper()
+	c, err := client.NewClientWithOpts(client.WithHost("unix:///nonexistent/docker.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.ContainerInspect(context.Background(), "any")
+	if !client.IsErrConnectionFailed(err) {
+		t.Fatalf("inspecting through a dead socket = %v, want a connection failure", err)
+	}
+	return err
+}
+
+// The daemon being unreachable is not the news that nothing is mounted (#101).
+// This container is still running, and the spec it was started from still mounts
+// the controller's token and its application set; the only thing that changed is
+// that nobody could be asked. So it fails the deploy, exactly as a daemon that
+// answers with an error does, rather than proceeding unguarded.
+func TestAnUnreachableDaemonRefusesTheDeployAndIsRetried(t *testing.T) {
+	api := asController(&fakeAPI{
+		selfErr: connectionFailure(t),
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
+	})
+	b := testBackend(t, api, nil)
+
+	err := b.DeployStack("s", oneOfEach, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
+	}
+	if !client.IsErrConnectionFailed(err) {
+		t.Errorf("DeployStack = %v, want the daemon's connection failure surfaced", err)
+	}
+	if len(api.created) != 0 {
+		t.Errorf("%d services created despite the failure", len(api.created))
+	}
+
+	api.selfErr = nil
+	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {
+		t.Fatalf("second DeployStack = %v, want the failure not to have been cached", err)
+	}
+}
+
+// And the half that made #101 critical rather than merely noisy: what the
+// unreachable daemon must not do is leave an empty set behind, because an empty
+// set is a valid answer and therefore caches. One hiccup used to turn the guard
+// off for the life of the controller — silently, with a healthy daemon, and for
+// every application on the swarm.
+func TestAnUnreachableDaemonDoesNotDisableTheGuard(t *testing.T) {
+	api := asController(&fakeAPI{
+		selfErr: connectionFailure(t),
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"},
+		}}},
+	})
+	b := testBackend(t, api, nil)
+
+	if err := b.DeployStack("tenant", mountsControllerConfig, ResolveNever); err == nil {
+		t.Fatal("DeployStack = nil, want the deploy refused while the guard could not be read")
+	}
+
+	api.selfErr = nil
+	err := b.DeployStack("tenant", mountsControllerConfig, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the guard still on once the daemon answers")
+	}
+	if !strings.Contains(err.Error(), "swarmcli-cd-applications") || !strings.Contains(err.Error(), "controller") {
+		t.Errorf("error %q is not the guard refusing the stack", err)
+	}
+	if len(api.created) != 0 || len(api.order) != 0 {
+		t.Errorf("the stack was deployed: created=%d order=%v", len(api.created), api.order)
+	}
+}
+
+// The service spec is a second round trip, so the daemon can be gone by the time
+// it is made — and reading it is the whole point of reading the daemon at all,
+// since the mount targets on the filesystem carry the wrong names.
+func TestAnUnreachableDaemonOnTheServiceReadAlsoRefuses(t *testing.T) {
+	api := asController(&fakeAPI{
+		selfSpecErr: connectionFailure(t),
+		secrets: []swarm.Secret{{ID: "tok", Spec: swarm.SecretSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli-cd-token"},
+		}}},
+	})
+	b := testBackend(t, api, nil)
+
+	err := b.DeployStack("tenant", mountsControllerSecret, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
+	}
+	if !client.IsErrConnectionFailed(err) {
+		t.Errorf("DeployStack = %v, want the daemon's connection failure surfaced", err)
+	}
+
+	api.selfSpecErr = nil
+	if err := b.DeployStack("tenant", mountsControllerSecret, ResolveNever); err == nil {
+		t.Fatal("DeployStack = nil, want the guard still on once the daemon answers")
+	}
+	if len(api.created) != 0 {
+		t.Errorf("%d services created, one of them holding the controller's token", len(api.created))
+	}
+}
+
 // A controller that is not a swarm task — a development run — has nothing
 // mounted by Swarm, which is an answer rather than a failure.
 func TestOutsideASwarmThereIsNothingOfOursToProtect(t *testing.T) {
@@ -1219,5 +1331,31 @@ func TestOutsideASwarmThereIsNothingOfOursToProtect(t *testing.T) {
 	}
 	if err := testBackend(t, api, nil).DeployStack("s", oneOfEach, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
+	}
+}
+
+// The other side of the split #101 drew, as the daemon really phrases it. A
+// not-found is the daemon answering, and what it answers is that this process is
+// not one of its containers — so nothing was mounted by Swarm, and failing the
+// deploy would break every development run and every plain `docker run` for no
+// gain. Only "could not ask" fails closed.
+func TestAContainerThisDaemonDoesNotKnowIsAnAnswer(t *testing.T) {
+	api := &fakeAPI{
+		selfErr: fmt.Errorf("Error: No such container: deadbeef: %w", errdefs.ErrNotFound),
+		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
+		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
+	}
+	b := testBackend(t, api, nil)
+
+	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want a controller that is not a swarm task to deploy", err)
+	}
+	// Cached, unlike the unreachable case: this one is an answer, and it cannot
+	// change for the life of the process.
+	if err := b.DeployStack("s", oneOfEach, ResolveNever); err != nil {
+		t.Fatalf("second DeployStack = %v, want nil", err)
+	}
+	if api.selfInspects != 1 {
+		t.Errorf("asked about this controller %d times, want 1", api.selfInspects)
 	}
 }

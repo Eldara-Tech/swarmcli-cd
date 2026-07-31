@@ -11,7 +11,6 @@ import (
 
 	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/client"
 )
 
 // serviceIDLabel is what Swarm stamps on every task container it starts. Its
@@ -33,6 +32,13 @@ type selfMounts struct {
 // sync.Once so that a failure is not cached: a daemon that was briefly
 // unreachable would otherwise poison the guard for the life of the controller,
 // and the failure mode of this particular cache is "refuse every deploy".
+//
+// That only holds while a read that never reached the daemon comes back as an
+// error, which is an invariant of readSelfMounts rather than of the mutex: only a
+// nil error sets loaded. Reporting an unreachable daemon as an empty set instead
+// would be worse than the sync.Once this avoids, because an empty set is a valid
+// answer and therefore caches — leaving the guard off silently, permanently, and
+// with a healthy daemon, rather than merely stuck refusing.
 type selfMountCache struct {
 	mu     sync.Mutex
 	loaded bool
@@ -76,7 +82,12 @@ type selfMountCache struct {
 //
 // A controller that is not a swarm service — a `go run` during development, a
 // plain `docker run` — has nothing mounted by Swarm and gets empty sets and no
-// error. That is the true answer rather than a failure.
+// error. That is the true answer rather than a failure, and it is cached as one.
+//
+// A daemon that could not be asked is not that answer. It arrives here as an
+// error, is not cached, and fails the deploy that needed it — the two are easy to
+// conflate because neither leaves anything to report, and readSelfMounts is where
+// they are kept apart.
 func (b *Backend) mounts(ctx context.Context) (selfMounts, error) {
 	b.self.mu.Lock()
 	defer b.self.mu.Unlock()
@@ -101,13 +112,22 @@ func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 	}
 
 	self, err := b.api.ContainerInspect(ctx, host)
-	// Not a container this daemon knows, or no daemon to ask: either way this is
-	// not a running swarm task and there is nothing mounted to protect. A
-	// controller that really is one cannot reach either case — the daemon it is
-	// asking is the one that started it.
-	if errdefs.IsNotFound(err) || client.IsErrConnectionFailed(err) {
+	// Not a container this daemon knows: this is not a running swarm task and
+	// there is nothing mounted to protect. A controller that really is one cannot
+	// reach this — the daemon it is asking is the one that started it — so it is a
+	// `go run` during development or a plain `docker run`, and an answer.
+	if errdefs.IsNotFound(err) {
 		return selfMounts{}, nil
 	}
+	// Anything else is the daemon not having been asked rather than an answer, and
+	// the difference is the whole guard. A connection failure in particular used to
+	// land in the branch above, on the reasoning that a real controller could not
+	// reach it either — but that only holds for a daemon that is permanently
+	// absent. A dockerd restart, or a socket unavailable for a few hundred
+	// milliseconds, produces exactly that error while this container keeps running
+	// with the controller's own secrets and configs still mounted. Called an empty
+	// set it would have cached, and from then on every stack could mount the
+	// application set and any secret whose target was renamed (#101).
 	if err != nil {
 		return selfMounts{}, fmt.Errorf("inspecting this container: %w", err)
 	}
@@ -121,6 +141,8 @@ func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 		// misconfiguration. Nothing to protect and nothing to complain about.
 		return selfMounts{}, nil
 	}
+	// The same split as above, and it is a second round trip: the daemon that
+	// answered the first read can be gone by this one.
 	if err != nil {
 		return selfMounts{}, fmt.Errorf("inspecting this controller's own service: %w", err)
 	}
