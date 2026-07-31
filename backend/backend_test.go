@@ -19,6 +19,7 @@ import (
 
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/api/types/volume"
@@ -72,50 +73,35 @@ func TestDeployStackCreatesReferencesBeforeServices(t *testing.T) {
 }
 
 // declaresAndMounts is the shape #84 was filed for: a chart that brings its own
-// config and secret and mounts them. Both sources are files, because that is the
-// only way compose carries content, and the loader resolves them against this
-// process's filesystem.
-func declaresAndMounts(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	write := func(name, content string) string {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return path
-	}
-	return `
+// secret and mounts it. Driver-backed, because since #99 that is the whole of
+// what a stack can own — the other way was a path, and compose resolves a path
+// against the controller's filesystem rather than the chart's.
+const declaresAndMounts = `
 services:
   app:
     image: busybox
-    configs: [site]
     secrets: [apikey]
-configs:
-  site:
-    file: ` + write("site.conf", "listen 80;\n") + `
 secrets:
   apikey:
-    file: ` + write("api.key", "s3cr3t\n") + `
+    driver: vault
 `
-}
 
 // A chart may mount what it declares. Converting a service resolves each config
 // and secret it mounts to the id Swarm addresses it by, so the conversion that
 // is applied cannot run until they exist — which is the ordering #84 got wrong.
 //
 // The id asserted at the end is the point of the whole arrangement: it is the
-// one the daemon reported for the config this deploy created, so the spec that
+// one the daemon reported for the secret this deploy created, so the spec that
 // reached the swarm came from the authoritative conversion and not from the
 // reference-free one the guard reads.
-func TestDeployStackCreatesAConfigAndSecretItThenMounts(t *testing.T) {
+func TestDeployStackCreatesASecretItThenMounts(t *testing.T) {
 	api := &fakeAPI{}
 
-	if err := testBackend(t, api, nil).DeployStack("rel", declaresAndMounts(t), ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack("rel", declaresAndMounts, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want a chart to be able to mount what it declares", err)
 	}
 
-	want := []string{"network:rel_default", "secret:rel_apikey", "config:rel_site"}
+	want := []string{"network:rel_default", "secret:rel_apikey"}
 	if !reflect.DeepEqual(api.order, want) {
 		t.Errorf("mutation order = %v, want %v", api.order, want)
 	}
@@ -123,9 +109,6 @@ func TestDeployStackCreatesAConfigAndSecretItThenMounts(t *testing.T) {
 		t.Fatalf("created %d services, want 1", len(api.created))
 	}
 	cs := api.created[0].TaskTemplate.ContainerSpec
-	if len(cs.Configs) != 1 || cs.Configs[0].ConfigName != "rel_site" || cs.Configs[0].ConfigID != "cfg-rel_site" {
-		t.Errorf("configs = %+v, want the id the daemon reported for the config just created", cs.Configs)
-	}
 	if len(cs.Secrets) != 1 || cs.Secrets[0].SecretName != "rel_apikey" || cs.Secrets[0].SecretID != "sec-rel_apikey" {
 		t.Errorf("secrets = %+v, want the id the daemon reported for the secret just created", cs.Secrets)
 	}
@@ -696,6 +679,13 @@ type errAPI struct {
 
 func (e *errAPI) ClientVersion() string { return "1.51" }
 
+// The read every deploy and every removal now makes about this controller
+// itself. A daemon that will not answer it is not the news that this controller
+// has no stack of its own, so it surfaces here like every other failure.
+func (e *errAPI) ContainerInspect(context.Context, string) (container.InspectResponse, error) {
+	return container.InspectResponse{}, e.err
+}
+
 func (e *errAPI) ServiceList(context.Context, swarm.ServiceListOptions) ([]swarm.Service, error) {
 	return nil, e.err
 }
@@ -889,15 +879,23 @@ func stackNetwork(id, name, stack string) network.Summary {
 
 // ---------------------------------------- the controller's own state (#63)
 
-// controllerService is this controller as Swarm holds it: mounting its own
-// bootstrap config and its admin token, under the names a reference resolves by.
+// controllerService is this controller as Swarm holds it: deployed as the stack
+// the README says to deploy it as, and mounting its own bootstrap config and its
+// admin token under the names a reference resolves by.
 //
 // The target rename on the secret is the point. MountedSecretNames would derive
 // "token" from /run/secrets and never match the "swarmcli-cd-token" a tenant
 // stack would actually name, so the filesystem-derived guard has a hole exactly
 // here — and reading the service spec closes it.
+//
+// The namespace label comes off the same read and is the whole of #102: `docker
+// stack deploy -c stack.yml swarmcli-cd` puts it there, so it is the name no
+// release may claim.
 func controllerService() swarm.ServiceSpec {
-	return swarm.ServiceSpec{TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{
+	return swarm.ServiceSpec{Annotations: swarm.Annotations{
+		Name:   "swarmcli-cd_controller",
+		Labels: map[string]string{convert.LabelNamespace: "swarmcli-cd"},
+	}, TaskTemplate: swarm.TaskSpec{ContainerSpec: &swarm.ContainerSpec{
 		Configs: []*swarm.ConfigReference{{
 			ConfigName: "swarmcli-cd-applications",
 			File:       &swarm.ConfigReferenceFileTarget{Name: "/etc/swarmcli-cd/applications.yaml"},
@@ -1006,25 +1004,23 @@ func TestDeployStackRefusesAControllerSecretRenamedOnTheWayIn(t *testing.T) {
 
 // ------------------------------------ a stack that claims one of our names (#86)
 
-// stealsByDeclaring is a manifest that takes a resource over instead of
+// stealsByDeclaring is a manifest that takes a secret over instead of
 // referencing it: the entry is not `external:`, so it is one of the stack's own
 // as far as conversion and the guard's reference check are concerned, and `name:`
 // points it at something that already exists.
 //
-// The file is any path the controller can read. It never reaches the swarm — a
-// secret that already exists is not created — so what is in it does not matter,
-// which is exactly why this is not hard to write.
-func stealsByDeclaring(t *testing.T, kind, name string, mount bool) string {
-	t.Helper()
-	decoy := filepath.Join(t.TempDir(), "decoy")
-	if err := os.WriteFile(decoy, []byte("not the real thing\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+// Driver-backed, and secrets only. This fixture used to carry a `file:` and to
+// take a kind, which is how it covered the config half of the same rule too —
+// but #99 refuses a path before the guard ever runs, and a config has no
+// `driver:` to fall back on, so a manifest can no longer express a stack-owned
+// config at all. The two config cases below therefore address the guard
+// directly.
+func stealsByDeclaring(name string, mount bool) string {
 	svc := "services:\n  thief:\n    image: alpine\n"
 	if mount {
-		svc += "    " + kind + ": [x]\n"
+		svc += "    secrets: [x]\n"
 	}
-	return svc + kind + ":\n  x:\n    name: " + name + "\n    file: " + decoy + "\n"
+	return svc + "secrets:\n  x:\n    name: " + name + "\n    driver: vault\n"
 }
 
 // The controller's own token, taken by declaring it rather than by referencing
@@ -1044,7 +1040,7 @@ func TestDeployStackRefusesAStackDeclaringAControllerSecret(t *testing.T) {
 	}}})
 	b := testBackend(t, api, nil).WithForbiddenSecrets(map[string]struct{}{"swarmcli-cd-token": {}}).(*Backend)
 
-	err := b.DeployStack("tenant", stealsByDeclaring(t, "secrets", "swarmcli-cd-token", true), ResolveNever)
+	err := b.DeployStack("tenant", stealsByDeclaring("swarmcli-cd-token", true), ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for declaring the controller's own secret")
 	}
@@ -1072,7 +1068,7 @@ func TestDeployStackRefusesADeclarationNoServiceMounts(t *testing.T) {
 	}}})
 
 	err := testBackend(t, api, nil).DeployStack("tenant",
-		stealsByDeclaring(t, "secrets", "swarmcli-cd-token", false), ResolveNever)
+		stealsByDeclaring("swarmcli-cd-token", false), ResolveNever)
 	if err == nil {
 		t.Fatal("DeployStack = nil, want a declaration of the controller's secret refused even unmounted")
 	}
@@ -1085,16 +1081,25 @@ func TestDeployStackRefusesADeclarationNoServiceMounts(t *testing.T) {
 // immutability check rather than by the guard — an error about configs being
 // immutable, for what is actually an attempt to take the application set over,
 // and only after applySecrets had already run.
+//
+// It reaches the guard directly rather than through DeployStack because #99
+// closed the only route a manifest had to a stack-owned config: content came
+// from `file:`, a config has no `driver:` to declare it without content, and an
+// `external:` entry is a reference rather than a declaration. Put back through
+// DeployStack it would be refused for the file source and prove nothing about
+// this rule. The rule stays under test because the route can reopen — it is
+// compose's inability to carry content that shuts it, not anything here.
 func TestDeployStackRefusesAStackDeclaringTheControllersOwnConfig(t *testing.T) {
 	api := asController(&fakeAPI{configs: []swarm.Config{{
 		ID:   "app-set",
 		Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"}, Data: []byte("real")},
 	}}})
+	st := stack("tenant")
+	st.Configs = []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"}}}
 
-	err := testBackend(t, api, nil).DeployStack("tenant",
-		stealsByDeclaring(t, "configs", "swarmcli-cd-applications", true), ResolveNever)
+	err := testBackend(t, api, nil).rejectForbiddenResources(t.Context(), st)
 	if err == nil {
-		t.Fatal("DeployStack = nil, want the stack refused for declaring the controller's own config")
+		t.Fatal("rejectForbiddenResources = nil, want the stack refused for declaring the controller's own config")
 	}
 	if !strings.Contains(err.Error(), "declares") || !strings.Contains(err.Error(), "controller") {
 		t.Errorf("error %q does not say what was refused", err)
@@ -1106,6 +1111,12 @@ func TestDeployStackRefusesAStackDeclaringTheControllersOwnConfig(t *testing.T) 
 
 // A release record, taken the same way. Not immutability's business at all: the
 // record it names does not exist yet, so nothing would have refused this.
+//
+// Through the guard rather than through DeployStack for the reason above, and
+// this is the one the integration suite used to prove end to end — see the note
+// where TestAStackMayNotClaimAReleaseRecordAsItsOwn was. Do not "restore" the
+// DeployStack form: no manifest can declare a config since #99, so it would fail
+// on the file-source refusal and prove nothing about this rule.
 func TestDeployStackRefusesAStackDeclaringAReleaseRecordName(t *testing.T) {
 	api := asController(&fakeAPI{configs: []swarm.Config{{
 		ID: "rec",
@@ -1114,11 +1125,12 @@ func TestDeployStackRefusesAStackDeclaringAReleaseRecordName(t *testing.T) {
 			Labels: map[string]string{charts.LabelType: charts.TypeRelease},
 		}},
 	}}})
+	st := stack("tenant")
+	st.Configs = []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "swarmcli.release.other-app.v3"}}}
 
-	err := testBackend(t, api, nil).DeployStack("tenant",
-		stealsByDeclaring(t, "configs", "swarmcli.release.other-app.v3", true), ResolveNever)
+	err := testBackend(t, api, nil).rejectForbiddenResources(t.Context(), st)
 	if err == nil {
-		t.Fatal("DeployStack = nil, want the stack refused for declaring a release record's name")
+		t.Fatal("rejectForbiddenResources = nil, want the stack refused for declaring a release record's name")
 	}
 	if !strings.Contains(err.Error(), "release record") {
 		t.Errorf("error %q does not say what was refused", err)
@@ -1127,13 +1139,13 @@ func TestDeployStackRefusesAStackDeclaringAReleaseRecordName(t *testing.T) {
 
 // The false-positive check, and the reason the new rule compares names rather
 // than refusing declarations outright: a chart declaring and mounting its own
-// config and secret is ordinary, and #84 exists so that it works. Their names are
-// namespace-scoped, so they are nobody else's.
-func TestAStackDeclaringItsOwnConfigAndSecretIsAllowed(t *testing.T) {
+// secret is ordinary, and #84 exists so that it works. Its name is
+// namespace-scoped, so it is nobody else's.
+func TestAStackDeclaringItsOwnSecretIsAllowed(t *testing.T) {
 	api := asController(&fakeAPI{})
 
-	if err := testBackend(t, api, nil).DeployStack("rel", declaresAndMounts(t), ResolveNever); err != nil {
-		t.Fatalf("DeployStack = %v, want a chart's own config and secret to be allowed", err)
+	if err := testBackend(t, api, nil).DeployStack("rel", declaresAndMounts, ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want a chart's own secret to be allowed", err)
 	}
 }
 
@@ -1152,8 +1164,14 @@ func TestDeployStackAllowsAnOrdinaryExternalConfig(t *testing.T) {
 }
 
 // A stack that declares everything it uses reaches outside itself for nothing,
-// so the guard must cost it no daemon calls at all.
-func TestAStackThatReachesForNothingCostsNoLookup(t *testing.T) {
+// so the guard must cost it no reading of the swarm's release records — the one
+// listing here that grows with every release ever deployed.
+//
+// The read about this controller itself is no longer conditional and cannot be:
+// a release name is compared against the controller's own namespace whatever the
+// manifest declares (#102). It costs one pair of round trips for the life of the
+// process, which is what TestTheControllersOwnMountsAreReadOnce pins.
+func TestAStackThatReachesForNothingCostsNoReleaseLookup(t *testing.T) {
 	const selfContained = `
 services:
   web:
@@ -1163,8 +1181,13 @@ services:
 	if err := testBackend(t, api, nil).DeployStack("s", selfContained, ResolveNever); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
-	if api.selfInspects != 0 {
-		t.Errorf("asked about this controller %d times, want 0", api.selfInspects)
+	for _, f := range api.labelFilters {
+		if strings.HasPrefix(f, "com.swarmcli.") {
+			t.Errorf("listed by %q; a stack that reaches for nothing must not cost a release-record read", f)
+		}
+	}
+	if api.selfInspects != 1 {
+		t.Errorf("asked about this controller %d times, want 1", api.selfInspects)
 	}
 }
 
@@ -1357,5 +1380,143 @@ func TestAContainerThisDaemonDoesNotKnowIsAnAnswer(t *testing.T) {
 	}
 	if api.selfInspects != 1 {
 		t.Errorf("asked about this controller %d times, want 1", api.selfInspects)
+	}
+}
+
+// ------------------------- a release named for the controller's own stack (#102)
+
+// takesOverTheController is the shape the report was filed with: a release named
+// after the controller's stack, with a service named after the controller's, and
+// the socket the controller itself is mounted with.
+//
+// It does not have to be this exact manifest to be dangerous — any spec written
+// over the controller is a controller running somebody else's image — but this is
+// the one that makes the escalation obvious.
+const takesOverTheController = `
+services:
+  controller:
+    image: attacker/evil
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+`
+
+// controllerStack is the swarm as it stands with a controller deployed on it:
+// its service, its overlay network and the volume holding every application's
+// clone and chart cache, all carrying its namespace.
+func controllerStack() *fakeAPI {
+	return asController(&fakeAPI{
+		existing: []swarm.Service{{
+			ID:   "ctl",
+			Spec: swarm.ServiceSpec{Annotations: stackScoped("swarmcli-cd_controller", "swarmcli-cd")},
+		}},
+		networks: []network.Summary{stackNetwork("net", "swarmcli-cd_default", "swarmcli-cd")},
+		volumes: []volume.Volume{{
+			Name:   "swarmcli-cd_swarmcli-cd-data",
+			Labels: map[string]string{convert.LabelNamespace: "swarmcli-cd"},
+		}},
+	})
+}
+
+// The takeover direction. A release name is the stack namespace, and the
+// controller's own service carries that label like anything else Swarm deployed —
+// so a release called "swarmcli-cd" with a service called "controller" scopes to
+// swarmcli-cd_controller, the controller's exact service name, and the write path
+// hands the daemon this chart's spec for it.
+func TestDeployStackRefusesTheControllersOwnStackName(t *testing.T) {
+	api := controllerStack()
+
+	err := testBackend(t, api, nil).DeployStack("swarmcli-cd", takesOverTheController, ResolveNever)
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a release claiming the controller's own stack refused")
+	}
+	// The name, and this refusal rather than the ownership one below it: a
+	// release claiming the controller's own stack is refused for being that name
+	// and not because the services under it happen to be unaccounted for.
+	if !strings.Contains(err.Error(), "swarmcli-cd") || !strings.Contains(err.Error(), "this controller itself") {
+		t.Errorf("error %q does not say which name was refused and why", err)
+	}
+	if len(api.created) != 0 || len(api.updated) != 0 || len(api.order) != 0 {
+		t.Errorf("the controller was written to: created=%d updated=%d order=%v",
+			len(api.created), len(api.updated), api.order)
+	}
+}
+
+// The destruction direction, which needs no chart at all. RemoveStack deletes
+// everything carrying the namespace label and checks no ownership — deliberately,
+// because that is what `docker stack rm` does — so its only protection is that the
+// name is not the controller's.
+func TestRemoveStackRefusesTheControllersOwnStackName(t *testing.T) {
+	api := controllerStack()
+
+	err := testBackend(t, api, nil).RemoveStack("swarmcli-cd")
+	if err == nil {
+		t.Fatal("RemoveStack = nil, want the controller's own stack refused")
+	}
+	if len(api.removed) != 0 {
+		t.Errorf("removed %v; the controller deleted itself", api.removed)
+	}
+}
+
+// And the volumes, which is what makes the destruction permanent: the controller
+// comes back from git, the git clone and chart cache in its volume do not, and
+// nothing reconverges because the thing that would have has been deleted.
+//
+// Guarded on the listing rather than only on the removal because the chart
+// engine's Uninstall purges volumes even when the stack removal before it failed:
+// it collects that error and carries on.
+func TestStackVolumesRefusesTheControllersOwnStackName(t *testing.T) {
+	api := controllerStack()
+
+	vols, err := testBackend(t, api, nil).StackVolumes(context.Background(), "swarmcli-cd")
+	if err == nil {
+		t.Fatal("StackVolumes = nil, want the controller's own volumes refused")
+	}
+	if vols != nil {
+		t.Errorf("StackVolumes = %v, want nothing for a purge to delete", vols)
+	}
+}
+
+// The guard is one name, not a mode. Everything else on the swarm deploys and is
+// removed exactly as before, including on a controller that is itself a stack.
+func TestAnyOtherReleaseIsDeployedAndRemovedAsBefore(t *testing.T) {
+	api := installed(asController(&fakeAPI{
+		existing: []swarm.Service{{
+			ID:   "svc",
+			Spec: swarm.ServiceSpec{Annotations: stackScoped("s_web", "s")},
+		}},
+	}), "s")
+	b := testBackend(t, api, nil)
+
+	if err := b.DeployStack("s", "services:\n  web:\n    image: nginx\n", ResolveNever); err != nil {
+		t.Fatalf("DeployStack = %v, want an ordinary release deployed", err)
+	}
+	if err := b.RemoveStack("s"); err != nil {
+		t.Fatalf("RemoveStack = %v, want an ordinary release removed", err)
+	}
+	if !slices.Contains(api.removed, "service:svc") {
+		t.Errorf("removed %v, want the release's own service", api.removed)
+	}
+}
+
+// A controller that is not a swarm service has no stack of its own, so there is
+// no name to protect and the guard says nothing. Refusing "swarmcli-cd" here
+// would be inventing a rule from a string rather than reading one off the swarm —
+// and it would break every development run against a swarm that happens to have a
+// release by that name.
+func TestOutsideASwarmTheNamespaceGuardIsInert(t *testing.T) {
+	api := &fakeAPI{existing: []swarm.Service{{
+		ID:   "ctl",
+		Spec: swarm.ServiceSpec{Annotations: stackScoped("swarmcli-cd_controller", "swarmcli-cd")},
+	}}}
+	b := testBackend(t, api, nil)
+
+	if err := b.RemoveStack("swarmcli-cd"); err != nil {
+		t.Fatalf("RemoveStack = %v, want no guard for a controller that has no stack", err)
+	}
+	if !slices.Contains(api.removed, "service:ctl") {
+		t.Errorf("removed %v, want the stack removed as it always was", api.removed)
+	}
+	if _, err := b.StackVolumes(context.Background(), "swarmcli-cd"); err != nil {
+		t.Fatalf("StackVolumes = %v, want no guard for a controller that has no stack", err)
 	}
 }

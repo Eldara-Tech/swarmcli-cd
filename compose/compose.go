@@ -87,11 +87,15 @@ func Convert(ctx context.Context, manifest, stack string, api client.APIClient) 
 	if err := checkBindSources(dict); err != nil {
 		return nil, err
 	}
+	if err := checkFileSources(dict); err != nil {
+		return nil, err
+	}
 
 	cfg, err := loader.Load(composetypes.ConfigDetails{
 		// A rendered manifest is not a file, so there is no directory for a
-		// relative path to mean anything against; checkBindSources has already
-		// refused the one case where the loader would have used this.
+		// relative path to mean anything against; checkBindSources and
+		// checkFileSources have already refused all three of the places the
+		// loader would have used this.
 		WorkingDir:  "/",
 		ConfigFiles: []composetypes.ConfigFile{{Config: dict}},
 	}, func(o *loader.Options) {
@@ -292,4 +296,77 @@ func bindSource(v any) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// checkFileSources refuses a manifest that takes content from a path, before the
+// loader can read one.
+//
+// Three keys make the loader read: a config's file:, a secret's file:, and a
+// service's env_file:. All three are resolved against the same WorkingDir as a
+// bind source, and for the same reason none of them can mean what a chart author
+// thinks: a rendered manifest is a string, not a file in a checkout, so the only
+// filesystem any of these paths can name is the controller's own. That one holds
+// the Docker socket, the application set and /run/secrets, so
+//
+//	secrets:
+//	  loot:
+//	    file: /run/secrets/swarmcli-cd-token
+//
+// had the controller read its own credential, create a swarm secret holding it
+// and mount that into the chart's container — under a name of the chart's own
+// choosing, which is why rejectForbiddenResources, comparing names, saw nothing
+// to object to (swarmcli-cd#99).
+//
+// So this refuses the key rather than the value: there is no path on the
+// controller a chart has any business reading, and a chart resolving one to
+// something harmless today is one commit away from resolving it elsewhere. A
+// resource whose content a chart cannot carry is external: — an operator creates
+// it on the swarm, and the stack references what it is given.
+//
+// This reads the parsed document rather than the loaded config because loading
+// is the read, so a check that ran afterwards would run too late.
+func checkFileSources(dict map[string]any) error {
+	for _, kind := range []struct{ key, what string }{{"configs", "config"}, {"secrets", "secret"}} {
+		objects, _ := dict[kind.key].(map[string]any)
+		for _, name := range sortedKeys(objects) {
+			obj, ok := objects[name].(map[string]any)
+			if !ok {
+				continue
+			}
+			if _, sourced := obj["file"]; !sourced {
+				continue
+			}
+			return fmt.Errorf("%s %q: file: reads a path on the controller's own filesystem, not the "+
+				"chart's; a rendered manifest is a string, so there is no chart directory for the path "+
+				"to resolve against — declare the %s external: and have an operator create it on the "+
+				"swarm", kind.what, name, kind.what)
+		}
+	}
+
+	services, _ := dict["services"].(map[string]any)
+	for _, name := range sortedKeys(services) {
+		svc, ok := services[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, sourced := svc["env_file"]; !sourced {
+			continue
+		}
+		return fmt.Errorf("service %q: env_file: reads a path on the controller's own filesystem, not "+
+			"the chart's; a rendered manifest is a string, so there is no chart directory for the path "+
+			"to resolve against — set the variables with environment: instead", name)
+	}
+	return nil
+}
+
+// sortedKeys is a manifest section's names in a fixed order. A manifest with two
+// faults must be refused for the same one every time: which one an operator is
+// shown is not Go's map iteration order's to decide.
+func sortedKeys(m map[string]any) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
