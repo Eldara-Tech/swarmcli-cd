@@ -251,6 +251,7 @@ func New(apps []application.Spec, o Options) *Reconciler {
 	}
 	maps.Copy(r.regAuth, o.RegistryAuth)
 	for _, spec := range apps {
+		r.noteInterval(spec)
 		r.apps[spec.Name] = &appEntry{
 			spec:   spec,
 			status: application.Status{Sync: application.Sync{State: application.SyncUnknown}},
@@ -313,6 +314,7 @@ func (r *Reconciler) Add(spec application.Spec) error {
 	if _, ok := r.apps[spec.Name]; ok {
 		return fmt.Errorf("application %q already present", spec.Name)
 	}
+	r.noteInterval(spec)
 	e := &appEntry{
 		spec:   spec,
 		status: application.Status{Sync: application.Sync{State: application.SyncUnknown}},
@@ -335,6 +337,7 @@ func (r *Reconciler) Replace(spec application.Spec) error {
 	if !ok {
 		return fmt.Errorf("no such application %q", spec.Name)
 	}
+	r.noteInterval(spec)
 	e.spec = spec
 	// A new spec is a new set of inputs — a different chart path, different
 	// values files — so whatever the old one could not render reproducibly is no
@@ -1359,11 +1362,41 @@ func (r *Reconciler) loop(ctx context.Context, app string) {
 	}
 }
 
+// intervalFor is how long this application waits between ticks: its own
+// syncPolicy.interval, floored, or the controller-wide one.
+//
+// The floor is on the application's number and not on the controller's, because
+// only one of the two is untrusted. syncPolicy.interval arrives in the app set,
+// which is itself reconciled from git — so whoever can commit to that repository
+// chooses it — while the controller-wide interval is set once by whoever runs
+// the controller, and a deployment that wants to reconcile everything every
+// second is entitled to say so about its own machine.
+//
+// Clamped rather than refused. Refusing at load time would stop the whole file
+// from being applied, so one bad interval would freeze every other application's
+// updates — a worse failure than the one being prevented. The `validate` command
+// refuses it instead, which is where an operator finds out before committing,
+// and noteInterval says so once at the point the spec is adopted so a clamped
+// application is not silently slower than it asked to be.
 func (r *Reconciler) intervalFor(spec application.Spec) time.Duration {
 	if d := time.Duration(spec.SyncPolicy.Interval); d > 0 {
-		return d
+		return max(d, application.MinInterval)
 	}
 	return r.interval
+}
+
+// noteInterval says once that an application asked to reconcile faster than the
+// floor allows.
+//
+// At the three points a spec enters the set rather than in intervalFor, which
+// runs every tick: at the floor a warning there would be several thousand
+// identical lines a day, and the thing an operator needs to know is that the
+// number they wrote is not the number in force.
+func (r *Reconciler) noteInterval(spec application.Spec) {
+	if d := time.Duration(spec.SyncPolicy.Interval); d > 0 && d < application.MinInterval {
+		r.log.Warn("syncPolicy.interval is below the floor and has been clamped",
+			"application", spec.Name, "declared", d, "using", application.MinInterval)
+	}
 }
 
 // backoff doubles the interval per consecutive failure, up to maxBackoff.

@@ -9,15 +9,21 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/appset"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
+	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
+	"github.com/Eldara-Tech/swarmcli-cd/source"
 
 	swarmlog "github.com/Eldara-Tech/swarmcli/utils/log"
 )
@@ -514,3 +520,104 @@ func (readyAuthorizer) Ready() error { return nil }
 type unreadyAuthorizer struct{ authz.Authorizer }
 
 func (unreadyAuthorizer) Ready() error { return authz.ErrNoToken }
+
+// countingFetcher stands in for the git side so a test can watch the reconcile
+// loop turn over. It is the cheapest observable that the reconciler is still
+// running: nothing else it does is visible from this package.
+type countingFetcher struct{ calls atomic.Int64 }
+
+func (f *countingFetcher) Fetch(_ context.Context, app string, _ application.Source) (git.Checkout, error) {
+	f.calls.Add(1)
+	return git.Checkout{Dir: "/tmp/" + app, Revision: strings.Repeat("a", 40)}, nil
+}
+
+// TestTheListenerIsDrainedBeforeTheReconcilerStops is the shutdown ordering.
+//
+// One context used to cancel the reconciler the moment the signal arrived and
+// only then drain the listener, so the gap between the two was a window in which
+// a POST /sync was still accepted and spawned a detached, uncancellable deploy
+// after the reconciler had provably stopped — with Shutdown seeing nothing in
+// flight and reporting a clean exit over a process leaving mid-apply.
+//
+// What is asserted is the inverse: while a request is still in flight and the
+// listener is therefore still draining, the reconciler has not been stopped.
+func TestTheListenerIsDrainedBeforeTheReconcilerStops(t *testing.T) {
+	fetcher := &countingFetcher{}
+	rec := reconcile.New([]application.Spec{{
+		Name:           "edge",
+		Source:         application.Source{RepoURL: "https://example.com/x.git", Revision: "main"},
+		DriftDetection: application.DriftManifest,
+	}}, reconcile.Options{
+		Fetcher:  fetcher,
+		Builder:  failingBuilder{},
+		Interval: 5 * time.Millisecond,
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, defaultAppSetFile), []byte("applications: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loop := appset.NewLoop(appset.NewPath(appset.PathConfig{Dir: dir, Path: defaultAppSetFile}), rec,
+		appset.LoopOptions{Interval: time.Hour, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hold", func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		_, _ = w.Write([]byte("done"))
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpSrv := &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+	// Serve the already-open listener, so the test does not race the bind.
+	go func() { _ = httpSrv.Serve(ln) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() {
+		stopped <- runUntilStopped(ctx, rec, loop, httpSrv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}()
+
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/hold")
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	<-entered
+
+	// The signal, with a request still in flight.
+	cancel()
+
+	// The reconciler must keep going while the listener drains. Measured as
+	// progress rather than as a state, because progress is what a stopped loop
+	// cannot fake.
+	before := fetcher.calls.Load()
+	time.Sleep(200 * time.Millisecond)
+	if after := fetcher.calls.Load(); after == before {
+		t.Fatalf("the reconciler stopped at %d fetches while the listener was still draining", after)
+	}
+
+	close(release)
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("runUntilStopped = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runUntilStopped did not return")
+	}
+}
+
+// failingBuilder ends every reconcile immediately after the fetch, so the loop
+// turns over quickly and touches no swarm.
+type failingBuilder struct{}
+
+func (failingBuilder) Build(context.Context, string, application.Source, git.Checkout) (*source.Built, error) {
+	return nil, errors.New("not building anything in this test")
+}

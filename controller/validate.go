@@ -4,10 +4,15 @@
 package controller
 
 import (
+	"strings"
+	"time"
+
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+
+	"github.com/Eldara-Tech/swarmcli-cd/application"
 
 	"github.com/Eldara-Tech/swarmcli-cd/config"
 )
@@ -49,10 +54,36 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, err)
 	}
+	if err := checkIntervals(cfg.Applications); err != nil {
+		return fail(stderr, err)
+	}
 	noun := "applications"
 	if len(cfg.Applications) == 1 {
 		noun = "application"
 	}
 	_, _ = fmt.Fprintf(stdout, "OK: %s (%d %s)\n", cfg.Path, len(cfg.Applications), noun)
 	return 0
+}
+
+// checkIntervals refuses an application asking to reconcile faster than the
+// floor allows.
+//
+// Here and not in config.Load, which is the same code path the running
+// controller loads its app set through. Refusing there would mean one bad
+// interval stopped the whole file from being applied, freezing every other
+// application's updates — so the controller clamps and says so, and this is
+// where an operator finds out before committing rather than afterwards from a
+// log line. Refusing is the point of a validator: it is the one context with
+// somebody present to fix it.
+func checkIntervals(apps []application.Spec) error {
+	var bad []string
+	for _, app := range apps {
+		if d := time.Duration(app.SyncPolicy.Interval); d > 0 && d < application.MinInterval {
+			bad = append(bad, fmt.Sprintf("%q: syncPolicy.interval %s is below the %s floor", app.Name, d, application.MinInterval))
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(bad, "; "))
 }

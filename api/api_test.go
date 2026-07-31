@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -762,4 +763,78 @@ func TestStatusWithoutAControllerStillAnswers(t *testing.T) {
 	if got.Applications != 1 || got.AppSet.Mode != "" {
 		t.Errorf("got %+v, want the application count and no app-set mode", got)
 	}
+}
+
+// TestShutdownEndsTheEventStreams is why Drain exists.
+//
+// http.Server.Shutdown waits for connections to go idle and does not cancel
+// in-flight request contexts, and an event stream never goes idle — so every
+// shutdown with a UI attached spent the whole timeout achieving nothing and then
+// logged that the API had not shut down cleanly. Swarm sends SIGKILL ten seconds
+// after SIGTERM, so that was half the budget spent on a false alarm.
+func TestShutdownEndsTheEventStreams(t *testing.T) {
+	s, h := testServer(t, &fakeReconciler{}, nil)
+
+	httpSrv := &http.Server{Handler: h, ReadHeaderTimeout: time.Second}
+	httpSrv.RegisterOnShutdown(s.Drain)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = httpSrv.Serve(ln) }()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/api/v1/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	for range 200 {
+		if s.events.count() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if s.events.count() != 1 {
+		t.Fatal("the request never subscribed")
+	}
+
+	// A generous timeout that a correct shutdown never comes close to, so the
+	// assertion is about promptness rather than about the number.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown = %v, want nil: the stream should have been ended, not waited out", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("Shutdown took %s: the event stream was waited out rather than ended", took)
+	}
+}
+
+// A request that slips past the listener while the streams are being ended must
+// not subscribe to a feed nothing will publish to, and then hold the drain open
+// waiting for it.
+func TestAStreamOpenedDuringShutdownEndsAtOnce(t *testing.T) {
+	s, _ := testServer(t, &fakeReconciler{}, nil)
+	s.Drain()
+
+	id, events := s.events.subscribe()
+	select {
+	case _, ok := <-events:
+		if ok {
+			t.Fatal("a stream opened during shutdown received an event, want a closed channel")
+		}
+	case <-time.After(time.Second):
+		// Not a closed channel and not an event: the handler would sit here
+		// until its request context ended, holding the drain open — which is
+		// the whole thing being prevented.
+		t.Fatal("a stream opened during shutdown was left waiting on a feed nothing will publish to")
+	}
+	if s.events.count() != 0 {
+		t.Fatalf("count = %d, want 0: a late subscriber must not be registered", s.events.count())
+	}
+	s.events.unsubscribe(id) // must not double-close
 }
