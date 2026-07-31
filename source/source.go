@@ -78,6 +78,15 @@ func (b *Builder) Build(ctx context.Context, app string, spec application.Source
 	// passes through it, and that is the copy anyone who can land a commit
 	// controls. Both source types have converged on a release file by this
 	// point, so neither can reach EnsureRepos without passing.
+	//
+	// The engine closed the same hole in Eldara-Tech/swarmcli#531: it validates
+	// a name in ReleaseFile.validate — which runs during the parse above, so for
+	// a name both charsets reject the engine's message is the one an operator
+	// sees — and again in indexFile, where the concatenation happens. This stays
+	// anyway. It is not the same charset (the engine allows a leading '.', '-'
+	// or '_' and this does not), the pin above it is a thing that moves, and
+	// #100 was about a name reaching the engine by two routes: a check being
+	// upstream of one of them does not make the route stop existing.
 	for _, r := range rf.Repositories {
 		if !application.ValidRepositoryName(r.Name) {
 			return nil, fmt.Errorf("application %q: %s declares chart repository %q: the name becomes a file in the chart cache, so letters, digits, dot, dash and underscore only, starting with a letter or digit", app, rf.Path, r.Name)

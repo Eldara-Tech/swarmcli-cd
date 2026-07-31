@@ -99,6 +99,12 @@ var repoNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 // repositories of its own, and package source checks those on the way past.
 // Two copies of this charset that drifted apart would leave one route open,
 // which is the whole of #100.
+//
+// The engine validates the name itself since Eldara-Tech/swarmcli#531, so the
+// traversal above is no longer open at the pin this module carries. This is kept
+// as the outer of two checks rather than deleted: it is stricter — the engine
+// permits a leading '.', '-' or '_' — and it is the one this repository owns,
+// which is what makes the guarantee independent of a version in go.mod.
 func ValidRepositoryName(name string) bool { return repoNameRE.MatchString(name) }
 
 // Destination names the swarm, resolved through the SwarmRegistry seam. Empty

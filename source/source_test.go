@@ -44,6 +44,27 @@ func builder(t *testing.T) *Builder {
 	return NewBuilder(t.TempDir(), nil)
 }
 
+// trustTestServer makes the chart repository store accept srv's certificate.
+//
+// A chart repository has to be served over TLS since Eldara-Tech/swarmcli#531,
+// and the store builds its own *http.Client inside charts.NewRepoStoreAt — there
+// is no seam to hand it a tls.Config through. A nil Transport resolves
+// http.DefaultTransport at request time, though, so that package variable is the
+// seam, and httptest has already assembled a transport trusting the server it
+// started rather than this having to build a second one.
+//
+// The alternative is charts.RepoStore.AllowPlaintext, and it is deliberately not
+// taken: package git refuses a plaintext remote outright, with no escape hatch,
+// because anyone on the path to it chooses what this controller deploys. A chart
+// repository serves the tarball that *becomes* the workload, so opting out one
+// layer down would contradict the rule one layer up.
+func trustTestServer(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	prev := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = prev })
+}
+
 func TestBuildReleaseFile(t *testing.T) {
 	co := tree(t, map[string]string{
 		"swarm/prod/swarmcli-release.yaml": `
@@ -117,7 +138,7 @@ func TestBuildChartSourceWithPath(t *testing.T) {
 }
 
 func TestBuildChartSourceWithRepositoryRef(t *testing.T) {
-	index := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	index := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/index.yaml" {
 			http.NotFound(w, r)
 			return
@@ -125,6 +146,7 @@ func TestBuildChartSourceWithRepositoryRef(t *testing.T) {
 		_, _ = fmt.Fprint(w, "apiVersion: v1\nentries:\n  whoami:\n    - name: whoami\n      version: 0.1.8\n      urls: [whoami-0.1.8.tgz]\n")
 	}))
 	defer index.Close()
+	trustTestServer(t, index)
 
 	co := tree(t, nil)
 	got, err := builder(t).Build(context.Background(), "edge", application.Source{
@@ -203,7 +225,7 @@ func TestBuildErrors(t *testing.T) {
 // A repository that cannot be reached fails the build rather than planning
 // against a chart nobody could resolve.
 func TestUnreachableChartRepository(t *testing.T) {
-	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	dead := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "gone", http.StatusNotFound)
 	}))
 	dead.Close() // nothing is listening
@@ -221,6 +243,41 @@ func TestUnreachableChartRepository(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "edge") {
 		t.Errorf("error %q does not name the application", err)
+	}
+	// Which error matters. On a plain-http server this test kept passing after
+	// Eldara-Tech/swarmcli#531 while never reaching the network at all — the
+	// store refused the URL's scheme, and "an error was returned" cannot tell the
+	// two apart. Assert the download is what failed.
+	if !strings.Contains(err.Error(), "index download failed") {
+		t.Errorf("error %q is not a failed download, so the repository was never reached", err)
+	}
+}
+
+// The engine refuses a plaintext chart repository since
+// Eldara-Tech/swarmcli#531, and this controller does not set the
+// charts.RepoStore.AllowPlaintext escape hatch it ships with. Package git
+// already refuses a plaintext *remote* with no hatch at all, because anyone on
+// the path to it chooses what gets deployed; a chart repository serves the
+// tarball that becomes the workload, so the same answer belongs one layer down.
+func TestPlaintextChartRepositoryIsRefused(t *testing.T) {
+	index := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, "apiVersion: v1\nentries: {}\n")
+	}))
+	defer index.Close()
+
+	_, err := builder(t).Build(context.Background(), "edge", application.Source{
+		Chart: &application.ChartSource{
+			Release:      "hello",
+			Ref:          "swarmcli-charts/whoami",
+			Version:      "0.1.8",
+			Repositories: []application.RepositorySpec{{Name: "swarmcli-charts", URL: index.URL}},
+		},
+	}, tree(t, nil))
+	if err == nil {
+		t.Fatal("Build = nil, want the plaintext repository refused")
+	}
+	if !strings.Contains(err.Error(), "edge") || !strings.Contains(err.Error(), "plaintext") {
+		t.Errorf("error %q names neither the application nor the reason", err)
 	}
 }
 
