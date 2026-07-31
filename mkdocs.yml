@@ -3,7 +3,7 @@ docs_dir: docs
 repo_url: https://github.com/Eldara-Tech/swarmcli-cd
 repo_name: Eldara-Tech/swarmcli-cd
 theme:
-  name: readthedocs
+  name: mkdocs
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
