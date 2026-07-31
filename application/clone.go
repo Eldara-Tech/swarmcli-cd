@@ -22,10 +22,13 @@ import "slices"
 // than documenting it. The cost is one shallow copy per release per read, on a
 // path that already serialises the result to JSON.
 //
-// Every reference-typed field has to be copied here, and TestStatusCloneShares
-// NothingWithItsOriginal is what enforces that: it walks the type and fails on
-// any pointer or slice the clone still shares, so a field added later cannot
-// quietly make this shallow again.
+// Every reference-typed field has to be copied here, and TestCloneSharesNothing
+// WithItsOriginal is what enforces that: it builds a value with every reference
+// field populated *by reflection*, clones it, and fails on any pointer or slice
+// the two still share. Populating by reflection rather than by hand is the whole
+// of what makes it a guard — the first version of this test used a hand-written
+// fixture, and Spec.Allow was added the same day and went unchecked, because a
+// fixture can only cover the fields somebody remembered to write into it.
 func (s Status) Clone() Status {
 	out := s
 	out.Sync.LastSync = clonePtr(s.Sync.LastSync)
@@ -51,6 +54,12 @@ func (s Status) Clone() Status {
 func (s Spec) Clone() Spec {
 	out := s
 	out.SyncPolicy.HistoryMax = clonePtr(s.SyncPolicy.HistoryMax)
+
+	out.Allow.HostPaths = slices.Clone(s.Allow.HostPaths)
+	out.Allow.Secrets = slices.Clone(s.Allow.Secrets)
+	out.Allow.Configs = slices.Clone(s.Allow.Configs)
+	out.Allow.Volumes = slices.Clone(s.Allow.Volumes)
+	out.Allow.Networks = slices.Clone(s.Allow.Networks)
 
 	if s.Source.Chart != nil {
 		chart := *s.Source.Chart

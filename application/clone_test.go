@@ -9,49 +9,80 @@ import (
 	"time"
 )
 
-// populated is a Status with every reference-typed field non-nil and non-empty,
-// so that a walk over it reaches each one. A field left zero here is a field the
-// walk cannot check, which is why this is built by hand rather than by a helper
-// that would drift with the type.
-func populated() Status {
-	return Status{
-		Sync: Sync{
-			State:    SyncOutOfSync,
-			Revision: "abc",
-			LastSync: &SyncResult{Revision: "abc", StartedAt: time.Unix(0, 0), Succeeded: true},
-		},
-		Health: Health{State: HealthDegraded, Services: ServiceCounts{Healthy: 1, Total: 2}},
-		Drift:  &Drift{State: DriftStateDetected, Services: 1, Resources: 2},
-		Releases: []ReleaseStatus{{
-			Name:     "whoami",
-			Services: []ServiceStatus{{Name: "whoami_web", Running: 1, Desired: 1}},
-			Compat:   &Compat{Status: CompatIncompatible, Required: ">=1.0.0"},
-			Drift: &ReleaseDrift{
-				State: DriftStateDetected,
-				Services: []ServiceDrift{{
-					Name:   "whoami_web",
-					Fields: []FieldDrift{{Field: "image", Desired: "a", Live: "b"}},
-				}},
-				Resources: []ResourceDrift{{Kind: ResourceNetwork, Name: "whoami_net"}},
-			},
-		}},
-		ObservedAt: time.Unix(0, 0),
-	}
+// The clones must share no memory with their originals.
+//
+// The value under test is populated by reflection rather than by hand, and that
+// is the whole point. The first version of this test built a fixture by hand and
+// said so — "built by hand rather than by a helper that would drift with the
+// type" — and Spec.Allow, five slices, was added the same day and went
+// unchecked. A hand-written fixture only covers the fields somebody remembered
+// to write into it, which is exactly the failure mode a guard against rot must
+// not have. Filling by reflection means a field added later is populated,
+// walked, and caught without anyone touching this file.
+func TestCloneSharesNothingWithItsOriginal(t *testing.T) {
+	t.Run("Status", func(t *testing.T) {
+		original := filled[Status](t)
+		assertClone(t, original, original.Clone(), "Status")
+	})
+
+	t.Run("Spec", func(t *testing.T) {
+		original := filled[Spec](t)
+		assertClone(t, original, original.Clone(), "Spec")
+	})
 }
 
-// The clone must share no memory with its original. This is the test that keeps
-// Clone honest as the type grows: it walks the value rather than checking a
-// list of fields somebody has to remember to update, so a pointer or slice
-// added later and not cloned fails here rather than years later in whichever
-// consumer first mutates one.
-func TestStatusCloneSharesNothingWithItsOriginal(t *testing.T) {
-	original := populated()
-	clone := original.Clone()
-
+func assertClone[T any](t *testing.T, original, clone T, name string) {
+	t.Helper()
 	if !reflect.DeepEqual(original, clone) {
 		t.Fatalf("the clone is not equal to its original:\n got %+v\nwant %+v", clone, original)
 	}
-	assertDisjoint(t, reflect.ValueOf(original), reflect.ValueOf(clone), "Status")
+	assertDisjoint(t, reflect.ValueOf(original), reflect.ValueOf(clone), name)
+}
+
+// filled returns a T with every reference-typed field reachable from it
+// populated, so the walk below has something to compare at each one. An empty
+// slice or a nil pointer is indistinguishable between a deep copy and a shallow
+// one, so a field left zero is a field the walk cannot check.
+func filled[T any](t *testing.T) T {
+	t.Helper()
+	var v T
+	fill(reflect.ValueOf(&v).Elem(), map[reflect.Type]bool{})
+	return v
+}
+
+// fill populates v's reference-typed fields, recursively.
+//
+// seen holds the types on the current path, so a type that contains itself —
+// none does today — terminates instead of recursing for ever.
+func fill(v reflect.Value, seen map[reflect.Type]bool) {
+	if v.Type() == timeType || seen[v.Type()] {
+		return
+	}
+	seen[v.Type()] = true
+	defer delete(seen, v.Type())
+
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
+		}
+		fill(v.Elem(), seen)
+
+	case reflect.Slice:
+		if v.Len() == 0 {
+			v.Set(reflect.MakeSlice(v.Type(), 1, 1))
+		}
+		for i := range v.Len() {
+			fill(v.Index(i), seen)
+		}
+
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if f := v.Field(i); f.CanSet() {
+				fill(f, seen)
+			}
+		}
+	}
 }
 
 // timeType is walked past rather than into. A time.Time carries a *Location,
@@ -71,8 +102,9 @@ func assertDisjoint(t *testing.T, a, b reflect.Value, path string) {
 	switch a.Kind() {
 	case reflect.Pointer:
 		if a.IsNil() {
-			// A nil on one side and not the other is a difference DeepEqual
-			// above has already caught.
+			// Unreachable while fill runs first, and left as a guard rather than
+			// an assertion because a nil on one side only is a difference the
+			// equality check above has already caught.
 			return
 		}
 		if a.Pointer() == b.Pointer() {
@@ -83,6 +115,10 @@ func assertDisjoint(t *testing.T, a, b reflect.Value, path string) {
 
 	case reflect.Slice:
 		if a.IsNil() || a.Len() == 0 {
+			// fill populates every slice, so an empty one here means the walk
+			// and the filler disagree about the shape — and a slice nobody
+			// populated is a slice nobody is checking.
+			t.Errorf("%s: empty, so this field is not actually being checked", path)
 			return
 		}
 		if a.UnsafePointer() == b.UnsafePointer() {
@@ -99,38 +135,13 @@ func assertDisjoint(t *testing.T, a, b reflect.Value, path string) {
 		}
 
 	case reflect.Map, reflect.Chan, reflect.Func:
-		// None of these appear in Status today. Failing rather than passing
-		// silently is the point: one added later needs a decision here, not a
-		// gap in the walk.
+		// None of these appears in Spec or Status today. Failing rather than
+		// passing silently is the point: one added later needs a decision in
+		// Clone and in fill, not a gap in the walk.
 		if !a.IsNil() {
 			t.Errorf("%s: %s is not covered by Clone or by this walk", path, a.Kind())
 		}
 	}
-}
-
-// The same walk over Spec. It is handed out by the same two calls and carries
-// the same shape of hazard: *ChartSource with two slices under it, and
-// SyncPolicy's *int.
-func TestSpecCloneSharesNothingWithItsOriginal(t *testing.T) {
-	max := 5
-	original := Spec{
-		Name: "edge",
-		Source: Source{
-			RepoURL: "https://example.com/x.git",
-			Chart: &ChartSource{
-				Release:      "whoami",
-				Values:       []string{"values.yaml", "prod.yaml"},
-				Repositories: []RepositorySpec{{Name: "repo", URL: "https://example.com/charts"}},
-			},
-		},
-		SyncPolicy: SyncPolicy{Automated: true, HistoryMax: &max},
-	}
-
-	clone := original.Clone()
-	if !reflect.DeepEqual(original, clone) {
-		t.Fatalf("the clone is not equal to its original:\n got %+v\nwant %+v", clone, original)
-	}
-	assertDisjoint(t, reflect.ValueOf(original), reflect.ValueOf(clone), "Spec")
 }
 
 // The hazard in the words of the thing that would hit it: a caller sorting what
@@ -143,5 +154,19 @@ func TestSortingAViewDoesNotReorderTheStore(t *testing.T) {
 
 	if stored.Releases[0].Name != "b" {
 		t.Errorf("the stored order became %q; a caller reordered the store", stored.Releases[0].Name)
+	}
+}
+
+// And the case this was written after. An application's allowlist is what the
+// controller will let its charts reach outside their own releases, so a caller
+// writing through a slice it was handed must not be able to widen it.
+func TestWritingToAHandedAllowlistDoesNotWidenTheStore(t *testing.T) {
+	stored := Spec{Allow: Allow{Networks: []string{"shared"}}}
+
+	handed := stored.Clone()
+	handed.Allow.Networks[0] = "anything"
+
+	if stored.Allow.Networks[0] != "shared" {
+		t.Errorf("the stored allowlist became %q; a caller widened it", stored.Allow.Networks[0])
 	}
 }
