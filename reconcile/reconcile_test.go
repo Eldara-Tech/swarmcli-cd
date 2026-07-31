@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/swarm"
 
 	"github.com/Eldara-Tech/swarmcli/charts"
@@ -3448,5 +3449,45 @@ func TestABackendThatCannotListResourcesStillSweepsServices(t *testing.T) {
 	}
 	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
 		t.Errorf("pruned services %v, want %v — the readable half still works", backend.pruned(), want)
+	}
+}
+
+// What a pruned service was mounting, which is reported and never deleted (#75).
+//
+// The loop had never run: every fixture in this file builds services without
+// mounts, so swapping mount.TypeVolume for mount.TypeTmpfs here changed nothing
+// the suite could see. What that silence costs is in the warning's own comment —
+// naming the volumes left behind is the difference between a cleanup an operator
+// can finish and one they believe is complete, and a filter matching the wrong
+// type names none of them while still logging nothing at all.
+func TestMountedVolumesNamesOnlyTheNamedVolumes(t *testing.T) {
+	svc := swarm.Service{Spec: swarm.ServiceSpec{TaskTemplate: swarm.TaskSpec{
+		ContainerSpec: &swarm.ContainerSpec{Mounts: []mount.Mount{
+			{Type: mount.TypeVolume, Source: "uploads", Target: "/srv/uploads"},
+			// A bind is a path on the node, not a resource anything could
+			// delete, and reporting one as a leftover volume sends an operator
+			// looking for something that was never there.
+			{Type: mount.TypeBind, Source: "/etc/hosts", Target: "/etc/hosts"},
+			{Type: mount.TypeTmpfs, Target: "/tmp"},
+			// An anonymous volume: Swarm names it, the manifest does not, and
+			// there is no name to report.
+			{Type: mount.TypeVolume, Target: "/cache"},
+			{Type: mount.TypeVolume, Source: "data", Target: "/var/lib/data"},
+		}},
+	}}}
+
+	// Sorted, because the report is read by a human and the mount order is the
+	// manifest's.
+	if got, want := mountedVolumes(svc), []string{"data", "uploads"}; !slices.Equal(got, want) {
+		t.Errorf("mountedVolumes = %v, want %v", got, want)
+	}
+}
+
+// A service that is not a container service at all — a plugin or a network
+// attachment — has no mounts to read, and reading them panicked the controller
+// once already.
+func TestMountedVolumesToleratesAServiceWithNoContainerSpec(t *testing.T) {
+	if got := mountedVolumes(swarm.Service{}); got != nil {
+		t.Errorf("mountedVolumes = %v, want nil", got)
 	}
 }

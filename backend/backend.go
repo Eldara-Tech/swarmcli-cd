@@ -260,6 +260,48 @@ func externalRefs(stack *cdcompose.Stack, svc cdcompose.Service) (secrets, confi
 	return secrets, configs
 }
 
+// rejectOwnNamespace refuses a release whose name is the stack namespace this
+// controller itself was deployed under.
+//
+// A release name is chosen by whoever writes the release file — CE validates its
+// characters and nothing else — and it becomes the stack namespace, which is the
+// whole of "which resources are this release's". The controller is deployed as a
+// stack too, with `docker stack deploy -c stack.yml swarmcli-cd`, so its own
+// service carries com.docker.stack.namespace=swarmcli-cd. A release of that name
+// therefore scopes its services onto the controller's: ApplyServices finds the
+// controller's service under the namespace it was told to converge, and writes
+// the chart's spec over it — any image, the docker.sock the controller is
+// mounted with, a manager placement. RemoveStack is the same collision pointed
+// the other way and needs no chart at all: it removes everything carrying the
+// label, which is the controller and, with prune-volumes on, the volume holding
+// every application's clone and chart cache. Nothing reconverges after that,
+// because the thing that would have is gone (#102).
+//
+// So both verbs are guarded, and the guard is here rather than at the reconciler
+// because these two methods are what every path acting on a release name goes
+// through — the engine's install, upgrade and uninstall, the drift correction,
+// and the sweep of a departed application, which resolves its own backend and
+// wears none of the reconciler's per-application clothing.
+//
+// A controller that is not a swarm service has no namespace and this is inert: a
+// `go run` during development deploys and removes exactly as before. That is the
+// same answer selfMounts gives about the mounts, for the same reason — there is
+// nothing of ours there to claim. A daemon that could not be asked is not that
+// answer and fails the call, which for a removal means the next sweep tries
+// again.
+func (b *Backend) rejectOwnNamespace(ctx context.Context, release string) error {
+	mine, err := b.mounts(ctx)
+	if err != nil {
+		return err
+	}
+	if mine.namespace == "" || mine.namespace != release {
+		return nil
+	}
+	return fmt.Errorf("refusing to act on release %q: it is the stack namespace this controller itself "+
+		"is deployed under, so deploying it would write this release's services over the controller's own "+
+		"and removing it would delete the controller. Give the release a name of its own", release)
+}
+
 // releaseConfigNames names the chart engine's release records.
 //
 // Matched by the engine's own exported label rather than by the
@@ -301,6 +343,13 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 // Nothing is deleted. Phase 1 is explicitly no prune.
 func (b *Backend) DeployStack(name, manifest, resolve string) error {
 	ctx := context.Background()
+
+	// Before the manifest is even converted: a release claiming the controller's
+	// own stack is refused whatever it declares, because the collision is the
+	// name and not anything in the chart.
+	if err := b.rejectOwnNamespace(ctx, name); err != nil {
+		return err
+	}
 
 	unresolved, err := cdcompose.ConvertUnresolved(ctx, manifest, name, b.api)
 	if err != nil {
@@ -378,6 +427,15 @@ func (b *Backend) RemoveStack(name string) error {
 	}
 
 	ctx := context.Background()
+
+	// And the name that is worse than none: this controller's own. Nothing below
+	// checks who owns what — that is what `docker stack rm` does and what this
+	// deliberately copies — so the only thing standing between a release name and
+	// the controller's own services, network and volumes is that the name is not
+	// the controller's (#102).
+	if err := b.rejectOwnNamespace(ctx, name); err != nil {
+		return err
+	}
 
 	// Failures are collected rather than returned at the first: the re-check
 	// below can only say "nothing is left" if everything was attempted, and one

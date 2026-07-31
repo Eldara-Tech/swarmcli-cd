@@ -163,6 +163,28 @@ One rule and one ownership model, applied once per kind rather than over a merge
 list — Swarm scopes all four into a single namespace of names, so a name is only
 ever evidence about its own kind.
 
+### What a release name may claim
+
+A release name *is* the stack namespace, so choosing one is a claim on everything
+already carrying that label. Two claims are refused.
+
+A release may not be named after the stack the controller itself runs as — the
+`swarmcli-cd` in `docker stack deploy -c stack.yml swarmcli-cd`. Deploying one
+would write that chart's services over the controller's own, and removing one
+would delete the controller along with the volume holding every application's
+clone and chart cache. The controller reads that name off its own service, so a
+development run that is not a swarm service has no name to protect and nothing to
+refuse.
+
+And a release may not deploy into a namespace whose services this controller has
+no release record for. Those services were put there by something else — a
+`docker stack deploy`, another tool, a shell — and the namespace label they carry
+says where they live, not who deployed them. An existing stack is brought under
+GitOps by removing it and letting the controller install it, not by naming a
+release after it: the release is also the unit an uninstall and a prune act on,
+so sharing a namespace with a stack the controller did not install means sharing
+that too.
+
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by
 swarmcli-cd, **its own `owner:` field is ignored** — the controller substitutes

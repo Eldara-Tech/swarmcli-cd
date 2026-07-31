@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -22,6 +23,8 @@ import (
 	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
+
+	"github.com/Eldara-Tech/swarmcli/charts"
 
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
@@ -90,16 +93,32 @@ type fakeAPI struct {
 	// for nothing outside itself never asks at all.
 	selfInspects int
 	selfErr      error
+	// inspectedIDs records the id of every container inspect, because the id is
+	// the guard's whole premise rather than a detail of the call.
+	inspectedIDs []string
 }
 
 // ContainerInspect answers for this process's own container. Not-found unless a
 // test says otherwise, so nothing else has to know the guard exists.
-func (f *fakeAPI) ContainerInspect(_ context.Context, _ string) (container.InspectResponse, error) {
+//
+// It answers for that container and no other. The id the guard sends is
+// os.Hostname(), which in a container is the container id — that is the entire
+// reason a controller can find itself from the inside, and a daemon asked about
+// anything else replies not-found, which readSelfMounts reads as "not a swarm
+// task" and therefore as no guard at all. A fake that discarded the id would
+// answer for any string, so the guard would pass its tests while asking about
+// the wrong container, which is the one way it can fail silently and completely.
+func (f *fakeAPI) ContainerInspect(_ context.Context, id string) (container.InspectResponse, error) {
 	f.selfInspects++
+	f.inspectedIDs = append(f.inspectedIDs, id)
 	if f.selfErr != nil {
 		return container.InspectResponse{}, f.selfErr
 	}
-	if f.selfServiceID == "" {
+	host, err := os.Hostname()
+	if err != nil {
+		return container.InspectResponse{}, err
+	}
+	if f.selfServiceID == "" || id != host {
 		return container.InspectResponse{}, errdefs.ErrNotFound
 	}
 	return container.InspectResponse{Config: &container.Config{
@@ -126,10 +145,18 @@ func (f *fakeAPI) ServiceList(_ context.Context, o swarm.ServiceListOptions) ([]
 	return f.existing, nil
 }
 
+// ServiceCreate stores what it created, so a later read finds it — as a daemon
+// would, and for the reason ConfigCreate does. Without it there is no
+// unit-level "deploy, then read back what the daemon holds": every apply starts
+// from an empty swarm, so the create-or-update decision is only ever tested on
+// the branch a fixture hands it, and nothing notices an applier that created the
+// same service twice.
 func (f *fakeAPI) ServiceCreate(_ context.Context, spec swarm.ServiceSpec, opts swarm.ServiceCreateOptions) (swarm.ServiceCreateResponse, error) {
 	f.created = append(f.created, spec)
 	f.createOpt = append(f.createOpt, opts)
-	return swarm.ServiceCreateResponse{ID: "new-" + spec.Name}, nil
+	id := "new-" + spec.Name
+	f.existing = append(f.existing, swarm.Service{ID: id, Spec: spec})
+	return swarm.ServiceCreateResponse{ID: id}, nil
 }
 
 func (f *fakeAPI) ServiceUpdate(_ context.Context, id string, v swarm.Version, spec swarm.ServiceSpec, opts swarm.ServiceUpdateOptions) (swarm.ServiceUpdateResponse, error) {
@@ -193,6 +220,28 @@ type cdService struct {
 	spec swarm.ServiceSpec
 }
 
+// installed makes the fake answer as though this controller installed the
+// release: one release-history config, written the way the engine writes them —
+// com.swarmcli.* labels and no stack namespace.
+//
+// Every test whose subject is *updating* a service needs it, because that is the
+// proof the write path asks for before it overwrites something already running
+// under a stack's namespace. A namespace with services in it and no record of
+// ours is somebody else's stack (#102).
+func installed(api *fakeAPI, release string) *fakeAPI {
+	api.configs = append(api.configs, swarm.Config{
+		ID: "rec-" + release,
+		Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+			Name: "swarmcli.release." + release + ".v1",
+			Labels: map[string]string{
+				charts.LabelType:    charts.TypeRelease,
+				charts.LabelRelease: release,
+			},
+		}},
+	})
+	return api
+}
+
 // deployed builds a service as it would come back off the swarm: the resolved
 // image in the spec, and the tag the manifest asked for in the stack label.
 func deployed(name, tag, resolved string, version uint64) swarm.Service {
@@ -233,8 +282,43 @@ func TestCreatesServicesThatDoNotExist(t *testing.T) {
 	}
 }
 
+// The create-or-update decision made against what the daemon holds, rather than
+// against a fixture that decided the answer in advance.
+//
+// Every other test here starts from an empty swarm or from a hand-written live
+// service, so each exercises one branch with the other's outcome impossible. A
+// second apply against the first one's result is the only shape in which the
+// branch is chosen: an applier that could not find what it had just created
+// would create it again on every reconcile, and the daemon would answer "name
+// conflicts with an existing object" forever.
+func TestASecondApplyUpdatesWhatTheFirstCreated(t *testing.T) {
+	api := installed(&fakeAPI{}, "s")
+	b := testBackend(t, api, nil)
+	ctx := context.Background()
+
+	if err := b.ApplyServices(ctx, stack("s", cdService{"web", spec("nginx:1.1")}), ResolveNever); err != nil {
+		t.Fatalf("first ApplyServices = %v, want nil", err)
+	}
+	if err := b.ApplyServices(ctx, stack("s", cdService{"web", spec("nginx:1.2")}), ResolveNever); err != nil {
+		t.Fatalf("second ApplyServices = %v, want nil", err)
+	}
+
+	if len(api.created) != 1 {
+		t.Errorf("created %d services, want the second apply to have found the first's", len(api.created))
+	}
+	if len(api.updated) != 1 {
+		t.Fatalf("updated %d services, want 1", len(api.updated))
+	}
+	if api.updated[0].id != "new-s_web" {
+		t.Errorf("updated %q, want the id the create returned", api.updated[0].id)
+	}
+	if got := api.updated[0].spec.TaskTemplate.ContainerSpec.Image; got != "nginx:1.2" {
+		t.Errorf("image = %q, want the second manifest's", got)
+	}
+}
+
 func TestUpdatesServicesThatExist(t *testing.T) {
-	api := &fakeAPI{existing: []swarm.Service{deployed("s_web", "nginx:1.1", "nginx:1.1", 7)}}
+	api := installed(&fakeAPI{existing: []swarm.Service{deployed("s_web", "nginx:1.1", "nginx:1.1", 7)}}, "s")
 	st := stack("s", cdService{"web", spec("nginx:1.2")})
 
 	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever); err != nil {
@@ -269,7 +353,7 @@ func TestCreateSendsRegistryAuth(t *testing.T) {
 }
 
 func TestUpdateSendsRegistryAuth(t *testing.T) {
-	api := &fakeAPI{existing: []swarm.Service{deployed("s_web", "ghcr.io/team/app:1", "ghcr.io/team/app:1", 4)}}
+	api := installed(&fakeAPI{existing: []swarm.Service{deployed("s_web", "ghcr.io/team/app:1", "ghcr.io/team/app:1", 4)}}, "s")
 	b := testBackend(t, api, nil)
 	b.registryAuth = func(image string) (string, error) { return "auth:" + image, nil }
 	st := stack("s", cdService{"web", spec("ghcr.io/team/app:2")})
@@ -324,10 +408,10 @@ func TestWithRegistryAuthLeavesTheSharedBackendAnonymous(t *testing.T) {
 // A service on the swarm that the manifest no longer declares is left alone.
 // Phase 1 is explicitly no prune, and the fake panics on any delete call.
 func TestNothingIsDeleted(t *testing.T) {
-	api := &fakeAPI{existing: []swarm.Service{
+	api := installed(&fakeAPI{existing: []swarm.Service{
 		deployed("s_web", "nginx", "nginx", 1),
 		deployed("s_gone", "old", "old", 1),
-	}}
+	}}, "s")
 	st := stack("s", cdService{"web", spec("nginx")})
 
 	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever); err != nil {
@@ -342,10 +426,10 @@ func TestNothingIsDeleted(t *testing.T) {
 // to converge, and its desired spec is complete, so re-applying it is correcting
 // drift rather than trampling it.
 func TestVersionConflictIsRetriedAndReported(t *testing.T) {
-	api := &fakeAPI{
+	api := installed(&fakeAPI{
 		existing:   []swarm.Service{deployed("s_web", "nginx", "nginx", 3)},
 		updateErrs: []error{outOfSequence()},
-	}
+	}, "s")
 	var reported []string
 	st := stack("s", cdService{"web", spec("nginx")})
 
@@ -373,10 +457,10 @@ func TestVersionConflictIsRetriedAndReported(t *testing.T) {
 // Spinning forever on a service somebody else is rewriting helps nobody. Give
 // up and let the next reconcile plan against whatever it settles on.
 func TestPersistentConflictGivesUp(t *testing.T) {
-	api := &fakeAPI{
+	api := installed(&fakeAPI{
 		existing:   []swarm.Service{deployed("s_web", "nginx", "nginx", 1)},
 		updateErrs: []error{outOfSequence(), outOfSequence(), outOfSequence(), outOfSequence()},
-	}
+	}, "s")
 	var reported []string
 	st := stack("s", cdService{"web", spec("nginx")})
 
@@ -399,10 +483,10 @@ func TestPersistentConflictGivesUp(t *testing.T) {
 // Only the compare-and-swap failure is retried. Retrying a real failure would
 // hammer the daemon and bury the reason.
 func TestNonConflictErrorIsNotRetried(t *testing.T) {
-	api := &fakeAPI{
+	api := installed(&fakeAPI{
 		existing:   []swarm.Service{deployed("s_web", "nginx", "nginx", 1)},
 		updateErrs: []error{errors.New("invalid mount config")},
-	}
+	}, "s")
 	st := stack("s", cdService{"web", spec("nginx")})
 
 	err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever)
@@ -427,7 +511,7 @@ func TestUnchangedImageKeepsTheResolvedDigest(t *testing.T) {
 
 	for _, resolve := range []string{ResolveNever, ResolveChanged} {
 		t.Run(resolve, func(t *testing.T) {
-			api := &fakeAPI{existing: []swarm.Service{deployed("s_web", tag, digest, 1)}}
+			api := installed(&fakeAPI{existing: []swarm.Service{deployed("s_web", tag, digest, 1)}}, "s")
 			st := stack("s", cdService{"web", spec(tag)})
 
 			if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, resolve); err != nil {
@@ -446,7 +530,7 @@ func TestUnchangedImageKeepsTheResolvedDigest(t *testing.T) {
 // A genuinely changed tag is written as the tag, and the registry is queried so
 // the daemon resolves it.
 func TestChangedImageIsWrittenAndResolved(t *testing.T) {
-	api := &fakeAPI{existing: []swarm.Service{deployed("s_web", "nginx:1.2", "nginx:1.2@sha256:aaaa", 1)}}
+	api := installed(&fakeAPI{existing: []swarm.Service{deployed("s_web", "nginx:1.2", "nginx:1.2@sha256:aaaa", 1)}}, "s")
 	st := stack("s", cdService{"web", spec("nginx:1.3")})
 
 	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveChanged); err != nil {
@@ -461,7 +545,7 @@ func TestChangedImageIsWrittenAndResolved(t *testing.T) {
 }
 
 func TestResolveAlwaysQueriesTheRegistry(t *testing.T) {
-	api := &fakeAPI{existing: []swarm.Service{deployed("s_web", "nginx", "nginx@sha256:aaaa", 1)}}
+	api := installed(&fakeAPI{existing: []swarm.Service{deployed("s_web", "nginx", "nginx@sha256:aaaa", 1)}}, "s")
 	st := stack("s", cdService{"web", spec("nginx")}, cdService{"new", spec("redis")})
 
 	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveAlways); err != nil {
@@ -497,7 +581,7 @@ func TestResolveNeverDoesNotQueryTheRegistry(t *testing.T) {
 func TestForceUpdateCounterIsCarriedForward(t *testing.T) {
 	cur := deployed("s_web", "nginx", "nginx", 1)
 	cur.Spec.TaskTemplate.ForceUpdate = 4
-	api := &fakeAPI{existing: []swarm.Service{cur}}
+	api := installed(&fakeAPI{existing: []swarm.Service{cur}}, "s")
 	st := stack("s", cdService{"web", spec("nginx")})
 
 	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever); err != nil {
@@ -511,11 +595,11 @@ func TestForceUpdateCounterIsCarriedForward(t *testing.T) {
 // A re-read that fails leaves nothing to compare against, so the apply stops
 // rather than guessing.
 func TestReReadFailureAbortsTheUpdate(t *testing.T) {
-	api := &fakeAPI{
+	api := installed(&fakeAPI{
 		existing:   []swarm.Service{deployed("s_web", "nginx", "nginx", 1)},
 		updateErrs: []error{outOfSequence()},
 		inspectErr: errors.New("daemon gone"),
-	}
+	}, "s")
 	st := stack("s", cdService{"web", spec("nginx")})
 
 	err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever)
@@ -827,21 +911,30 @@ func (f *fakeAPI) Info(context.Context) (system.Info, error) { return system.Inf
 // write the operator's image straight back, making the image the one thing a
 // converge could not undo.
 func TestOutOfBandImageIsNotPreserved(t *testing.T) {
-	const tag = "nginx:1.2"
+	// The second pair is the shape that normalising the *live* side would hide:
+	// `--image nginx@sha256:…` leaves the spec untagged, so stripping its digest
+	// gives back exactly the string the manifest wrote.
+	for name, tc := range map[string]struct{ tag, running string }{
+		"a tagged manifest": {"nginx:1.2", "nginx:9.9@sha256:bbbb"},
+		"an untagged manifest repinned by hand": {
+			"nginx",
+			"nginx@sha256:0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff",
+		},
+	} {
+		for _, resolve := range []string{ResolveNever, ResolveChanged} {
+			t.Run(name+"/"+resolve, func(t *testing.T) {
+				// Label says what we deployed; the running image is somebody else's.
+				api := installed(&fakeAPI{existing: []swarm.Service{deployed("s_web", tc.tag, tc.running, 1)}}, "s")
+				st := stack("s", cdService{"web", spec(tc.tag)})
 
-	for _, resolve := range []string{ResolveNever, ResolveChanged} {
-		t.Run(resolve, func(t *testing.T) {
-			// Label says what we deployed; the running image is somebody else's.
-			api := &fakeAPI{existing: []swarm.Service{deployed("s_web", tag, "nginx:9.9@sha256:bbbb", 1)}}
-			st := stack("s", cdService{"web", spec(tag)})
-
-			if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, resolve); err != nil {
-				t.Fatalf("ApplyServices = %v, want nil", err)
-			}
-			if got := api.updated[0].spec.TaskTemplate.ContainerSpec.Image; got != tag {
-				t.Errorf("image = %q, want the manifest's tag %q written back over the out-of-band one", got, tag)
-			}
-		})
+				if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, resolve); err != nil {
+					t.Fatalf("ApplyServices = %v, want nil", err)
+				}
+				if got := api.updated[0].spec.TaskTemplate.ContainerSpec.Image; got != tc.tag {
+					t.Errorf("image = %q, want the manifest's tag %q written back over the out-of-band one", got, tc.tag)
+				}
+			})
+		}
 	}
 }
 
@@ -855,7 +948,7 @@ func TestLiveServiceWithoutAContainerSpecDoesNotPanic(t *testing.T) {
 	cur := deployed("s_web", "nginx:1.2", "nginx:1.2@sha256:aaaa", 1)
 	cur.Spec.TaskTemplate.ContainerSpec = nil
 	cur.Spec.TaskTemplate.NetworkAttachmentSpec = &swarm.NetworkAttachmentSpec{ContainerID: "abc"}
-	api := &fakeAPI{existing: []swarm.Service{cur}}
+	api := installed(&fakeAPI{existing: []swarm.Service{cur}}, "s")
 	st := stack("s", cdService{"web", spec("nginx:1.2")})
 
 	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever); err != nil {
@@ -911,16 +1004,143 @@ func TestPrepareUpdateGuardsBothContainerSpecs(t *testing.T) {
 	})
 }
 
-func TestImageTagStripsTheDigest(t *testing.T) {
-	for in, want := range map[string]string{
-		"nginx":                        "nginx",
-		"nginx:1.2":                    "nginx:1.2",
-		"nginx:1.2@sha256:aaaa":        "nginx:1.2",
-		"ghcr.io/team/app@sha256:aaaa": "ghcr.io/team/app",
-		"":                             "",
-	} {
-		if got := imageTag(in); got != want {
-			t.Errorf("imageTag(%q) = %q, want %q", in, got, want)
-		}
+// The same case as TestUnchangedImageKeepsTheResolvedDigest for a manifest that
+// named no tag, which is the shape the guard used to miss entirely.
+//
+// convert.Service writes the manifest's own string into the stack label, and the
+// client tags what it sends, so the label says `nginx` where the live spec says
+// `nginx:latest@…`. Comparing them literally never matched: the digest was
+// dropped on the first correction and never resolved again under
+// `--resolve-image changed`, so a stack pinned by digest quietly stopped being.
+func TestUnchangedUntaggedImageKeepsTheResolvedDigest(t *testing.T) {
+	const digest = "nginx:latest@sha256:aaaa"
+
+	for _, resolve := range []string{ResolveNever, ResolveChanged} {
+		t.Run(resolve, func(t *testing.T) {
+			api := installed(&fakeAPI{existing: []swarm.Service{deployed("s_web", "nginx", digest, 1)}}, "s")
+			st := stack("s", cdService{"web", spec("nginx")})
+
+			if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, resolve); err != nil {
+				t.Fatalf("ApplyServices = %v, want nil", err)
+			}
+			if got := api.updated[0].spec.TaskTemplate.ContainerSpec.Image; got != digest {
+				t.Errorf("image = %q, want the resolved digest %q kept", got, digest)
+			}
+			if api.updated[0].opts.QueryRegistry {
+				t.Error("QueryRegistry set for an image that did not change")
+			}
+		})
+	}
+}
+
+// ---------------------------------------- whose services these are (#102)
+
+// The write path's half of the rule the sweep has applied all along: the label
+// says where a service lives, the record says whose it is. A service running
+// under a namespace this controller has no release record for was put there by
+// something else — `docker stack deploy`, another tool, the controller's own
+// stack — and a release that happens to be named after it must not have its spec
+// written over that service.
+func TestRefusesToOverwriteAServiceItDidNotInstall(t *testing.T) {
+	api := &fakeAPI{existing: []swarm.Service{deployed("s_web", "nginx", "nginx", 1)}}
+	st := stack("s", cdService{"web", spec("attacker/evil")})
+
+	err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever)
+	if err == nil {
+		t.Fatal("ApplyServices = nil, want a service this controller did not install left alone")
+	}
+	if !strings.Contains(err.Error(), "s_web") {
+		t.Errorf("error %q does not name the service it refused to overwrite", err)
+	}
+	if len(api.updated) != 0 || len(api.created) != 0 {
+		t.Errorf("wrote to a foreign namespace: updated=%d created=%d", len(api.updated), len(api.created))
+	}
+}
+
+// Refused whether or not a name collides, because the namespace is the unit
+// RemoveStack and every sweep act on: a release sharing one with a stack this
+// engine did not install is a release whose uninstall takes both. It is also the
+// two-commit version of the takeover — claim the namespace under harmless names
+// first, add the service named like theirs afterwards — and this is where that is
+// stopped, one commit earlier.
+func TestRefusesToInstallAlongsideAStackItDidNotInstall(t *testing.T) {
+	api := &fakeAPI{existing: []swarm.Service{deployed("s_theirs", "nginx", "nginx", 1)}}
+	st := stack("s", cdService{"mine", spec("alpine")})
+
+	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever); err == nil {
+		t.Fatal("ApplyServices = nil, want an install into somebody else's namespace refused")
+	}
+	if len(api.created) != 0 {
+		t.Errorf("created %d services in a namespace that is not ours", len(api.created))
+	}
+}
+
+// A chart can put any labels it likes on a config it declares, so the record's
+// labels are forgeable — but a config created by a stack deploy is stamped with
+// that stack's namespace on the way in and cannot be talked out of it, while a
+// genuine record is written with com.swarmcli.* labels and no namespace at all.
+// Declaring a name is not owning it (#86), and neither is declaring a label.
+func TestAForgedReleaseRecordIsNotProofOfOwnership(t *testing.T) {
+	api := &fakeAPI{
+		existing: []swarm.Service{deployed("s_web", "nginx", "nginx", 1)},
+		configs: []swarm.Config{{ID: "forged", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+			Name: "swarmcli.release.s.v1",
+			Labels: map[string]string{
+				charts.LabelType:       charts.TypeRelease,
+				charts.LabelRelease:    "s",
+				convert.LabelNamespace: "s",
+			},
+		}}}},
+	}
+	st := stack("s", cdService{"web", spec("attacker/evil")})
+
+	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever); err == nil {
+		t.Fatal("ApplyServices = nil, want a config a chart declared not to count as a release record")
+	}
+	if len(api.updated) != 0 {
+		t.Error("a chart-declared config was accepted as proof that the stack is ours")
+	}
+}
+
+// Any owner counts, including none, and that is a decision rather than an
+// oversight. The stamp answers which application installed a release, so that a
+// sweep does not delete another controller's work; this asks whether the engine
+// installed it at all. Requiring the stamp to be ours here would refuse both
+// handovers the docs describe as supported — a release installed from the command
+// line and then adopted by an application, and every release on the swarm after
+// --controller-id changes, which is corrected by redeploying each one once.
+func TestARecordWrittenByAnotherOwnerStillCounts(t *testing.T) {
+	api := &fakeAPI{
+		existing: []swarm.Service{deployed("s_web", "nginx:1.1", "nginx:1.1", 1)},
+		configs: []swarm.Config{{ID: "rec", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+			Name: "swarmcli.release.s.v1",
+			Labels: map[string]string{
+				charts.LabelType:    charts.TypeRelease,
+				charts.LabelRelease: "s",
+				charts.LabelOwner:   "apply/prod-swarm:release/s",
+			},
+		}}}},
+	}
+	st := stack("s", cdService{"web", spec("nginx:1.2")})
+
+	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever); err != nil {
+		t.Fatalf("ApplyServices = %v, want a release the engine installed to be updatable", err)
+	}
+	if len(api.updated) != 1 {
+		t.Errorf("updated %d services, want the release taken over as the engine allows", len(api.updated))
+	}
+}
+
+// Another release's records are not this one's proof. The read is scoped to the
+// release being deployed, which the fake honours the way the daemon does.
+func TestAnotherReleasesRecordIsNotProofOfOwnership(t *testing.T) {
+	api := installed(&fakeAPI{existing: []swarm.Service{deployed("s_web", "nginx", "nginx", 1)}}, "other")
+	st := stack("s", cdService{"web", spec("attacker/evil")})
+
+	if err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever); err == nil {
+		t.Fatal("ApplyServices = nil, want another release's record not to prove this one is ours")
+	}
+	if len(api.updated) != 0 {
+		t.Error("a record belonging to another release was accepted as proof")
 	}
 }

@@ -123,10 +123,21 @@ func Live(desired *compose.Stack, live map[string]swarm.Service, nets NetworkNam
 // controller wrote would not converge, in which case redeploying is the one
 // answer that cannot work: Swarm has already judged it (swarmcli-cd#90).
 //
-// Only the two rollback states count. `paused` is the *default* failure_action
-// and leaves the spec Swarm accepted in place, so it produces no difference here
-// and is a convergence question — which is syncPolicy.wait's. `updating` is a
-// rollout in progress and says nothing about the outcome.
+// All three rollback states count, `started` included — which reads like a
+// rollout still deciding and is not one. Swarmkit sets ROLLBACK_STARTED and
+// replaces the service's spec with the previous one in the *same* store
+// transaction (manager/orchestrator/update.Updater.rollbackUpdate), so from the
+// first moment the state can be observed the live spec already is the reverted
+// one. Leaving it out let convergeable re-push the spec Swarm had just rejected,
+// and that ServiceUpdate resets UpdateStatus to nil
+// (manager/controlapi.UpdateService) — erasing the record of the rollback and
+// starting the whole cycle over, for ever.
+//
+// The other states are somebody's write rather than the platform's verdict.
+// `paused` is the *default* failure_action and leaves the spec Swarm accepted in
+// place, so it produces no difference here and is a convergence question — which
+// is syncPolicy.wait's. `updating` is a rollout in progress and says nothing
+// about the outcome.
 //
 // Deliberately only consulted when the specs already differ. UpdateStatus
 // persists on a service until its next update, so a rollback somebody's own
@@ -138,7 +149,9 @@ func rolledBack(live swarm.Service) (string, bool) {
 		return "", false
 	}
 	switch live.UpdateStatus.State {
-	case swarm.UpdateStateRollbackCompleted, swarm.UpdateStateRollbackPaused:
+	case swarm.UpdateStateRollbackStarted,
+		swarm.UpdateStateRollbackPaused,
+		swarm.UpdateStateRollbackCompleted:
 		return live.UpdateStatus.Message, true
 	default:
 		return "", false
@@ -211,22 +224,42 @@ const (
 )
 
 // compareJob reports the two counts that make a replicated job, which are to a
-// job what replicas are to a service.
+// job what replicas are to a service — and it applies the daemon's defaults for
+// the same reason replicas does below.
 //
-// Both sides flatten a nil to zero, because serviceSpecFromGRPC addresses the
-// stored value unconditionally — the same shape RestartPolicy.MaxAttempts has —
-// so the live side is never nil where the manifest left a count unstated.
-//
-// Zero is reported as zero rather than as the one swarmkit would actually run.
-// This reports spec values throughout, and a rendering that guessed the effective
-// count would be one more thing that could be wrong about a number nobody can
-// then check.
+// Compose fills both pointers from the manifest's single `replicas:`
+// (cli/compose/convert.convertDeployMode), so they are nil or set together and
+// both are nil when it names no count. The daemon defaults a nil
+// MaxConcurrent to 1 and a nil TotalCompletions to whatever MaxConcurrent ended
+// up as (moby/daemon/cluster/convert.ServiceSpecToGRPC), then addresses both
+// stored values unconditionally on the way back — the same shape
+// RestartPolicy.MaxAttempts has — so the live side reads back as 1 and 1 against
+// a manifest that named nothing. Flattening the desired side to zero instead
+// reported a job nobody had touched as drifted on every tick, for ever.
 func compareJob(want, got *swarm.ReplicatedJob, add func(name, desired, live string)) {
 	if want == nil || got == nil {
 		return
 	}
-	compareUint64("maxConcurrent", orZeroUint64(want.MaxConcurrent), orZeroUint64(got.MaxConcurrent), add)
-	compareUint64("totalCompletions", orZeroUint64(want.TotalCompletions), orZeroUint64(got.TotalCompletions), add)
+	wantConcurrent, wantTotal := jobCounts(want)
+	gotConcurrent, gotTotal := jobCounts(got)
+	compareUint64("maxConcurrent", wantConcurrent, gotConcurrent, add)
+	compareUint64("totalCompletions", wantTotal, gotTotal, add)
+}
+
+// jobCounts is a job's two counts with the daemon's defaults applied, in the
+// daemon's own order: an unstated concurrency is one, and an unstated total is
+// that concurrency rather than one — a job told to run four at a time and
+// nothing else completes four.
+func jobCounts(j *swarm.ReplicatedJob) (maxConcurrent, totalCompletions uint64) {
+	maxConcurrent = 1
+	if j.MaxConcurrent != nil {
+		maxConcurrent = *j.MaxConcurrent
+	}
+	totalCompletions = maxConcurrent
+	if j.TotalCompletions != nil {
+		totalCompletions = *j.TotalCompletions
+	}
+	return maxConcurrent, totalCompletions
 }
 
 // modeKind names which of the four service modes is set. Replicated is the
@@ -261,11 +294,16 @@ func replicas(m swarm.ServiceMode) uint64 {
 
 // compareImage reports an image the manifest did not ask for.
 //
-// The live spec's image is not comparable to the manifest's as written: with
-// image resolution on, the daemon appends the digest it resolved the tag to. So
-// a live image matches when it is either exactly what we asked for — which
-// covers a manifest that pins a digest itself — or that same reference with a
-// digest appended.
+// The live spec's image is not comparable to the manifest's as written — the
+// daemon appends a resolved digest, the client tags and familiarises what it
+// sends — so the two are put side by side through compose.SameImage, which is
+// also what the applier's "nobody has changed this behind us" guard asks. The
+// reasons are written down there, once, because the applier and this reporter
+// disagreeing is a redeploy loop rather than a wrong answer.
+//
+// The reported values are the two specs as written, not as compared: what an
+// operator reads should be the reference their manifest names and the one their
+// swarm is running.
 //
 // What this must catch is `docker service update --image`, and note what it
 // does NOT rely on: the stack image label. That update rewrites the spec's
@@ -277,19 +315,10 @@ func compareImage(want, got swarm.ServiceSpec, add func(name, desired, live stri
 	if wanted == "" {
 		return
 	}
-	if running == wanted || imageTag(running) == wanted {
+	if compose.SameImage(running, wanted) {
 		return
 	}
 	add("image", wanted, running)
-}
-
-// imageTag strips a digest suffix. LastIndex rather than Cut so a reference
-// containing more than one "@" loses only the digest.
-func imageTag(image string) string {
-	if i := strings.LastIndex(image, "@"); i >= 0 {
-		return image[:i]
-	}
-	return image
 }
 
 // compareResources reports changed CPU and memory limits and reservations.
