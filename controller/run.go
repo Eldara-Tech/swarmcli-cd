@@ -26,6 +26,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 	"github.com/Eldara-Tech/swarmcli-cd/prune"
+	"github.com/Eldara-Tech/swarmcli-cd/reclaim"
 	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 	"github.com/Eldara-Tech/swarmcli-cd/secrets"
@@ -368,6 +369,13 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		Interval: o.appSetInterval,
 		Log:      log,
 		Pruner:   pruner,
+		// Unconditional, unlike the pruner. It deletes this controller's own
+		// caches of an application that has left the set — nothing deployed, and
+		// nothing that is not re-fetched the moment that name comes back — and
+		// the volume they fill is a manager's, shared with the raft log. The
+		// app-set root is not swept: it is the bootstrap tier and is not a name
+		// the set can name.
+		Reclaimer: reclaim.New(reclaim.Options{Roots: []string{repos, chartCache}, Log: log}),
 	})
 
 	srv := api.New(rec, api.Options{Log: log, Controller: loop})

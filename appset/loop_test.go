@@ -45,8 +45,10 @@ type fakeReconciler struct {
 	// interleaving between kinds can be read from.
 	ops []string
 
-	// failAdd names an application whose Add fails, for the best-effort case.
-	failAdd string
+	// failAdd names an application whose Add fails, for the best-effort case,
+	// and failRemove one whose Remove does — which leaves it in the running set.
+	failAdd    string
+	failRemove string
 }
 
 func newFakeReconciler(apps ...application.Spec) *fakeReconciler {
@@ -130,6 +132,11 @@ func (f *fakeReconciler) Replace(spec application.Spec) error {
 func (f *fakeReconciler) Remove(name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if name == f.failRemove {
+		// Left in the set, which is what a real Remove that failed leaves behind
+		// and what the cache reclaim has to read rather than reading the file.
+		return errors.New("cannot stop it")
+	}
 	i := slices.IndexFunc(f.apps, func(s application.Spec) bool { return s.Name == name })
 	if i < 0 {
 		return errors.New("no such application")
@@ -199,6 +206,12 @@ func (f *fakeReconciler) setFailAdd(name string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failAdd = name
+}
+
+func (f *fakeReconciler) setFailRemove(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failRemove = name
 }
 
 // noCredentials is the injected credential resolver for tests that are not about
@@ -1031,5 +1044,116 @@ func TestAReturningApplicationLeavesThePrunedList(t *testing.T) {
 
 	if got := loop.Status().AppSet.Pruned; len(got) != 0 {
 		t.Errorf("pruned = %v, want empty once the application is back", got)
+	}
+}
+
+// ------------------------------------------------------------- cache reclaim
+
+// fakeReclaimer records the keep list of every sweep, which is the whole of what
+// the loop decides: the sweeper itself owns when a candidate is old enough to
+// delete.
+type fakeReclaimer struct {
+	keeps [][]string
+	err   error
+}
+
+func (f *fakeReclaimer) Sweep(keep []string) error {
+	f.keeps = append(f.keeps, slices.Clone(keep))
+	return f.err
+}
+
+// The sweep is told what the reconciler holds, not what the file declares. An
+// application whose Remove failed is still reconciling and still reading its
+// checkout, and a sweep driven by the file would have handed its name over as
+// departed while it was.
+func TestReclaimIsDrivenByTheRunningSet(t *testing.T) {
+	m := pathMode(t, twoApps)
+	rec := newFakeReconciler()
+	sweeper := &fakeReclaimer{}
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Mode: "path", Log: discard(), Credentials: noCredentials, Reclaimer: sweeper,
+	})
+
+	if err := loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if len(sweeper.keeps) != 1 || !slices.Equal(sweeper.keeps[0], []string{"edge", "core"}) {
+		t.Fatalf("swept keeping %v, want both running applications", sweeper.keeps)
+	}
+
+	// One leaves the set: the next sweep stops naming it, and only then can the
+	// sweeper start its grace period.
+	m.publish(oneApp)
+	if err := loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if len(sweeper.keeps) != 2 || !slices.Equal(sweeper.keeps[1], []string{"edge"}) {
+		t.Fatalf("swept keeping %v, want only the application still in the set", sweeper.keeps)
+	}
+}
+
+// A removal that failed keeps the application in the running set, so its clone
+// is kept — even though the file has already stopped declaring it. This is the
+// difference between reading the reconciler and reading the file.
+func TestReclaimKeepsAnApplicationThatCouldNotBeRemoved(t *testing.T) {
+	m := pathMode(t, twoApps)
+	rec := newFakeReconciler()
+	sweeper := &fakeReclaimer{}
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Mode: "path", Log: discard(), Credentials: noCredentials, Reclaimer: sweeper,
+	})
+	if err := loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+
+	rec.setFailRemove("core")
+	m.publish(oneApp)
+	if err := loop.Once(context.Background()); err == nil {
+		t.Fatal("Once = nil, want the failed removal reported")
+	}
+
+	if len(sweeper.keeps) != 2 {
+		t.Fatalf("swept %d times, want one sweep per pass", len(sweeper.keeps))
+	}
+	if last := sweeper.keeps[1]; !slices.Contains(last, "core") {
+		t.Errorf("swept keeping %v, want the application still reconciling kept", last)
+	}
+}
+
+// It is not behind the clean-apply gate the prune sweep is behind. What it
+// deletes is a cache rebuilt on the next fetch, and letting the manager's volume
+// fill because some other application will not start is the worse failure.
+func TestReclaimRunsEvenWhenAnAddFails(t *testing.T) {
+	m := pathMode(t, twoApps)
+	rec := newFakeReconciler()
+	rec.setFailAdd("core")
+	sweeper := &fakeReclaimer{}
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Mode: "path", Log: discard(), Credentials: noCredentials, Reclaimer: sweeper,
+	})
+
+	if err := loop.Once(context.Background()); err == nil {
+		t.Fatal("Once = nil, want the failed add reported")
+	}
+	if len(sweeper.keeps) != 1 {
+		t.Errorf("swept %d times, want the reclaim to have run anyway", len(sweeper.keeps))
+	}
+}
+
+// A sweep that could not delete something is reported rather than swallowed: the
+// pass did not do everything it set out to, and the status endpoint says so.
+func TestReclaimFailureIsReported(t *testing.T) {
+	m := pathMode(t, oneApp)
+	loop := NewLoop(m.loader, newFakeReconciler(), LoopOptions{
+		Mode: "path", Log: discard(), Credentials: noCredentials,
+		Reclaimer: &fakeReclaimer{err: errors.New("permission denied")},
+	})
+
+	err := loop.Once(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("Once = %v, want the sweep failure carried out", err)
+	}
+	if got := loop.Status().AppSet.Error; !strings.Contains(got, "permission denied") {
+		t.Errorf("status error = %q, want the sweep failure reported", got)
 	}
 }
