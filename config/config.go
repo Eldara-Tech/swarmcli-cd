@@ -236,6 +236,13 @@ func validateChart(c application.ChartSource) error {
 		if r.Name == "" || r.URL == "" {
 			return fmt.Errorf("source.chart.repositories[%d] needs both name and url", i)
 		}
+		// The name becomes a filesystem path in the chart engine, so it is held
+		// to a charset rather than only to being non-empty. Package source runs
+		// the same check over a release file's own repositories, which never
+		// pass through here.
+		if !application.ValidRepositoryName(r.Name) {
+			return fmt.Errorf("source.chart.repositories[%d]: invalid name %q: it becomes a file in the chart cache, so letters, digits, dot, dash and underscore only, starting with a letter or digit", i, r.Name)
+		}
 	}
 	for i, v := range c.Values {
 		if err := repoPath(fmt.Sprintf("source.chart.values[%d]", i), v); err != nil {

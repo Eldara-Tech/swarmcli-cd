@@ -19,7 +19,10 @@
 // not move when CE's does.
 package application
 
-import "time"
+import (
+	"regexp"
+	"time"
+)
 
 // Spec is what an operator declares in applications.yaml. It is read-only over
 // the API: the file is the only source of truth, whether it is mounted at
@@ -74,6 +77,29 @@ type RepositorySpec struct {
 	Name string `json:"name" yaml:"name"`
 	URL  string `json:"url" yaml:"url"`
 }
+
+// repoNameRE is the charset a chart repository name is held to: no separator,
+// and a leading dot — hence ".." — rejected.
+var repoNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// ValidRepositoryName reports whether a chart repository may be called name.
+//
+// Declaring a name is not all it does. The chart engine builds its cache file
+// by concatenating the name into "index-<name>.yaml" and joining that onto its
+// store directory, so the name is a path component before it is an identifier.
+// The concatenation is what makes it dangerous: "index-.." is an ordinary
+// segment, so Join's Clean does not neutralise a traversal, it only costs one
+// extra "../" — and a name that escapes writes attacker-chosen YAML wherever a
+// process holding the docker socket can reach, up to and including the app set
+// naming every repository the controller then deploys from.
+//
+// It lives here, in the wire contract, rather than in the config loader,
+// because a name reaches the engine by two routes and only one of them is the
+// operator's file: a release file committed to a tenant's repository carries
+// repositories of its own, and package source checks those on the way past.
+// Two copies of this charset that drifted apart would leave one route open,
+// which is the whole of #100.
+func ValidRepositoryName(name string) bool { return repoNameRE.MatchString(name) }
 
 // Destination names the swarm, resolved through the SwarmRegistry seam. Empty
 // means the local swarm, which is the only one Phase 1 can resolve.
