@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
+	"github.com/Eldara-Tech/swarmcli-cd/extension"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 )
 
@@ -213,7 +215,10 @@ func testServer(t *testing.T, rec Reconciler, a authz.Authorizer) (*Server, http
 	// Run a triggered sync inline, so a test asserts on what happened rather
 	// than on when a goroutine got round to it.
 	s.syncing = func(_ string, run func(context.Context)) { run(context.Background()) }
-	h := s.Handler()
+	h, err := s.Handler()
+	if err != nil {
+		t.Fatalf("building the router: %v", err)
+	}
 	return s, h
 }
 
@@ -423,7 +428,11 @@ func TestTriggeredSyncOutlivesTheRequest(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	rr := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rr, httptest.NewRequest("POST", "/api/v1/applications/edge/sync", nil).WithContext(ctx))
+	h, err := s.Handler()
+	if err != nil {
+		t.Fatalf("building the router: %v", err)
+	}
+	h.ServeHTTP(rr, httptest.NewRequest("POST", "/api/v1/applications/edge/sync", nil).WithContext(ctx))
 	// What net/http does once the response is written.
 	cancel()
 
@@ -1017,10 +1026,10 @@ func TestHistoryBeforeTheFirstReconcile(t *testing.T) {
 // A response writer that cannot flush would produce a stream that silently
 // never arrives, which is worse than refusing.
 func TestStreamRefusesAWriterThatCannotFlush(t *testing.T) {
-	s, _ := testServer(t, &fakeReconciler{}, nil)
+	s, h := testServer(t, &fakeReconciler{}, nil)
 	rr := httptest.NewRecorder()
 
-	s.Handler().ServeHTTP(unflushable{rr}, httptest.NewRequest("GET", "/api/v1/events", nil))
+	h.ServeHTTP(unflushable{rr}, httptest.NewRequest("GET", "/api/v1/events", nil))
 	if rr.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", rr.Code)
 	}
@@ -1213,5 +1222,428 @@ func TestASyncQueuedBehindAnotherIsReportedAsCoalesced(t *testing.T) {
 	}
 	if got := rec.syncedApps(); len(got) != 0 {
 		t.Fatalf("ran %v, want nothing: a coalesced request must not start a second sync", got)
+	}
+}
+
+// --- the extension seam ---
+
+// fakeExtension is a companion's contribution: whatever routes it was built
+// with. The seam is a declaration, so a fake needs no behaviour beyond
+// returning what it was handed.
+type fakeExtension struct{ routes, public []extension.Route }
+
+func (f fakeExtension) Routes() []extension.Route       { return f.routes }
+func (f fakeExtension) PublicRoutes() []extension.Route { return f.public }
+
+// withExtensions installs a set of extensions for the duration of one test, in
+// the style of run_test.go's swapAuthorizer.
+//
+// It swaps what Handler reads rather than calling extension.Register, and it has
+// to: the seam is a seam.List, a List appends and has no removal, and half the
+// tests below declare a colliding or malformed route on purpose. Registering one
+// of those into the process-wide list would leave it registered, and every later
+// call to Handler in this binary would fail on the collision a finished test
+// installed. TestTheSeamIsWhatHandlerReads is what keeps this from testing a
+// variable no companion can reach.
+func withExtensions(t *testing.T, exts ...loaded) {
+	t.Helper()
+	original := activeExtensions
+	t.Cleanup(func() { activeExtensions = original })
+	activeExtensions = func() []loaded { return exts }
+}
+
+// extRoute is one declared route, kept short because every test below writes
+// several.
+func extRoute(pattern string, act authz.Action, h extension.Handler) extension.Route {
+	return extension.Route{Pattern: pattern, Action: act, Handler: h}
+}
+
+// recordSubject is a handler that reports the subject it was given, which is
+// the thing a context lookup would have got wrong.
+func recordSubject(got *authz.Subject) extension.Handler {
+	return func(w http.ResponseWriter, _ *http.Request, subject authz.Subject) {
+		*got = subject
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+func okHandler(w http.ResponseWriter, _ *http.Request, _ authz.Subject) { w.WriteHeader(http.StatusOK) }
+
+// refuses builds a router over the given extensions and returns the message
+// Handler refused with. A router that built at all is the failure: the check has
+// to happen before anything reaches the mux, so there is nothing to serve.
+func refuses(t *testing.T, exts ...loaded) string {
+	t.Helper()
+	withExtensions(t, exts...)
+
+	s := New(&fakeReconciler{}, Options{Authorizer: &allowAll{}, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	h, err := s.Handler()
+	if err == nil {
+		t.Fatal("Handler built a router for a set it had to refuse")
+	}
+	if h != nil {
+		t.Errorf("Handler refused and still returned a router (%T); nothing must be servable", h)
+	}
+	if got := s.Routes(); len(got) != 0 {
+		t.Errorf("Routes = %v after a refusal, want nothing: no route was registered", got)
+	}
+	return err.Error()
+}
+
+// names asserts that a refusal message identifies the offender. A refusal an
+// operator cannot act on is barely better than the panic it replaced.
+func names(t *testing.T, msg string, want ...string) {
+	t.Helper()
+	for _, w := range want {
+		if !strings.Contains(msg, w) {
+			t.Errorf("error %q does not name %q", msg, w)
+		}
+	}
+}
+
+// The guarantee registeredRoutes structurally cannot give any more: it reads
+// this package's source, and an extension route is registered from a pattern
+// held in a slice, in a private module the scan cannot see. So the same two
+// questions TestEveryApiEndpointIsGuarded asks are asked again here at runtime,
+// against a route that came in through the seam.
+//
+// The core, not the companion, decides what wraps a declared handler. That is
+// the entire security argument for a table rather than a mux, and this is where
+// it is checked.
+func TestAnExtensionRouteIsGuarded(t *testing.T) {
+	reached := false
+	install := func(t *testing.T) {
+		t.Helper()
+		reached = false
+		withExtensions(t, loaded{name: "projects", ext: fakeExtension{routes: []extension.Route{
+			extRoute("GET /api/v1/projects", authz.ActionRead, func(w http.ResponseWriter, _ *http.Request, _ authz.Subject) {
+				reached = true
+				w.WriteHeader(http.StatusOK)
+			}),
+		}}})
+	}
+
+	t.Run("authentication", func(t *testing.T) {
+		install(t)
+		_, h := testServer(t, &fakeReconciler{}, denyAuthn{})
+		if rr := do(t, h, "GET", "/api/v1/projects"); rr.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401", rr.Code)
+		}
+		if reached {
+			t.Error("an unauthenticated request reached the extension's handler")
+		}
+	})
+
+	t.Run("authorization", func(t *testing.T) {
+		install(t)
+		_, h := testServer(t, &fakeReconciler{}, denyAuthz{})
+		if rr := do(t, h, "GET", "/api/v1/projects"); rr.Code != http.StatusForbidden {
+			t.Errorf("status = %d, want 403", rr.Code)
+		}
+		if reached {
+			t.Error("an unauthorised request reached the extension's handler")
+		}
+	})
+}
+
+// The route's own action, not read. authz.Action is a string type with additive
+// constants precisely so an extension can declare one of its own, and an
+// authorizer that was asked "read" about an endpoint the companion called
+// "projects" was asked the wrong question — one it may well answer yes to.
+//
+// The application scope comes from the path the same way it does for a core
+// route, so a companion's RBAC can scope on it without the core knowing what the
+// wildcard means.
+func TestAnExtensionRouteIsAuthorisedWithItsOwnAction(t *testing.T) {
+	withExtensions(t, loaded{name: "projects", ext: fakeExtension{routes: []extension.Route{
+		extRoute("GET /api/v1/projects/{app}", authz.Action("projects"), okHandler),
+	}}})
+
+	a := &allowAll{}
+	_, h := testServer(t, &fakeReconciler{}, a)
+	if rr := do(t, h, "GET", "/api/v1/projects/edge"); rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	want := []string{"projects:edge"}
+	if !slices.Equal(a.calls, want) {
+		t.Errorf("asked %v, want %v", a.calls, want)
+	}
+}
+
+// The subject the guard authenticated has to arrive at the handler, or a
+// companion's own second decision — the one the core cannot make for it —
+// is made about nobody.
+//
+// projectAuthorizer refuses any subject Authenticate did not return, so a zero
+// Subject reaching the handler shows up as a 403 rather than as a passing test.
+func TestTheSubjectReachesAnExtensionHandler(t *testing.T) {
+	var got authz.Subject
+	withExtensions(t, loaded{name: "projects", ext: fakeExtension{routes: []extension.Route{
+		extRoute("GET /api/v1/projects", authz.ActionRead, recordSubject(&got)),
+	}}})
+
+	_, h := testServer(t, &fakeReconciler{}, projectAuthorizer{visible: "edge"})
+	if rr := do(t, h, "GET", "/api/v1/projects"); rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if got.Name != "tenant" || !slices.Equal(got.Groups, []string{"project-a"}) {
+		t.Errorf("handler got %+v, want the subject Authenticate returned", got)
+	}
+}
+
+// The opt-out works, and only where it was asked for. One extension, two routes,
+// one credential-less request each: the public one answers and the guarded one
+// does not.
+func TestAPublicRouteNeedsNoCredential(t *testing.T) {
+	withExtensions(t, loaded{name: "sso", ext: fakeExtension{
+		routes: []extension.Route{extRoute("GET /api/v1/projects", authz.ActionRead, okHandler)},
+		public: []extension.Route{{Pattern: "GET /sso/callback", Handler: okHandler}},
+	}})
+
+	_, h := testServer(t, &fakeReconciler{}, denyAuthn{})
+	if rr := do(t, h, "GET", "/sso/callback"); rr.Code != http.StatusOK {
+		t.Errorf("public route = %d, want 200: nothing authenticates it", rr.Code)
+	}
+	if rr := do(t, h, "GET", "/api/v1/projects"); rr.Code != http.StatusUnauthorized {
+		t.Errorf("guarded route = %d, want 401: declaring one route public must not open the other", rr.Code)
+	}
+}
+
+// Nothing authenticated the request, so there is no subject and the handler is
+// told so plainly. An authorizer handed a zero Subject fails closed, which is
+// the right direction and the wrong failure — it reads as a caller with no
+// permissions rather than as a route that was never going to have one.
+func TestAPublicHandlerGetsTheZeroSubject(t *testing.T) {
+	var got authz.Subject
+	withExtensions(t, loaded{name: "sso", ext: fakeExtension{
+		public: []extension.Route{{Pattern: "GET /sso/callback", Handler: recordSubject(&got)}},
+	}})
+
+	// allowAll would have produced a named subject for a guarded route, so a
+	// non-zero one here means the public path went through the guard.
+	_, h := testServer(t, &fakeReconciler{}, &allowAll{})
+	if rr := do(t, h, "GET", "/sso/callback"); rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	// DeepEqual against the zero value rather than a field-by-field check, so
+	// that a field added to Subject later is covered by this without anyone
+	// having to remember it.
+	if !reflect.DeepEqual(got, authz.Subject{}) {
+		t.Errorf("handler got %+v, want the zero Subject", got)
+	}
+}
+
+// A companion re-registering a path the core already serves is the likeliest
+// collision there is, and the one with teeth: net/http's last registration does
+// not win, it panics, and either outcome would have a private module deciding
+// what /api/v1/status means.
+func TestARouteCollidingWithACoreRouteIsRefused(t *testing.T) {
+	msg := refuses(t, loaded{name: "projects", ext: fakeExtension{routes: []extension.Route{
+		extRoute("GET /api/v1/status", authz.ActionRead, okHandler),
+	}}})
+	names(t, msg, "projects", "GET /api/v1/status", "core route")
+}
+
+func TestTwoExtensionsCollidingAreRefused(t *testing.T) {
+	msg := refuses(t,
+		loaded{name: "sso", ext: fakeExtension{routes: []extension.Route{
+			extRoute("GET /api/v1/projects", authz.ActionRead, okHandler),
+		}}},
+		loaded{name: "projects", ext: fakeExtension{routes: []extension.Route{
+			extRoute("GET /api/v1/projects", authz.ActionRead, okHandler),
+		}}},
+	)
+	// Both, because an operator with two companions loaded has to know which
+	// pair to take up with whom.
+	names(t, msg, "sso", "projects", "GET /api/v1/projects")
+}
+
+// The check is over one flat set, so an extension colliding with itself is
+// caught by the same pass. It would otherwise reach the mux and panic there,
+// which is a crash rather than a refusal to start.
+func TestAnExtensionCollidingWithItselfIsRefused(t *testing.T) {
+	msg := refuses(t, loaded{name: "sso", ext: fakeExtension{routes: []extension.Route{
+		extRoute("GET /login", authz.ActionRead, okHandler),
+		extRoute("GET /login", authz.ActionRead, okHandler),
+	}}})
+	names(t, msg, "sso", "GET /login", "twice")
+}
+
+// The dangerous member of that flat set. The same pattern in both methods would
+// be registered twice, and which registration won would decide whether the
+// endpoint was authenticated — a security property settled by the order of two
+// loops.
+func TestAPatternDeclaredBothGuardedAndPublicIsRefused(t *testing.T) {
+	msg := refuses(t, loaded{name: "sso", ext: fakeExtension{
+		routes: []extension.Route{extRoute("GET /sso/callback", authz.ActionRead, okHandler)},
+		public: []extension.Route{{Pattern: "GET /sso/callback", Handler: okHandler}},
+	}})
+	names(t, msg, "sso", "GET /sso/callback", "guarded", "public")
+}
+
+// There is no action that is obviously right for a route this repository has
+// never seen, and defaulting to one would be guessing at a permission on a
+// process holding the docker socket.
+func TestAGuardedRouteWithNoActionIsRefused(t *testing.T) {
+	msg := refuses(t, loaded{name: "projects", ext: fakeExtension{routes: []extension.Route{
+		{Pattern: "GET /api/v1/projects", Handler: okHandler},
+	}}})
+	names(t, msg, "projects", "GET /api/v1/projects", "no action")
+}
+
+// The contradiction, and the reason it is worth refusing rather than ignoring:
+// the likeliest author of it believed the action would be enforced, and on a
+// route nothing authenticates it cannot be.
+func TestAPublicRouteWithAnActionIsRefused(t *testing.T) {
+	msg := refuses(t, loaded{name: "sso", ext: fakeExtension{
+		public: []extension.Route{extRoute("GET /sso/callback", authz.ActionSync, okHandler)},
+	}})
+	names(t, msg, "sso", "GET /sso/callback", "sync")
+}
+
+// A nil handler is the one malformed field that would otherwise reach an
+// operator as an outage — a 500 on the first request that touched it — rather
+// than as a controller that would not start.
+func TestARouteWithNoHandlerIsRefused(t *testing.T) {
+	msg := refuses(t, loaded{name: "projects", ext: fakeExtension{routes: []extension.Route{
+		{Pattern: "GET /api/v1/projects", Action: authz.ActionRead},
+	}}})
+	names(t, msg, "projects", "GET /api/v1/projects", "no handler")
+}
+
+// The OSS-build no-op guarantee: with nothing registered the mux is exactly
+// today's. The extension list is empty in every build of this repository, so
+// this is the only case CI ever exercises end to end and it must be provably a
+// no-op rather than merely believed to be one.
+//
+// It doubles as the check that coreRoutes has not drifted from the registrations
+// themselves. registeredRoutes reads the mux.Handle literals out of this
+// package's source; coreRoutes is what the collision check is seeded with and
+// what Routes reports. If those two ever disagree, the collision check has a
+// hole in it exactly the size of the disagreement, and this is where that shows
+// up.
+func TestZeroExtensionsChangesNothing(t *testing.T) {
+	withExtensions(t)
+
+	s, h := testServer(t, &fakeReconciler{views: []application.View{view("edge")}}, nil)
+
+	var got []string
+	for _, rt := range s.Routes() {
+		if rt.Extension != "" {
+			t.Errorf("route %q names extension %q with nothing registered", rt.Pattern, rt.Extension)
+		}
+		if rt.Public != openRoutes[rt.Pattern] {
+			t.Errorf("route %q public = %v, want %v", rt.Pattern, rt.Public, openRoutes[rt.Pattern])
+		}
+		got = append(got, rt.Pattern)
+	}
+
+	want := registeredRoutes(t)
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("Routes reports %v, but this package's source registers %v", got, want)
+	}
+
+	// And the router still answers, which a list of names cannot show.
+	if rr := do(t, h, "GET", "/api/v1/applications/edge"); rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+	if rr := do(t, h, "GET", "/api/v1/projects"); rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404: nothing registered that", rr.Code)
+	}
+}
+
+// What the startup log is built from. The pattern alone is not enough: a WARN
+// saying an unauthenticated endpoint exists, without saying which module added
+// it, leaves an operator with two companions loaded no way to act on it.
+func TestRoutesNamesEveryRegisteredRoute(t *testing.T) {
+	withExtensions(t,
+		loaded{name: "sso", ext: fakeExtension{
+			routes: []extension.Route{extRoute("GET /sso/whoami", authz.ActionRead, okHandler)},
+			public: []extension.Route{{Pattern: "GET /sso/callback", Handler: okHandler}},
+		}},
+		loaded{name: "projects", ext: fakeExtension{
+			routes: []extension.Route{extRoute("GET /api/v1/projects", authz.Action("projects"), okHandler)},
+		}},
+	)
+
+	s, _ := testServer(t, &fakeReconciler{}, nil)
+	got := s.Routes()
+
+	// The core's first, then every guarded route in registration order, then
+	// every public one — the order Handler registers them in.
+	want := append(append([]RegisteredRoute(nil), coreRoutes...),
+		RegisteredRoute{Pattern: "GET /sso/whoami", Extension: "sso"},
+		RegisteredRoute{Pattern: "GET /api/v1/projects", Extension: "projects"},
+		RegisteredRoute{Pattern: "GET /sso/callback", Extension: "sso", Public: true},
+	)
+	if !slices.Equal(got, want) {
+		t.Errorf("Routes =\n%+v\nwant\n%+v", got, want)
+	}
+
+	// The copy is a copy: a caller ranging over the result to build a log line
+	// cannot edit what the server thinks it registered.
+	got[0].Pattern = "GET /tampered"
+	if s.Routes()[0].Pattern == "GET /tampered" {
+		t.Error("mutating the result of Routes changed the server's own list")
+	}
+}
+
+// armed is an extension that contributes its routes only while the test that
+// registered it is running.
+//
+// extension.Register appends to a package-level seam with no removal, so a route
+// left registered here would still be registered for every test that ran
+// afterwards — and for a second run of this one under -count, where it would
+// collide with itself and fail every Handler call in the binary.
+type armed struct {
+	mu     sync.Mutex
+	on     bool
+	routes []extension.Route
+}
+
+func (a *armed) Routes() []extension.Route {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.on {
+		return nil
+	}
+	return a.routes
+}
+
+func (*armed) PublicRoutes() []extension.Route { return nil }
+
+func (a *armed) set(on bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.on = on
+}
+
+// The one test that goes through extension.Register itself.
+//
+// Every other test here installs its set by swapping activeExtensions, for the
+// reason withExtensions gives, and that indirection is only worth anything if
+// what it stands in for is the seam a companion can actually reach. Without
+// this, all of them could pass over a variable no init() anywhere writes to.
+func TestTheSeamIsWhatHandlerReads(t *testing.T) {
+	e := &armed{routes: []extension.Route{
+		extRoute("GET /api/v1/seam-check", authz.ActionRead, okHandler),
+	}}
+	e.set(true)
+	t.Cleanup(func() { e.set(false) })
+	extension.Register("seam-check", e)
+
+	s, h := testServer(t, &fakeReconciler{}, nil)
+	if rr := do(t, h, "GET", "/api/v1/seam-check"); rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: a route registered through extension.Register was not served", rr.Code)
+	}
+	// And under the name it registered with, which is what the WARN line for a
+	// public route depends on.
+	if !slices.Contains(s.Routes(), RegisteredRoute{Pattern: "GET /api/v1/seam-check", Extension: "seam-check"}) {
+		t.Errorf("Routes = %+v, want the seam's own registration named", s.Routes())
 	}
 }
