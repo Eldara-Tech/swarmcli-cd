@@ -166,7 +166,14 @@ ever evidence about its own kind.
 ### What a release name may claim
 
 A release name *is* the stack namespace, so choosing one is a claim on everything
-already carrying that label. Two claims are refused.
+already carrying that label — and it is the release name that claims it, never
+the application's. An application named `eldara-zammad` installing a release
+named `zammad` deploys the stack `zammad`. A `chart` application that names no
+release installs one named after itself, which is usually what was meant; a
+`releaseFile` application installs whatever its file declares, because one
+application there is several releases and cannot be any one of them.
+
+Three claims are refused.
 
 A release may not be named after the stack the controller itself runs as — the
 `swarmcli-cd` in `docker stack deploy -c stack.yml swarmcli-cd`. Deploying one
@@ -184,6 +191,17 @@ GitOps by removing it and letting the controller install it, not by naming a
 release after it: the release is also the unit an uninstall and a prune act on,
 so sharing a namespace with a stack the controller did not install means sharing
 that too.
+
+And two applications may not claim one release. A shared release name is a shared
+stack: each application deploys its own manifest over the other's on every
+interval, and each takes the owner stamp from the other as it goes — after which
+the one that stops declaring the release reads the other's live stack as its own
+orphan. The app-set file is refused at load when it can see the collision, which
+is when both are `chart` applications; a release file's releases are in a
+repository the loader has not fetched, so the second half of the rule is at
+reconcile time, where **no application deletes a release, or anything inside one,
+that another application in the set still declares**. It is held rather than
+deleted, and the log line says which two applications to look at.
 
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by

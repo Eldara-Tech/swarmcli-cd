@@ -1504,6 +1504,80 @@ func TestPruneRemovesReleasesTheApplicationNoLongerDeclares(t *testing.T) {
 	}
 }
 
+// chartApp is an application whose source names one chart, so what it declares
+// is knowable from its spec alone — before it has ever planned.
+func chartApp(name, release string) application.Spec {
+	s := spec(name, false)
+	s.Source.Chart = &application.ChartSource{Release: release, Path: "./c"}
+	return s
+}
+
+// declaring is a synced plan for one named release, so that an application's
+// status reports it as held.
+func declaring(release string) *charts.Plan {
+	return &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: release, Ref: "repo/" + release, Action: charts.ActionUnchanged, ToVersion: "0.1.0"},
+	}}
+}
+
+// The stamp says who installed a release; it does not say who is responsible for
+// it now. Where two applications have claimed one release name — which the
+// config loader refuses for two chart sources but cannot see inside a release
+// file — the stamp is whichever of them deployed last, so the one that stops
+// declaring the release reads the other's live stack as its own orphan and,
+// with pruneVolumes, takes the data with it.
+func TestAReleaseAnotherApplicationDeclaresIsNotPruned(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{orphaning("zammad"), synced()}}
+	r := newTest(t, []application.Spec{
+		pruningSpec("edge", true),
+		chartApp("acme", "zammad"),
+	}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := engine.pruned(); len(got) != 0 {
+		t.Errorf("uninstalled %v, want nothing — another application still declares it", got)
+	}
+}
+
+// The other half of what an application declares. A releaseFile source names no
+// release in its spec, so only its plan can say what it holds — which is why
+// both are read, and why an application that has planned protects releases a
+// spec could never have named.
+func TestAReleaseFileApplicationProtectsWhatItPlanned(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{declaring("zammad"), orphaning("zammad"), synced()}}
+	r := newTest(t, []application.Spec{spec("acme", false), pruningSpec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "acme"); err != nil {
+		t.Fatalf("Sync acme = %v, want nil", err)
+	}
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync edge = %v, want nil", err)
+	}
+	if got := engine.pruned(); len(got) != 0 {
+		t.Errorf("uninstalled %v, want nothing — acme's plan declares it", got)
+	}
+}
+
+// The guard asks about *other* applications, and an application's own status
+// still names the release it has just stopped declaring — the prune runs before
+// the status is rewritten. Reading its own would make every sweep a no-op.
+func TestAnApplicationDoesNotProtectAReleaseFromItself(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{declaring("zammad"), orphaning("zammad"), synced()}}
+	r := newTest(t, []application.Spec{pruningSpec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []string{"zammad"}; !slices.Equal(engine.pruned(), want) {
+		t.Errorf("uninstalled %v, want %v", engine.pruned(), want)
+	}
+}
+
 // The D-e default. An orphan is reported and left running unless the
 // application's own sync policy asks for it to go.
 func TestOrphansSurviveWhenPruneIsOff(t *testing.T) {
@@ -2959,6 +3033,49 @@ func TestAServiceDroppedFromTheChartIsPrunedInManifestMode(t *testing.T) {
 
 	if want := []string{"id-sidecar"}; !slices.Equal(backend.pruned(), want) {
 		t.Errorf("removed %v, want %v — only the service the chart stopped declaring", backend.pruned(), want)
+	}
+}
+
+// The release-level rule one scope down. Inside a namespace two applications
+// share there is nothing to tell one's services from the other's: a service this
+// application dropped from its template may be one the other still declares, and
+// its own revision history says only that it used to declare it too. So the
+// deletion is held — and the report is not, because the leftover is exactly what
+// an operator needs to see to find the collision.
+func TestTheServiceSweepIsHeldForAReleaseAnotherApplicationAlsoDeclares(t *testing.T) {
+	backend := sweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{
+		sweepingSpec("edge", application.DriftManifest),
+		chartApp("acme", "whoami"),
+	}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := backend.pruned(); len(got) != 0 {
+		t.Errorf("removed %v, want nothing — acme declares this release too", got)
+	}
+	if want := []string{"whoami_sidecar"}; !slices.Equal(orphanedServices(t, r, "edge"), want) {
+		t.Errorf("orphaned = %v, want %v — held is not the same as unreported", orphanedServices(t, r, "edge"), want)
+	}
+}
+
+// The same hold for the other three kinds, which are written by a separate sweep
+// at a separate moment and so need their own guard.
+func TestTheResourceSweepIsHeldForAReleaseAnotherApplicationAlsoDeclares(t *testing.T) {
+	backend := resourceSweepBackend()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{
+		sweepingSpec("edge", application.DriftManifest),
+		chartApp("acme", "whoami"),
+	}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := backend.prunedResources(); len(got) != 0 {
+		t.Errorf("pruned %v, want nothing — acme declares this release too", got)
 	}
 }
 

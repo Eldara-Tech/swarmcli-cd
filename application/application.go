@@ -71,6 +71,21 @@ type Source struct {
 // path, because a floating pin would silently upgrade production on the next
 // reconcile.
 type ChartSource struct {
+	// Release is the release name to install as, and a release name *is* the
+	// Swarm stack namespace — so this, and not the application's Name, is what
+	// `docker stack ls` shows. The two are separate on purpose: a releaseFile
+	// application installs several releases under one name, so the application
+	// cannot be the release.
+	//
+	// Empty means the application's name. That is Argo CD's default for
+	// `source.helm.releaseName`, which is the reflex an operator arrives with
+	// (#139), and it is the one choice that cannot collide: application names
+	// are unique within an app set, so a set that never writes this down can
+	// never have two applications claiming one namespace.
+	//
+	// The config loader resolves the default, so by the time a spec is served,
+	// planned or synthesised this holds the name that will reach the swarm.
+	// Deriving it again anywhere downstream would be a second copy of the rule.
 	Release      string           `json:"release" yaml:"release"`
 	Path         string           `json:"path,omitempty" yaml:"path,omitempty"` // chart directory within the repo
 	Ref          string           `json:"ref,omitempty" yaml:"ref,omitempty"`   // repo/chart

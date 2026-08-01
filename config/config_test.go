@@ -97,6 +97,86 @@ func TestDriftDetectionLiveAccepted(t *testing.T) {
 	}
 }
 
+// A release name is the Swarm stack namespace, so an application that names no
+// release must reach the swarm under the name the operator wrote down — the
+// application's (#139). Anything else is a stack an operator cannot find.
+func TestChartReleaseDefaultsToTheApplicationName(t *testing.T) {
+	src := "applications:\n  - name: eldara-zammad\n    source:\n      repoURL: https://x/y.git\n" +
+		"      revision: main\n      chart: {ref: swarmcli-charts/zammad, version: \"0.1.0\", " +
+		"repositories: [{name: swarmcli-charts, url: https://x/}]}\n"
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if got := f.Applications[0].Source.Chart.Release; got != "eldara-zammad" {
+		t.Errorf("release = %q, want the application's name", got)
+	}
+}
+
+// The default is a default and not a rule: an application that says which
+// release it installs still installs that one.
+func TestAnExplicitChartReleaseIsKept(t *testing.T) {
+	src := "applications:\n  - name: eldara-zammad\n    source:\n      repoURL: https://x/y.git\n" +
+		"      revision: main\n      chart: {release: zammad, path: ./c}\n"
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if got := f.Applications[0].Source.Chart.Release; got != "zammad" {
+		t.Errorf("release = %q, want zammad", got)
+	}
+}
+
+// Two applications sharing a release name share a Swarm stack: each deploys over
+// the other every interval, and whichever stops declaring it reads the other's
+// live stack as its own orphan. The error names both, because the file is where
+// it is fixed and one name does not say which pair to look at.
+func TestTwoApplicationsMayNotClaimOneRelease(t *testing.T) {
+	const src = `
+applications:
+  - name: eldara-zammad
+    source:
+      repoURL: https://x/y.git
+      revision: main
+      chart: {release: zammad, path: ./c}
+  - name: acme-zammad
+    source:
+      repoURL: https://x/z.git
+      revision: main
+      chart: {release: zammad, path: ./c}
+`
+	_, err := Parse([]byte(src), "applications.yaml")
+	if err == nil {
+		t.Fatal("Parse = nil, want a shared-release error")
+	}
+	for _, want := range []string{"eldara-zammad", "acme-zammad", `"zammad"`, "stack"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
+}
+
+// The collision above is what the default makes unreachable: application names
+// are unique within a set, so a set that writes no release name down cannot
+// produce two claims on one stack.
+func TestDefaultedReleasesCannotCollide(t *testing.T) {
+	const src = `
+applications:
+  - name: eldara-zammad
+    source: {repoURL: https://x/y.git, revision: main, chart: {path: ./c}}
+  - name: acme-zammad
+    source: {repoURL: https://x/z.git, revision: main, chart: {path: ./c}}
+`
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	a, b := f.Applications[0].Source.Chart.Release, f.Applications[1].Source.Chart.Release
+	if a != "eldara-zammad" || b != "acme-zammad" {
+		t.Errorf("releases = %q and %q, want each application's own name", a, b)
+	}
+}
+
 // A misspelled key that was quietly ignored would leave a setting an operator
 // believes they configured silently doing nothing.
 func TestUnknownKeysRejected(t *testing.T) {
@@ -136,7 +216,6 @@ func TestValidationErrors(t *testing.T) {
 		"both source types":  {base("      releaseFile: r.yaml\n      chart: {release: h, path: ./c}\n"), "both releaseFile and chart"},
 		"absolute path":      {base("      releaseFile: /etc/passwd\n"), "must be relative"},
 		"escaping path":      {base("      releaseFile: ../../etc/passwd\n"), "escapes the repository"},
-		"no chart release":   {base("      chart: {path: ./c}\n"), "chart.release is required"},
 		"no chart source":    {base("      chart: {release: h}\n"), "one of path or ref"},
 		"both chart source":  {base("      chart: {release: h, path: ./c, ref: r/c, version: \"1\"}\n"), "both path and ref"},
 		"version with path":  {base("      chart: {release: h, path: ./c, version: \"1\"}\n"), "cannot be set with a path"},
