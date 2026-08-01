@@ -9,7 +9,7 @@ services:
                 com.docker.stack.namespace: edge
                 traefik.constraint-label: traefik-public
                 traefik.enable: "true"
-                traefik.http.middlewares.admin-auth.basicauth.users: admin:$$apr1$$otIz5Cnl$$/y77Sc88rr1SfA6k0Ospw/
+                traefik.http.middlewares.admin-auth.basicauth.users: admin:$apr1$otIz5Cnl$/y77Sc88rr1SfA6k0Ospw/
                 traefik.http.middlewares.hsts-header.headers.forceSTSHeader: "false"
                 traefik.http.middlewares.hsts-header.headers.stsIncludeSubdomains: "true"
                 traefik.http.middlewares.hsts-header.headers.stsPreload: "true"
