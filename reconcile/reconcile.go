@@ -2235,12 +2235,19 @@ func scopedTo(states []charts.ServiceState, names []string) []charts.ServiceStat
 // prune deletes the releases this application used to declare and no longer
 // does, when its sync policy asks for it.
 //
-// orphaned is charts' own classification and is already the right list: it
-// names releases carrying this application's owner stamp that its release file
-// has stopped declaring. A release belonging to another application, or applied
-// from the command line, fails that ownership check and is reported as
-// unmanaged instead — so nothing here can reach outside the application it is
-// reconciling.
+// orphaned is charts' own classification: it names releases carrying this
+// application's owner stamp that its release file has stopped declaring. A
+// release belonging to another application, or applied from the command line,
+// fails that ownership check and is reported as unmanaged instead.
+//
+// That is one signal short of enough, and declaredElsewhere is the second. The
+// stamp says who installed a release; it does not say who is responsible for it
+// now, and where two applications have claimed one release name the stamp is
+// simply whichever of them deployed last. So the one that stops declaring the
+// release reads the other's live stack as its own orphan and deletes it, with
+// its volumes if pruneVolumes is on. Asking whether anybody else still declares
+// it is the same second question prune.Departed already asks for exactly this
+// reason (#62), which the per-application sweep was missing.
 //
 // The sync is not failed by a prune that does not work. The deploy landed, and
 // what is left behind is a release that will be classified as orphaned again on
@@ -2251,9 +2258,17 @@ func (r *Reconciler) prune(ctx context.Context, spec application.Spec, backend c
 		return nil
 	}
 
+	elsewhere := r.declaredElsewhere(spec.Name)
+
 	var errs []error
 	var pruned []string
 	for _, release := range orphaned {
+		if other, shared := elsewhere[release]; shared {
+			r.log.Warn("not pruning a release another application in the set still declares; "+
+				"a release name is the stack namespace, so give each application one of its own",
+				"application", spec.Name, "release", release, "declaredBy", other)
+			continue
+		}
 		result, err := prune.Release(ctx, r.log, backend, engine, release, prune.VolumePurge{
 			Enabled:  spec.SyncPolicy.PruneVolumes,
 			Registry: r.swarms,
@@ -2326,9 +2341,22 @@ func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, b
 		return nil
 	}
 
+	elsewhere := r.declaredElsewhere(spec.Name)
+
 	var errs []error
 	var removed []string
 	for _, release := range slices.Sorted(maps.Keys(doomed)) {
+		if other, shared := elsewhere[release]; shared {
+			// The release-level rule one scope down, and said once for both
+			// sweeps. A service this application dropped from its template may
+			// be one the other application still declares, and inside a shared
+			// namespace there is nothing to tell the two apart. Departed reports
+			// them either way — only the deletion is held.
+			r.log.Warn("not pruning what a release stopped declaring; another application in the set declares that release too, "+
+				"so give each application a release name of its own",
+				"application", spec.Name, "release", release, "declaredBy", other)
+			continue
+		}
 		for _, svc := range doomed[release].services {
 			if err := remover.RemoveService(ctx, svc.id); err != nil {
 				errs = append(errs, fmt.Errorf("pruning service %q of release %q: %w", svc.name, release, err))
@@ -2412,10 +2440,16 @@ func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec appli
 	if counts == nil {
 		counts = map[string]int{}
 	}
+	// The same hold as pruneServices, which has already said so — one release
+	// held is one log line, not one per sweep.
+	elsewhere := r.declaredElsewhere(spec.Name)
 
 	var errs []error
 	var removed []string
 	for _, release := range slices.Sorted(maps.Keys(doomed)) {
+		if _, shared := elsewhere[release]; shared {
+			continue
+		}
 		for _, res := range doomed[release].resources {
 			var err error
 			switch res.kind {
@@ -2467,6 +2501,56 @@ func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec appli
 			Message: err.Error(),
 		})
 	}
+}
+
+// declaredElsewhere maps each release some application in the set other than
+// app declares to the application declaring it. Nothing named here is deleted by
+// app's sweeps, whatever its owner stamp says.
+//
+// The declaring application is carried rather than a bare set because it is half
+// of what the operator has to fix: a log line naming only the release says a
+// collision exists and not where the other end of it is.
+//
+// Two applications sharing a release name is a misconfiguration and the config
+// loader refuses the case it can see — two chart sources. It cannot see a
+// releaseFile's releases, which are in a repository it has not fetched, so this
+// is the half that covers a set the loader accepted. It is deliberately not a
+// second refusal: holding a deletion costs an operator a stack they have to
+// remove by hand, and refusing to deploy would break the one legitimate way two
+// applications transiently declare one release — moving it from one to the
+// other, which is two commits and a window in between.
+//
+// Both halves of what an application declares are read. The spec answers for a
+// chart source before it has ever planned, which matters because an application
+// that has not reconciled yet reports no releases and would otherwise protect
+// none of them; the status answers for a releaseFile source, whose releases are
+// not knowable until it has been rendered. That leaves one gap, and it is the
+// narrow one: a releaseFile application in its very first interval. The app-set
+// loop's own sweep holds for exactly that condition (appset.unreconciled) and
+// this deliberately does not — a per-application prune that stalled on a sibling
+// nobody has looked at yet would be a cleanup silently not happening, which is
+// the failure mode #107 was about.
+//
+// A retiring entry is not consulted. An application that has left the set has
+// its releases swept by prune.Departed, which asks the same question across the
+// whole set and holds while anything is still draining.
+func (r *Reconciler) declaredElsewhere(app string) map[string]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make(map[string]string, len(r.apps))
+	for name, e := range r.apps {
+		if name == app {
+			continue
+		}
+		if c := e.spec.Source.Chart; c != nil && c.Release != "" {
+			out[c.Release] = name
+		}
+		for _, rel := range e.status.Releases {
+			out[rel.Name] = name
+		}
+	}
+	return out
 }
 
 // currentLocked reports whether e is still the entry the set holds under its

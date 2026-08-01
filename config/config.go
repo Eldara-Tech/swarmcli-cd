@@ -118,8 +118,25 @@ func Parse(data []byte, path string) (*File, error) {
 
 func (f *File) applyDefaults() {
 	for i := range f.Applications {
-		if f.Applications[i].DriftDetection == "" {
-			f.Applications[i].DriftDetection = application.DriftManifest
+		app := &f.Applications[i]
+		if app.DriftDetection == "" {
+			app.DriftDetection = application.DriftManifest
+		}
+		// A chart source that names no release installs one named after the
+		// application. See ChartSource.Release for why that is the default; what
+		// matters here is that it is resolved once, before validation, so that
+		// the duplicate check below, the API, the CLI and the synthesised
+		// release file all see the name that will reach the swarm rather than
+		// each deriving it again.
+		//
+		// An application whose name is empty or malformed is refused by
+		// validateApplication for its name a moment later, which is the error
+		// worth reporting; whatever this copied never reaches a swarm. Nothing
+		// else is needed to keep a defaulted release name legal — the charset an
+		// application name is held to is a subset of the engine's release-name
+		// charset.
+		if c := app.Source.Chart; c != nil && c.Release == "" {
+			c.Release = app.Name
 		}
 	}
 }
@@ -133,6 +150,7 @@ func (f *File) validate() error {
 	}
 
 	seen := make(map[string]bool, len(f.Applications))
+	claimed := make(map[string]string, len(f.Applications))
 	for i, app := range f.Applications {
 		if err := validateApplication(app); err != nil {
 			return fmt.Errorf("applications[%d]: %w", i, err)
@@ -141,6 +159,25 @@ func (f *File) validate() error {
 			return fmt.Errorf("applications[%d]: duplicate application name %q", i, app.Name)
 		}
 		seen[app.Name] = true
+
+		// Two applications may not claim one release. A release name is the
+		// Swarm stack namespace, so a shared one is a shared stack: each
+		// application deploys its own manifest over the other's on every
+		// interval, and each takes the owner stamp from the other as it goes —
+		// after which the one that stops declaring the release reads it as its
+		// own orphan and, with pruneVolumes, takes the data too.
+		//
+		// Only chart sources are visible from here: what a releaseFile declares
+		// is in a repository this has not fetched. The reconciler holds the
+		// other half — it refuses to delete a release another application in the
+		// set declares — but this is the half with an operator present to fix
+		// it, which is where a name collision belongs.
+		if c := app.Source.Chart; c != nil {
+			if other, taken := claimed[c.Release]; taken {
+				return fmt.Errorf("applications[%d]: %q and %q both declare the release %q, and a release name is the Swarm stack namespace, so they would share one stack", i, other, app.Name, c.Release)
+			}
+			claimed[c.Release] = app.Name
+		}
 	}
 	return nil
 }
@@ -253,11 +290,13 @@ func validateSource(src application.Source) error {
 	}
 }
 
+// validateChart holds a chart source to the rules the engine's own parser
+// applies, so that a set fails to load rather than failing to deploy.
+//
+// It does not check that a release name is present: applyDefaults has filled it
+// from the application's name, and an application with no usable name has
+// already been refused for that.
 func validateChart(c application.ChartSource) error {
-	if c.Release == "" {
-		return errors.New("source.chart.release is required")
-	}
-
 	switch {
 	case c.Path != "" && c.Ref != "":
 		return errors.New("source.chart has both path and ref, so which chart is meant is ambiguous")

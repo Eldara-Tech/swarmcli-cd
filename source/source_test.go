@@ -121,6 +121,14 @@ func TestBuildChartSourceWithPath(t *testing.T) {
 	}
 	spec := rf.Releases[0]
 
+	// The release name is the Swarm stack namespace, so this is the value an
+	// operator sees in `docker stack ls`. It comes from the chart source and
+	// never from the chart or the application, which is what #139 was about —
+	// the config loader is the one place that defaults it.
+	if spec.Name != "hello" {
+		t.Errorf("release name = %q, want the chart source's release", spec.Name)
+	}
+
 	// Without a leading "./" the engine reads "charts/hello" as the chart
 	// "hello" in a repository named "charts".
 	if !charts.IsPathRef(spec.Chart) {

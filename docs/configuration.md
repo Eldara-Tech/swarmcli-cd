@@ -106,7 +106,7 @@ source:
   repoURL: https://github.com/your-org/infra.git
   revision: v1.2.0
   chart:
-    release: hello                  # the release name to install as (required)
+    release: hello                  # the release name; omit for the application's name
     ref: swarmcli-charts/whoami     # repository/chart
     version: "0.1.8"                 # required WITH a ref
     values: [values/hello.yaml]      # optional; paths within the repo
@@ -120,9 +120,23 @@ package* to pull, and the `values` files configure *how it renders* — replica
 counts, the app's own image tag, and so on. Values are consumed by the chart, so
 they cannot select its version, which is why a `ref` carries its own `version`.
 
+**The release name is the stack name.** A release name *is* the Swarm stack
+namespace, so `release` — not the application's `name` — is what `docker stack
+ls` shows. Omit it and the application's own name is used, which is Argo CD's
+default for `source.helm.releaseName` and the one choice that cannot collide:
+application names are unique within an app set, so a file that never writes a
+release name down can never have two applications claiming one stack. Write one
+down to install under a different name; two applications that write the same one
+are refused at load.
+
+The two are separate fields rather than one because a `releaseFile` application
+installs several releases under a single application name, so the application
+cannot *be* the release. See [concepts § what a release name may
+claim](concepts.md#what-a-release-name-may-claim).
+
 | Field | | |
 |---|---|---|
-| `release` | required | the release name |
+| `release` | optional | the release name, and the Swarm stack name; defaults to the application's `name` |
 | `path` | one of path/ref | a chart directory within the repo (`./charts/mine`); `version` must be **omitted** — the chart's `Chart.yaml` is its version |
 | `ref` | one of path/ref | `repository/chart`; needs `version` and `repositories` |
 | `version` | with `ref` | the pinned chart version — **required** with a ref, because a floating pin would silently upgrade production on the next reconcile |

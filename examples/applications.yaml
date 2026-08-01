@@ -91,7 +91,11 @@ applications:
       repoURL: https://github.com/your-org/infra.git
       revision: v1.2.0
       chart:
-        release: hello                    # the release name to install as
+        # release: the release name to install as — and a release name IS the
+        # Swarm stack namespace, so it is what `docker stack ls` shows, not the
+        # application's `name` above. Omitted here, which means the application's
+        # name: "hello". Write one down only to install under a different name,
+        # and no two applications may claim the same one.
         ref: swarmcli-charts/whoami       # repository/chart
         version: "0.1.8"                   # which CHART version to pull — not app config (that lives in values); required and pinned with a ref, or it would silently upgrade on the next reconcile
         values: [values/hello.yaml]        # configure how the chart renders (replicas, image tag, …); paths within the repo (optional)
