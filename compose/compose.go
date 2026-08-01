@@ -305,6 +305,12 @@ func unescapeDollars(v any) {
 // would have put it, because a chart author who wrote "./data" did not mean a
 // path on a node they have never seen.
 //
+// A Windows-style source (C:\data, \\server\share) lands here too, by the same
+// test: this controller reconciles a Linux swarm, and an allowlist entry is a
+// Linux path, so PermitsPath comparing prefixes of a drive path would be a
+// comparison with no meaning. Refusing it says so; CE, which runs on the
+// operator's own machine and has no allowlist to consult, deploys it as written.
+//
 // # A host path this application may not bind
 //
 // A bind names a path on whichever node runs the task, and a chart chooses where
@@ -376,8 +382,19 @@ func checkBindSources(dict map[string]any, allow application.Allow) error {
 }
 
 // bindSource returns the host side of a volume entry, and whether that entry
-// names a host path at all. A short-syntax entry does when its source looks like
-// a path; anything else is a named volume, which has no host side to check.
+// names a host path at all.
+//
+// A short-syntax entry is classified by the parser that decides — ParseVolume
+// wraps volumespec.Parse, which is what the loader itself runs a few lines
+// later. Reading it as "cut at the first colon, then look for /.~ in the source"
+// was wrong in both directions (#153): compose asks isFilePath, which reads the
+// source's FIRST character and nothing else, so `my.data:/data` is a legal named
+// volume that the dot got refused as a relative bind; and not every colon
+// separates, so `C:\data:/d` cut to a source of "C" and was skipped by this
+// check and by the allowlist both, while compose read it as a bind.
+//
+// An entry ParseVolume cannot read names nothing here. loader.Load refuses it a
+// few lines after this runs, with a better message than this could give.
 //
 // The long form is read by its `type:`, and two of the six types name a path:
 // bind, and npipe. npipe is here because it is what the check would otherwise be
@@ -392,15 +409,13 @@ func checkBindSources(dict map[string]any, allow application.Allow) error {
 func bindSource(v any) (string, bool) {
 	switch entry := v.(type) {
 	case string:
-		source, _, ok := strings.Cut(entry, ":")
-		if !ok {
-			// An anonymous volume: just a container path.
+		// An anonymous volume — a container path and nothing else — parses as a
+		// volume, so it needs no case of its own.
+		v, err := loader.ParseVolume(entry)
+		if err != nil || v.Type != "bind" {
 			return "", false
 		}
-		if !strings.ContainsAny(source, "/.~") {
-			return "", false
-		}
-		return source, true
+		return v.Source, true
 	case map[string]any:
 		switch t, _ := entry["type"].(string); t {
 		case "bind", "npipe":

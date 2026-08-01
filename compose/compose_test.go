@@ -296,6 +296,15 @@ func TestRelativeBindSourceIsRejected(t *testing.T) {
 		{"parent", `["../data:/data"]`},
 		{"home", `["~/data:/data"]`},
 		{"long syntax", `[{type: bind, source: ./data, target: /data}]`},
+		// Windows-style sources, which compose reads as binds and which the
+		// heuristic this replaced never saw at all — the drive letter's colon is
+		// not a separator, so cutting at the first one yielded a source of "C"
+		// that looked like a volume name (#153). They are refused rather than
+		// permitted, because an allow.hostPaths entry is a Linux path and this
+		// controller reconciles a Linux swarm.
+		{"a drive letter", `['C:\data:/data']`},
+		{"a UNC path", `['\\server\share:/data']`},
+		{"drive-relative", `["C:data:/data"]`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Convert(context.Background(),
@@ -330,13 +339,15 @@ services:
       - /anonymous
       - {type: volume, source: named, target: /named}
       - {type: bind, source: /srv/app/app.conf, target: /etc/app.conf}
+      - my.data:/data3
 volumes:
   data: {}
   named: {}
+  my.data: {}
 `, "s", nil, application.Allow{HostPaths: []string{"/srv/app"}})
 
-	if n := len(got.Services[0].Spec.TaskTemplate.ContainerSpec.Mounts); n != 6 {
-		t.Errorf("got %d mounts, want 6", n)
+	if n := len(got.Services[0].Spec.TaskTemplate.ContainerSpec.Mounts); n != 7 {
+		t.Errorf("got %d mounts, want 7", n)
 	}
 }
 
