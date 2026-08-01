@@ -28,6 +28,11 @@ import (
 // FromPlan maps a plan to an application's sync status and its per-release
 // detail.
 //
+// The releases come back in the plan's own order, which the chart engine sorts
+// by wave — so a status lists them in the order a sync applies them rather than
+// the order the release file happens to write them. That is the useful order for
+// a reader: it is where a stalled sync stopped.
+//
 // The returned Sync carries no Revision and no LastSync: a plan does not know
 // which commit produced it, or what happened the last time one was applied.
 // The reconciler fills both. ReleaseStatus.Revision is likewise left zero —
@@ -76,6 +81,7 @@ func releaseStatus(rp charts.ReleasePlan) application.ReleaseStatus {
 		Action:  application.SyncAction(rp.Action),
 		Sync:    state,
 		Compat:  compat(rp.Compat),
+		Wave:    rp.Wave,
 	}
 }
 

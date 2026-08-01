@@ -459,6 +459,17 @@ type ReleaseStatus struct {
 	Services []ServiceStatus `json:"services,omitempty"`
 	Compat   *Compat         `json:"compat,omitempty"`
 
+	// Wave is the release file's `wave:`, the group this release is applied in.
+	// Releases are listed in wave order, every release in a wave converges before
+	// the next wave starts, and a wave that does not converge stops the ones
+	// after it — so this is how a reader tells which releases a stalled sync
+	// never reached.
+	//
+	// Omitted when zero, which is both the default and "explicitly first"; there
+	// is no unset wave to tell apart from wave 0. An application whose release
+	// file declares no wave therefore serves exactly the payload it always has.
+	Wave int `json:"wave,omitempty"`
+
 	// Drift is what the live comparison found for this release, nil when it was
 	// not made: manifest mode, a release the plan would install or upgrade
 	// (there is nothing settled to compare against), or a backend that cannot

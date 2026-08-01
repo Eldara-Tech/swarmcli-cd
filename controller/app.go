@@ -348,15 +348,28 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 	if len(view.Status.Releases) == 0 {
 		return nil
 	}
+	// The wave column appears only for an application whose release file declares
+	// more than one. Every other application would get a column of zeroes, which
+	// is a column that says nothing.
+	waved := spansWaves(view.Status.Releases)
+
 	rows := make([][]string, 0, len(view.Status.Releases))
 	for _, r := range view.Status.Releases {
-		rows = append(rows, []string{
+		row := []string{
 			r.Name, r.Chart, r.Version, fmt.Sprint(r.Revision),
 			state(r.Action), state(r.Sync), state(r.Health.State),
-		})
+		}
+		if waved {
+			row = append(row, fmt.Sprint(r.Wave))
+		}
+		rows = append(rows, row)
+	}
+	headers := []string{"RELEASE", "CHART", "VERSION", "REV", "ACTION", "SYNC", "HEALTH"}
+	if waved {
+		headers = append(headers, "WAVE")
 	}
 	_, _ = fmt.Fprintln(out)
-	table(out, []string{"RELEASE", "CHART", "VERSION", "REV", "ACTION", "SYNC", "HEALTH"}, rows)
+	table(out, headers, rows)
 
 	for _, r := range view.Status.Releases {
 		if len(r.Services) == 0 {
@@ -375,6 +388,19 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 
 	printDrift(out, view.Status.Releases)
 	return nil
+}
+
+// spansWaves reports whether an application's releases declare more than one
+// wave, which is the only case where the ordering is worth a column. The
+// releases are already listed in the order a sync applies them, so a reader with
+// no waves declared loses nothing by not being told they are all wave 0.
+func spansWaves(releases []application.ReleaseStatus) bool {
+	for _, r := range releases {
+		if r.Wave != releases[0].Wave {
+			return true
+		}
+	}
+	return false
 }
 
 // printDrift lists what no longer matches the repository, per release.
