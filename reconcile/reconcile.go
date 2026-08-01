@@ -2105,7 +2105,7 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := backend.DeployStack(ctx, release, manifests[release], ""); err != nil {
+		if err := backend.DeployStack(ctx, charts.DeployRequest{Name: release, Manifest: manifests[release], Resolve: ""}); err != nil {
 			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
 			continue
 		}
