@@ -395,8 +395,8 @@ When and how a plan is applied.
 |---|---|---|
 | `automated` | `false` | `true` reconciles **and applies** on a schedule. `false` is manual: the controller still reconciles and reports drift, but applies only on an explicit `swarmcli-cd app sync`. "Manual" means "not on a schedule", not "never". |
 | `interval` | controller default (3m) | how often to reconcile this application, as a duration string (`90s`, `5m`) |
-| `wait` | `false` | block each release until its services converge, and — when the service declares `update_config.failure_action: rollback` — let Swarm roll it back on a failed rollout |
-| `timeout` | engine default | how long `wait` waits for a rollout before giving up |
+| `wait` | `false` | block each release until its services converge, and — when the service declares `update_config.failure_action: rollback` — let Swarm roll it back on a failed rollout. It is **not** what orders releases; see [sync waves](#sync-waves) |
+| `timeout` | engine default (5m) | how long a rollout may take before it is given up on. It bounds `wait`, and it bounds each wave boundary — which happens whether or not `wait` is set |
 | `historyMax` | `10` | revisions kept per release (one Docker config each); older revisions are pruned after a deploy that succeeded. An explicit `0` keeps every revision, which is what the chart engine has always read the number as — and, on a controller deploying on a timer, a slow leak into the manager's raft log |
 | `prune` | `false` | delete the resources of a release this application no longer declares. Only ever its own releases — see [prune](#prune) |
 | `pruneVolumes` | `false` | extend `prune` to the named volumes of what it deletes. Requires `prune`; set alone it is a config error |
@@ -407,8 +407,50 @@ When and how a plan is applied.
 `--timeout`, defaulting to 5m — that bounds how long the CLI watches, not the
 apply itself.)
 
-Releases are applied in the order the release file lists them; use `wait: true`
-if a later release needs an earlier one live first.
+#### Sync waves
+
+Releases apply in **wave order**, and within a wave in the order the release file
+lists them. A wave is declared in the release file, beside the releases it orders
+and in the repository the team that owns the chart controls — not here:
+
+```yaml
+# swarmcli-release.yaml, in the application's own repository
+releases:
+  - name: db
+    chart: ./charts/postgres        # no wave: means wave 0
+  - name: migrate
+    chart: ./charts/migrate
+    wave: 1
+  - name: api
+    chart: ./charts/api
+    wave: 2
+  - name: worker
+    chart: ./charts/worker
+    wave: 2                         # with api — the order between them is not meaningful
+```
+
+Every release in a wave is deployed, the whole wave converges, then the next wave
+starts. **A wave that does not converge stops every wave after it** — nothing
+later is deployed at all, no service and no revision record — so a migration that
+fails can never let the API that depends on it start. The sync is reported as
+failed, and `app get` shows which releases were never reached.
+
+A release file that declares no wave is one wave: the same order it has always
+applied in, with nothing added and nothing blocking.
+
+**The barrier does not need `wait`, and with waves you usually want `wait: false`.**
+The two answer different questions. A wave boundary always waits; `wait` is
+whether each *individual* release blocks until it is live. Setting both serialises
+everything inside a wave, which is the coarse behaviour waves exist to replace —
+the three services in wave 2 above would go out one at a time instead of together.
+`timeout` bounds each wave, defaulting to five minutes.
+
+One honest limitation: a barrier waits for the releases that wave actually
+deployed, not for the ones the plan left unchanged. A wave whose releases are all
+already deployed is therefore not a health check on them — if wave 0's database is
+live but broken, wave 1 still starts. The alternative is an application that can
+never sync again, since applying skips unchanged releases by design; health is the
+axis that answers that question.
 
 #### A chart that does not render the same twice
 
@@ -460,9 +502,14 @@ the swarm was put back to it. `app get` shows the outcome and a
 A correction is a deploy, so `syncPolicy.wait` governs it too: with `wait: true`
 the sync blocks until the corrected release converges or `timeout` expires, and
 a correction that deploys but never settles fails the sync rather than reporting
-success. Releases are corrected in the order the release file lists them, so
-`wait` also gives the same ordering guarantee here that it gives an ordinary
-apply.
+success.
+
+[Sync waves](#sync-waves) order corrections as well, for the same reason they
+order an install: the dependency that makes a migration run before the API does
+not stop mattering because the change came from the swarm rather than from git.
+Each wave's corrections settle before the next wave's begin — again regardless of
+`wait` — and a wave that does not settle leaves the releases after it drifted and
+uncorrected, reported as such and retried on the next sync.
 
 A release whose live state could not be read reports `unknown` and is **not**
 corrected: the controller does not rewrite a service on the strength of a read

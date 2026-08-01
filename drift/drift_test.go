@@ -212,3 +212,31 @@ func TestOrphanedAndUnmanagedAreNotSurfaced(t *testing.T) {
 		t.Errorf("got %d releases, want only the declared one", len(releases))
 	}
 }
+
+// A release's wave reaches the status, and the status lists releases in the
+// order the plan applies them.
+//
+// The order matters more than the number: the chart engine sorts plan.Releases
+// by wave, so this is where "which releases did a stalled sync never reach"
+// becomes answerable from a status payload rather than only from a log.
+func TestReleasesCarryTheirWaveInPlanOrder(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "db", Ref: "r/pg", Action: charts.ActionUnchanged, ToVersion: "1"},
+		{Name: "migrate", Ref: "r/migrate", Action: charts.ActionInstall, ToVersion: "1", Wave: 1},
+		{Name: "api", Ref: "r/api", Action: charts.ActionInstall, ToVersion: "1", Wave: 2},
+	}}
+
+	_, releases := FromPlan(plan)
+	if len(releases) != 3 {
+		t.Fatalf("got %d releases, want 3", len(releases))
+	}
+	for i, want := range []struct {
+		name string
+		wave int
+	}{{"db", 0}, {"migrate", 1}, {"api", 2}} {
+		if releases[i].Name != want.name || releases[i].Wave != want.wave {
+			t.Errorf("releases[%d] = %s wave %d, want %s wave %d",
+				i, releases[i].Name, releases[i].Wave, want.name, want.wave)
+		}
+	}
+}

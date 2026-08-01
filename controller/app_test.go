@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -781,5 +782,43 @@ func TestAppGetMarksAnOrphanedServiceAndLeavesOtherUnexpectedOnesPlain(t *testin
 	}
 	if strings.Contains(stdout, "web_stranger  unexpected (orphaned)") {
 		t.Errorf("stdout marks a service nobody proved was ours:\n%s", stdout)
+	}
+}
+
+// An application whose release file declares no wave renders exactly as it
+// always has. Every application that existed before waves is one of these, and a
+// column of zeroes on all of them would be noise rather than information.
+func TestAppGetOmitsTheWaveColumnForASingleWave(t *testing.T) {
+	server := start(t, &stubReconciler{view: syncedView()})
+
+	code, stdout, _ := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(stdout, "WAVE") {
+		t.Errorf("stdout = %q, want no wave column when there is only one wave", stdout)
+	}
+}
+
+// One that does declare waves shows which one each release is in — the order the
+// releases are listed in is the order a sync applies them, so this is how a
+// reader sees where a stalled sync stopped.
+func TestAppGetShowsTheWaveWhenThereIsMoreThanOne(t *testing.T) {
+	v := syncedView()
+	v.Status.Releases = []application.ReleaseStatus{
+		{Name: "db", Chart: "r/pg", Version: "1", Action: application.ActionUnchanged, Sync: application.SyncSynced},
+		{Name: "api", Chart: "r/api", Version: "1", Action: application.ActionInstall, Sync: application.SyncOutOfSync, Wave: 2},
+	}
+	server := start(t, &stubReconciler{view: v})
+
+	code, stdout, _ := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "WAVE") {
+		t.Fatalf("stdout = %q, want a wave column", stdout)
+	}
+	if !regexp.MustCompile(`api\s+r/api\s+1\s+0\s+install\s+out-of-sync\s+\S*\s*2`).MatchString(stdout) {
+		t.Errorf("stdout = %q, want api reported in wave 2", stdout)
 	}
 }

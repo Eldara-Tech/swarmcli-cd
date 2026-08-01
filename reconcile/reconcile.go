@@ -2098,26 +2098,70 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 	for _, rp := range plan.Releases {
 		manifests[rp.Name] = rp.Manifest
 	}
+	wanted := make(map[string]struct{}, len(drifted))
+	for _, release := range drifted {
+		wanted[release] = struct{}{}
+	}
 
 	var errs []error
 	var converged []string
-	for _, release := range drifted {
-		if err := ctx.Err(); err != nil {
-			return err
+	waves := waveGroups(plan.Releases)
+	for i, wave := range waves {
+		// scopes is what this wave corrected, and the services each correction
+		// was made for. The barrier below waits on exactly that: a release this
+		// wave did not touch, or one it could not write, is not something a later
+		// wave should be held up by.
+		scopes := map[string][]string{}
+		for _, rp := range wave {
+			if _, drifting := wanted[rp.Name]; !drifting {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := backend.DeployStack(ctx, charts.DeployRequest{Name: rp.Name, Manifest: manifests[rp.Name], Resolve: ""}); err != nil {
+				errs = append(errs, fmt.Errorf("converging release %q: %w", rp.Name, err))
+				continue
+			}
+			scope := correcting(live[rp.Name])
+			if err := r.awaitConverged(ctx, spec, backend, rp.Name, scope); err != nil {
+				// Deployed but not settled. Not counted as converged: the write
+				// landed, the correction did not finish, and the sync says so.
+				errs = append(errs, fmt.Errorf("converging release %q: %w", rp.Name, err))
+				continue
+			}
+			scopes[rp.Name] = scope
+			converged = append(converged, rp.Name)
+			r.log.Warn("redeployed a release whose running services had been changed outside the repository",
+				"application", spec.Name, "release", rp.Name)
 		}
-		if err := backend.DeployStack(ctx, charts.DeployRequest{Name: release, Manifest: manifests[release], Resolve: ""}); err != nil {
-			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
+
+		// The wave boundary, and it holds whether or not the policy says wait —
+		// the same rule the apply path follows, so `wait` means one thing across
+		// both. A correction is a deploy, and the dependency that makes an
+		// install ordered makes a correction ordered too: putting a migration
+		// back before the API that reads it is the whole of why the release file
+		// declared a wave.
+		//
+		// Not after the last wave: there is no later correction whose safety
+		// depends on it, and under `wait` awaitConverged has already waited for
+		// each release individually.
+		if i == len(waves)-1 || len(scopes) == 0 {
 			continue
 		}
-		if err := r.awaitConverged(ctx, spec, backend, release, correcting(live[release])); err != nil {
-			// Deployed but not settled. Not counted as converged: the write
-			// landed, the correction did not finish, and the sync says so.
-			errs = append(errs, fmt.Errorf("converging release %q: %w", release, err))
-			continue
+		if err := r.awaitSettled(ctx, spec, backend, scopes); err != nil {
+			// Everything after this wave is left drifted and reported as such.
+			// Said out loud because the status cannot say it: a release in wave 2
+			// that was never corrected looks exactly like one whose correction
+			// was attempted and failed.
+			errs = append(errs, fmt.Errorf("waiting for wave %d to settle: %w", wave[0].Wave, err))
+			if skipped := remaining(waves[i+1:], wanted); len(skipped) > 0 {
+				r.log.Warn("a wave did not settle, so the releases in the waves after it were not corrected; "+
+					"they stay drifted until a later sync gets past this one",
+					"application", spec.Name, "wave", wave[0].Wave, "notCorrected", skipped)
+			}
+			break
 		}
-		converged = append(converged, release)
-		r.log.Warn("redeployed a release whose running services had been changed outside the repository",
-			"application", spec.Name, "release", release)
 	}
 
 	if len(converged) > 0 {
@@ -2128,6 +2172,38 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 		})
 	}
 	return errors.Join(errs...)
+}
+
+// waveGroups splits a plan's releases into contiguous runs of equal wave.
+//
+// It mirrors the chart engine's own grouping and relies on the same thing:
+// PlanApply returns releases sorted by wave, so a run of equal waves is a wave.
+// This repository has its own copy because the correction path cannot go through
+// Engine.Apply at all — see converge — not because the rule differs.
+func waveGroups(releases []charts.ReleasePlan) [][]charts.ReleasePlan {
+	var groups [][]charts.ReleasePlan
+	for i, start := 0, 0; i < len(releases); i++ {
+		if i+1 < len(releases) && releases[i+1].Wave == releases[start].Wave {
+			continue
+		}
+		groups = append(groups, releases[start:i+1])
+		start = i + 1
+	}
+	return groups
+}
+
+// remaining names the releases in later waves that a correction would have
+// reached, for the warning that says what a stalled wave cost.
+func remaining(waves [][]charts.ReleasePlan, wanted map[string]struct{}) []string {
+	var out []string
+	for _, wave := range waves {
+		for _, rp := range wave {
+			if _, drifting := wanted[rp.Name]; drifting {
+				out = append(out, rp.Name)
+			}
+		}
+	}
+	return out
 }
 
 // convergePollInterval is how often a correction re-reads the swarm while
@@ -2155,10 +2231,6 @@ const defaultConvergeTimeout = 5 * time.Minute
 // instead of degraded — the exact failure the wait policy exists to convert into
 // something an operator is told about.
 //
-// It also gives the converge path the ordering the docs already promise, since
-// releases are corrected in plan order: with wait set, a later release is not
-// redeployed until an earlier one it depends on is live.
-//
 // The judgement is the chart engine's own exported rollup, not a second copy.
 // Every rule in it was corrected at least once — the running count by actual
 // rather than desired state, the target over active nodes, a completed one-shot
@@ -2181,8 +2253,42 @@ const defaultConvergeTimeout = 5 * time.Minute
 // An empty scope rolls up everything, which is the state before a comparison
 // narrowed it and cannot arise from convergeable: a release is only corrected
 // when something was found modified or missing on it.
+//
+// It is no longer what orders the correction path. This used to note that with
+// wait set a later release is not redeployed until an earlier one is live, which
+// was true and was the only ordering there was. Sync waves are that ordering now,
+// they hold whether or not wait is set, and the barrier between them is
+// awaitSettled — see converge.
 func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, backend charts.Backend, release string, wrote []string) error {
 	if !spec.SyncPolicy.Wait {
+		return nil
+	}
+	return r.awaitSettled(ctx, spec, backend, map[string][]string{release: wrote})
+}
+
+// awaitSettled is the waiting itself, for one release or for a whole wave.
+//
+// It is separate from awaitConverged because the two callers differ in exactly
+// one thing: whether the wait is conditional. A per-release wait happens only
+// under syncPolicy.wait, which is what that policy has always meant. A wave
+// boundary happens regardless — a wave whose predecessor has not settled is the
+// one thing waves exist to prevent, so making it opt-in would leave a declared
+// ordering silently doing nothing.
+//
+// One deadline covers everything it was given, rather than one per release. The
+// releases in a wave were corrected one after another without waiting, so their
+// rollouts overlap; charging the wave the sum of what it spends in parallel would
+// make syncPolicy.timeout mean something different depending on how many releases
+// happened to share a wave. It is the same choice charts.waitWave makes.
+//
+// scopes maps each release to the services its correction actually wrote, and
+// keeping it per release is the whole of #130: a rollup over everything sharing a
+// namespace label folds in services this write never touched, and Swarm's
+// UpdateStatus persists until a service's *next* update — so an undeclared
+// service that was once rolled back would report "did not converge" over somebody
+// else's history, forever.
+func (r *Reconciler) awaitSettled(ctx context.Context, spec application.Spec, backend charts.Backend, scopes map[string][]string) error {
+	if len(scopes) == 0 {
 		return nil
 	}
 
@@ -2191,18 +2297,28 @@ func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, 
 		timeout = defaultConvergeTimeout
 	}
 	deadline := r.now().Add(timeout)
+	// Sorted so a message names releases in a stable order rather than the map's.
+	releases := slices.Sorted(maps.Keys(scopes))
+	pending := make([]string, 0, len(releases))
 
 	for {
-		switch c := charts.Rollup(scopedTo(backend.StackServices(ctx, release), wrote)); c.Phase {
-		case charts.PhaseWedged:
-			// Swarm has given up and will not continue on its own, so waiting
-			// out the deadline would only delay the same answer.
-			return fmt.Errorf("release %q did not converge: %s", release, c.Reason)
-		case charts.PhaseConverged:
+		pending = pending[:0]
+		for _, release := range releases {
+			switch c := charts.Rollup(scopedTo(backend.StackServices(ctx, release), scopes[release])); c.Phase {
+			case charts.PhaseWedged:
+				// Swarm has given up and will not continue on its own, so waiting
+				// out the deadline would only delay the same answer.
+				return fmt.Errorf("release %q did not converge: %s", release, c.Reason)
+			case charts.PhaseConverged:
+			default:
+				pending = append(pending, release)
+			}
+		}
+		if len(pending) == 0 {
 			return nil
 		}
 		if !r.now().Before(deadline) {
-			return fmt.Errorf("timed out after %s waiting for release %q to converge", timeout, release)
+			return fmt.Errorf("timed out after %s waiting for %s to converge", timeout, releaseList(pending))
 		}
 		select {
 		case <-ctx.Done():
@@ -2210,6 +2326,20 @@ func (r *Reconciler) awaitConverged(ctx context.Context, spec application.Spec, 
 		case <-time.After(convergePollInterval):
 		}
 	}
+}
+
+// releaseList renders what a wait gave up on, singular or plural. One release
+// produces exactly the phrase this wait produced before it could take more than
+// one, so nothing reading that text has to change.
+func releaseList(releases []string) string {
+	if len(releases) == 1 {
+		return fmt.Sprintf("release %q", releases[0])
+	}
+	quoted := make([]string, 0, len(releases))
+	for _, release := range releases {
+		quoted = append(quoted, fmt.Sprintf("%q", release))
+	}
+	return "releases " + strings.Join(quoted, ", ")
 }
 
 // scopedTo keeps the states of the named services, so a rollup answers about
