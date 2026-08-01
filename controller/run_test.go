@@ -21,6 +21,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/appset"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
+	"github.com/Eldara-Tech/swarmcli-cd/extension"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
@@ -103,6 +104,75 @@ func TestServeRefusesAnUnreadyAuthorizer(t *testing.T) {
 		t.Errorf("serve = %v, want it to name the authorizer in force", err)
 	}
 }
+
+// The route set is decided by a seam, so a companion can hand the controller one
+// it cannot serve. Coming up anyway would mean serving whichever half of a
+// colliding pair the mux happened to keep — and which half that is depends on
+// declaration order, so the endpoint an operator thought was guarded may not be
+// the one answering. serve must refuse, name the pattern, and bind nothing.
+func TestServeRefusesARouteSetItCannotServe(t *testing.T) {
+	swapAuthorizer(t, readyAuthorizer{})
+	collision.armed.Store(true)
+	t.Cleanup(func() { collision.armed.Store(false) })
+
+	o := staticOptions(writeConfig(t), t.TempDir())
+	o.listen = freePort(t)
+
+	// Already cancelled, so that a serve which failed to refuse returns rather
+	// than running the whole controller until the test timeout.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := serve(ctx, o, discardLog())
+	if err == nil {
+		t.Fatal("serve = nil, want a refusal")
+	}
+	if !strings.Contains(err.Error(), collidingPattern) {
+		t.Errorf("serve = %v, want the error to name the pattern", err)
+	}
+	// The refusal is only worth something if it happened before anything was
+	// served. A controller half-up on a route set it could not build is the
+	// outage the refusal exists to prevent, so binding the address ourselves is
+	// the assertion: it succeeds only if nothing else holds it.
+	ln, err := net.Listen("tcp", o.listen)
+	if err != nil {
+		t.Fatalf("something is listening on %s: %v", o.listen, err)
+	}
+	_ = ln.Close()
+}
+
+// collidingPattern is one of the core's own routes, so an extension declaring it
+// makes the whole route set unservable.
+const collidingPattern = "GET /api/v1/status"
+
+// collidingExtension declares that pattern, but only while a test has armed it.
+//
+// It is registered once, from the init below, because extension is a seam.List:
+// it appends, it has no removal, and api.Handler re-reads it every time it
+// builds a mux. A colliding route left in that list would therefore fail every
+// later Handler call in this binary — which is every test here that starts an
+// API server. Disarmed it declares nothing, and an extension declaring nothing
+// builds exactly the mux the OSS build does, so no other test can observe it
+// whatever order they run in. That is what makes this safe under -shuffle, and
+// it is why the arming is scoped to one test rather than the registration.
+type collidingExtension struct{ armed atomic.Bool }
+
+func (e *collidingExtension) Routes() []extension.Route {
+	if !e.armed.Load() {
+		return nil
+	}
+	return []extension.Route{{
+		Pattern: collidingPattern,
+		Action:  authz.ActionRead,
+		Handler: func(http.ResponseWriter, *http.Request, authz.Subject) {},
+	}}
+}
+
+func (e *collidingExtension) PublicRoutes() []extension.Route { return nil }
+
+var collision = &collidingExtension{}
+
+func init() { extension.Register("collision", collision) }
 
 // The clone root and the chart cache must be separate directories: everything
 // under a clone is force-checked-out and cleaned on every fetch, so a chart

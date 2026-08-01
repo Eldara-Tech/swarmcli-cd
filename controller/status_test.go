@@ -255,9 +255,12 @@ func startStatus(t *testing.T, status application.ControllerStatus) string {
 	t.Setenv(authz.EnvToken, "s3cret")
 	swapAuthorizer(t, bearerAuthorizer{token: "s3cret"})
 
-	handler := api.New(&stubReconciler{view: syncedView()}, api.Options{
+	handler, err := api.New(&stubReconciler{view: syncedView()}, api.Options{
 		Controller: stubController{status: status},
 	}).Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 	return srv.URL

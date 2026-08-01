@@ -35,7 +35,11 @@ func start(t *testing.T, rec *stubReconciler) string {
 	// the real one being exercised.
 	swapAuthorizer(t, bearerAuthorizer{token: "s3cret"})
 
-	srv := httptest.NewServer(api.New(rec, api.Options{}).Handler())
+	h, err := api.New(rec, api.Options{}).Handler()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return srv.URL
 }

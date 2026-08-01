@@ -23,6 +23,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/backend"
 	"github.com/Eldara-Tech/swarmcli-cd/config"
+	"github.com/Eldara-Tech/swarmcli-cd/extension"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 	"github.com/Eldara-Tech/swarmcli-cd/prune"
@@ -281,6 +282,10 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		"authz", authz.Active(),
 		"notify", notify.Active(),
 		"secrets", secrets.Active(),
+		// Which modules registered routes, not which routes: what is actually
+		// served cannot be known until the mux is built, which is a different
+		// moment and one that can fail. See the "routes" line below.
+		"extension", extension.Active(),
 	)
 
 	auth, err := git.AuthFromEnv(os.Getenv, os.ReadFile)
@@ -390,9 +395,45 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// behind per server ever constructed.
 	notify.Register("api", srv)
 
+	// Building the mux is what reads the extension seam, so this is where a
+	// companion's route set is either accepted or found unservable — a pattern
+	// colliding with a core route or with another module's, a route naming no
+	// action, a nil handler. Refusing here is the same judgement the authorizer
+	// check at the top of this function makes: both alternatives reach an
+	// operator as an outage rather than as a controller that said what was wrong
+	// and stopped, since net/http panics on a duplicate pattern deep inside
+	// wiring and a nil handler panics on the first request that finds it.
+	h, err := srv.Handler()
+	if err != nil {
+		return fmt.Errorf("api routes: %w", err)
+	}
+
+	// What is served, now that it is settled. The guarded routes are one line
+	// because a guarded route is unremarkable.
+	routes := srv.Routes()
+	guardedRoutes := make([]string, 0, len(routes))
+	for _, rt := range routes {
+		if !rt.Public {
+			guardedRoutes = append(guardedRoutes, rt.Pattern)
+		}
+	}
+	log.Info("routes", "guarded", guardedRoutes)
+	for _, rt := range routes {
+		// An extension's public route only. GET /healthz is public too, in every
+		// build, and no deployment can change that — so warning about it would
+		// put a WARN nobody can act on in every startup of every controller,
+		// which is precisely how an operator learns to ignore the one that
+		// matters: an unauthenticated endpoint a companion added to a process
+		// holding the docker socket.
+		if !rt.Public || rt.Extension == "" {
+			continue
+		}
+		log.Warn("public route", "route", rt.Pattern, "extension", rt.Extension)
+	}
+
 	httpSrv := &http.Server{
 		Addr:    o.listen,
-		Handler: srv.Handler(),
+		Handler: h,
 		// The controller holds write access to the swarm. An unbounded header
 		// read is the cheapest way to tie up a connection slot on something
 		// that valuable.

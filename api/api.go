@@ -21,17 +21,24 @@
 // mounted at deploy time or committed to git, and changing them means changing
 // that file rather than posting to this API. The paths are nouns so that CRUD
 // can be added later without any of them moving.
+//
+// That set is the core's. A companion module adds routes of its own through the
+// extension seam, and everything Handler registers — core route or companion's —
+// is served behind guard, with the authz.Action the route declares, unless the
+// companion declared it public on purpose. See docs/extensibility.md.
 package api
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
+	"github.com/Eldara-Tech/swarmcli-cd/extension"
 )
 
 // Reconciler is what the API serves. *reconcile.Reconciler implements it.
@@ -71,6 +78,9 @@ type Server struct {
 	// syncing runs a sync detached from the request that asked for it.
 	// Overridable in tests, which otherwise have to race a goroutine.
 	syncing func(app string, run func(context.Context))
+	// routes is what Handler registered, kept so that the caller can log it.
+	// Empty until Handler has succeeded; see Routes.
+	routes []RegisteredRoute
 }
 
 // Options tune a Server. Every field has a working default.
@@ -102,8 +112,50 @@ func New(rec Reconciler, o Options) *Server {
 	return s
 }
 
+// coreRoutes is every route this package registers itself: the pattern, and
+// whether it is served without a credential.
+//
+// It is the seed of the collision check and the core half of what Routes
+// reports, in one place so that the two cannot answer differently. What it
+// deliberately is not is the thing Handler ranges over to register: the
+// guarantee that every core route is guarded comes from api_test.go's
+// registeredRoutes, which reads this package's own source and only sees a
+// mux.Handle whose first argument is a string literal. A loop over this slice
+// would hand it a selector instead, and the scan would go quiet rather than
+// fail — the one way that test could stop checking anything without saying so.
+// So the literals below stay, and TestZeroExtensionsChangesNothing compares
+// them against this list: drift between the two is a test failure rather than a
+// collision check with a hole in it.
+var coreRoutes = []RegisteredRoute{
+	{Pattern: "GET /healthz", Public: true},
+	{Pattern: "GET /api/v1/status"},
+	{Pattern: "GET /api/v1/applications"},
+	{Pattern: "GET /api/v1/applications/{app}"},
+	{Pattern: "GET /api/v1/applications/{app}/diff"},
+	{Pattern: "GET /api/v1/applications/{app}/history"},
+	{Pattern: "POST /api/v1/applications/{app}/sync"},
+	{Pattern: "GET /api/v1/events"},
+}
+
 // Handler returns the router.
-func (s *Server) Handler() http.Handler {
+//
+// This is where the extension seam is read, and it is read exactly once. A
+// seam.List is not settled at the end of init() and a consumer may not snapshot
+// it at construction — but nothing joins this one after the mux exists, so the
+// moment the mux is built is the moment the answer stops changing, and reading
+// it here is the consumer-side half of that rule rather than an exception to it.
+//
+// The error is a refusal to start. Everything a companion declared is checked
+// before a single route reaches the mux, because both alternatives reach an
+// operator as an outage rather than as a controller that would not start:
+// net/http panics on a duplicate pattern, deep inside wiring, and a nil handler
+// would panic on the first request that hit it.
+func (s *Server) Handler() (http.Handler, error) {
+	guardedRoutes, publicRoutes, err := extensionRoutes()
+	if err != nil {
+		return nil, err
+	}
+
 	mux := http.NewServeMux()
 
 	// Unauthenticated, and deliberately says nothing: a container healthcheck
@@ -123,7 +175,199 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/applications/{app}/sync", s.guard(authz.ActionSync, s.sync))
 	mux.Handle("GET /api/v1/events", s.guard(authz.ActionRead, s.stream))
 
-	return mux
+	routes := append([]RegisteredRoute(nil), coreRoutes...)
+
+	// The core decides what wraps a companion's handler, which is the whole
+	// reason a route is declared here rather than registered by whoever owns it:
+	// guard is not something an extension can forget or opt out of by leaving a
+	// field unset. The conversion is exact — extension.Handler and guarded have
+	// identical underlying types, deliberately, so that the two shapes are
+	// provably the same without extension having to import this package.
+	for _, rt := range guardedRoutes {
+		mux.Handle(rt.route.Pattern, s.guard(rt.route.Action, guarded(rt.route.Handler)))
+		routes = append(routes, RegisteredRoute{Pattern: rt.route.Pattern, Extension: rt.name})
+	}
+	for _, rt := range publicRoutes {
+		// rt is a fresh variable per iteration since Go 1.22, so each closure
+		// captures its own route. Said out loud because the bug it used to be is
+		// silent: every public pattern would serve the last handler declared,
+		// and an SSO callback answering with another module's handler is not a
+		// failure that shows up as an error anywhere.
+		mux.Handle(rt.route.Pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The zero Subject, because nothing authenticated this request.
+			// extension.Handler says the same from the other side: a public
+			// handler must not consult it, since an authorizer handed one fails
+			// closed and the refusal would look like a caller with no
+			// permissions rather than like the route being public.
+			rt.route.Handler(w, r, authz.Subject{})
+		}))
+		routes = append(routes, RegisteredRoute{Pattern: rt.route.Pattern, Extension: rt.name, Public: true})
+	}
+
+	s.routes = routes
+	return mux, nil
+}
+
+// RegisteredRoute is one route the server serves, and who put it there.
+type RegisteredRoute struct {
+	Pattern   string // "GET /api/v1/projects"
+	Extension string // the name it registered under; empty for a core route
+	Public    bool   // served with no authentication
+}
+
+// Routes reports every route Handler registered — the core's first, then each
+// extension's in registration order — and is meaningful only once Handler has
+// succeeded, because until the seam has been read the set is not decided.
+//
+// It exists for the startup log rather than for the router. An operator's only
+// signal that a companion added an unauthenticated endpoint to a process
+// holding the docker socket is a line naming the pattern and the module that
+// added it, and a companion's source is not something the operator running the
+// binary necessarily has.
+//
+// The caller logs the guarded ones as a list and warns, one line each, on the
+// public routes that carry an extension name. Not on a public core route: this
+// repository argued for that one in its own source and no deployment can change
+// it, and a WARN on every startup about something nobody can act on is how an
+// operator learns to ignore the WARN that matters.
+func (s *Server) Routes() []RegisteredRoute {
+	return append([]RegisteredRoute(nil), s.routes...)
+}
+
+// loaded is one registered extension beside the name it registered under.
+type loaded struct {
+	name string
+	ext  extension.Extension
+}
+
+// activeExtensions is the seam, read as one list of name-and-implementation
+// pairs.
+//
+// A variable rather than a call to extension.All written where it is used, for
+// the reason Server.syncing is one: a test has to be able to install a set. The
+// seam is a seam.List, a List appends and has no removal, and the tests that
+// matter most here declare a colliding pattern on purpose — registering that
+// into the process-wide list would make every later call to Handler in the same
+// binary fail on a collision a finished test installed. Nothing in production
+// assigns this. TestTheSeamIsWhatHandlerReads is what keeps the indirection
+// honest, by going through extension.Register itself.
+var activeExtensions = func() []loaded {
+	// Two reads rather than one, because the seam reports names and
+	// implementations separately and pairing them by index is what Active
+	// documents. The bound is for the one case that cannot arise from an init()
+	// but is cheap to survive: a registration landing between the two calls.
+	names, all := extension.Active(), extension.All()
+	out := make([]loaded, len(all))
+	for i, e := range all {
+		out[i].ext = e
+		if i < len(names) {
+			out[i].name = names[i]
+		}
+	}
+	return out
+}
+
+// declared is one route an extension asked for, beside the name it registered
+// under — which a collision message and the startup log both need and which the
+// Route itself does not carry.
+type declared struct {
+	name  string
+	route extension.Route
+}
+
+// claimant is what holds a pattern: an index into the extension list, or
+// coreOwner for one of this package's own.
+//
+// An index rather than a name because names need not be unique — notify permits
+// the same — so "this extension declared it twice" and "another extension that
+// happens to share its name declared it" are different sentences, and only the
+// index tells them apart.
+type claimant struct {
+	ext    int
+	public bool
+}
+
+const coreOwner = -1
+
+// extensionRoutes reads the seam and returns what it declared, split by whether
+// the core will guard it, or an error naming the extension that made the set
+// unservable.
+//
+// Every check runs before Handler touches the mux and the first failure returns,
+// so a set with one bad route registers none of them. Half a companion's routes
+// serving while the other half did not is the worst of the available failures:
+// the controller would be up, the operator would have no reason to look, and
+// which half survived would be a matter of declaration order.
+func extensionRoutes() (guardedRoutes, publicRoutes []declared, err error) {
+	exts := activeExtensions()
+
+	seen := make(map[string]claimant, len(coreRoutes))
+	for _, rt := range coreRoutes {
+		seen[rt.Pattern] = claimant{ext: coreOwner}
+	}
+
+	// claim records a pattern or explains who already had it.
+	//
+	// The comparison is exact-string, and that is not the question ServeMux
+	// asks: two patterns can conflict without being equal — "GET /a/{x}"
+	// against "GET /a/b" — and such a pair passes here, reaches the mux and
+	// still panics there. Accepted rather than solved. This catches the
+	// overwhelmingly likely case, a companion re-registering a path the core
+	// already serves, and reimplementing net/http's pattern.conflictsWith in
+	// this repository would be a second copy of standard-library logic that
+	// drifts from the first.
+	claim := func(i int, rt extension.Route, public bool) error {
+		held, taken := seen[rt.Pattern]
+		switch {
+		case !taken:
+			seen[rt.Pattern] = claimant{ext: i, public: public}
+			return nil
+		case held.ext == coreOwner:
+			return fmt.Errorf("extension %q declares route %q, which is a core route", exts[i].name, rt.Pattern)
+		case held.ext == i && held.public != public:
+			// The dangerous one. Registering both would put the same pattern on
+			// the mux twice, and which registration won would decide whether the
+			// endpoint was authenticated at all.
+			return fmt.Errorf("extension %q declares route %q as both a guarded and a public route", exts[i].name, rt.Pattern)
+		case held.ext == i:
+			return fmt.Errorf("extension %q declares route %q twice", exts[i].name, rt.Pattern)
+		default:
+			return fmt.Errorf("extension %q declares route %q, which extension %q already declared", exts[i].name, rt.Pattern, exts[held.ext].name)
+		}
+	}
+
+	for i, e := range exts {
+		for _, rt := range e.ext.Routes() {
+			if rt.Handler == nil {
+				// Every other malformed field is caught here; a nil handler left
+				// to the mux would panic on the first request that reached it.
+				return nil, nil, fmt.Errorf("extension %q declares route %q with no handler", e.name, rt.Pattern)
+			}
+			if rt.Action == "" {
+				return nil, nil, fmt.Errorf("extension %q declares route %q with no action: a guarded route names the authz.Action the core authorises it with, and there is none that is obviously right for a route this repository has never seen", e.name, rt.Pattern)
+			}
+			if err := claim(i, rt, false); err != nil {
+				return nil, nil, err
+			}
+			guardedRoutes = append(guardedRoutes, declared{name: e.name, route: rt})
+		}
+		for _, rt := range e.ext.PublicRoutes() {
+			if rt.Handler == nil {
+				return nil, nil, fmt.Errorf("extension %q declares public route %q with no handler", e.name, rt.Pattern)
+			}
+			if rt.Action != "" {
+				// A contradiction, and the likeliest cause is a companion author
+				// who believed the action would be enforced — which on a route
+				// nothing authenticates it cannot be.
+				return nil, nil, fmt.Errorf("extension %q declares public route %q with action %q: a public route is served with no authentication and no authorisation, so the action would never be asked", e.name, rt.Pattern, rt.Action)
+			}
+			if err := claim(i, rt, true); err != nil {
+				return nil, nil, err
+			}
+			publicRoutes = append(publicRoutes, declared{name: e.name, route: rt})
+		}
+	}
+	return guardedRoutes, publicRoutes, nil
 }
 
 // guarded is a handler that runs only behind the guard, and is handed the

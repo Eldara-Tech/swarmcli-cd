@@ -114,8 +114,9 @@ Confirm the controller is up:
 ```bash
 docker service logs swarmcli-cd_controller
 # A "seams" line reports which implementations loaded — for the OSS build,
-#   msg=seams swarms=local authz=token notify=[log] secrets=plaintext
-# followed by a "starting" line with the application count and listen address.
+#   msg=seams swarms=local authz=token notify=[log] secrets=plaintext extension=[]
+# then a "routes" line naming every path this controller serves, and a
+# "starting" line with the application count and listen address.
 ```
 
 ## 4. Reach the API
