@@ -2087,10 +2087,10 @@ func (b *driftBackend) attempted() []string {
 	return slices.Clone(b.attemptedResources)
 }
 
-func (b *driftBackend) DeployStack(_ context.Context, name, manifest, _ string) error {
+func (b *driftBackend) DeployStack(_ context.Context, req charts.DeployRequest) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.deployed = append(b.deployed, name+"|"+manifest)
+	b.deployed = append(b.deployed, req.Name+"|"+req.Manifest)
 	return b.deployErr
 }
 
@@ -2626,7 +2626,7 @@ func (b *conflictingBackend) WithOutOfBandNotifier(fn func(string)) charts.Backe
 	return &c
 }
 
-func (b *conflictingBackend) DeployStack(context.Context, string, string, string) error {
+func (b *conflictingBackend) DeployStack(context.Context, charts.DeployRequest) error {
 	for range b.fires {
 		b.notify("edge_web")
 	}
@@ -2650,7 +2650,7 @@ func TestOutOfBandWriteIsReported(t *testing.T) {
 		t.Fatal(err)
 	}
 	scoped := r.withOutOfBandNotifier(context.Background(), b, spec("edge", true))
-	if err := scoped.DeployStack(t.Context(), "edge", "", ""); err != nil {
+	if err := scoped.DeployStack(t.Context(), charts.DeployRequest{Name: "edge", Manifest: "", Resolve: ""}); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 

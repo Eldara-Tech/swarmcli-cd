@@ -60,7 +60,7 @@ func TestDeployStackCreatesReferencesBeforeServices(t *testing.T) {
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	}
 
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 
@@ -99,7 +99,7 @@ secrets:
 func TestDeployStackCreatesASecretItThenMounts(t *testing.T) {
 	api := &fakeAPI{}
 
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), "rel", declaresAndMounts, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "rel", Manifest: declaresAndMounts, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want a chart to be able to mount what it declares", err)
 	}
 
@@ -116,6 +116,43 @@ func TestDeployStackCreatesASecretItThenMounts(t *testing.T) {
 	}
 }
 
+// DeployRequest.Files is ignored, and this asserts that it is ignored on purpose
+// rather than dropped by accident. Since #99 no manifest reaching this backend
+// can name a file — configs.*.file, secrets.*.file and services.*.env_file are
+// all refused before the loader runs — so a request carrying files describes a
+// chart whose files nothing here will ever read. Two things follow, and both are
+// checked: the deploy proceeds exactly as it would without them, and the bytes
+// are not written anywhere. The temp directory is the probe for the second
+// because it is where materialising them would put them — CE's own
+// docker.DeployStackInContext writes its manifest there — so an empty one after
+// the deploy is the evidence that this method did nothing with the field.
+func TestDeployStackIgnoresTheChartsFiles(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	api := &fakeAPI{}
+
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+		Name:     "rel",
+		Manifest: declaresAndMounts,
+		Resolve:  ResolveNever,
+		Files:    map[string][]byte{"files/nginx.conf": []byte("server {}\n")},
+	})
+	if err != nil {
+		t.Fatalf("DeployStack = %v, want a request carrying files deployed like any other", err)
+	}
+
+	if len(api.created) != 1 || api.created[0].Name != "rel_app" {
+		t.Errorf("created services %+v, want the deploy to have run as it does without files", api.created)
+	}
+	left, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		t.Errorf("%d entries under %s, want the files ignored rather than materialised", len(left), tmp)
+	}
+}
+
 // A manifest that cannot be converted at all creates nothing. The stack is
 // refused whole for every conversion failure and not only for a forbidden mount,
 // which is what the reference-free first pass buys: it fails here, before the
@@ -123,12 +160,12 @@ func TestDeployStackCreatesASecretItThenMounts(t *testing.T) {
 func TestAnUnconvertibleManifestCreatesNothing(t *testing.T) {
 	api := &fakeAPI{}
 
-	err := testBackend(t, api, nil).DeployStack(t.Context(), "s", `
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: `
 services:
   web:
     image: nginx
     secrets: [absent]
-`, ResolveNever)
+`, Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want a manifest referencing an undeclared secret to be refused")
 	}
@@ -158,7 +195,7 @@ func TestDeployStackRefusesMountingAControllerSecret(t *testing.T) {
 	}
 	b := testBackend(t, api, nil).WithForbiddenSecrets(map[string]struct{}{"swarmcli-cd-token": {}}).(*Backend)
 
-	err := b.DeployStack(t.Context(), "s", mountsControllerSecret, ResolveNever)
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: mountsControllerSecret, Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for mounting a controller secret")
 	}
@@ -708,7 +745,7 @@ func TestDaemonFailuresSurface(t *testing.T) {
 		call func(*Backend) error
 	}{
 		{"DeployStack", func(b *Backend) error {
-			return b.DeployStack(t.Context(), "s", "services:\n  web:\n    image: x\n", ResolveNever)
+			return b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: "services:\n  web:\n    image: x\n", Resolve: ResolveNever})
 		}},
 		{"RemoveStack", func(b *Backend) error { return b.RemoveStack(t.Context(), "s") }},
 		{"ListConfigs", func(b *Backend) error { _, err := b.ListConfigs(ctx); return err }},
@@ -1150,7 +1187,7 @@ func TestDeployStackRefusesMountingTheControllersOwnConfig(t *testing.T) {
 		}}},
 	})
 
-	err := testBackend(t, api, nil).DeployStack(t.Context(), "s", mountsControllerConfig, ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: mountsControllerConfig, Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for mounting the controller's config")
 	}
@@ -1185,7 +1222,7 @@ func TestTheSelfGuardIdentifiesThisContainerByItsHostname(t *testing.T) {
 		}}},
 	})
 
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant", mountsControllerConfig, ResolveNever); err == nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsControllerConfig, Resolve: ResolveNever}); err == nil {
 		t.Fatal("DeployStack = nil; the guard did not recognise this process as the controller")
 	}
 	if !reflect.DeepEqual(api.inspectedIDs, []string{host}) {
@@ -1215,7 +1252,7 @@ func TestDeployStackRefusesMountingAReleaseRecord(t *testing.T) {
 		}}}},
 	})
 
-	err := testBackend(t, api, nil).DeployStack(t.Context(), "s", mountsAReleaseRecord, ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: mountsAReleaseRecord, Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for mounting a release record")
 	}
@@ -1235,7 +1272,7 @@ func TestDeployStackRefusesAControllerSecretRenamedOnTheWayIn(t *testing.T) {
 		}}},
 	})
 
-	err := testBackend(t, api, nil).DeployStack(t.Context(), "s", mountsControllerSecret, ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: mountsControllerSecret, Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for mounting the controller's token")
 	}
@@ -1282,7 +1319,7 @@ func TestDeployStackRefusesAStackDeclaringAControllerSecret(t *testing.T) {
 	}}})
 	b := testBackend(t, api, nil).WithForbiddenSecrets(map[string]struct{}{"swarmcli-cd-token": {}}).(*Backend)
 
-	err := b.DeployStack(t.Context(), "tenant", stealsByDeclaring("swarmcli-cd-token", true), ResolveNever)
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: stealsByDeclaring("swarmcli-cd-token", true), Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for declaring the controller's own secret")
 	}
@@ -1309,8 +1346,7 @@ func TestDeployStackRefusesADeclarationNoServiceMounts(t *testing.T) {
 		Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-token"}},
 	}}})
 
-	err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant",
-		stealsByDeclaring("swarmcli-cd-token", false), ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: stealsByDeclaring("swarmcli-cd-token", false), Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want a declaration of the controller's secret refused even unmounted")
 	}
@@ -1386,7 +1422,7 @@ func TestDeployStackRefusesAStackDeclaringAReleaseRecordName(t *testing.T) {
 func TestAStackDeclaringItsOwnSecretIsAllowed(t *testing.T) {
 	api := asController(&fakeAPI{})
 
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), "rel", declaresAndMounts, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "rel", Manifest: declaresAndMounts, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want a chart's own secret to be allowed", err)
 	}
 }
@@ -1400,7 +1436,7 @@ func TestDeployStackAllowsAnOrdinaryExternalConfig(t *testing.T) {
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	})
 
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 }
@@ -1420,7 +1456,7 @@ services:
     image: nginx
 `
 	api := asController(&fakeAPI{})
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), "s", selfContained, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: selfContained, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 	for _, f := range api.labelFilters {
@@ -1447,7 +1483,7 @@ func TestTheControllersOwnMountsAreReadOnce(t *testing.T) {
 	b := testBackend(t, api, nil)
 
 	for range 3 {
-		if err := b.WithRegistryAuth(nil).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+		if err := b.WithRegistryAuth(nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 			t.Fatalf("DeployStack = %v, want nil", err)
 		}
 	}
@@ -1467,7 +1503,7 @@ func TestAFailedSelfReadRefusesTheDeployAndIsRetried(t *testing.T) {
 	}
 	b := testBackend(t, api, nil)
 
-	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err == nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err == nil {
 		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
 	}
 	if len(api.created) != 0 {
@@ -1475,7 +1511,7 @@ func TestAFailedSelfReadRefusesTheDeployAndIsRetried(t *testing.T) {
 	}
 
 	api.selfErr = nil
-	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("second DeployStack = %v, want the failure not to have been cached", err)
 	}
 }
@@ -1514,7 +1550,7 @@ func TestAnUnreachableDaemonRefusesTheDeployAndIsRetried(t *testing.T) {
 	})
 	b := testBackend(t, api, nil)
 
-	err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever)
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
 	}
@@ -1526,7 +1562,7 @@ func TestAnUnreachableDaemonRefusesTheDeployAndIsRetried(t *testing.T) {
 	}
 
 	api.selfErr = nil
-	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("second DeployStack = %v, want the failure not to have been cached", err)
 	}
 }
@@ -1545,12 +1581,12 @@ func TestAnUnreachableDaemonDoesNotDisableTheGuard(t *testing.T) {
 	})
 	b := testBackend(t, api, nil)
 
-	if err := b.DeployStack(t.Context(), "tenant", mountsControllerConfig, ResolveNever); err == nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsControllerConfig, Resolve: ResolveNever}); err == nil {
 		t.Fatal("DeployStack = nil, want the deploy refused while the guard could not be read")
 	}
 
 	api.selfErr = nil
-	err := b.DeployStack(t.Context(), "tenant", mountsControllerConfig, ResolveNever)
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsControllerConfig, Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the guard still on once the daemon answers")
 	}
@@ -1574,7 +1610,7 @@ func TestAnUnreachableDaemonOnTheServiceReadAlsoRefuses(t *testing.T) {
 	})
 	b := testBackend(t, api, nil)
 
-	err := b.DeployStack(t.Context(), "tenant", mountsControllerSecret, ResolveNever)
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsControllerSecret, Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
 	}
@@ -1583,7 +1619,7 @@ func TestAnUnreachableDaemonOnTheServiceReadAlsoRefuses(t *testing.T) {
 	}
 
 	api.selfSpecErr = nil
-	if err := b.DeployStack(t.Context(), "tenant", mountsControllerSecret, ResolveNever); err == nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsControllerSecret, Resolve: ResolveNever}); err == nil {
 		t.Fatal("DeployStack = nil, want the guard still on once the daemon answers")
 	}
 	if len(api.created) != 0 {
@@ -1598,7 +1634,7 @@ func TestOutsideASwarmThereIsNothingOfOursToProtect(t *testing.T) {
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	}
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 }
@@ -1620,12 +1656,12 @@ func TestAContainerThisDaemonDoesNotKnowIsAnAnswer(t *testing.T) {
 	installed(api, "s")
 	b := testBackend(t, api, nil)
 
-	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want a controller that is not a swarm task to deploy", err)
 	}
 	// Cached, unlike the unreachable case: this one is an answer, and it cannot
 	// change for the life of the process.
-	if err := b.DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("second DeployStack = %v, want nil", err)
 	}
 	if api.selfInspects != 1 {
@@ -1835,7 +1871,7 @@ func controllerStack() *fakeAPI {
 func TestDeployStackRefusesTheControllersOwnStackName(t *testing.T) {
 	api := controllerStack()
 
-	err := testBackend(t, api, nil).DeployStack(t.Context(), "swarmcli-cd", takesOverTheController, ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: takesOverTheController, Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want a release claiming the controller's own stack refused")
 	}
@@ -1897,7 +1933,7 @@ func TestAnyOtherReleaseIsDeployedAndRemovedAsBefore(t *testing.T) {
 	}), "s")
 	b := testBackend(t, api, nil)
 
-	if err := b.DeployStack(t.Context(), "s", "services:\n  web:\n    image: nginx\n", ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: "services:\n  web:\n    image: nginx\n", Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want an ordinary release deployed", err)
 	}
 	if err := b.RemoveStack(t.Context(), "s"); err != nil {
@@ -1967,8 +2003,7 @@ func TestDeployStackRefusesMountingTheControllersOwnVolume(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
 
-			err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant",
-				mountsAVolume("swarmcli-cd_swarmcli-cd-data", external), ResolveNever)
+			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsAVolume("swarmcli-cd_swarmcli-cd-data", external), Resolve: ResolveNever})
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the stack refused for mounting the controller's own volume")
 			}
@@ -2004,7 +2039,7 @@ func TestAStackMayMountAVolumeItsApplicationPermits(t *testing.T) {
 			// A fake of its own per case: this one records what it creates, so a
 			// second deploy through the same one sees the first's services under a
 			// namespace with no release record and is refused for that instead (#105).
-			if err := allowing(t, asController(&fakeAPI{}), tc.allow).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
+			if err := allowing(t, asController(&fakeAPI{}), tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever}); err != nil {
 				t.Fatalf("DeployStack = %v, want the volume allowed", err)
 			}
 		})
@@ -2028,8 +2063,7 @@ func TestAStackMayNotMountAVolumeItsApplicationDoesNotPermit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
 
-			err := allowing(t, api, tc.allow).DeployStack(t.Context(), "tenant",
-				mountsAVolume("shared-cache", true), ResolveNever)
+			err := allowing(t, api, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsAVolume("shared-cache", true), Resolve: ResolveNever})
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the volume refused")
 			}
@@ -2067,8 +2101,7 @@ func TestDeployStackRefusesJoiningTheControllersOwnNetwork(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
 
-			err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant",
-				joinsANetwork("swarmcli-cd_default", external), ResolveNever)
+			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: joinsANetwork("swarmcli-cd_default", external), Resolve: ResolveNever})
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the stack refused for joining the controller's own network")
 			}
@@ -2089,7 +2122,7 @@ func TestDeployStackRefusesJoiningTheControllersOwnNetwork(t *testing.T) {
 func TestDeployStackRefusesANetworkNamedForTheControllersStack(t *testing.T) {
 	api := asController(&fakeAPI{})
 
-	err := testBackend(t, api, nil).DeployStack(t.Context(), "tenant", joinsANetwork("swarmcli-cd", true), ResolveNever)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: joinsANetwork("swarmcli-cd", true), Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the controller's own namespace refused as a network name")
 	}
@@ -2122,7 +2155,7 @@ func TestAStackMayJoinANetworkItsApplicationPermits(t *testing.T) {
 		{"a release named like ours", "swarmcli-cd-apps", "services:\n  app:\n    image: busybox\n", application.Allow{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := allowing(t, asController(&fakeAPI{}), tc.allow).DeployStack(t.Context(), tc.release, tc.manifest, ResolveNever); err != nil {
+			if err := allowing(t, asController(&fakeAPI{}), tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: tc.release, Manifest: tc.manifest, Resolve: ResolveNever}); err != nil {
 				t.Fatalf("DeployStack = %v, want the network allowed", err)
 			}
 		})
@@ -2144,8 +2177,7 @@ func TestAStackMayNotJoinANetworkItsApplicationDoesNotPermit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
 
-			err := allowing(t, api, tc.allow).DeployStack(t.Context(), "tenant",
-				joinsANetwork("traefik-public", tc.external), ResolveNever)
+			err := allowing(t, api, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: joinsANetwork("traefik-public", tc.external), Resolve: ResolveNever})
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the network refused")
 			}
@@ -2181,7 +2213,7 @@ func TestOutsideASwarmTheVolumeAndNetworkGuardsAreInert(t *testing.T) {
 		{"network", joinsANetwork("swarmcli-cd_default", true), application.Allow{Networks: []string{"swarmcli-cd_default"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := allowing(t, &fakeAPI{}, tc.allow).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
+			if err := allowing(t, &fakeAPI{}, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever}); err != nil {
 				t.Fatalf("DeployStack = %v, want no guard for a controller with no stack of its own", err)
 			}
 		})
@@ -2201,7 +2233,7 @@ func TestAnUnreachableDaemonRefusesAVolumeOrNetworkDeploy(t *testing.T) {
 			api := asController(&fakeAPI{selfErr: connectionFailure(t)})
 			b := testBackend(t, api, nil)
 
-			err := b.DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever)
+			err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever})
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
 			}
@@ -2210,7 +2242,7 @@ func TestAnUnreachableDaemonRefusesAVolumeOrNetworkDeploy(t *testing.T) {
 			}
 
 			api.selfErr = nil
-			if err := b.DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err == nil {
+			if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever}); err == nil {
 				t.Fatal("DeployStack = nil, want the guard on once the daemon answers")
 			}
 			if len(api.created) != 0 {
@@ -2323,7 +2355,7 @@ func TestAStackMayReferenceOnlyWhatItsApplicationPermits(t *testing.T) {
 				})
 			}
 
-			if err := allowing(t, existing(), tc.permitted).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever); err != nil {
+			if err := allowing(t, existing(), tc.permitted).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever}); err != nil {
 				t.Fatalf("DeployStack = %v, want the permitted reference deployed", err)
 			}
 
@@ -2337,7 +2369,7 @@ func TestAStackMayReferenceOnlyWhatItsApplicationPermits(t *testing.T) {
 				t.Run(refused.why, func(t *testing.T) {
 					api := existing()
 
-					err := allowing(t, api, refused.allow).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever)
+					err := allowing(t, api, refused.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever})
 					if err == nil {
 						t.Fatal("DeployStack = nil, want the reference refused")
 					}
@@ -2366,7 +2398,7 @@ func TestAStackNeedsNoPermissionForWhatItOwns(t *testing.T) {
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	})
 
-	if err := allowing(t, api, application.Allow{}).DeployStack(t.Context(), "s", oneOfEach, ResolveNever); err != nil {
+	if err := allowing(t, api, application.Allow{}).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want a release's own resources to need no permission", err)
 	}
 }
@@ -2411,7 +2443,7 @@ func TestNoAllowlistReachesTheControllersOwn(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := allowing(t, tc.api, tc.allow).DeployStack(t.Context(), "tenant", tc.manifest, ResolveNever)
+			err := allowing(t, tc.api, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever})
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the controller's own refused whatever the app set says")
 			}
@@ -2436,7 +2468,7 @@ func TestNoAllowlistReachesAReleaseRecord(t *testing.T) {
 	api.configs[0].Spec.Labels = map[string]string{charts.LabelType: charts.TypeRelease}
 
 	err := allowing(t, api, application.Allow{Configs: []string{"swarmcli.release.victim.v1"}}).
-		DeployStack(t.Context(), "tenant", mountsAConfig("swarmcli.release.victim.v1"), ResolveNever)
+		DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsAConfig("swarmcli.release.victim.v1"), Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want a release record refused whatever the app set says")
 	}
@@ -2473,15 +2505,13 @@ func TestWithAllowedReferencesDoesNotMutate(t *testing.T) {
 func TestAnUndecoratedBackendPermitsNothing(t *testing.T) {
 	b := testBackend(t, asController(&fakeAPI{}), nil)
 
-	if err := b.DeployStack(t.Context(), "tenant", mountsAVolume("shared-cache", true), ResolveNever); err == nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsAVolume("shared-cache", true), Resolve: ResolveNever}); err == nil {
 		t.Fatal("DeployStack = nil, want a backend nobody scoped to permit nothing")
 	}
 	// And what a release owns still needs nothing, so "permits nothing" does not
 	// mean "refuses everything": an undecorated backend still deploys an ordinary
 	// chart.
-	if err := b.DeployStack(t.Context(), "tenant",
-		"services:\n  app:\n    image: busybox\n    volumes: [\"data:/data\"]\nvolumes:\n  data: {}\n",
-		ResolveNever); err != nil {
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: "services:\n  app:\n    image: busybox\n    volumes: [\"data:/data\"]\nvolumes:\n  data: {}\n", Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want a chart that owns everything it names deployed", err)
 	}
 }

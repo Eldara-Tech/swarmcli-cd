@@ -568,15 +568,32 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 // conversion is the one whose specs are applied.
 //
 // Nothing is deleted. Phase 1 is explicitly no prune.
-func (b *Backend) DeployStack(ctx context.Context, name, manifest, resolve string) error {
+//
+// req.Files is ignored, and that is a decision rather than an oversight. A
+// manifest reaching here can never name a file: this controller converts it
+// in-process, with no checkout for a relative path to resolve against
+// (cdcompose.Convert sets WorkingDir: "/"), and cdcompose.checkFileSources
+// refuses configs.*.file, secrets.*.file and services.*.env_file outright
+// before the loader can read one — swarmcli-cd#99, because the only filesystem
+// those paths could name is the one holding the Docker socket, the application
+// set and /run/secrets. The chart engine fills the map from exactly those keys,
+// so what arrives here is always empty.
+//
+// Making the field mean something is a separate change with its own threat
+// argument, not a line added to this method: it means materialising the files
+// to a temp directory, pointing WorkingDir at that directory, and relaxing
+// checkFileSources from "refuse the key" to "refuse a path that escapes" —
+// reopening half of #99's guard on a process holding the socket. That is #528's
+// CE-side PR 4 and a follow-up issue here.
+func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) error {
 	// Before the manifest is even converted: a release claiming the controller's
 	// own stack is refused whatever it declares, because the collision is the
 	// name and not anything in the chart.
-	if err := b.rejectOwnNamespace(ctx, name); err != nil {
+	if err := b.rejectOwnNamespace(ctx, req.Name); err != nil {
 		return err
 	}
 
-	unresolved, err := cdcompose.ConvertUnresolved(ctx, manifest, name, b.api, b.allow)
+	unresolved, err := cdcompose.ConvertUnresolved(ctx, req.Manifest, req.Name, b.api, b.allow)
 	if err != nil {
 		return err
 	}
@@ -604,11 +621,11 @@ func (b *Backend) DeployStack(ctx context.Context, name, manifest, resolve strin
 		return err
 	}
 
-	stack, err := cdcompose.Convert(ctx, manifest, name, b.api, b.allow)
+	stack, err := cdcompose.Convert(ctx, req.Manifest, req.Name, b.api, b.allow)
 	if err != nil {
 		return err
 	}
-	return b.ApplyServices(ctx, stack, resolve)
+	return b.ApplyServices(ctx, stack, req.Resolve)
 }
 
 // RemoveStack deletes the services, networks, configs and secrets carrying the
