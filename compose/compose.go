@@ -92,6 +92,8 @@ func Convert(ctx context.Context, manifest, stack string, api client.APIClient, 
 	if err != nil {
 		return nil, fmt.Errorf("parsing the manifest: %w", err)
 	}
+	// Before the checks below, so they read the strings the swarm will get.
+	unescapeDollars(dict)
 	if err := checkBindSources(dict, allow); err != nil {
 		return nil, err
 	}
@@ -112,7 +114,9 @@ func Convert(ctx context.Context, manifest, stack string, api client.APIClient, 
 		// accident. Interpolating it would make the controller's environment —
 		// whatever its own stack.yml happens to give it — an invisible input to
 		// every application's deployment, and would silently substitute the
-		// empty string for anything unset. Schema validation stays on.
+		// empty string for anything unset. Schema validation stays on, and the
+		// one half of interpolation that is not substitution — the `$$` escape —
+		// is done above, by unescapeDollars.
 		o.SkipInterpolation = true
 	})
 	if err != nil {
@@ -240,6 +244,47 @@ func declaredNetworks(services []composetypes.ServiceConfig) map[string]struct{}
 		}
 	}
 	return out
+}
+
+// unescapeDollars rewrites Compose's `$$` escape, in place, to the single `$` it
+// stands for, over every string value in a parsed manifest.
+//
+// This is the half of interpolation that belongs to the file format rather than
+// to substitution. `$$` means one `$` whatever any environment holds, and a
+// chart writes `export PASS="$$(cat /run/secrets/db)"` precisely so that the
+// *container's* shell expands it and the plaintext never lands in the manifest
+// or in `docker inspect`. Leaving the escape in place hands `$$` to that shell,
+// which reads it as the pid of the process it is running in — so the password
+// becomes "1(cat /run/secrets/db)" and the application fails somewhere far away
+// holding a credential nobody wrote (Eldara-Tech/swarmcli-charts#108). Seven of
+// the charts in that repository depend on this: for secrets, for a `$apr1$`
+// htpasswd hash, and for shell variables a healthcheck expands at runtime.
+//
+// Values only, matching interpolation.recursiveInterpolate, which walks a map's
+// values and leaves its keys alone. Replacement is left-to-right and
+// non-overlapping, so `$$$$` reduces to `$$` and a lone `$` is untouched — the
+// same reduction template.SubstituteWith performs for its escape group. What
+// this deliberately does not do is the other half: `$FOO` and `${FOO}` survive
+// as literals, for the reason Convert gives.
+func unescapeDollars(v any) {
+	switch v := v.(type) {
+	case map[string]any:
+		for k, e := range v {
+			if s, ok := e.(string); ok {
+				v[k] = strings.ReplaceAll(s, "$$", "$")
+				continue
+			}
+			unescapeDollars(e)
+		}
+	case []any:
+		for i, e := range v {
+			if s, ok := e.(string); ok {
+				v[i] = strings.ReplaceAll(s, "$$", "$")
+				continue
+			}
+			unescapeDollars(e)
+		}
+	}
 }
 
 // checkBindSources refuses the two bind mounts a reconciled stack may not have:

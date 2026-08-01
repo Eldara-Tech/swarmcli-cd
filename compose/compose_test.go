@@ -178,6 +178,72 @@ services:
 	}
 }
 
+// The other half of interpolation is the file format's own: `$$` is one `$`,
+// and a chart writes it so the CONTAINER's shell does the expanding. Handing
+// `$$` to that shell instead gets the pid of the process it runs in, so a
+// password reads "1(cat /run/secrets/db)" and the app fails far from here
+// (Eldara-Tech/swarmcli-charts#108).
+func TestConvertUnescapesTheComposeDollarEscape(t *testing.T) {
+	t.Setenv("SECRET_FROM_THE_CONTROLLER", "leaked")
+
+	got := convertOK(t, `
+services:
+  web:
+    image: nginx
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |-
+        export PASS="$$(cat /run/secrets/db)"
+        exec nginx -g "daemon off;"
+    environment:
+      HTPASSWD: "user:$$apr1$$salt$$hash"
+      LITERAL: "${SECRET_FROM_THE_CONTROLLER}"
+      DOUBLED: "$$$$"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://$$HOSTNAME:80/ || exit 1"]
+`, "s", nil)
+
+	cs := got.Services[0].Spec.TaskTemplate.ContainerSpec
+
+	// command -> Args: the case charts/zammad hit. A whole shell wrapper, so
+	// the fix has to reach a string nested in a list under a service.
+	wantArgs := "export PASS=\"$(cat /run/secrets/db)\"\nexec nginx -g \"daemon off;\""
+	if len(cs.Args) != 1 || cs.Args[0] != wantArgs {
+		t.Errorf("args = %q, want %q", cs.Args, wantArgs)
+	}
+
+	// environment -> Env: a map's values. `$apr1$` is charts/traefik's htpasswd
+	// hash, which would otherwise be a silently wrong one rather than a failure;
+	// `$$$$` must reduce to `$$`, not to `$`; and substitution stays off, so the
+	// controller's environment is still not an input.
+	wantEnv := map[string]string{
+		"HTPASSWD": "user:$apr1$salt$hash",
+		"DOUBLED":  "$$",
+		"LITERAL":  "${SECRET_FROM_THE_CONTROLLER}",
+	}
+	for _, e := range cs.Env {
+		k, v, _ := strings.Cut(e, "=")
+		want, ok := wantEnv[k]
+		if !ok {
+			t.Errorf("env %q is not one of the three set", e)
+			continue
+		}
+		if v != want {
+			t.Errorf("env %s = %q, want %q", k, v, want)
+		}
+		delete(wantEnv, k)
+	}
+	for k := range wantEnv {
+		t.Errorf("env %s missing", k)
+	}
+
+	// healthcheck.test -> Healthcheck.Test: a list the shell expands at runtime.
+	wantTest := []string{"CMD-SHELL", "curl -sf http://$HOSTNAME:80/ || exit 1"}
+	if cs.Healthcheck == nil || !reflect.DeepEqual(cs.Healthcheck.Test, wantTest) {
+		t.Errorf("healthcheck = %+v, want test %q", cs.Healthcheck, wantTest)
+	}
+}
+
 // An external network is a promise the manifest makes about the swarm, not
 // something to conjure. Creating one would silently produce an empty overlay
 // where the operator meant an existing shared network.
