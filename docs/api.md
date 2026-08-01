@@ -34,6 +34,17 @@ two-tier model: with the set mounted as a Docker config there is nothing to writ
 into, and with the set in git the way to change it is a commit, which is the
 whole point. See [configuration § where the app set lives](configuration.md#where-the-app-set-lives).
 
+That table is the **core's** route set, and a companion module may add to it
+through the `extension` seam. What it adds is authorised the same way: the core,
+not the companion, registers each route behind the same guard as everything
+above, with the `authz.Action` the route declares. The one exception is a route
+the companion declares public on purpose, which is served with no credential at
+all. A running controller logs every route it serves at startup —
+the guarded ones as a list, each public one on a `WARN` line naming the pattern
+and the module that registered it — so what a build actually exposes is readable
+from its own log rather than from the companion's source. See
+[extensibility.md](extensibility.md).
+
 ## Authentication
 
 Every `/api/v1/…` endpoint requires the admin token as a bearer credential:

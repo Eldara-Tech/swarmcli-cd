@@ -3,13 +3,14 @@ SPDX-License-Identifier: Apache-2.0
 Copyright © 2026 Eldara Tech
 -->
 
-# Extensibility: how the private companion replaces a seam
+# Extensibility: the seams a private companion replaces, and the one it adds to
 
 swarmcli-cd is open core. This repository is the whole product — reconcile,
 diff, health, API, CLI and, later, the web UI — and a private `swarmcli-cd-be`
-companion replaces four specific behaviours with licensed ones. Per D6 the
-companion arrives in Phase 3, but the seams ship from day one so that nothing
-in the public tree has to move when it does.
+companion replaces four specific behaviours with licensed ones and, through a
+fifth seam, **adds** HTTP routes of its own rather than replacing anything. Per
+D6 the companion arrives in Phase 3, but the seams ship from day one so that
+nothing in the public tree has to move when it does.
 
 The mechanism is the one `swarmcli-be` already uses against `swarmcli`: `init()`
 self-registration and a blank import. **No build tags, and no stubbed files in
@@ -23,12 +24,12 @@ package registers its OSS default in its own `init()`; a companion package
 registers its replacement in *its* `init()`, which necessarily runs later. The
 companion always wins, and nothing has to coordinate the order.
 
-**That argument covers three of the four.** It holds because the default lives
-in the very package the companion must import, which is what makes "later"
-guaranteed. `swarms`' default does not — it is in `swarms/local`, so that the
-seam does not drag the Docker applier in behind it — and two unrelated sibling
-packages are initialised in import-path order, which neither of them controls.
-Under that order `…/swarmcli-cd-be/swarms` runs *before*
+**That argument covers three of the four defaults.** It holds because the
+default lives in the very package the companion must import, which is what
+makes "later" guaranteed. `swarms`' default does not — it is in `swarms/local`,
+so that the seam does not drag the Docker applier in behind it — and two
+unrelated sibling packages are initialised in import-path order, which neither
+of them controls. Under that order `…/swarmcli-cd-be/swarms` runs *before*
 `…/swarmcli-cd/swarms/local` (`-` sorts before `/`), so last-wins would have the
 OSS default overwrite the companion, silently, with `swarms.Active()` reporting
 `local` as the only evidence.
@@ -37,25 +38,166 @@ So `swarms/local` registers **only if nothing has**, which is order-independent
 and makes "the companion always wins" true unconditionally. A default outside
 its seam package must do the same; one inside it never needs to.
 
-## The four seams
+## The five seams
 
-| Package | Interface | OSS default | Replaced by |
+| Package | Interface | OSS default | What the companion brings |
 |---|---|---|---|
 | `swarms` | `Registry` | `local` — the swarm the controller runs in | multi-swarm through swarmcli-rbac-proxy |
 | `authz` | `Authorizer` | `token` — one shared bearer token | SSO, projects and RBAC |
 | `notify` | `Notifier` | `log` — a structured line per event | Slack, webhooks, e-mail |
 | `secrets` | `Provider` | `plaintext` — passes material through, refuses what it cannot decrypt | SOPS decryption |
+| `extension` | `Extension` | none — no route is the right OSS behaviour | SSO login and callback, `/api/v1/projects`, entitlement endpoints |
 
 Three of them **replace**: there is exactly one answer to "which swarm registry
-is in force". `notify` **appends**, because a companion adding Slack must not
-remove the log notifier — and because the HTTP API's own event stream is itself
-a registered notifier, so replacing would silently kill the UI's live updates.
+is in force". `notify` and `extension` **append**. `notify` does because a
+companion adding Slack must not remove the log notifier — and because the HTTP
+API's own event stream is itself a registered notifier, so replacing would
+silently kill the UI's live updates. `extension` does because it has nothing to
+replace: the core's endpoint set stays exactly where it is and a companion's
+routes are served beside it, so several companions may each add their own and
+appending is the only sensible composition.
 
 `swarms`' default is the one that is not in its own package: it lives in
 `swarms/local` and the binary blank-imports it, so that `swarms` stays a
 contract and nothing importing it links the Docker applier. A build that takes
 neither the default nor a companion registers `none`, which says so in the
 startup line below and errors naming the missing import.
+
+### Adding routes to the API
+
+`extension` is the seam whose subject is the HTTP API rather than the reconcile
+loop. SSO needs a login endpoint and a callback, projects need
+`/api/v1/projects`, and the `licence` package sketched below needs somewhere to
+answer about entitlements. None of them can be reached from outside the module:
+`api` has no mux to hand out and `controller` exports only `Main()`, so before
+this seam the only way to serve one of them was to fork both packages.
+
+A route is **declared, not registered**. The extension says what it wants
+served and the core decides what wraps it, because what wraps it is an
+authorisation decision on a process holding write access to the swarm:
+
+```go
+type Handler func(w http.ResponseWriter, r *http.Request, subject authz.Subject)
+
+type Route struct {
+    Pattern string       // "GET /api/v1/projects" — a ServeMux pattern, any path
+    Action  authz.Action // what the core authorises this route with
+    Handler Handler
+}
+
+type Extension interface {
+    Routes() []Route       // served behind the same guard as every core route
+    PublicRoutes() []Route // no authentication, no authorisation
+}
+
+func Register(name string, e Extension) // call it from an init()
+func All() []Extension
+func Active() []string
+```
+
+`Handler` is `api`'s own guarded-handler shape. The subject is a parameter
+rather than something read out of the request context, for the reason the core
+handlers give: a context lookup that came back empty hands a handler a zero
+`Subject`, an authorizer given one fails closed, and the result looks like a
+caller with no permissions rather than like the wiring mistake it is.
+
+`Action` has no default. Empty is a startup error, because there is no action
+that is obviously right for a route this repository has never seen and guessing
+one would be guessing at a permission. `authz.Action` is a string type with
+additive constants, so an extension may declare an action of its own — the
+authorizer it ships with is the only thing that has to recognise it, and an
+action an authorizer does not recognise is refused. Each route is authorised
+with `r.PathValue("app")` as the scope, exactly as the core routes are, so a
+pattern with no `{app}` wildcard authorises with an empty application: "not
+scoped to one application", which is already what `GET /api/v1/status` does.
+
+The registration is the core's, and that is the whole of the design:
+
+```go
+mux.Handle(rt.Pattern, s.guard(rt.Action, rt.Handler))
+```
+
+Handing the companion a mux instead would give away three things that cannot be
+got back — the guarantee that a route is authorised, the ability to name every
+route in the startup log, and the chance to catch a collision before the
+standard library panics on it.
+
+`extension` is also the one seam with no OSS default and no `init()` of its own.
+The other four register a working implementation so that there is something in
+place before a companion arrives; here no route is the correct free-build
+behaviour, and a `seam.List`'s zero value already is exactly that.
+
+The companion side is an `init()` and two methods:
+
+```go
+// swarmcli-cd-be/licence/register.go
+package licence
+
+import (
+    "net/http"
+
+    "github.com/Eldara-Tech/swarmcli-cd/authz"
+    "github.com/Eldara-Tech/swarmcli-cd/extension"
+)
+
+func init() { extension.Register("licence", routes{}) }
+
+type routes struct{}
+
+func (routes) Routes() []extension.Route {
+    return []extension.Route{{
+        Pattern: "GET /api/v1/licence",
+        Action:  authz.ActionRead,
+        Handler: func(w http.ResponseWriter, r *http.Request, subject authz.Subject) {
+            // The subject is the one the core authenticated, so an entitlement
+            // this module gates per user is decided here, inside the
+            // implementation — not by swapping something out of a Slot.
+        },
+    }}
+}
+
+// Nothing unauthenticated to serve. The method still has to be written, which
+// is the point of it being a method.
+func (routes) PublicRoutes() []extension.Route { return nil }
+```
+
+**A collision refuses to start.** Before it touches the mux the core checks
+every extension pattern against the core's own and against every other
+extension's; a duplicate produces an error naming the pattern and both
+extensions, `serve` fails with it, and the controller does not come up. That is
+why `api.Server.Handler()` returns `(http.Handler, error)`.
+
+The check is a conservative exact-string one, not `net/http`'s conflict
+analysis. Two patterns `ServeMux` would consider conflicting without being equal
+— `GET /a/{x}` against `GET /a/b` — still reach the mux and still panic there,
+so a companion should not register a wildcard pattern overlapping a core path.
+What it gets if it does is the standard library's panic, which at least names
+both patterns and both registration sites. Reimplementing `ServeMux`'s conflict
+rules here would be a second copy of standard-library logic, drifting.
+
+**Every route is in the startup log**, guarded ones once at `INFO` as a list.
+**Every public route is logged individually at `WARN`**, by pattern and by the
+name its extension registered under.
+
+`PublicRoutes` is a separate method rather than a `Public bool` on `Route`, and
+the reason is the one `api` gives for passing the subject as a parameter: the
+dangerous state must not be the zero value. An unset bool reads like every other
+unset field in a struct literal, while a second method has to be written, named
+and returned from. It exists for one shape — a callback arriving with a
+credential this controller never issued, which therefore cannot be
+authenticated by the authorizer that guards everything else. A route returned
+from it must leave `Action` empty, since a public route naming an action is a
+contradiction whose likeliest cause is an author who thought the action would
+be enforced; and its handler is passed the zero `Subject`, so it must not
+consult one.
+
+A private module adding an unauthenticated endpoint to a controller holding the
+Docker socket is the most dangerous thing this mechanism permits, and it has to
+be visible in a running controller's log rather than only in the companion's
+source. The `WARN` line is what discharges that: every unauthenticated path the
+process serves, and the module that put it there, in the controller's own
+startup output — readable by an operator who has neither the companion's source
+nor a reason to trust its documentation.
 
 ### Optional interfaces beside a seam
 
@@ -114,6 +256,11 @@ may read `Get` once and keep the result — `api.New`, `reconcile.New` and
 A `List` is not. The API server registers itself as a notifier during wiring,
 long after every `init()`, so `notify.Dispatch` re-reads `All` on every event.
 
+`extension` is a `List` and reads it exactly once, when `api.Handler()` builds
+the mux — which is also during wiring, after every `init()` — because a route
+registered after that has nowhere to go: the mux is already serving. So an
+extension may only register from an `init()`, where every companion's does.
+
 **Entitlement gating therefore belongs inside an implementation, not in
 swapping a `Slot` at runtime.** A licensed authorizer whose entitlement lapses
 must start refusing from the inside. Replacing it in the slot would be seen by
@@ -161,8 +308,8 @@ package main
 import (
     "github.com/Eldara-Tech/swarmcli-cd/controller" // the entry point, see below
 
-    _ "github.com/Eldara-Tech/swarmcli-cd-be/authz"    // SSO + RBAC
-    _ "github.com/Eldara-Tech/swarmcli-cd-be/licence"  // entitlement gating
+    _ "github.com/Eldara-Tech/swarmcli-cd-be/authz"    // SSO + RBAC, login and callback
+    _ "github.com/Eldara-Tech/swarmcli-cd-be/licence"  // entitlement gating + endpoints
     _ "github.com/Eldara-Tech/swarmcli-cd-be/notify"   // Slack, webhooks
     _ "github.com/Eldara-Tech/swarmcli-cd-be/secrets"  // SOPS
     _ "github.com/Eldara-Tech/swarmcli-cd-be/swarms"   // multi-swarm
@@ -170,6 +317,11 @@ import (
 
 func main() { controller.Main() }
 ```
+
+Routes add no line to this file. `authz` and `licence` register theirs through
+`extension` from the same `init()` that registers everything else they bring, so
+the endpoints the companion serves are wired by the import that was already
+there — which is what keeps this the only file that differs between the builds.
 
 No `swarmcli-cd/swarms/local` here: the companion registers its own registry,
 and importing the default beside it would only mean building a Docker client
@@ -212,10 +364,27 @@ than inferring it from behaviour:
 log.Info("seams",
     "swarms", swarms.Active(),
     "authz", authz.Active(),
-    "notify", notify.Active(),   // a list: every notifier is live
+    "notify", notify.Active(),        // a list: every notifier is live
     "secrets", secrets.Active(),
+    "extension", extension.Active(),  // a list too: every extension is served
 )
 ```
+
+`extension` reports which modules registered routes, not which routes. What is
+actually served is a second line, logged after the mux is built — which is a
+different moment, because building it is the step that can fail on a collision:
+
+```go
+log.Info("routes", "guarded", guarded)  // every guarded pattern, core and extension
+for _, r := range public {
+    log.Warn("public route", "route", r)  // one line each: pattern and extension name
+}
+```
+
+Two levels rather than one. A guarded route is unremarkable, so the whole list
+is one `INFO` line. An unauthenticated route on a process holding the Docker
+socket is not, and a line per route at `WARN` is what makes it as easy to find
+afterwards as it is at startup.
 
 ## Adding a seam
 
@@ -224,10 +393,17 @@ is an interface a companion must keep implementing across releases, so the bar
 is a licensed feature that cannot be expressed any other way — not a
 configuration knob, and not somewhere a future feature *might* go.
 
-1. Add a package under the repository root with the interface, the OSS default,
-   and `Register` / `Get` / `Active` wrapping a `seam.Slot` (or a `seam.List`
-   when several implementations should all run).
-2. Register the default from the package's own `init()`.
+1. Add a package under the repository root with the interface, its OSS default
+   where it has one, and `Register` / `Get` / `Active` wrapping a `seam.Slot`
+   (or a `seam.List` when several implementations should all run).
+2. Register the default from the package's own `init()` — unless the zero value
+   is already the behaviour a build with no companion should have. `extension`
+   is the one seam where it is: no route is the right answer for a controller
+   with nothing loaded, and an empty `seam.List` is exactly no routes, so the
+   step would only add an implementation returning nothing. The step exists to
+   stop a `Slot` handing a consumer a nil implementation to call, and a `List`
+   has none to hand out. A seam that *replaces* a behaviour always needs its
+   default.
 3. Add it to the table above.
 
 Take every parameter a companion implements as a struct, from the first commit.
@@ -237,21 +413,17 @@ The day the companion ships, every signature in this document is frozen.
 
 Recorded so that it is a known gap rather than a discovery.
 
-**Add a route.** SSO needs a login and a callback endpoint, projects need
-`/api/v1/projects`, and the `licence` package sketched above has no
-registration point at all. `api.Options` has no mux and `controller` exports
-only `Main()`, so none of them can be added without forking both. The design is
-a fifth registration point rather than a fourth option field — a `seam.List` of
-extensions, each route declaring the `authz.Action` the core guards it with,
-with an explicit opt-out for the one shape that must be unauthenticated (an SSO
-callback arrives without a credential this controller issued) and every
-registered route logged at startup by name. A private module adding an
-unauthenticated endpoint to a controller holding the Docker socket is the most
-dangerous thing this mechanism permits, and it has to be visible in a running
-controller's log rather than only in the companion's source.
+**The list is currently empty.** Adding a route was the last entry and it is now
+the `extension` seam above. The heading stays because an empty list is worth
+stating — a companion author reading this should be able to tell "nothing is
+missing" from "nobody has written it down".
 
-It is the last open item of
-[#111](https://github.com/Eldara-Tech/swarmcli-cd/issues/111), and deliberately
-not landed with the rest of it: this is a new registration mechanism, and one
-whose worst case is the paragraph above deserves a review of its own rather than
-a corner of a larger change.
+One loose end, which is a gap in the wiring rather than in the contract:
+`swarms.Lister` is landed and nothing consumes it, so a companion implementing
+it changes no behaviour yet. The sweep that would use it, `prune.Departed`,
+takes bare application names, and swarm-qualifying what the app-set loop hands
+it cannot be tested against a build whose registry resolves one swarm. Neither
+`prune.Departed` nor `appset`'s pruner is implemented outside this repository,
+so unlike `swarms.Registry.Backend` there is no now-or-never here: the
+signatures can change the day the companion exists. It is the one item
+[#111](https://github.com/Eldara-Tech/swarmcli-cd/issues/111) stays open on.
