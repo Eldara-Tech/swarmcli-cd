@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -260,6 +261,17 @@ func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {
 	return nil, fmt.Errorf("--log-format '%s': want text or json", format)
 }
 
+// chartWarnf routes the chart engine's warnings into this handler. They are
+// written for a CLI's stderr and so end in a newline, which a slog message must
+// not carry: the message is one line already, and the handler escapes a
+// trailing newline rather than ending the line, so every such warning would
+// reach an operator with a `\n` written out at the end of it.
+func chartWarnf(log *slog.Logger) func(string, ...any) {
+	return func(format string, a ...any) {
+		log.Warn(strings.TrimSpace(fmt.Sprintf(format, a...)))
+	}
+}
+
 // serve wires the packages together and runs until ctx ends or a component
 // fails. It is the only place in the repository that knows how the whole thing
 // fits together.
@@ -351,10 +363,8 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	}
 
 	rec := reconcile.New(cfg.Applications, reconcile.Options{
-		Fetcher: git.New(repos, auth),
-		Builder: source.NewBuilder(chartCache, func(format string, a ...any) {
-			log.Warn(fmt.Sprintf(format, a...))
-		}),
+		Fetcher:               git.New(repos, auth),
+		Builder:               source.NewBuilder(chartCache, chartWarnf(log)),
 		RegistryAuth:          resolvers,
 		ForbiddenSecretMounts: forbidden,
 		ControllerID:          o.controllerID,
