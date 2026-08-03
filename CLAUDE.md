@@ -66,9 +66,30 @@ Flags, not environment variables: only credentials come from the environment
 here, for the reason `controllerUsage` gives.
 
 `text` is logfmt, which quotes any value containing a space and escapes the
-quotes inside it — so an error built with `%q` arrives with backslashes. That is
-the format working. `--log-format json` is the answer for anything that parses
-rather than reads.
+quotes inside it. **So a message names things in `'single quotes'`, not with
+`%q`** — every error and status string here ends up as a logfmt value sooner or
+later, and `%q` puts the one character the encoding has to escape into the
+middle of it. `\"` all through a line an operator is reading is the format
+working, but it is our `"` it is escaping; single quotes cost the encoding
+nothing and read the same. That is issue #157, and it is why this repository
+diverges from CE, which uses `%q` throughout.
+
+This does not make the log backslash-free, and should not be sold as if it did:
+a wrapped error keeps its author's quoting, and `net/http` renders a URL as
+`Get "…"`, so an unreachable repository still arrives escaped. What the rule
+buys is that `\"` around something *this* controller is reporting is now a bug
+rather than the normal state.
+
+`%q` also escaped control characters, and dropping it does not reopen anything:
+on the log path slog escapes them whatever the message did, and on the terminal
+path the surrounding text was never escaped anyway — `app.go` prints a status
+`Message` with `%s`, and those messages already embed Docker task text
+(`health.go`) and daemon reasons (`reconcile.go`) verbatim. Quoting the name
+while interpolating the daemon's sentence raw was not a defence.
+
+`--log-format json` is still the answer for anything that parses rather than
+reads; note it escapes `"` exactly as logfmt does, so it was never the fix for
+this.
 
 Levels: `Error` is a reconcile or a component failing, `Warn` is something an
 operator must see but that did not stop the loop (a prune held, a resource left

@@ -89,7 +89,7 @@ func (b *Builder) Build(ctx context.Context, app string, spec application.Source
 	// upstream of one of them does not make the route stop existing.
 	for _, r := range rf.Repositories {
 		if !application.ValidRepositoryName(r.Name) {
-			return nil, fmt.Errorf("application %q: %s declares chart repository %q: the name becomes a file in the chart cache, so letters, digits, dot, dash and underscore only, starting with a letter or digit", app, rf.Path, r.Name)
+			return nil, fmt.Errorf("application '%s': %s declares chart repository '%s': the name becomes a file in the chart cache, so letters, digits, dot, dash and underscore only, starting with a letter or digit", app, rf.Path, r.Name)
 		}
 	}
 
@@ -102,7 +102,7 @@ func (b *Builder) Build(ctx context.Context, app string, spec application.Source
 		store.Warnf = b.warnf
 	}
 	if err := store.EnsureRepos(rf.Repositories); err != nil {
-		return nil, fmt.Errorf("application %q: %w", app, err)
+		return nil, fmt.Errorf("application '%s': %w", app, err)
 	}
 
 	return &Built{
@@ -118,23 +118,23 @@ func (b *Builder) releaseFile(app string, spec application.Source, co git.Checko
 	case spec.ReleaseFile != "":
 		path, err := Contained(co.Dir, spec.ReleaseFile)
 		if err != nil {
-			return nil, fmt.Errorf("application %q: releaseFile: %w", app, err)
+			return nil, fmt.Errorf("application '%s': releaseFile: %w", app, err)
 		}
 		rf, err := charts.LoadReleaseFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("application %q: %w", app, err)
+			return nil, fmt.Errorf("application '%s': %w", app, err)
 		}
 		return rf, nil
 
 	case spec.Chart != nil:
 		rf, err := synthesise(app, *spec.Chart, co)
 		if err != nil {
-			return nil, fmt.Errorf("application %q: %w", app, err)
+			return nil, fmt.Errorf("application '%s': %w", app, err)
 		}
 		return rf, nil
 
 	default:
-		return nil, fmt.Errorf("application %q: source names neither a releaseFile nor a chart", app)
+		return nil, fmt.Errorf("application '%s': source names neither a releaseFile nor a chart", app)
 	}
 }
 
@@ -201,7 +201,7 @@ func valuesReader(ctx context.Context, app string, co git.Checkout, rf *charts.R
 	return func(path string) ([]byte, error) {
 		resolved, err := containedAbs(rf.Dir, path)
 		if err != nil {
-			return nil, fmt.Errorf("application %q: values: %w", app, err)
+			return nil, fmt.Errorf("application '%s': values: %w", app, err)
 		}
 		data, err := os.ReadFile(resolved)
 		if err != nil {
@@ -235,7 +235,7 @@ func valuesReader(ctx context.Context, app string, co git.Checkout, rf *charts.R
 func containedAbs(root, path string) (string, error) {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
-		return "", fmt.Errorf("%q is not under the repository", path)
+		return "", fmt.Errorf("'%s' is not under the repository", path)
 	}
 	return Contained(root, rel)
 }
@@ -256,7 +256,7 @@ func containedAbs(root, path string) (string, error) {
 // whose failure mode is reading whatever the controller can.
 func Contained(root, rel string) (string, error) {
 	if filepath.IsAbs(rel) {
-		return "", fmt.Errorf("%q must be relative to the repository", rel)
+		return "", fmt.Errorf("'%s' must be relative to the repository", rel)
 	}
 
 	realRoot, err := filepath.EvalSymlinks(root)
@@ -270,14 +270,14 @@ func Contained(root, rel string) (string, error) {
 			// configuration out of a tree — the app-set source does — has to tell
 			// an absent file from a failure to resolve one, and says something
 			// else entirely about it.
-			return "", fmt.Errorf("%q is not in the repository at this revision: %w", rel, fs.ErrNotExist)
+			return "", fmt.Errorf("'%s' is not in the repository at this revision: %w", rel, fs.ErrNotExist)
 		}
-		return "", fmt.Errorf("resolving %q: %w", rel, err)
+		return "", fmt.Errorf("resolving '%s': %w", rel, err)
 	}
 
 	inside, err := filepath.Rel(realRoot, path)
 	if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("%q resolves outside the repository", rel)
+		return "", fmt.Errorf("'%s' resolves outside the repository", rel)
 	}
 	return path, nil
 }

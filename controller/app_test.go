@@ -612,7 +612,7 @@ func driftedView() application.View {
 	v.Status.Drift = &application.Drift{
 		State:    application.DriftStateDetected,
 		Services: 2,
-		Message:  `release "web": 2 service(s) do not match the repository`,
+		Message:  `release 'web': 2 service(s) do not match the repository`,
 	}
 	v.Status.Releases[0].Sync = application.SyncOutOfSync
 	v.Status.Releases[0].Drift = &application.ReleaseDrift{

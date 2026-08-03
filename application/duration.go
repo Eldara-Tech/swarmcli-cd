@@ -54,7 +54,7 @@ func (d *Duration) parse(s string) error {
 	}
 	v, err := time.ParseDuration(s)
 	if err != nil {
-		return fmt.Errorf("invalid duration %q: %w", s, err)
+		return fmt.Errorf("invalid duration '%s': %w", s, err)
 	}
 	*d = Duration(v)
 	return nil

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -158,7 +159,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 		return usageErr(stderr, err.Error(), controllerUsage)
 	}
 	if fs.NArg() > 0 {
-		return usageErr(stderr, fmt.Sprintf("unexpected argument %q", fs.Arg(0)), controllerUsage)
+		return usageErr(stderr, fmt.Sprintf("unexpected argument '%s'", fs.Arg(0)), controllerUsage)
 	}
 	// --config always has a value, so "the operator set it" is a question only
 	// the flag set can answer. It matters because pointing the controller at a
@@ -262,7 +263,7 @@ func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {
 	case "error":
 		lvl = slog.LevelError
 	default:
-		return nil, fmt.Errorf("--log-level %q: want debug, info, warn or error", level)
+		return nil, fmt.Errorf("--log-level '%s': want debug, info, warn or error", level)
 	}
 
 	opts := &slog.HandlerOptions{Level: lvl}
@@ -272,7 +273,18 @@ func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {
 	case "json":
 		return slog.New(slog.NewJSONHandler(w, opts)), nil
 	}
-	return nil, fmt.Errorf("--log-format %q: want text or json", format)
+	return nil, fmt.Errorf("--log-format '%s': want text or json", format)
+}
+
+// chartWarnf routes the chart engine's warnings into this handler. They are
+// written for a CLI's stderr and so end in a newline, which a slog message must
+// not carry: the message is one line already, and the handler escapes a
+// trailing newline rather than ending the line, so every such warning would
+// reach an operator with a `\n` written out at the end of it.
+func chartWarnf(log *slog.Logger) func(string, ...any) {
+	return func(format string, a ...any) {
+		log.Warn(strings.TrimSpace(fmt.Sprintf(format, a...)))
+	}
 }
 
 // serve wires the packages together and runs until ctx ends or a component
@@ -285,7 +297,7 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// load because that load may now be a clone of a remote repository, and
 	// spending its timeout before refusing for an unrelated reason helps nobody.
 	if err := authz.Get().Ready(); err != nil {
-		return fmt.Errorf("authorizer %q: %w", authz.Active(), err)
+		return fmt.Errorf("authorizer '%s': %w", authz.Active(), err)
 	}
 
 	// So that an operator can tell from the logs whether the companion loaded,
@@ -366,10 +378,8 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	}
 
 	rec := reconcile.New(cfg.Applications, reconcile.Options{
-		Fetcher: git.New(repos, auth),
-		Builder: source.NewBuilder(chartCache, func(format string, a ...any) {
-			log.Warn(fmt.Sprintf(format, a...))
-		}),
+		Fetcher:               git.New(repos, auth),
+		Builder:               source.NewBuilder(chartCache, chartWarnf(log)),
 		RegistryAuth:          resolvers,
 		ForbiddenSecretMounts: forbidden,
 		ControllerID:          o.controllerID,

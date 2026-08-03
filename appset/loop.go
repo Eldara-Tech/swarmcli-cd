@@ -408,7 +408,7 @@ func (l *Loop) apply(desired []application.Spec) error {
 	// before it grows.
 	for _, name := range remove {
 		if err := l.rec.Remove(name); err != nil {
-			errs = append(errs, fmt.Errorf("removing %q: %w", name, err))
+			errs = append(errs, fmt.Errorf("removing '%s': %w", name, err))
 			continue
 		}
 		l.orphan(name)
@@ -425,7 +425,7 @@ func (l *Loop) apply(desired []application.Spec) error {
 			continue
 		}
 		if err := l.rec.Replace(spec); err != nil {
-			errs = append(errs, fmt.Errorf("replacing %q: %w", spec.Name, err))
+			errs = append(errs, fmt.Errorf("replacing '%s': %w", spec.Name, err))
 			continue
 		}
 		l.log.Info("application changed in the app set", "application", spec.Name)
@@ -437,7 +437,7 @@ func (l *Loop) apply(desired []application.Spec) error {
 			continue
 		}
 		if err := l.rec.Add(spec); err != nil {
-			errs = append(errs, fmt.Errorf("adding %q: %w", spec.Name, err))
+			errs = append(errs, fmt.Errorf("adding '%s': %w", spec.Name, err))
 			continue
 		}
 		l.adopt(spec.Name)

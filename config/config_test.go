@@ -149,7 +149,7 @@ applications:
 	if err == nil {
 		t.Fatal("Parse = nil, want a shared-release error")
 	}
-	for _, want := range []string{"eldara-zammad", "acme-zammad", `"zammad"`, "stack"} {
+	for _, want := range []string{"eldara-zammad", "acme-zammad", `'zammad'`, "stack"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %s", err, want)
 		}

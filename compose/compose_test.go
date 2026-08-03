@@ -315,7 +315,7 @@ func TestRelativeBindSourceIsRejected(t *testing.T) {
 			if !strings.Contains(err.Error(), "must be absolute") {
 				t.Errorf("error %q does not say why", err)
 			}
-			if !strings.Contains(err.Error(), `service "app"`) {
+			if !strings.Contains(err.Error(), `service 'app'`) {
 				t.Errorf("error %q does not name the service", err)
 			}
 		})
@@ -398,7 +398,7 @@ func TestAnUnpermittedHostPathIsRefused(t *testing.T) {
 			if !strings.Contains(err.Error(), "allow.hostPaths") {
 				t.Errorf("error %q does not say where the permission would go", err)
 			}
-			if !strings.Contains(err.Error(), `service "app"`) {
+			if !strings.Contains(err.Error(), `service 'app'`) {
 				t.Errorf("error %q does not name the service", err)
 			}
 		})
@@ -464,18 +464,18 @@ func TestFileSourcesAreRefused(t *testing.T) {
 			"secret",
 			"services:\n  x:\n    image: alpine\n    secrets: [loot]\n" +
 				"secrets:\n  loot:\n    file: /run/secrets/swarmcli-cd-token\n",
-			`secret "loot"`,
+			`secret 'loot'`,
 		},
 		{
 			"config",
 			"services:\n  x:\n    image: alpine\n    configs: [loot]\n" +
 				"configs:\n  loot:\n    file: /run/secrets/swarmcli-cd-token\n",
-			`config "loot"`,
+			`config 'loot'`,
 		},
 		{
 			"env_file",
 			"services:\n  x:\n    image: alpine\n    env_file: /run/secrets/swarmcli-cd-token\n",
-			`service "x"`,
+			`service 'x'`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

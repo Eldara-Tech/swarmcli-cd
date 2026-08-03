@@ -124,7 +124,7 @@ func Release(in Input) (application.Health, []application.ServiceStatus) {
 		if rank(state) > rank(worst.State) {
 			worst = application.Health{
 				State:   state,
-				Message: fmt.Sprintf("service %q: %s", s.Name, message),
+				Message: fmt.Sprintf("service '%s': %s", s.Name, message),
 			}
 		}
 	}
@@ -202,7 +202,7 @@ func Application(releases []application.ReleaseStatus) application.Health {
 		out.Services.Total += rel.Health.Services.Total
 		if rank(rel.Health.State) > rank(out.State) {
 			out.State = rel.Health.State
-			out.Message = fmt.Sprintf("release %q: %s", rel.Name, rel.Health.Message)
+			out.Message = fmt.Sprintf("release '%s': %s", rel.Name, rel.Health.Message)
 		}
 	}
 	return out

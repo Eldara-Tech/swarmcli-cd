@@ -77,12 +77,12 @@ func Load(apps []application.Spec, secretsDir string, readFile func(string) ([]b
 		path := filepath.Join(secretsDir, app.RegistryAuth)
 		data, err := readFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("application %q: registryAuth secret %q is not mounted at %s — "+
+			return nil, fmt.Errorf("application '%s': registryAuth secret '%s' is not mounted at %s — "+
 				"add it to the controller's secrets in stack.yml: %w", app.Name, app.RegistryAuth, path, err)
 		}
 		resolver, err := FromConfig(data)
 		if err != nil {
-			return nil, fmt.Errorf("application %q: registryAuth secret %q: %w", app.Name, app.RegistryAuth, err)
+			return nil, fmt.Errorf("application '%s': registryAuth secret '%s': %w", app.Name, app.RegistryAuth, err)
 		}
 		out[app.Name] = resolver
 	}

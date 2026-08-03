@@ -549,6 +549,24 @@ func TestTheControllerSetsTheDefaultLogger(t *testing.T) {
 	}
 }
 
+// The chart engine writes its warnings for a CLI's stderr, so they end in a
+// newline. A slog message must not: the handler escapes the trailing one rather
+// than ending the line, and the operator reads a `\n` at the end of the warning
+// — the same complaint as #157, from the other direction.
+func TestAChartWarningLosesItsTrailingNewline(t *testing.T) {
+	var buf bytes.Buffer
+	warnf := chartWarnf(slog.New(slog.NewTextHandler(&buf, nil)))
+	warnf("could not refresh repository '%s' (%v); using the cached index\n", "eldara", io.EOF)
+
+	got := buf.String()
+	if strings.Contains(got, `\n`) {
+		t.Errorf("warning logged as %q, want no escaped newline in it", got)
+	}
+	if !strings.Contains(got, "using the cached index") {
+		t.Errorf("warning logged as %q, want the engine's text carried through", got)
+	}
+}
+
 // Issue #72: the CE packages the applier is built on log through swarmcli's
 // own logger, which stays a no-op until something initialises it. Nothing here
 // did, so every diagnostic they wrote — docker.SnapshotWith's included — went

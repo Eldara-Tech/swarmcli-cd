@@ -305,10 +305,10 @@ func TestWaveGroups(t *testing.T) {
 // as it did before the wait could take more than one — the integration suite
 // matches on that text.
 func TestReleaseListReadsTheSameForOneRelease(t *testing.T) {
-	if got := releaseList([]string{"solo"}); got != `release "solo"` {
+	if got := releaseList([]string{"solo"}); got != `release 'solo'` {
 		t.Errorf("releaseList = %q, want the phrase a single-release wait always produced", got)
 	}
-	if got := releaseList([]string{"a", "b"}); got != `releases "a", "b"` {
+	if got := releaseList([]string{"a", "b"}); got != `releases 'a', 'b'` {
 		t.Errorf("releaseList = %q, want both named", got)
 	}
 }

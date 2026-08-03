@@ -254,7 +254,7 @@ func purgeEveryNode(ctx context.Context, log *slog.Logger, backend charts.Backen
 		// Not "there were no volumes". A registry that reaches nothing has not
 		// looked, and returning nil here would let the caller delete the
 		// records that are the only way to find this release again.
-		return fmt.Errorf("purging the volumes of release %q: the registry reaches no node of this swarm", release)
+		return fmt.Errorf("purging the volumes of release '%s': the registry reaches no node of this swarm", release)
 	}
 
 	var deleted []string
@@ -280,7 +280,7 @@ func purgeEveryNode(ctx context.Context, log *slog.Logger, backend charts.Backen
 		}
 		for _, name := range names {
 			if err := settle(ctx, func(ctx context.Context) error { return nb.RemoveVolume(ctx, name) }); err != nil {
-				return failed(fmt.Errorf("removing volume %q on node %s: %w", name, nodeName(node), err))
+				return failed(fmt.Errorf("removing volume '%s' on node %s: %w", name, nodeName(node), err))
 			}
 			deleted = append(deleted, nodeName(node)+"/"+name)
 		}
@@ -409,7 +409,7 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 
 	for _, name := range names {
 		if err := settle(ctx, func(ctx context.Context) error { return backend.RemoveVolume(ctx, name) }); err != nil {
-			return fmt.Errorf("removing volume %q: %w", name, err)
+			return fmt.Errorf("removing volume '%s': %w", name, err)
 		}
 	}
 
@@ -637,7 +637,7 @@ func (p *Pruner) uninstall(ctx context.Context, backend charts.Backend, engine E
 		Target:   swarms.Target{},
 	})
 	if err != nil {
-		return fmt.Errorf("pruning release %q of departed application %q: %w", release, app, err)
+		return fmt.Errorf("pruning release '%s' of departed application '%s': %w", release, app, err)
 	}
 	// Warn rather than Info, like the departure itself: this is the controller
 	// deleting somebody's running stack, and it is the log line an operator

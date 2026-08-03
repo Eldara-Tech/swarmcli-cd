@@ -126,7 +126,7 @@ func (b *Backend) applyNetworks(ctx context.Context, stack *cdcompose.Stack) err
 			continue
 		}
 		if _, err := b.api.NetworkCreate(ctx, nw.Name, opts); err != nil {
-			return fmt.Errorf("creating network %q: %w", nw.Name, err)
+			return fmt.Errorf("creating network '%s': %w", nw.Name, err)
 		}
 		b.log.Info("network created", "network", nw.Name, "driver", opts.Driver)
 	}
@@ -161,11 +161,11 @@ func (b *Backend) applySecrets(ctx context.Context, secrets []swarm.SecretSpec) 
 		case errdefs.IsNotFound(err):
 			spec.Labels = b.stampCreated(spec.Labels)
 			if _, err := b.api.SecretCreate(ctx, spec); err != nil {
-				return fmt.Errorf("creating secret %q: %w", spec.Name, err)
+				return fmt.Errorf("creating secret '%s': %w", spec.Name, err)
 			}
 			b.log.Info("secret created", "secret", spec.Name)
 		case err != nil:
-			return fmt.Errorf("inspecting secret %q: %w", spec.Name, err)
+			return fmt.Errorf("inspecting secret '%s': %w", spec.Name, err)
 		default:
 			// A secret's data is unreadable once stored — GetSecret nils out
 			// Spec.Data — so unlike a config there is nothing to compare
@@ -180,7 +180,7 @@ func (b *Backend) applySecrets(ctx context.Context, secrets []swarm.SecretSpec) 
 			spec.Data = nil
 			spec.Labels = keepCreated(spec.Labels, cur.Spec.Labels)
 			if err := b.api.SecretUpdate(ctx, cur.ID, cur.Version, spec); err != nil {
-				return fmt.Errorf("updating secret %q: %w", spec.Name, err)
+				return fmt.Errorf("updating secret '%s': %w", spec.Name, err)
 			}
 		}
 	}
@@ -195,17 +195,17 @@ func (b *Backend) applyConfigs(ctx context.Context, configs []swarm.ConfigSpec) 
 		case errdefs.IsNotFound(err):
 			spec.Labels = b.stampCreated(spec.Labels)
 			if _, err := b.api.ConfigCreate(ctx, spec); err != nil {
-				return fmt.Errorf("creating config %q: %w", spec.Name, err)
+				return fmt.Errorf("creating config '%s': %w", spec.Name, err)
 			}
 			b.log.Info("config created", "config", spec.Name)
 		case err != nil:
-			return fmt.Errorf("inspecting config %q: %w", spec.Name, err)
+			return fmt.Errorf("inspecting config '%s': %w", spec.Name, err)
 		case !bytes.Equal(cur.Spec.Data, spec.Data):
 			// `docker stack deploy` sends the new data to ConfigUpdate and lets
 			// the daemon answer "only updates to Labels are allowed" — an error
 			// naming neither the config nor the remedy, arriving partway
 			// through a deploy. Say what is wrong and what to do instead.
-			return fmt.Errorf("config %q already exists on this swarm with different content. "+
+			return fmt.Errorf("config '%s' already exists on this swarm with different content. "+
 				"Swarm configs are immutable: only labels can be changed. Give the config a name that "+
 				"changes with its content — a version suffix or a content hash — so that a new one is "+
 				"created and the services referencing it are updated to it", spec.Name)
@@ -218,7 +218,7 @@ func (b *Backend) applyConfigs(ctx context.Context, configs []swarm.ConfigSpec) 
 			spec.Data = nil
 			spec.Labels = keepCreated(spec.Labels, cur.Spec.Labels)
 			if err := b.api.ConfigUpdate(ctx, cur.ID, cur.Version, spec); err != nil {
-				return fmt.Errorf("updating config %q: %w", spec.Name, err)
+				return fmt.Errorf("updating config '%s': %w", spec.Name, err)
 			}
 			spec.Data = data
 		}
@@ -296,14 +296,14 @@ func (b *Backend) ListConfigs(ctx context.Context) ([]charts.ConfigMeta, error) 
 func (b *Backend) InspectConfig(ctx context.Context, name string) ([]byte, error) {
 	cfg, _, err := b.api.ConfigInspectWithRaw(ctx, name)
 	if err != nil {
-		return nil, fmt.Errorf("inspecting config %q: %w", name, err)
+		return nil, fmt.Errorf("inspecting config '%s': %w", name, err)
 	}
 	return cfg.Spec.Data, nil
 }
 
 func (b *Backend) DeleteConfig(ctx context.Context, name string) error {
 	if err := b.api.ConfigRemove(ctx, name); err != nil {
-		return fmt.Errorf("removing config %q: %w", name, err)
+		return fmt.Errorf("removing config '%s': %w", name, err)
 	}
 	return nil
 }
@@ -381,7 +381,7 @@ func (b *Backend) SwarmNodes(ctx context.Context) (int, error) {
 // (daemon/cluster/helpers.go:274).
 func (b *Backend) RemoveVolume(ctx context.Context, name string) error {
 	if err := b.api.VolumeRemove(ctx, name, false); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("removing volume %q: %w", name, err)
+		return fmt.Errorf("removing volume '%s': %w", name, err)
 	}
 	return nil
 }
@@ -405,7 +405,7 @@ func (b *Backend) CreateOverlayNetwork(ctx context.Context, name, driver string,
 		driver = defaultNetworkDriver
 	}
 	if _, err := b.api.NetworkCreate(ctx, name, network.CreateOptions{Driver: driver, Attachable: attachable}); err != nil {
-		return fmt.Errorf("creating network %q: %w", name, err)
+		return fmt.Errorf("creating network '%s': %w", name, err)
 	}
 	return nil
 }
@@ -422,7 +422,7 @@ func (b *Backend) RemoveOverlayNetwork(ctx context.Context, name string) error {
 	for _, n := range nets {
 		if n.Name == name {
 			if err := b.api.NetworkRemove(ctx, n.ID); err != nil {
-				return fmt.Errorf("removing network %q: %w", name, err)
+				return fmt.Errorf("removing network '%s': %w", name, err)
 			}
 			return nil
 		}

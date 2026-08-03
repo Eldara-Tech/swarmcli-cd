@@ -74,7 +74,7 @@ func appMain(args []string, stdout, stderr io.Writer) int {
 	case "list", "get", "diff", "history", "sync":
 		return appCommand(sub, rest, stdout, stderr)
 	default:
-		return usageErr(stderr, fmt.Sprintf("unknown command %q", sub), appUsage)
+		return usageErr(stderr, fmt.Sprintf("unknown command '%s'", sub), appUsage)
 	}
 }
 
@@ -98,7 +98,7 @@ func appCommand(sub string, args []string, stdout, stderr io.Writer) int {
 	}
 
 	if *output != "text" && *output != "json" {
-		return usageErr(stderr, fmt.Sprintf("invalid --output %q (want text or json)", *output), appUsage)
+		return usageErr(stderr, fmt.Sprintf("invalid --output '%s' (want text or json)", *output), appUsage)
 	}
 
 	// list takes no application; the rest take exactly one. Saying so is what
@@ -112,7 +112,7 @@ func appCommand(sub string, args []string, stdout, stderr io.Writer) int {
 		positional = positional[1:]
 	}
 	if len(positional) > 0 {
-		return usageErr(stderr, fmt.Sprintf("unexpected argument %q", positional[0]), appUsage)
+		return usageErr(stderr, fmt.Sprintf("unexpected argument '%s'", positional[0]), appUsage)
 	}
 
 	token, tokenErr := authz.TokenFromEnv(os.Getenv, os.ReadFile)

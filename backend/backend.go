@@ -379,12 +379,12 @@ func inControllersStack(namespace, name string) bool {
 }
 
 func mountsForbidden(service, kind, name, what string) error {
-	return fmt.Errorf("service %q mounts %s %q, which is %s; a reconciled stack may not mount it",
+	return fmt.Errorf("service '%s' mounts %s '%s', which is %s; a reconciled stack may not mount it",
 		service, kind, name, what)
 }
 
 func declaresForbidden(kind, name, what string) error {
-	return fmt.Errorf("this stack declares %s %q, which is %s; a reconciled stack may not declare "+
+	return fmt.Errorf("this stack declares %s '%s', which is %s; a reconciled stack may not declare "+
 		"one of those names as its own, because Swarm addresses a %s by name — the existing one "+
 		"would be handed to this stack's services and relabelled as this stack's", kind, name, what, kind)
 }
@@ -394,27 +394,27 @@ func declaresForbidden(kind, name, what string) error {
 // this is the one who can, and because an allowlist whose message does not say
 // where it lives is indistinguishable from a bug.
 func mountsUnpermitted(service, kind, name, field string) error {
-	return fmt.Errorf("service %q mounts %s %q, which this release does not own and this application is "+
+	return fmt.Errorf("service '%s' mounts %s '%s', which this release does not own and this application is "+
 		"not permitted to reference. A %s is addressed by name with no namespace on the reference, so "+
 		"naming another stack's is being handed it — add it to %s in the app set if that is what is meant",
 		service, kind, name, kind, field)
 }
 
 func declaresUnpermitted(kind, name, field string) error {
-	return fmt.Errorf("this stack declares %s %q, which is not scoped to this release and which this "+
+	return fmt.Errorf("this stack declares %s '%s', which is not scoped to this release and which this "+
 		"application is not permitted to reference. A declaration carrying a name that already exists is "+
 		"handed the existing %s and relabels it as this stack's, so declaring one is not owning it — add "+
 		"the name to %s in the app set if that is what is meant", kind, name, kind, field)
 }
 
 func joinsUnpermitted(name string) error {
-	return fmt.Errorf("this stack joins network %q, which is not scoped to this release and which this "+
+	return fmt.Errorf("this stack joins network '%s', which is not scoped to this release and which this "+
 		"application is not permitted to join. Everything already on a shared network is reachable from "+
 		"it — add the name to allow.networks in the app set if that is what is meant", name)
 }
 
 func joinsForbidden(name, namespace string) error {
-	return fmt.Errorf("this stack joins network %q, which belongs to the stack this controller itself "+
+	return fmt.Errorf("this stack joins network '%s', which belongs to the stack this controller itself "+
 		"is deployed as (%s); a reconciled stack may not join it. The controller's API is deliberately "+
 		"unpublished and reachable only from inside the swarm, which is what makes a single bearer token "+
 		"over plaintext HTTP an acceptable design — a stack on that network is on the inside. Give the "+
@@ -524,7 +524,7 @@ func (b *Backend) rejectOwnNamespace(ctx context.Context, release string) error 
 	if mine.namespace == "" || mine.namespace != release {
 		return nil
 	}
-	return fmt.Errorf("refusing to act on release %q: it is the stack namespace this controller itself "+
+	return fmt.Errorf("refusing to act on release '%s': it is the stack namespace this controller itself "+
 		"is deployed under, so deploying it would write this release's services over the controller's own "+
 		"and removing it would delete the controller. Give the release a name of its own", release)
 }
@@ -688,7 +688,7 @@ func (b *Backend) RemoveStack(ctx context.Context, name string) error {
 	}
 	for _, s := range services {
 		if err := b.api.ServiceRemove(ctx, s.ID); err != nil && !errdefs.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("removing service %q: %w", s.Spec.Name, err))
+			errs = append(errs, fmt.Errorf("removing service '%s': %w", s.Spec.Name, err))
 		}
 	}
 
@@ -712,7 +712,7 @@ func (b *Backend) RemoveStack(ctx context.Context, name string) error {
 			continue
 		}
 		if err := b.api.ConfigRemove(ctx, c.ID); err != nil && !errdefs.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("removing config %q: %w", c.Spec.Name, err))
+			errs = append(errs, fmt.Errorf("removing config '%s': %w", c.Spec.Name, err))
 		}
 	}
 
@@ -722,7 +722,7 @@ func (b *Backend) RemoveStack(ctx context.Context, name string) error {
 	}
 	for _, s := range secrets {
 		if err := b.api.SecretRemove(ctx, s.ID); err != nil && !errdefs.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("removing secret %q: %w", s.Spec.Name, err))
+			errs = append(errs, fmt.Errorf("removing secret '%s': %w", s.Spec.Name, err))
 		}
 	}
 
@@ -732,7 +732,7 @@ func (b *Backend) RemoveStack(ctx context.Context, name string) error {
 	}
 	for _, n := range networks {
 		if err := b.api.NetworkRemove(ctx, n.ID); err != nil && !errdefs.IsNotFound(err) {
-			errs = append(errs, fmt.Errorf("removing network %q: %w", n.Name, err))
+			errs = append(errs, fmt.Errorf("removing network '%s': %w", n.Name, err))
 		}
 	}
 

@@ -267,7 +267,7 @@ func resolve(repo *gogit.Repository, revision string) (plumbing.Hash, error) {
 		// what comes back is already a commit hash.
 		return *hash, nil
 	}
-	return plumbing.ZeroHash, fmt.Errorf("cannot resolve revision %q as a commit, tag or branch", revision)
+	return plumbing.ZeroHash, fmt.Errorf("cannot resolve revision '%s' as a commit, tag or branch", revision)
 }
 
 // validAppDir keeps a caller from escaping the cache root. Names that reach
@@ -279,7 +279,7 @@ func validAppDir(app string) error {
 		return errors.New("no application name")
 	}
 	if app == "." || app == ".." || strings.ContainsAny(app, `/\`) {
-		return fmt.Errorf("invalid application name %q for a cache directory", app)
+		return fmt.Errorf("invalid application name '%s' for a cache directory", app)
 	}
 	return nil
 }
@@ -298,13 +298,13 @@ func supportedURL(url string) error {
 	case strings.HasPrefix(url, "https://"):
 		return nil
 	case strings.HasPrefix(url, "http://"):
-		return fmt.Errorf("refusing the plaintext remote %q: anything on the path to it decides what this controller deploys", url)
+		return fmt.Errorf("refusing the plaintext remote '%s': anything on the path to it decides what this controller deploys", url)
 	case strings.HasPrefix(url, "ssh://") || strings.HasPrefix(url, "git@"):
-		return fmt.Errorf("ssh remotes are not supported yet, use https for %q", url)
+		return fmt.Errorf("ssh remotes are not supported yet, use https for '%s'", url)
 	case filepath.IsAbs(url):
 		return nil
 	default:
-		return fmt.Errorf("unsupported repository URL %q, want https:// or an absolute path", url)
+		return fmt.Errorf("unsupported repository URL '%s', want https:// or an absolute path", url)
 	}
 }
 

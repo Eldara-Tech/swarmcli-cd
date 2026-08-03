@@ -364,11 +364,11 @@ func checkBindSources(dict map[string]any, allow application.Allow) error {
 				continue
 			}
 			if !filepath.IsAbs(source) {
-				return fmt.Errorf("service %q: bind source %q is relative; a swarm bind mount names a path "+
+				return fmt.Errorf("service '%s': bind source '%s' is relative; a swarm bind mount names a path "+
 					"on the node that runs the task, so it must be absolute (or use a named volume)", name, source)
 			}
 			if !allow.PermitsPath(source) {
-				return fmt.Errorf("service %q: bind source %q is not a host path this application may "+
+				return fmt.Errorf("service '%s': bind source '%s' is not a host path this application may "+
 					"bind; list the paths its charts may reach in the application's allow.hostPaths. A "+
 					"swarm bind mount names a path on whichever node runs the task and a chart chooses "+
 					"where its services run, so a bind is that node's filesystem handed to whoever writes "+
@@ -467,7 +467,7 @@ func checkFileSources(dict map[string]any) error {
 			if _, sourced := obj["file"]; !sourced {
 				continue
 			}
-			return fmt.Errorf("%s %q: file: reads a path on the controller's own filesystem, not the "+
+			return fmt.Errorf("%s '%s': file: reads a path on the controller's own filesystem, not the "+
 				"chart's; a rendered manifest is a string, so there is no chart directory for the path "+
 				"to resolve against — declare the %s external: and have an operator create it on the "+
 				"swarm", kind.what, name, kind.what)
@@ -483,7 +483,7 @@ func checkFileSources(dict map[string]any) error {
 		if _, sourced := svc["env_file"]; !sourced {
 			continue
 		}
-		return fmt.Errorf("service %q: env_file: reads a path on the controller's own filesystem, not "+
+		return fmt.Errorf("service '%s': env_file: reads a path on the controller's own filesystem, not "+
 			"the chart's; a rendered manifest is a string, so there is no chart directory for the path "+
 			"to resolve against — set the variables with environment: instead", name)
 	}
