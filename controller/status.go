@@ -55,10 +55,10 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		return usageErr(stderr, err.Error(), statusUsage)
 	}
 	if fs.NArg() > 0 {
-		return usageErr(stderr, fmt.Sprintf("unexpected argument %q", fs.Arg(0)), statusUsage)
+		return usageErr(stderr, fmt.Sprintf("unexpected argument '%s'", fs.Arg(0)), statusUsage)
 	}
 	if *output != "text" && *output != "json" {
-		return usageErr(stderr, fmt.Sprintf("invalid --output %q (want text or json)", *output), statusUsage)
+		return usageErr(stderr, fmt.Sprintf("invalid --output '%s' (want text or json)", *output), statusUsage)
 	}
 
 	token, tokenErr := authz.TokenFromEnv(os.Getenv, os.ReadFile)

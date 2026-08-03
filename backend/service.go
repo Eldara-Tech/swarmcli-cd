@@ -221,7 +221,7 @@ func (b *Backend) rejectForeignNamespace(ctx context.Context, namespace string, 
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	return fmt.Errorf("refusing to deploy release %q: %s already run under its stack namespace and this "+
+	return fmt.Errorf("refusing to deploy release '%s': %s already run under its stack namespace and this "+
 		"controller has no release record for it, so they were deployed by something else — a `docker stack "+
 		"deploy`, another tool, or the controller's own stack — and this release would write its services "+
 		"over them. Give the release a name of its own, or remove that stack first if it is meant to be "+
@@ -257,7 +257,7 @@ func (b *Backend) releaseRecorded(ctx context.Context, release string) (bool, er
 		Filters: filters.NewArgs(filters.Arg("label", charts.LabelRelease+"="+release)),
 	})
 	if err != nil {
-		return false, fmt.Errorf("listing release %q's records to check whether this controller installed it: %w",
+		return false, fmt.Errorf("listing release '%s''s records to check whether this controller installed it: %w",
 			release, err)
 	}
 	for _, c := range list {
@@ -275,14 +275,14 @@ func (b *Backend) releaseRecorded(ctx context.Context, release string) (bool, er
 func (b *Backend) createService(ctx context.Context, name string, spec swarm.ServiceSpec, resolve string) error {
 	auth, err := b.encodedAuth(spec)
 	if err != nil {
-		return fmt.Errorf("creating service %q: %w", name, err)
+		return fmt.Errorf("creating service '%s': %w", name, err)
 	}
 	resp, err := b.api.ServiceCreate(ctx, spec, swarm.ServiceCreateOptions{
 		QueryRegistry:       resolve == ResolveAlways || resolve == ResolveChanged,
 		EncodedRegistryAuth: auth,
 	})
 	if err != nil {
-		return fmt.Errorf("creating service %q: %w", name, err)
+		return fmt.Errorf("creating service '%s': %w", name, err)
 	}
 	b.log.Info("service created", "service", name, "id", resp.ID)
 	b.warn(name, resp.Warnings)
@@ -304,7 +304,7 @@ func (b *Backend) updateService(ctx context.Context, name string, cur swarm.Serv
 
 		auth, err := b.encodedAuth(desired)
 		if err != nil {
-			return fmt.Errorf("updating service %q: %w", name, err)
+			return fmt.Errorf("updating service '%s': %w", name, err)
 		}
 		opts.EncodedRegistryAuth = auth
 
@@ -315,7 +315,7 @@ func (b *Backend) updateService(ctx context.Context, name string, cur swarm.Serv
 			return nil
 		}
 		if !isVersionConflict(err) {
-			return fmt.Errorf("updating service %q: %w", name, err)
+			return fmt.Errorf("updating service '%s': %w", name, err)
 		}
 
 		b.log.Warn("service changed between read and write; re-reading and re-applying",
@@ -324,11 +324,11 @@ func (b *Backend) updateService(ctx context.Context, name string, cur swarm.Serv
 
 		fresh, _, ierr := b.api.ServiceInspectWithRaw(ctx, cur.ID, swarm.ServiceInspectOptions{})
 		if ierr != nil {
-			return fmt.Errorf("re-reading service %q after a version conflict: %w", name, ierr)
+			return fmt.Errorf("re-reading service '%s' after a version conflict: %w", name, ierr)
 		}
 		cur = fresh
 	}
-	return fmt.Errorf("service %q changed underneath us %d times; giving up so the next reconcile can plan "+
+	return fmt.Errorf("service '%s' changed underneath us %d times; giving up so the next reconcile can plan "+
 		"against whatever it settles on", name, maxConflictRetries)
 }
 

@@ -47,7 +47,7 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 		return usageErr(stderr, err.Error(), validateUsage)
 	}
 	if fs.NArg() > 0 {
-		return usageErr(stderr, fmt.Sprintf("unexpected argument %q", fs.Arg(0)), validateUsage)
+		return usageErr(stderr, fmt.Sprintf("unexpected argument '%s'", fs.Arg(0)), validateUsage)
 	}
 
 	cfg, err := config.Load(*file)
@@ -79,7 +79,7 @@ func checkIntervals(apps []application.Spec) error {
 	var bad []string
 	for _, app := range apps {
 		if d := time.Duration(app.SyncPolicy.Interval); d > 0 && d < application.MinInterval {
-			bad = append(bad, fmt.Sprintf("%q: syncPolicy.interval %s is below the %s floor", app.Name, d, application.MinInterval))
+			bad = append(bad, fmt.Sprintf("'%s': syncPolicy.interval %s is below the %s floor", app.Name, d, application.MinInterval))
 		}
 	}
 	if len(bad) == 0 {

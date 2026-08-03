@@ -113,7 +113,7 @@ func (b *Backend) LiveNetworkNames(ctx context.Context) (map[string]string, erro
 // reconciler rather than here.
 func (b *Backend) RemoveService(ctx context.Context, id string) error {
 	if err := b.api.ServiceRemove(ctx, id); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("removing service %q: %w", id, err)
+		return fmt.Errorf("removing service '%s': %w", id, err)
 	}
 	return nil
 }
@@ -241,12 +241,12 @@ func (b *Backend) RemoveNetwork(ctx context.Context, id string) error {
 	if checkErr != nil {
 		// Both, because neither answers on its own: the removal may well have
 		// worked, and the read that would have said so is the thing that failed.
-		return errors.Join(fmt.Errorf("removing network %q: %w", id, err), checkErr)
+		return errors.Join(fmt.Errorf("removing network '%s': %w", id, err), checkErr)
 	}
 	if gone {
 		return nil
 	}
-	return fmt.Errorf("removing network %q: %w", id, err)
+	return fmt.Errorf("removing network '%s': %w", id, err)
 }
 
 // networkGone reports whether the swarm still lists a network.
@@ -260,7 +260,7 @@ func (b *Backend) networkGone(ctx context.Context, id string) (bool, error) {
 		Filters: filters.NewArgs(filters.Arg("id", id)),
 	})
 	if err != nil {
-		return false, fmt.Errorf("re-checking network %q: %w", id, err)
+		return false, fmt.Errorf("re-checking network '%s': %w", id, err)
 	}
 	for _, n := range nets {
 		if n.ID == id {
@@ -277,7 +277,7 @@ func (b *Backend) networkGone(ctx context.Context, id string) (bool, error) {
 // config that is already gone.
 func (b *Backend) RemoveConfig(ctx context.Context, id string) error {
 	if err := b.api.ConfigRemove(ctx, id); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("removing config %q: %w", id, err)
+		return fmt.Errorf("removing config '%s': %w", id, err)
 	}
 	return nil
 }
@@ -285,7 +285,7 @@ func (b *Backend) RemoveConfig(ctx context.Context, id string) error {
 // RemoveSecret deletes one secret by id.
 func (b *Backend) RemoveSecret(ctx context.Context, id string) error {
 	if err := b.api.SecretRemove(ctx, id); err != nil && !errdefs.IsNotFound(err) {
-		return fmt.Errorf("removing secret %q: %w", id, err)
+		return fmt.Errorf("removing secret '%s': %w", id, err)
 	}
 	return nil
 }

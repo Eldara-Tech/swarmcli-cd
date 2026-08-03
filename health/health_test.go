@@ -224,7 +224,7 @@ func TestReleaseRollupCountsAndWorstWins(t *testing.T) {
 	if h.State != application.HealthDegraded {
 		t.Errorf("health = %q, want degraded", h.State)
 	}
-	if !strings.Contains(h.Message, `service "api"`) {
+	if !strings.Contains(h.Message, `service 'api'`) {
 		t.Errorf("message = %q, want the offending service named", h.Message)
 	}
 	if h.Services != (application.ServiceCounts{Healthy: 2, Total: 3}) {
@@ -315,7 +315,7 @@ func TestApplicationRollup(t *testing.T) {
 
 	t.Run("the worst release is named", func(t *testing.T) {
 		got := Application([]application.ReleaseStatus{healthy, degraded})
-		if !strings.Contains(got.Message, `release "db"`) {
+		if !strings.Contains(got.Message, `release 'db'`) {
 			t.Errorf("message = %q, want the offending release named", got.Message)
 		}
 	})

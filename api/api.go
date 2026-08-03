@@ -323,16 +323,16 @@ func extensionRoutes() (guardedRoutes, publicRoutes []declared, err error) {
 			seen[rt.Pattern] = claimant{ext: i, public: public}
 			return nil
 		case held.ext == coreOwner:
-			return fmt.Errorf("extension %q declares route %q, which is a core route", exts[i].name, rt.Pattern)
+			return fmt.Errorf("extension '%s' declares route '%s', which is a core route", exts[i].name, rt.Pattern)
 		case held.ext == i && held.public != public:
 			// The dangerous one. Registering both would put the same pattern on
 			// the mux twice, and which registration won would decide whether the
 			// endpoint was authenticated at all.
-			return fmt.Errorf("extension %q declares route %q as both a guarded and a public route", exts[i].name, rt.Pattern)
+			return fmt.Errorf("extension '%s' declares route '%s' as both a guarded and a public route", exts[i].name, rt.Pattern)
 		case held.ext == i:
-			return fmt.Errorf("extension %q declares route %q twice", exts[i].name, rt.Pattern)
+			return fmt.Errorf("extension '%s' declares route '%s' twice", exts[i].name, rt.Pattern)
 		default:
-			return fmt.Errorf("extension %q declares route %q, which extension %q already declared", exts[i].name, rt.Pattern, exts[held.ext].name)
+			return fmt.Errorf("extension '%s' declares route '%s', which extension '%s' already declared", exts[i].name, rt.Pattern, exts[held.ext].name)
 		}
 	}
 
@@ -341,10 +341,10 @@ func extensionRoutes() (guardedRoutes, publicRoutes []declared, err error) {
 			if rt.Handler == nil {
 				// Every other malformed field is caught here; a nil handler left
 				// to the mux would panic on the first request that reached it.
-				return nil, nil, fmt.Errorf("extension %q declares route %q with no handler", e.name, rt.Pattern)
+				return nil, nil, fmt.Errorf("extension '%s' declares route '%s' with no handler", e.name, rt.Pattern)
 			}
 			if rt.Action == "" {
-				return nil, nil, fmt.Errorf("extension %q declares route %q with no action: a guarded route names the authz.Action the core authorises it with, and there is none that is obviously right for a route this repository has never seen", e.name, rt.Pattern)
+				return nil, nil, fmt.Errorf("extension '%s' declares route '%s' with no action: a guarded route names the authz.Action the core authorises it with, and there is none that is obviously right for a route this repository has never seen", e.name, rt.Pattern)
 			}
 			if err := claim(i, rt, false); err != nil {
 				return nil, nil, err
@@ -353,13 +353,13 @@ func extensionRoutes() (guardedRoutes, publicRoutes []declared, err error) {
 		}
 		for _, rt := range e.ext.PublicRoutes() {
 			if rt.Handler == nil {
-				return nil, nil, fmt.Errorf("extension %q declares public route %q with no handler", e.name, rt.Pattern)
+				return nil, nil, fmt.Errorf("extension '%s' declares public route '%s' with no handler", e.name, rt.Pattern)
 			}
 			if rt.Action != "" {
 				// A contradiction, and the likeliest cause is a companion author
 				// who believed the action would be enforced — which on a route
 				// nothing authenticates it cannot be.
-				return nil, nil, fmt.Errorf("extension %q declares public route %q with action %q: a public route is served with no authentication and no authorisation, so the action would never be asked", e.name, rt.Pattern, rt.Action)
+				return nil, nil, fmt.Errorf("extension '%s' declares public route '%s' with action '%s': a public route is served with no authentication and no authorisation, so the action would never be asked", e.name, rt.Pattern, rt.Action)
 			}
 			if err := claim(i, rt, true); err != nil {
 				return nil, nil, err

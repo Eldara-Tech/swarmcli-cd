@@ -1269,17 +1269,29 @@ whole of it — including what the CE libraries the controller is built on write
 which goes through the same handler rather than a log file of their own.
 
 `text` is [logfmt](https://brandur.org/logfmt), which is what an operator
-reading those logs wants. It quotes any value containing a space and escapes the
-quotes inside it, so an error that names things in quotes arrives looking like
-this:
+reading those logs wants. It quotes any value containing a space, and escapes
+any quote inside it so that the value stays one field:
 
 ```
-time=2026-07-28T13:42:30.788Z level=ERROR msg="reconcile failed" application=swarm-cronjob failures=2 error="planning: release \"swarm-cronjob\": chart \"swarm-cronjob\" version \"0.1.2\" not found"
+time=2026-08-02T08:46:57.840Z level=ERROR msg="reconcile failed" application=eldara-zammad failures=1 error="applying: release 'zammad': this stack joins network 'shared-services', which is not scoped to this release"
 ```
 
-That is the format working, not a fault: the backslashes are what keep the value
-one field. `--log-format json` is the option for anything that parses rather
-than reads — a log shipper will unescape it back.
+Messages the controller writes name things in single quotes for that reason —
+`"` would arrive as `\"` in the middle of every line, which is the encoding
+doing its job on a character we chose to put there.
+
+Errors raised by the CE libraries the controller wraps are not written here and
+still use `"`, so a failure originating in the chart engine — resolving a chart,
+rendering a template — arrives escaped:
+
+```
+error="planning: release 'swarm-cronjob': chart \"swarm-cronjob\" version \"0.1.2\" not found"
+```
+
+That is the format working, not a fault. `--log-format json` is the option for
+anything that parses rather than reads — a log shipper will unescape it back —
+but note it escapes `"` exactly as logfmt does, so it does not make those lines
+any easier to read.
 
 ### Environment
 

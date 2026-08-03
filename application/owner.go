@@ -97,9 +97,9 @@ func ValidateControllerID(id string) error {
 	case id == "":
 		return fmt.Errorf("the controller id is empty")
 	case strings.ContainsAny(id, "/:"):
-		return fmt.Errorf("invalid controller id %q: it must not contain '/' or ':'", id)
+		return fmt.Errorf("invalid controller id '%s': it must not contain '/' or ':'", id)
 	case strings.IndexFunc(id, unicode.IsSpace) >= 0:
-		return fmt.Errorf("invalid controller id %q: it must not contain whitespace", id)
+		return fmt.Errorf("invalid controller id '%s': it must not contain whitespace", id)
 	}
 	return nil
 }

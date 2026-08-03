@@ -75,7 +75,7 @@ type registry struct {
 // in-swarm controller is the mounted docker.sock.
 func (r *registry) Backend(_ context.Context, t swarms.Target) (charts.Backend, error) {
 	if t.Swarm != "" {
-		return nil, fmt.Errorf("unknown swarm %q: this build resolves only the swarm the controller runs in", t.Swarm)
+		return nil, fmt.Errorf("unknown swarm '%s': this build resolves only the swarm the controller runs in", t.Swarm)
 	}
 	// The client is built once and reused: it holds a connection pool, and the
 	// reconcile loop asks on every tick for every application.

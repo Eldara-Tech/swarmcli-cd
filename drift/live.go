@@ -1266,7 +1266,7 @@ func Application(releases []application.ReleaseStatus) *application.Drift {
 		case application.DriftStateUnknown:
 			if out.State == application.DriftStateNone {
 				out.State = application.DriftStateUnknown
-				out.Message = fmt.Sprintf("release %q: %s", rel.Name, rel.Drift.Message)
+				out.Message = fmt.Sprintf("release '%s': %s", rel.Name, rel.Drift.Message)
 			}
 		}
 	}
@@ -1286,11 +1286,11 @@ func Application(releases []application.ReleaseStatus) *application.Drift {
 func detectedMessage(release string, d *application.ReleaseDrift) string {
 	switch {
 	case len(d.Resources) == 0:
-		return fmt.Sprintf("release %q: %d service(s) do not match the repository", release, len(d.Services))
+		return fmt.Sprintf("release '%s': %d service(s) do not match the repository", release, len(d.Services))
 	case len(d.Services) == 0:
-		return fmt.Sprintf("release %q: %d resource(s) the repository no longer declares", release, len(d.Resources))
+		return fmt.Sprintf("release '%s': %d resource(s) the repository no longer declares", release, len(d.Resources))
 	default:
-		return fmt.Sprintf("release %q: %d service(s) do not match the repository and %d resource(s) it no longer declares",
+		return fmt.Sprintf("release '%s': %d service(s) do not match the repository and %d resource(s) it no longer declares",
 			release, len(d.Services), len(d.Resources))
 	}
 }

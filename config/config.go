@@ -143,7 +143,7 @@ func (f *File) applyDefaults() {
 
 func (f *File) validate() error {
 	if f.APIVersion != "" && f.APIVersion != "v1" {
-		return fmt.Errorf("unsupported apiVersion %q, want v1", f.APIVersion)
+		return fmt.Errorf("unsupported apiVersion '%s', want v1", f.APIVersion)
 	}
 	if len(f.Applications) == 0 {
 		return errors.New("no applications declared")
@@ -156,7 +156,7 @@ func (f *File) validate() error {
 			return fmt.Errorf("applications[%d]: %w", i, err)
 		}
 		if seen[app.Name] {
-			return fmt.Errorf("applications[%d]: duplicate application name %q", i, app.Name)
+			return fmt.Errorf("applications[%d]: duplicate application name '%s'", i, app.Name)
 		}
 		seen[app.Name] = true
 
@@ -174,7 +174,7 @@ func (f *File) validate() error {
 		// it, which is where a name collision belongs.
 		if c := app.Source.Chart; c != nil {
 			if other, taken := claimed[c.Release]; taken {
-				return fmt.Errorf("applications[%d]: %q and %q both declare the release %q, and a release name is the Swarm stack namespace, so they would share one stack", i, other, app.Name, c.Release)
+				return fmt.Errorf("applications[%d]: '%s' and '%s' both declare the release '%s', and a release name is the Swarm stack namespace, so they would share one stack", i, other, app.Name, c.Release)
 			}
 			claimed[c.Release] = app.Name
 		}
@@ -187,41 +187,41 @@ func validateApplication(app application.Spec) error {
 		return errors.New("name is required")
 	}
 	if !nameRE.MatchString(app.Name) {
-		return fmt.Errorf("invalid name %q: lowercase letters, digits, dot, dash and underscore only, starting with a letter or digit", app.Name)
+		return fmt.Errorf("invalid name '%s': lowercase letters, digits, dot, dash and underscore only, starting with a letter or digit", app.Name)
 	}
 	if !app.DriftDetection.Valid() {
-		return fmt.Errorf("%q: unsupported driftDetection %q, this build implements %q and %q",
+		return fmt.Errorf("'%s': unsupported driftDetection '%s', this build implements '%s' and '%s'",
 			app.Name, app.DriftDetection, application.DriftManifest, application.DriftLive)
 	}
 	if app.RegistryAuth != "" && !secretNameRE.MatchString(app.RegistryAuth) {
-		return fmt.Errorf("%q: invalid registryAuth %q: it names a Docker secret, so letters, digits, dot, dash and underscore only", app.Name, app.RegistryAuth)
+		return fmt.Errorf("'%s': invalid registryAuth '%s': it names a Docker secret, so letters, digits, dot, dash and underscore only", app.Name, app.RegistryAuth)
 	}
 	if err := validateAllow(app.Allow); err != nil {
-		return fmt.Errorf("%q: %w", app.Name, err)
+		return fmt.Errorf("'%s': %w", app.Name, err)
 	}
 	if err := validateSource(app.Source); err != nil {
-		return fmt.Errorf("%q: %w", app.Name, err)
+		return fmt.Errorf("'%s': %w", app.Name, err)
 	}
 	if app.SyncPolicy.Interval < 0 || app.SyncPolicy.Timeout < 0 {
-		return fmt.Errorf("%q: syncPolicy interval and timeout cannot be negative", app.Name)
+		return fmt.Errorf("'%s': syncPolicy interval and timeout cannot be negative", app.Name)
 	}
 	// Nil is "not set", which means the default; only a number written down can
 	// be wrong. An explicit 0 is legal and means keep every revision.
 	if app.SyncPolicy.HistoryMax != nil && *app.SyncPolicy.HistoryMax < 0 {
-		return fmt.Errorf("%q: syncPolicy historyMax cannot be negative", app.Name)
+		return fmt.Errorf("'%s': syncPolicy historyMax cannot be negative", app.Name)
 	}
 	// Refused rather than ignored. Obeying half of a destructive instruction is
 	// the wrong failure mode in both directions: taken as "prune with volumes"
 	// it deletes data nobody asked to lose, and taken as "prune nothing" it
 	// leaves an operator believing cleanup is on when it is not.
 	if app.SyncPolicy.PruneVolumes && !app.SyncPolicy.Prune {
-		return fmt.Errorf("%q: syncPolicy pruneVolumes means nothing without prune", app.Name)
+		return fmt.Errorf("'%s': syncPolicy pruneVolumes means nothing without prune", app.Name)
 	}
 	// pruneFirst orders both prunes — the release sweep and the resource sweep —
 	// so either gate gives it something to order. pruneResources needs no gate of
 	// its own: it is a sibling of prune rather than an extension of it.
 	if app.SyncPolicy.PruneFirst && !app.SyncPolicy.Prune && !app.SyncPolicy.PruneResources {
-		return fmt.Errorf("%q: syncPolicy pruneFirst means nothing without prune or pruneResources", app.Name)
+		return fmt.Errorf("'%s': syncPolicy pruneFirst means nothing without prune or pruneResources", app.Name)
 	}
 	return nil
 }
@@ -247,9 +247,9 @@ func validateAllow(a application.Allow) error {
 		case p == "":
 			return fmt.Errorf("allow.hostPaths[%d] is empty", i)
 		case !path.IsAbs(p):
-			return fmt.Errorf("allow.hostPaths[%d] %q must be absolute: it names a path on whichever node runs the task, so there is nothing for a relative one to resolve against", i, p)
+			return fmt.Errorf("allow.hostPaths[%d] '%s' must be absolute: it names a path on whichever node runs the task, so there is nothing for a relative one to resolve against", i, p)
 		case path.Clean(p) != p:
-			return fmt.Errorf("allow.hostPaths[%d] %q is not written in its simplest form; use %q", i, p, path.Clean(p))
+			return fmt.Errorf("allow.hostPaths[%d] '%s' is not written in its simplest form; use '%s'", i, p, path.Clean(p))
 		}
 	}
 	for _, kind := range []struct {
@@ -263,7 +263,7 @@ func validateAllow(a application.Allow) error {
 	} {
 		for i, name := range kind.names {
 			if !allowNameRE.MatchString(name) {
-				return fmt.Errorf("%s[%d]: invalid name %q: it is compared against a name on the swarm, so letters, digits, dot, dash and underscore only, starting with a letter or digit", kind.field, i, name)
+				return fmt.Errorf("%s[%d]: invalid name '%s': it is compared against a name on the swarm, so letters, digits, dot, dash and underscore only, starting with a letter or digit", kind.field, i, name)
 			}
 		}
 	}
@@ -320,10 +320,10 @@ func validateChart(c application.ChartSource) error {
 			return errors.New("source.chart.version is required with a ref: an unpinned chart would silently upgrade on the next reconcile")
 		}
 		if !strings.Contains(c.Ref, "/") {
-			return fmt.Errorf("invalid source.chart.ref %q, want repository/chart", c.Ref)
+			return fmt.Errorf("invalid source.chart.ref '%s', want repository/chart", c.Ref)
 		}
 		if len(c.Repositories) == 0 {
-			return fmt.Errorf("source.chart.ref %q needs source.chart.repositories to resolve it", c.Ref)
+			return fmt.Errorf("source.chart.ref '%s' needs source.chart.repositories to resolve it", c.Ref)
 		}
 
 	default:
@@ -339,7 +339,7 @@ func validateChart(c application.ChartSource) error {
 		// the same check over a release file's own repositories, which never
 		// pass through here.
 		if !application.ValidRepositoryName(r.Name) {
-			return fmt.Errorf("source.chart.repositories[%d]: invalid name %q: it becomes a file in the chart cache, so letters, digits, dot, dash and underscore only, starting with a letter or digit", i, r.Name)
+			return fmt.Errorf("source.chart.repositories[%d]: invalid name '%s': it becomes a file in the chart cache, so letters, digits, dot, dash and underscore only, starting with a letter or digit", i, r.Name)
 		}
 	}
 	for i, v := range c.Values {
@@ -359,11 +359,11 @@ func repoPath(field, p string) error {
 		return fmt.Errorf("%s is required", field)
 	}
 	if path.IsAbs(p) {
-		return fmt.Errorf("%s %q must be relative to the repository root", field, p)
+		return fmt.Errorf("%s '%s' must be relative to the repository root", field, p)
 	}
 	clean := path.Clean(p)
 	if clean == ".." || strings.HasPrefix(clean, "../") {
-		return fmt.Errorf("%s %q escapes the repository", field, p)
+		return fmt.Errorf("%s '%s' escapes the repository", field, p)
 	}
 	return nil
 }

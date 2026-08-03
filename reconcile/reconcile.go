@@ -345,7 +345,7 @@ func (r *Reconciler) Add(spec application.Spec) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.apps[spec.Name]; ok {
-		return fmt.Errorf("application %q already present", spec.Name)
+		return fmt.Errorf("application '%s' already present", spec.Name)
 	}
 	r.noteInterval(spec)
 	e := newEntry(spec)
@@ -365,7 +365,7 @@ func (r *Reconciler) Replace(spec application.Spec) error {
 	defer r.mu.Unlock()
 	e, ok := r.apps[spec.Name]
 	if !ok {
-		return fmt.Errorf("no such application %q", spec.Name)
+		return fmt.Errorf("no such application '%s'", spec.Name)
 	}
 	r.noteInterval(spec)
 	e.spec = spec
@@ -430,7 +430,7 @@ func (r *Reconciler) Remove(name string) error {
 	e, ok := r.apps[name]
 	if !ok {
 		r.mu.Unlock()
-		return fmt.Errorf("no such application %q", name)
+		return fmt.Errorf("no such application '%s'", name)
 	}
 	delete(r.apps, name)
 	// With the entry goes the credential: a name that returns to the set later
@@ -1539,7 +1539,7 @@ func (r *Reconciler) entry(app string) (*appEntry, error) {
 	if e, ok := r.apps[app]; ok {
 		return e, nil
 	}
-	return nil, fmt.Errorf("no such application %q", app)
+	return nil, fmt.Errorf("no such application '%s'", app)
 }
 
 // Sync reconciles one application now, applying if its policy allows.
@@ -1634,7 +1634,7 @@ func (r *Reconciler) sync(ctx context.Context, e *appEntry, force bool) error {
 func (r *Reconciler) reconcile(ctx context.Context, e *appEntry, force bool) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			err = fmt.Errorf("panic reconciling %q: %v", e.name, p)
+			err = fmt.Errorf("panic reconciling '%s': %v", e.name, p)
 			// The stack is the only thing that makes a recovered panic
 			// diagnosable, and it is not in the error because the error is what
 			// the status endpoint publishes.
@@ -2120,14 +2120,14 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 				return err
 			}
 			if err := backend.DeployStack(ctx, charts.DeployRequest{Name: rp.Name, Manifest: manifests[rp.Name], Resolve: ""}); err != nil {
-				errs = append(errs, fmt.Errorf("converging release %q: %w", rp.Name, err))
+				errs = append(errs, fmt.Errorf("converging release '%s': %w", rp.Name, err))
 				continue
 			}
 			scope := correcting(live[rp.Name])
 			if err := r.awaitConverged(ctx, spec, backend, rp.Name, scope); err != nil {
 				// Deployed but not settled. Not counted as converged: the write
 				// landed, the correction did not finish, and the sync says so.
-				errs = append(errs, fmt.Errorf("converging release %q: %w", rp.Name, err))
+				errs = append(errs, fmt.Errorf("converging release '%s': %w", rp.Name, err))
 				continue
 			}
 			scopes[rp.Name] = scope
@@ -2308,7 +2308,7 @@ func (r *Reconciler) awaitSettled(ctx context.Context, spec application.Spec, ba
 			case charts.PhaseWedged:
 				// Swarm has given up and will not continue on its own, so waiting
 				// out the deadline would only delay the same answer.
-				return fmt.Errorf("release %q did not converge: %s", release, c.Reason)
+				return fmt.Errorf("release '%s' did not converge: %s", release, c.Reason)
 			case charts.PhaseConverged:
 			default:
 				pending = append(pending, release)
@@ -2333,11 +2333,11 @@ func (r *Reconciler) awaitSettled(ctx context.Context, spec application.Spec, ba
 // one, so nothing reading that text has to change.
 func releaseList(releases []string) string {
 	if len(releases) == 1 {
-		return fmt.Sprintf("release %q", releases[0])
+		return fmt.Sprintf("release '%s'", releases[0])
 	}
 	quoted := make([]string, 0, len(releases))
 	for _, release := range releases {
-		quoted = append(quoted, fmt.Sprintf("%q", release))
+		quoted = append(quoted, fmt.Sprintf("'%s'", release))
 	}
 	return "releases " + strings.Join(quoted, ", ")
 }
@@ -2405,7 +2405,7 @@ func (r *Reconciler) prune(ctx context.Context, spec application.Spec, backend c
 			Target:   swarms.Target{Swarm: spec.Destination.Swarm},
 		})
 		if err != nil {
-			errs = append(errs, fmt.Errorf("pruning release %q: %w", release, err))
+			errs = append(errs, fmt.Errorf("pruning release '%s': %w", release, err))
 			continue
 		}
 		pruned = append(pruned, release)
@@ -2489,7 +2489,7 @@ func (r *Reconciler) pruneServices(ctx context.Context, spec application.Spec, b
 		}
 		for _, svc := range doomed[release].services {
 			if err := remover.RemoveService(ctx, svc.id); err != nil {
-				errs = append(errs, fmt.Errorf("pruning service %q of release %q: %w", svc.name, release, err))
+				errs = append(errs, fmt.Errorf("pruning service '%s' of release '%s': %w", svc.name, release, err))
 				continue
 			}
 			removed = append(removed, svc.name)
@@ -2601,7 +2601,7 @@ func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec appli
 					"application", spec.Name, "release", release,
 					"kind", string(res.kind), "resource", res.name, "error", err,
 					"attempt", counts[pruneKey(release, res)], "limit", maxPruneAttempts)
-				errs = append(errs, fmt.Errorf("pruning %s %q of release %q: %w", res.kind, res.name, release, err))
+				errs = append(errs, fmt.Errorf("pruning %s '%s' of release '%s': %w", res.kind, res.name, release, err))
 				continue
 			}
 			// Cleared, not merely left alone: a resource that went on the fourth
@@ -2913,7 +2913,7 @@ func (r *Reconciler) Diffs(app string) ([]application.ReleaseDiff, error) {
 	r.mu.RUnlock()
 
 	if !ok {
-		return nil, fmt.Errorf("no such application %q", app)
+		return nil, fmt.Errorf("no such application '%s'", app)
 	}
 	if plan == nil {
 		return nil, application.ErrNotPlanned
@@ -2942,7 +2942,7 @@ func (r *Reconciler) History(ctx context.Context, app string) (application.Histo
 	r.mu.RUnlock()
 
 	if !ok {
-		return application.History{}, fmt.Errorf("no such application %q", app)
+		return application.History{}, fmt.Errorf("no such application '%s'", app)
 	}
 	if plan == nil {
 		return application.History{}, application.ErrNotPlanned
@@ -2965,7 +2965,7 @@ func (r *Reconciler) History(ctx context.Context, app string) (application.Histo
 				out.Releases = append(out.Releases, application.ReleaseHistory{Name: rp.Name})
 				continue
 			}
-			return application.History{}, fmt.Errorf("reading the history of release %q: %w", rp.Name, err)
+			return application.History{}, fmt.Errorf("reading the history of release '%s': %w", rp.Name, err)
 		}
 		out.Releases = append(out.Releases, application.ReleaseHistory{Name: rp.Name, Revisions: revisions(revs)})
 	}

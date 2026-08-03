@@ -49,7 +49,7 @@ func runHealthcheck(args []string, stdout, stderr io.Writer) int {
 		return usageErr(stderr, err.Error(), healthcheckUsage)
 	}
 	if fs.NArg() > 0 {
-		return usageErr(stderr, fmt.Sprintf("unexpected argument %q", fs.Arg(0)), healthcheckUsage)
+		return usageErr(stderr, fmt.Sprintf("unexpected argument '%s'", fs.Arg(0)), healthcheckUsage)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)

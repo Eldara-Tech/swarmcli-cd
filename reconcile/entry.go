@@ -155,7 +155,7 @@ func newEntry(spec application.Spec) *appEntry {
 // the check is repeated after the wait because the wait is where it happens.
 func (e *appEntry) acquire(ctx context.Context) (context.Context, func(), error) {
 	if err := e.ctx.Err(); err != nil {
-		return nil, nil, fmt.Errorf("reconciling %q: %w", e.name, err)
+		return nil, nil, fmt.Errorf("reconciling '%s': %w", e.name, err)
 	}
 
 	select {
@@ -163,12 +163,12 @@ func (e *appEntry) acquire(ctx context.Context) (context.Context, func(), error)
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
 	case <-e.ctx.Done():
-		return nil, nil, fmt.Errorf("reconciling %q: %w", e.name, e.ctx.Err())
+		return nil, nil, fmt.Errorf("reconciling '%s': %w", e.name, e.ctx.Err())
 	}
 
 	if err := e.ctx.Err(); err != nil {
 		<-e.held
-		return nil, nil, fmt.Errorf("reconciling %q: %w", e.name, err)
+		return nil, nil, fmt.Errorf("reconciling '%s': %w", e.name, err)
 	}
 
 	work, cancel := context.WithCancel(ctx)
@@ -198,7 +198,7 @@ func (e *appEntry) drain(d time.Duration) error {
 		<-e.held
 		return nil
 	case <-timer.C:
-		return fmt.Errorf("%q was cancelled but is %w after %s", e.name, errStillSyncing, d)
+		return fmt.Errorf("'%s' was cancelled but is %w after %s", e.name, errStillSyncing, d)
 	}
 }
 

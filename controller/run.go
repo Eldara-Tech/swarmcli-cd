@@ -150,7 +150,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 		return usageErr(stderr, err.Error(), controllerUsage)
 	}
 	if fs.NArg() > 0 {
-		return usageErr(stderr, fmt.Sprintf("unexpected argument %q", fs.Arg(0)), controllerUsage)
+		return usageErr(stderr, fmt.Sprintf("unexpected argument '%s'", fs.Arg(0)), controllerUsage)
 	}
 	// --config always has a value, so "the operator set it" is a question only
 	// the flag set can answer. It matters because pointing the controller at a
@@ -247,7 +247,7 @@ func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {
 	case "error":
 		lvl = slog.LevelError
 	default:
-		return nil, fmt.Errorf("--log-level %q: want debug, info, warn or error", level)
+		return nil, fmt.Errorf("--log-level '%s': want debug, info, warn or error", level)
 	}
 
 	opts := &slog.HandlerOptions{Level: lvl}
@@ -257,7 +257,7 @@ func newLogger(w io.Writer, level, format string) (*slog.Logger, error) {
 	case "json":
 		return slog.New(slog.NewJSONHandler(w, opts)), nil
 	}
-	return nil, fmt.Errorf("--log-format %q: want text or json", format)
+	return nil, fmt.Errorf("--log-format '%s': want text or json", format)
 }
 
 // serve wires the packages together and runs until ctx ends or a component
@@ -270,7 +270,7 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// load because that load may now be a clone of a remote repository, and
 	// spending its timeout before refusing for an unrelated reason helps nobody.
 	if err := authz.Get().Ready(); err != nil {
-		return fmt.Errorf("authorizer %q: %w", authz.Active(), err)
+		return fmt.Errorf("authorizer '%s': %w", authz.Active(), err)
 	}
 
 	// So that an operator can tell from the logs whether the companion loaded,

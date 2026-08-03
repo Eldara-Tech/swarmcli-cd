@@ -77,7 +77,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprint(stdout, usage)
 		return 0
 	default:
-		return usageErr(stderr, fmt.Sprintf("unknown command %q", args[0]), usage)
+		return usageErr(stderr, fmt.Sprintf("unknown command '%s'", args[0]), usage)
 	}
 }
 

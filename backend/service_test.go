@@ -642,7 +642,7 @@ func TestCreateFailureStopsTheApply(t *testing.T) {
 	st := stack("s", cdService{"a", spec("x")}, cdService{"b", spec("y")})
 
 	err := testBackend(t, api, nil).ApplyServices(context.Background(), st, ResolveNever)
-	if err == nil || !strings.Contains(err.Error(), `service "s_a"`) {
+	if err == nil || !strings.Contains(err.Error(), `service 's_a'`) {
 		t.Fatalf("err = %v, want the failing service named", err)
 	}
 	if api.calls != 1 {
