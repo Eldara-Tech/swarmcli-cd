@@ -57,6 +57,14 @@ func (f *fakeFetcher) count() int {
 	return f.calls
 }
 
+// setErr changes what Fetch does from here on, so a test can break an
+// application and then mend it while its loop is running.
+func (f *fakeFetcher) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
 type fakeBuilder struct{ err error }
 
 func (f *fakeBuilder) Build(context.Context, string, application.Source, git.Checkout) (*source.Built, error) {
@@ -833,6 +841,90 @@ func TestBackoff(t *testing.T) {
 	// A long interval must not overflow into a negative duration.
 	if got := backoff(24*time.Hour, 20); got != maxBackoff {
 		t.Errorf("long interval = %v, want the cap", got)
+	}
+}
+
+// The backoff is evidence about the spec that earned it, so replacing the spec
+// must not leave the application waiting it out. It is the one piece of held
+// state Replace could not clear while it was a local of loop, and the one that
+// decides how long a correction takes to land: the longer an application had
+// been broken, the longer its own fix was parked (#160).
+func TestReplaceWakesALoopOutOfItsBackoff(t *testing.T) {
+	fetcher := &fakeFetcher{revision: strings.Repeat("a", 40), err: errors.New("repository unreachable")}
+	r := New([]application.Spec{spec("edge", true)}, Options{
+		Fetcher:   fetcher,
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{},
+		NewEngine: func(charts.Backend) Engine { return &fakeEngine{plans: []*charts.Plan{synced()}} },
+		// Long enough that no timer this test arms can expire during it, so the
+		// second reconcile below is the wake and cannot be a tick.
+		Interval: time.Hour,
+		Log:      discardLog(),
+		Now:      func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+
+	// One failure parks the loop for two hours.
+	waitFor(t, "the first reconcile to fail", func() bool { return fetcher.count() == 1 })
+	fetcher.setErr(nil)
+
+	next := spec("edge", true)
+	next.Source.RepoURL = "https://example.com/replaced.git"
+	if err := r.Replace(next); err != nil {
+		t.Fatalf("Replace = %v", err)
+	}
+
+	waitFor(t, "the replaced spec to be reconciled without waiting out the backoff", func() bool {
+		return fetcher.count() >= 2
+	})
+	if v, _ := r.View("edge"); v.Status.Error != "" {
+		t.Errorf("the application still reports the failure of the spec it replaced: %s", v.Status.Error)
+	}
+}
+
+// And the count with it. The wake alone gets the corrected spec reconciled at
+// once; clearing the count is what stops a correction that does not work first
+// time resuming at the old spec's exponent — thirty minutes rather than six.
+func TestReplaceClearsTheFailureCount(t *testing.T) {
+	r := newTest(t, []application.Spec{spec("edge", true)}, &fakeEngine{}, nil)
+	e := r.apps["edge"]
+
+	if got := r.noteFailure(e, errors.New("first")); got != 1 {
+		t.Fatalf("first failure counted as %d, want 1", got)
+	}
+	if got := r.noteFailure(e, errors.New("second")); got != 2 {
+		t.Fatalf("second failure counted as %d, want 2", got)
+	}
+
+	if err := r.Replace(spec("edge", true)); err != nil {
+		t.Fatalf("Replace = %v", err)
+	}
+
+	if got := r.noteFailure(e, errors.New("the replaced spec fails too")); got != 1 {
+		t.Errorf("the first failure after a Replace counted as %d, want 1: the replaced spec's failures are still being counted", got)
+	}
+	if got := r.noteFailure(e, nil); got != 0 {
+		t.Errorf("a success left the count at %d, want 0", got)
+	}
+}
+
+// An application that has left the set writes nothing. Its loop is already
+// cancelled, and the entry it would be counting against is no longer the one its
+// name resolves to.
+func TestNoteFailureIgnoresADepartedApplication(t *testing.T) {
+	r := newTest(t, []application.Spec{spec("edge", true)}, &fakeEngine{}, nil)
+	e := r.apps["edge"]
+
+	if err := r.Remove("edge"); err != nil {
+		t.Fatalf("Remove = %v", err)
+	}
+	if got := r.noteFailure(e, errors.New("too late")); got != 0 {
+		t.Errorf("a departed application counted a failure as %d, want 0", got)
+	}
+	if e.failures != 0 {
+		t.Errorf("the departed entry's count was written to: %d", e.failures)
 	}
 }
 

@@ -79,6 +79,13 @@ Options:
   --listen <addr>   API listen address (default ` + defaultListen + `)
   --data <dir>      Repository clones and chart cache (default ` + defaultDataDir + `)
 
+  --reconcile-interval <dur>
+                    How often an application is reconciled, for those that do
+                    not set syncPolicy.interval (default ` + reconcile.DefaultInterval.String() + `). Every tick
+                    costs a git fetch, a full render and a read of the swarm's
+                    release records, so lowering it costs all three per
+                    application
+
 The application set is the mounted --config file unless one of these points it
 somewhere that can change without a redeploy. Which one is set selects the mode;
 setting both, or either alongside an explicit --config, is an error.
@@ -131,6 +138,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.configPath, "config", defaultConfigPath, "")
 	fs.StringVar(&o.listen, "listen", defaultListen, "")
 	fs.StringVar(&o.dataDir, "data", defaultDataDir, "")
+	fs.DurationVar(&o.interval, "reconcile-interval", reconcile.DefaultInterval, "")
 	fs.StringVar(&o.appSetRepo, "appset-repo", "", "")
 	fs.StringVar(&o.appSetRevision, "appset-revision", "", "")
 	fs.StringVar(&o.appSetDir, "appset-dir", "", "")
@@ -199,6 +207,13 @@ type options struct {
 	configPath string
 	listen     string
 	dataDir    string
+
+	// interval is how often an application that names no syncPolicy.interval is
+	// reconciled. Controller-wide and deliberately not floored by
+	// application.MinInterval, unlike the per-application one: the app set is the
+	// untrusted tier and this is set by whoever runs the controller, who is
+	// entitled to say how hard their own machine works. See reconcile.intervalFor.
+	interval time.Duration
 
 	// The app-set selectors. Which of appSetRepo and appSetDir is set chooses
 	// the mode; neither leaves the mounted configPath, which is what every
@@ -358,6 +373,7 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		RegistryAuth:          resolvers,
 		ForbiddenSecretMounts: forbidden,
 		ControllerID:          o.controllerID,
+		Interval:              o.interval,
 		Log:                   log,
 	})
 
@@ -500,6 +516,11 @@ func (o options) validate() error {
 		// Not silently defaulted: an operator writing 0 means something by it,
 		// and "never re-read" is not a thing this controller can do.
 		return errors.New("--appset-interval must be positive")
+	case o.interval <= 0:
+		// The same judgement, and the same reason: reconcile.New treats a
+		// non-positive interval as "use the default", so accepting one here would
+		// silently give an operator three minutes where they asked for none.
+		return errors.New("--reconcile-interval must be positive")
 	case application.ValidateControllerID(o.controllerID) != nil:
 		return fmt.Errorf("--controller-id: %w", application.ValidateControllerID(o.controllerID))
 	case o.pruneVolumes && !o.prune:

@@ -374,6 +374,13 @@ func (r *Reconciler) Replace(spec application.Spec) error {
 	// longer evidence about this one. Held state that survived an edit meant to
 	// fix it would need a manual sync to shift, which is the wrong way round.
 	e.unstable, e.unstableReleases = "", nil
+	// The backoff is that state too, and until #160 it was the one piece this
+	// could not reach — it lived in the loop. So the count goes with the hold,
+	// and the loop is woken rather than merely retuned: an application that had
+	// failed four times was parked for thirty minutes, and the edit correcting it
+	// waited them out. The argument above with nothing left over.
+	e.failures = 0
+	e.poke()
 	return nil
 }
 
@@ -1436,32 +1443,63 @@ func asDeclared(states []charts.ServiceState, rd *application.ReleaseDrift) []st
 //
 // It runs on the entry's context, so it stops when the application is removed
 // and when the controller does, through the same cancel.
+//
+// A poke short-circuits whatever wait it is in, because that wait is a backoff
+// earned by a spec this loop is no longer reconciling. Without it the one edit
+// that could fix a failing application was the one thing that could not shorten
+// its backoff — the timer is a local here, so clearing the count Replace can now
+// reach would still leave the current window running — and the wait grows with
+// how long the mistake went unnoticed, which is the shape appset.Loop.Run
+// rejects one tier up for the same reason (#160).
 func (r *Reconciler) loop(e *appEntry) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
-	failures := 0
 	for {
 		select {
 		case <-e.ctx.Done():
 			return
 		case <-timer.C:
+		case <-e.wake:
+			// Nothing to stop or drain. The Reset at the bottom is the only place
+			// this loop's schedule is set, and since Go 1.23 a timer channel holds
+			// no value for a fire nobody was waiting on — so the timer still armed
+			// from the old schedule cannot deliver a tick after this one.
 		}
 
-		if err := r.sync(e.ctx, e, false); err != nil {
-			// A cancelled context is a shutdown, not a failure to back off
-			// from.
-			if e.ctx.Err() != nil {
-				return
-			}
-			failures++
+		err := r.sync(e.ctx, e, false)
+		// A cancelled context is a shutdown, not a failure to back off from.
+		if err != nil && e.ctx.Err() != nil {
+			return
+		}
+		failures := r.noteFailure(e, err)
+		if err != nil {
 			r.log.Error("reconcile failed", "application", e.name, "failures", failures, "error", err)
-		} else {
-			failures = 0
 		}
 
 		timer.Reset(backoff(r.intervalFor(r.currentSpec(e)), failures))
 	}
+}
+
+// noteFailure records how one reconcile went and returns how many have failed in
+// a row, which is what the loop's backoff is computed from. A success clears the
+// count, and so does Replace.
+//
+// An application that has left the set counts nothing and reports none: its loop
+// is already cancelled, and the entry it would be writing to is no longer the one
+// that name resolves to.
+func (r *Reconciler) noteFailure(e *appEntry, err error) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.currentLocked(e) {
+		return 0
+	}
+	if err == nil {
+		e.failures = 0
+	} else {
+		e.failures++
+	}
+	return e.failures
 }
 
 // intervalFor is how long this application waits between ticks: its own
