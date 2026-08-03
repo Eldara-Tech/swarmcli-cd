@@ -1,0 +1,103 @@
+name: govulncheck
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install govulncheck
+        # govulncheck statically type-checks targets with the go/types of the
+        # toolchain it was *built* with; a binary built with an older Go cannot
+        # analyze this module and silently scans nothing. Build it with the
+        # module's own toolchain (read from go.mod, stays in sync on bumps).
+        run: |
+          GOTOOLCHAIN=$(awk '/^toolchain /{print $2}' go.mod) \
+            go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+
+      - name: Run govulncheck
+        # GO-2026-4887 and GO-2026-4883 are Docker daemon-side vulnerabilities
+        # (AuthZ plugin handler, plugin privilege validation), and GO-2026-5668
+        # is the docker cp race that creates empty files. This controller drives
+        # a daemon over the client API; it never runs those paths.
+        # Fixed in: N/A — docker/docker@v28.5.2 is the latest release with no
+        # upstream fix available. govulncheck has no native ignore flag, so the
+        # JSON output is filtered to suppress only these known false-positives.
+        run: |
+          python3 - <<'PYEOF'
+          import subprocess, sys, json
+
+          SUPPRESSED = {"GO-2026-4883", "GO-2026-4887", "GO-2026-5668"}
+
+          # -format json exits 0 and streams JSON; vulnerability data is in the stream.
+          proc = subprocess.run(
+              ["govulncheck", "-format", "json", "./..."],
+              capture_output=True, text=True,
+          )
+
+          # Parse the pretty-printed JSON stream (one object per message).
+          # raw_decode is string-aware; counting braces instead desynchronises on
+          # the first unmatched '{' inside advisory text or a symbol name, and
+          # the swallowed decode error then drops every later finding -- passing
+          # a vulnerable module as "no vulnerabilities found".
+          text, decoder, pos = proc.stdout, json.JSONDecoder(), 0
+          symbol_vulns, saw_config = set(), False
+          while True:
+              while pos < len(text) and text[pos].isspace():
+                  pos += 1
+              if pos >= len(text):
+                  break
+              try:
+                  obj, pos = decoder.raw_decode(text, pos)
+              except ValueError:
+                  sys.stderr.write(proc.stderr)
+                  print("govulncheck emitted unparsable JSON at offset %d -- "
+                        "refusing to report a clean scan" % pos)
+                  sys.exit(1)
+              if 'config' in obj:
+                  saw_config = True
+              if obj.get('finding'):
+                  f = obj['finding']
+                  osv = f.get('osv', '')
+                  # Symbol-level finding: trace has a frame with a function
+                  if osv and any('function' in fr for fr in f.get('trace', [])):
+                      symbol_vulns.add(osv)
+
+          # Fail loudly if govulncheck errored instead of scanning. A silent
+          # exit-0 here previously masked broken runs (e.g. a govulncheck built
+          # with an older Go toolchain emitting "requires newer Go version" and
+          # exiting 0) as "no vulnerabilities found".
+          LOAD_ERR = ("loading packages", "requires newer Go version",
+                      "toolchain not available", "no go.mod file")
+          blob = proc.stderr + proc.stdout
+          if (proc.returncode != 0 or not saw_config
+                  or any(s in blob for s in LOAD_ERR)):
+              sys.stderr.write(proc.stderr)
+              print("govulncheck did not analyze any packages "
+                    "(exit %d, config=%s) -- see stderr above"
+                    % (proc.returncode, saw_config))
+              sys.exit(proc.returncode or 1)
+
+          unexpected = symbol_vulns - SUPPRESSED
+          if unexpected:
+              subprocess.run(["govulncheck", "./..."])
+              sys.exit(1)
+
+          if symbol_vulns:
+              print("govulncheck: suppressed", len(symbol_vulns),
+                    "daemon false-positive(s):", sorted(symbol_vulns))
+          else:
+              print("govulncheck: no vulnerabilities found.")
+          PYEOF
