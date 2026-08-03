@@ -3,16 +3,17 @@
 GitOps continuous delivery for Docker Swarm — reconcile your swarm from Git, the
 way Argo CD does for Kubernetes.
 
-> **Status: Phase 2, release candidates.** The pull loop works end to end —
+> **Status: Phase 2, first stable release.** The pull loop works end to end —
 > fetch, render, plan, diff, apply, prune, drift detection and health — and is
 > exercised against a real swarm by the integration tests. `driftDetection:
 > live` has landed: a `docker service update` made behind the controller's back
-> is seen, and on an automated application corrected. So has app-of-apps, which
-> puts the application set itself in git. Webhook triggers and sync waves are
-> the rest of Phase 2; the licensed companion is Phase 3. Everything tagged so
-> far is a **release candidate**, so expect rough edges and pin the tag you
-> deploy: `:latest` never moves to a prerelease, so no such image tag exists
-> yet. The design, decisions and phase plan live in
+> is seen, and on an automated application corrected. So have app-of-apps, which
+> puts the application set itself in git, and sync waves, which order the
+> releases within an application. Webhook triggers are the rest of Phase 2; the
+> licensed companion is Phase 3. **`v1.0.0` is the first stable tag**, so
+> `:latest` now resolves to a release and `stack.yml` works as written — pin the
+> tag you deploy anyway if you would rather choose when you upgrade. The design,
+> decisions and phase plan live in
 > [issue #1](https://github.com/Eldara-Tech/swarmcli-cd/issues/1).
 >
 > **New here?** Start with the [getting-started guide](docs/getting-started.md).
