@@ -394,7 +394,7 @@ When and how a plan is applied.
 | Field | Default | |
 |---|---|---|
 | `automated` | `false` | `true` reconciles **and applies** on a schedule. `false` is manual: the controller still reconciles and reports drift, but applies only on an explicit `swarmcli-cd app sync`. "Manual" means "not on a schedule", not "never". |
-| `interval` | controller default (3m) | how often to reconcile this application, as a duration string (`90s`, `5m`) |
+| `interval` | [`--reconcile-interval`](#flags) (3m) | how often to reconcile this application, as a duration string (`90s`, `5m`). Floored at 10s and clamped rather than refused — the app set is the untrusted tier, so a number here is held to a floor that the controller-wide flag is not |
 | `wait` | `false` | block each release until its services converge, and — when the service declares `update_config.failure_action: rollback` — let Swarm roll it back on a failed rollout. It is **not** what orders releases; see [sync waves](#sync-waves) |
 | `timeout` | engine default (5m) | how long a rollout may take before it is given up on. It bounds `wait`, and it bounds each wave boundary — which happens whether or not `wait` is set |
 | `historyMax` | `10` | revisions kept per release (one Docker config each); older revisions are pruned after a deploy that succeeded. An explicit `0` keeps every revision, which is what the chart engine has always read the number as — and, on a controller deploying on a timer, a slow leak into the manager's raft log |
@@ -1249,6 +1249,7 @@ line that shows exactly what the controller is following is worth having in
 | `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config. Static mode |
 | `--listen` | `:8080` | API listen address |
 | `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume so a restart does not re-clone everything. An application that leaves the set has both reclaimed, one app-set interval after it goes |
+| `--reconcile-interval` | `3m` | how often an application that sets no [`syncPolicy.interval`](#syncpolicy-optional) is reconciled. Every tick is a git fetch, a full render and a read of the swarm's release records, per application. Unlike the per-application field it has no floor: the app set is the untrusted tier, and this one is set by whoever runs the controller |
 | `--appset-repo` | — | pull the app set from this repository. Selects **git** mode |
 | `--appset-revision` | — | branch, tag or SHA to track. Required with `--appset-repo`; an unpinned app set would follow whatever the default branch happens to point at |
 | `--appset-dir` | — | read the app set from a directory something else keeps current. Selects **path** mode |

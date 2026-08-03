@@ -226,6 +226,7 @@ func TestAppSetModeFollowsTheSelectors(t *testing.T) {
 func TestAppSetSelectorsAreValidated(t *testing.T) {
 	valid := func(o options) options {
 		o.appSetInterval = appset.DefaultInterval
+		o.interval = reconcile.DefaultInterval
 		if o.controllerID == "" {
 			o.controllerID = application.DefaultControllerID
 		}
@@ -244,6 +245,7 @@ func TestAppSetSelectorsAreValidated(t *testing.T) {
 		{"a revision with no repository", valid(options{appSetRevision: "main"}), "--appset-revision"},
 		{"a path with no source", valid(options{appSetPath: "applications.yaml"}), "--appset-path"},
 		{"an interval of zero", options{appSetDir: "/var/lib/appset", controllerID: application.DefaultControllerID}, "--appset-interval"},
+		{"a reconcile interval of zero", options{appSetDir: "/var/lib/appset", appSetInterval: appset.DefaultInterval, controllerID: application.DefaultControllerID}, "--reconcile-interval"},
 		{"a controller id with a slash", valid(options{controllerID: "a/b"}), "--controller-id"},
 		{"a controller id with a colon", valid(options{controllerID: "a:b"}), "--controller-id"},
 		{"volumes without prune", valid(options{pruneVolumes: true}), "--prune-volumes"},
@@ -403,6 +405,42 @@ func TestControllerHelpNamesTheAppSetFlags(t *testing.T) {
 		if !strings.Contains(stdout.String(), flagName) {
 			t.Errorf("stdout = %q, want it to name %s", stdout.String(), flagName)
 		}
+	}
+}
+
+// Every application that names no syncPolicy.interval of its own runs on this
+// one, and until #160 nothing could set it: the app set is the untrusted tier,
+// so an operator wanting the whole controller to reconcile faster had to write
+// the number into every application in it.
+func TestControllerTakesAReconcileInterval(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run = %d, want 0", code)
+	}
+	if !strings.Contains(stdout.String(), "--reconcile-interval") {
+		t.Errorf("stdout = %q, want it to name --reconcile-interval", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	// Zero is refused rather than defaulted: reconcile.New reads a non-positive
+	// interval as "use the default", so accepting it would hand an operator who
+	// asked for none the three-minute one. Asserted on the refusal's own words,
+	// because a flag that was never registered is also a usage error naming the
+	// flag — which is what this test used to accept.
+	if code := run([]string{"controller", "--reconcile-interval", "0", "--data", t.TempDir()}, &stdout, &stderr); code != 2 {
+		t.Errorf("run = %d, want 2 for an interval of zero", code)
+	}
+	if !strings.Contains(stderr.String(), "--reconcile-interval must be positive") {
+		t.Errorf("stderr = %q, want the refusal to say --reconcile-interval must be positive", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	// And a duration it accepts gets past the usage layer. This fails later, on
+	// the unconfigured authorizer, which is exit 1 rather than 2.
+	if code := run([]string{"controller", "--reconcile-interval", "90s", "--data", t.TempDir()}, &stdout, &stderr); code == 2 {
+		t.Errorf("run = 2 (%s), want --reconcile-interval 90s to be accepted", stderr.String())
 	}
 }
 

@@ -89,6 +89,17 @@ type appEntry struct {
 	// the one already waiting rather than each redeploying the swarm in turn.
 	pending chan struct{}
 
+	// wake asks the loop to reconcile now rather than when its timer says so,
+	// because the evidence its schedule rests on is no longer about this
+	// application. Capacity one and never blocking, so a poke from under
+	// Reconciler.mu cannot stall on a loop that is busy.
+	//
+	// It exists because clearing the failure count below is not enough on its
+	// own: the timer is already armed for a window the count had earned, and it
+	// is a local of loop that nothing else can reach. So an edit that fixed a
+	// failing application waited out the spec it replaced. See #160.
+	wake chan struct{}
+
 	spec   application.Spec
 	status application.Status
 	// plan is the last plan for this application so the diff endpoint can be
@@ -103,6 +114,16 @@ type appEntry struct {
 	// ever; see checkReproducible.
 	unstable         string
 	unstableReleases []string
+
+	// failures counts the reconciles that have failed in a row, and is what the
+	// loop's backoff is computed from.
+	//
+	// Here rather than in loop, where it was, because it is held state about a
+	// spec rather than about the goroutine: Replace clears it for exactly the
+	// reason it clears unstable above, and while it was a local nothing outside
+	// the loop could. An application that had failed four times sat on a
+	// thirty-minute backoff, and the edit correcting it waited that out (#160).
+	failures int
 
 	// pruneFailures counts consecutive failed deletions of one resource, keyed
 	// by pruneKey, and is the whole of what makes maxPruneAttempts possible: a
@@ -138,8 +159,22 @@ func newEntry(spec application.Spec) *appEntry {
 		cancel:  cancel,
 		held:    make(chan struct{}, 1),
 		pending: make(chan struct{}, 1),
+		wake:    make(chan struct{}, 1),
 		spec:    spec,
 		status:  application.Status{Sync: application.Sync{State: application.SyncUnknown}},
+	}
+}
+
+// poke asks the loop to reconcile now rather than at the time it is waiting for.
+//
+// Dropped rather than queued when one is already waiting: two pokes before the
+// loop has looked are one thing to tell it, and the loop reads the current spec
+// when it wakes, so the second has nothing to add. Never blocks, because the
+// caller holds Reconciler.mu and the loop takes it to read that spec.
+func (e *appEntry) poke() {
+	select {
+	case e.wake <- struct{}{}:
+	default:
 	}
 }
 
