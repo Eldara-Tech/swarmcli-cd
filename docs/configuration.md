@@ -1280,18 +1280,22 @@ Messages the controller writes name things in single quotes for that reason —
 `"` would arrive as `\"` in the middle of every line, which is the encoding
 doing its job on a character we chose to put there.
 
-Errors raised by the CE libraries the controller wraps are not written here and
-still use `"`, so a failure originating in the chart engine — resolving a chart,
-rendering a template — arrives escaped:
+Backslashes have not gone away entirely, because not every error in a line is
+written here. Anything the controller *wraps* keeps whatever quoting its author
+chose, and Go's own `net/http` renders a URL that way — so a repository the
+controller cannot reach arrives escaped whatever this end does:
 
 ```
-error="planning: release 'swarm-cronjob': chart \"swarm-cronjob\" version \"0.1.2\" not found"
+error="fetching source: cloning https://git.example.com/x.git: Get \"https://git.example.com/x.git/info/refs?service=git-upload-pack\": dial tcp: connect: connection refused"
 ```
 
-That is the format working, not a fault. `--log-format json` is the option for
-anything that parses rather than reads — a log shipper will unescape it back —
-but note it escapes `"` exactly as logfmt does, so it does not make those lines
-any easier to read.
+The rule is about which half of the line is ours: `\"` around something the
+controller is itself telling you about is a bug worth reporting, `\"` inside a
+sentence another package wrote is the encoding working.
+
+`--log-format json` is the option for anything that parses rather than reads — a
+log shipper will unescape it back — but note it escapes `"` exactly as logfmt
+does, so it does not make either kind of line easier to read.
 
 ### Environment
 

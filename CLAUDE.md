@@ -74,6 +74,12 @@ working, but it is our `"` it is escaping; single quotes cost the encoding
 nothing and read the same. That is issue #157, and it is why this repository
 diverges from CE, which uses `%q` throughout.
 
+This does not make the log backslash-free, and should not be sold as if it did:
+a wrapped error keeps its author's quoting, and `net/http` renders a URL as
+`Get "…"`, so an unreachable repository still arrives escaped. What the rule
+buys is that `\"` around something *this* controller is reporting is now a bug
+rather than the normal state.
+
 `%q` also escaped control characters, and dropping it does not reopen anything:
 on the log path slog escapes them whatever the message did, and on the terminal
 path the surrounding text was never escaped anyway — `app.go` prints a status
