@@ -86,6 +86,28 @@ const (
 	// ActionSync triggers a reconcile that applies whatever the plan contains.
 	// The only action that writes.
 	ActionSync Action = "sync"
+	// ActionController is the controller and the build themselves, as distinct
+	// from the applications they reconcile: where the app set is sourced from,
+	// how many applications there are in total, why a load was refused, the
+	// version, the licence, and which seam implementation is loaded behind each
+	// seam.
+	//
+	// Its own action because none of that is a per-application fact, so Visible
+	// cannot narrow it the way it narrows a list of names — and because
+	// ActionRead is the widest action this API has and the one an authorizer
+	// implementing projects hands to ordinary tenants. A tenant scoped to one
+	// project has no business reading the repository the whole fleet is
+	// deployed from, the total number of applications in it, the build number,
+	// or a map of the modules loaded into a process holding the docker socket.
+	//
+	// **Refusing it is not a 403.** The two endpoints that ask are still
+	// reachable with ActionRead and answer a narrowed document, because a
+	// browser reads both on every screen — the list screen shows the app set's
+	// shape and the shell reads the capability report to decide what to draw.
+	// That is also what makes this action safe to have added: an authorizer
+	// that predates it refuses it, as this type's contract requires, and gets
+	// less disclosed rather than a screen that stopped working.
+	ActionController Action = "controller"
 )
 
 // Authorizer gates every API request.

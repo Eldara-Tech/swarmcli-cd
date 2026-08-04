@@ -6,9 +6,14 @@ package authz
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	gotoken "go/token"
+	"io/fs"
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -134,14 +139,72 @@ func TestAuthenticateAcceptsAnySchemeCase(t *testing.T) {
 
 // The default authorises everything it authenticates; finer scoping is the
 // Business Edition's job.
+//
+// Over the actions read out of this package's own source rather than a list
+// written here. What this test exists to catch is an action added later, and a
+// literal only ever checks what somebody remembered to add to it — while the
+// failure it would miss is silent by construction: a free build that quietly
+// refuses one thing a licensed build allows, on the one authorizer nobody
+// configures.
 func TestAuthorizeAllowsEverything(t *testing.T) {
 	tok := newToken(env(map[string]string{EnvToken: "s3cret"}), files(nil))
 
-	for _, act := range []Action{ActionRead, ActionDiff, ActionHistory, ActionSync} {
+	declared := declaredActions(t)
+	if len(declared) < 4 {
+		t.Fatalf("found %d Action constants in this package's source; the scan has stopped matching", len(declared))
+	}
+	for name, act := range declared {
 		if err := tok.Authorize(context.Background(), Subject{Name: "admin"}, act, "edge"); err != nil {
-			t.Errorf("Authorize(%s) = %v, want nil", act, err)
+			t.Errorf("Authorize(%s = %q) = %v, want nil", name, act, err)
 		}
 	}
+}
+
+// declaredActions is every Action constant this package declares, by constant
+// name and wire value.
+func declaredActions(t *testing.T) map[string]Action {
+	t.Helper()
+
+	fset := gotoken.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatalf("parsing this package: %v", err)
+	}
+
+	out := map[string]Action{}
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			for _, decl := range file.Decls {
+				gen, ok := decl.(*ast.GenDecl)
+				if !ok || gen.Tok != gotoken.CONST {
+					continue
+				}
+				for _, spec := range gen.Specs {
+					value, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					if ident, ok := value.Type.(*ast.Ident); !ok || ident.Name != "Action" {
+						continue
+					}
+					for i, name := range value.Names {
+						lit, ok := value.Values[i].(*ast.BasicLit)
+						if !ok || lit.Kind != gotoken.STRING {
+							t.Fatalf("%s is an Action constant this scan cannot read", name.Name)
+						}
+						unquoted, err := strconv.Unquote(lit.Value)
+						if err != nil {
+							t.Fatalf("%s: %v", name.Name, err)
+						}
+						out[name.Name] = Action(unquoted)
+					}
+				}
+			}
+		}
+	}
+	return out
 }
 
 func TestDefaultIsRegistered(t *testing.T) {

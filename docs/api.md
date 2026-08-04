@@ -59,23 +59,36 @@ curl -H "Authorization: Bearer $SWARMCLI_CD_ADMIN_TOKEN" \
 ```
 
 The default authorizer checks one shared token and grants every action there is:
-`read` (the status, list, detail and event-stream endpoints), `diff`, `history`
-and `sync` (the `POST`). Those are four rather than two so that a licensed
-authorizer can grant one and not another — a diff is the rendered manifest and a
-history is a walk of the swarm's stored revisions, which are a different
-disclosure from a list row. With one shared token there is one subject and the
-distinction makes no difference. A missing or wrong token is `401`. The
+`read` (the status, list, detail and event-stream endpoints), `diff`, `history`,
+`sync` (the `POST`) and `controller`. Those are five rather than two so that a
+licensed authorizer can grant one and not another — a diff is the rendered
+manifest and a history is a walk of the swarm's stored revisions, which are a
+different disclosure from a list row. With one shared token there is one subject
+and the distinction makes no difference. A missing or wrong token is `401`. The
 controller refuses to start with no token configured at all, so a `401` always
 means the token was presented and rejected, never that auth was off. SSO, per-user
 identity and RBAC are a licensed capability; see
 [extensibility.md](extensibility.md).
 
-The two endpoints that answer about every application are **narrowed rather than
+The endpoints that answer about every application are **narrowed rather than
 gated**: `GET /api/v1/applications` returns only the applications the caller may
-see, and `/api/v1/events` delivers only their events. With one shared token that
-is all of them; an authorizer implementing projects is what makes it fewer, and
-an authorizer that cannot answer refuses the request rather than serving the
-whole collection.
+see, `/api/v1/events` delivers only their events, and `GET /api/v1/status`
+reports only the caller's own applications in its three name lists. With one
+shared token that is all of them; an authorizer implementing projects is what
+makes it fewer, and an authorizer that cannot answer refuses the request rather
+than serving the whole collection.
+
+`controller` is the fifth action and the odd one out: it is not about any
+application, so there is nothing for the narrowing above to narrow. It covers
+the facts that belong to the controller and the build rather than to what they
+reconcile — where the app set is sourced from, how many applications there are
+in total, why a load was refused, the version, the licence, and which
+implementation is loaded behind each seam. `GET /api/v1/status` and
+`GET /api/v1/capabilities` are the two endpoints that carry any of it, and both
+stay reachable with `read`: a subject the authorizer will not grant `controller`
+gets the same document with those fields removed, not a `403`. That is
+deliberate — a browser reads both on every load, and an authorizer written
+before this action existed refuses it, as the contract requires.
 
 `/healthz` takes no credential on purpose: a container healthcheck runs beside
 the process and cannot carry one without putting it in the stack file and in
@@ -188,6 +201,14 @@ looks like for the first pass or two (see
 `applications` counts what is actually being reconciled, which is not always what
 the last loaded file declares.
 
+All three name lists are narrowed to the applications the caller may see, so a
+tenant scoped to one project does not read the names of applications in another.
+The rest of the document above — `source`, `revision`, `error` and
+`applications` — is the `controller` action's. A subject without it reads `mode`,
+`loadedAt`, `stale` and the narrowed lists, an `applications` count of what it
+can see, and, when the set really has an error, a sentence saying so without the
+names. Nothing changes for the default authorizer, which grants everything.
+
 ### List — `GET /api/v1/applications`
 
 An object wrapping the array, so the response stays an object if fields are ever
@@ -298,7 +319,9 @@ carries `"start": "/auth/login"`, a typed-in credential carries nothing. The
 list comes from the authorizer, so a deployment that has moved to SSO stops
 offering a box for a credential it no longer issues.
 
-The capability document is guarded by `read`:
+The capability document is reachable with `read` and split at `controller` —
+`version`, `licence` and `seams` are the latter's, and are absent or empty for a
+subject that is not granted it:
 
 ```json
 {
@@ -319,7 +342,12 @@ linked — which is a different thing from a licensed build with no licence
 installed, which reports a status of `absent`; the other four statuses are
 `valid`, `grace` (expired, still granting, renew before it stops), `expired` and
 `invalid`. `seams` is the startup `seams` log line, readable by an operator who
-has the token but not the logs.
+has the token but not the logs — which is also why it is behind `controller`: it
+names every implementation loaded into a process holding the docker socket,
+companion modules included, and `version` is the build number that
+`bootstrap.json` deliberately withholds from an unauthenticated caller. What a
+subject without `controller` keeps is `edition` and `features`, because that is
+what a UI decides what to draw from.
 
 ## Event stream — `GET /api/v1/events`
 
