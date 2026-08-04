@@ -13,12 +13,12 @@ import type { ReleaseStatus, ServiceDrift } from '../api/types'
  * tree says whether what is running is working, this says whether it is what
  * git asked for. A release with nothing to report renders nothing at all.
  *
- * It differs from controller/app.go's printDrift in one place, deliberately: a
- * release whose drift state is "unknown" is rendered here even though it has no
+ * A release whose drift state is "unknown" is rendered even though it has no
  * services and no resources to list. That state is the record that the question
  * was asked and went unanswered, and a release whose live state could not be
  * read is not converged — so silence would read as "nothing to report", which
- * is the opposite of what it means.
+ * is the opposite of what it means. controller/app.go's printDrift did read it
+ * as nothing to report; that was #199, and the two now agree.
  */
 export function DriftPanel({ releases }: { releases: ReleaseStatus[] }) {
   const drifted = releases.filter(hasFindings)

@@ -23,6 +23,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/client"
+	"github.com/Eldara-Tech/swarmcli-cd/drift"
 )
 
 // start runs the real API server over rec and returns the address that points
@@ -867,6 +868,147 @@ func TestAppGetOmitsDriftWhenNotUsed(t *testing.T) {
 	}
 	if strings.Contains(stdout, "Drift") {
 		t.Errorf("stdout = %q, want no drift line for a manifest-mode application", stdout)
+	}
+}
+
+// unreadView is a release whose live state could not be read: no findings, and
+// a message saying why. The rollup is computed rather than written out, because
+// which release it ends up naming is the whole point of the test below.
+func unreadView() application.View {
+	v := syncedView()
+	v.Status.Releases[0].Drift = &application.ReleaseDrift{
+		State:   application.DriftStateUnknown,
+		Message: "reading services: Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+	}
+	v.Status.Drift = drift.Application(v.Status.Releases)
+	return v
+}
+
+// A release with no findings is not necessarily a release that converged. One
+// that could not be read has nothing to list and everything to say, and the
+// reconciler will not converge drift it could not read — so an operator who is
+// shown nothing waits for a correction that is never coming (#199).
+func TestAppGetShowsAReleaseWhoseLiveStateCouldNotBeRead(t *testing.T) {
+	server := start(t, &stubReconciler{view: unreadView()})
+
+	code, stdout, stderr := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	for _, want := range []string{"web drift:", "unknown", "Cannot connect to the Docker daemon"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+	// The sentence goes under the heading, not into a cell: there are no
+	// findings to tabulate, and a REASON column wide enough for a daemon error
+	// would wreck every other release's table.
+	if strings.Contains(stdout, "KIND") {
+		t.Errorf("stdout = %q, want no findings table for a release with no findings", stdout)
+	}
+}
+
+// The case the application line cannot cover. Detected outranks Unknown in the
+// rollup deliberately — a difference that was found leads — so the one message
+// that line carries names the drifted release, and the unread one is left with
+// this section as its only surface. Both are reported, and the rollup is not
+// touched: a header saying "unknown" when a service demonstrably does not match
+// would be the same bug facing the other way.
+func TestAppGetNamesAnUnreadReleaseBesideADriftedOne(t *testing.T) {
+	v := driftedView()
+	unread := v.Status.Releases[0]
+	unread.Name = "cache"
+	unread.Sync = application.SyncSynced
+	unread.Services = nil
+	unread.Drift = &application.ReleaseDrift{
+		State:   application.DriftStateUnknown,
+		Message: "reading services: context deadline exceeded",
+	}
+	v.Status.Releases = append(v.Status.Releases, unread)
+	v.Status.Drift = drift.Application(v.Status.Releases)
+	server := start(t, &stubReconciler{view: v})
+
+	code, stdout, stderr := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	for _, want := range []string{
+		"Drift        detected",
+		"web drift:", "web_nginx", "modified",
+		"cache drift:", "unknown", "context deadline exceeded",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+}
+
+// The two halves of one record, which reconcile.withOrphans produces: a release
+// whose manifest would not resolve — a config it mounts, deleted by hand — loses
+// its field comparison, and the sweep over the same release still finds services
+// the repository no longer declares. The findings carry the state to Detected
+// with the failed read's message still on it, and printing the table alone would
+// serve a partial answer as a whole one.
+func TestAppGetSaysWhatCouldNotBeComparedBesideWhatWasFound(t *testing.T) {
+	v := driftedView()
+	v.Status.Releases[0].Drift = &application.ReleaseDrift{
+		State:    application.DriftStateDetected,
+		Message:  "converting the manifest: config 'web_settings' not found",
+		Services: []application.ServiceDrift{{Name: "web_sidecar", Reason: application.DriftUnexpected, Orphaned: true}},
+	}
+	v.Status.Drift = drift.Application(v.Status.Releases)
+	server := start(t, &stubReconciler{view: v})
+
+	code, stdout, _ := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{
+		"web drift:", "config 'web_settings' not found",
+		"web_sidecar", "unexpected (orphaned)",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+}
+
+// An unknown state with no message still says the question went unanswered,
+// which is the whole of what the section is for. Nothing here produces one —
+// every unknown this controller writes carries the error that caused it — but a
+// newer controller's payload or a companion backend could, and the state alone
+// is worth the line. The separator is what has nothing to separate.
+func TestAppGetReportsAnUnknownDriftStateWithNoMessage(t *testing.T) {
+	v := unreadView()
+	v.Status.Releases[0].Drift.Message = ""
+	server := start(t, &stubReconciler{view: v})
+
+	code, stdout, _ := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	// Matched whole, because the thing being asserted is what is *not* there:
+	// the state alone, with no dangling separator behind it.
+	if !strings.Contains(stdout, "web drift:\n  unknown\n") {
+		t.Errorf("stdout = %q, want the release named with its state and nothing after it", stdout)
+	}
+}
+
+// The other release with no findings, and the one that genuinely has nothing to
+// report: compared, and converged. It prints no section at all, which is what
+// the rest of a converged application does.
+func TestAppGetOmitsAReleaseThatWasComparedAndMatched(t *testing.T) {
+	v := syncedView()
+	v.Status.Releases[0].Drift = &application.ReleaseDrift{State: application.DriftStateNone}
+	v.Status.Drift = drift.Application(v.Status.Releases)
+	server := start(t, &stubReconciler{view: v})
+
+	code, stdout, _ := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if strings.Contains(stdout, " drift:") {
+		t.Errorf("stdout = %q, want no drift section for a release that matches", stdout)
 	}
 }
 

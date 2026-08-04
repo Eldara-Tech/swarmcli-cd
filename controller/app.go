@@ -438,10 +438,19 @@ func spansWaves(releases []application.ReleaseStatus) bool {
 //
 // Separate from the service tables above because it answers a different
 // question: those say whether what is running is working, this says whether it
-// is what git asked for. A release with nothing to report prints nothing.
+// is what git asked for. A release with nothing to report prints nothing — and
+// that is only a release that was compared and converged, or one that was not
+// compared at all.
+//
+// A release whose state is Unknown has no findings and is emphatically not one
+// of those: it is the record that the question was asked and went unanswered,
+// and the reconciler will not converge drift it could not read. Skipping it for
+// having no rows was #199. The application line above prints one such message,
+// but it prints the *worst* release — Detected outranks Unknown in the rollup —
+// so an unread release beside a drifted one had nothing anywhere naming it.
 func printDrift(out io.Writer, releases []application.ReleaseStatus) {
 	for _, r := range releases {
-		if r.Drift == nil || (len(r.Drift.Services) == 0 && len(r.Drift.Resources) == 0) {
+		if r.Drift == nil || r.Drift.State == application.DriftStateNone {
 			continue
 		}
 		rows := make([][]string, 0, len(r.Drift.Services)+len(r.Drift.Resources))
@@ -468,6 +477,24 @@ func printDrift(out io.Writer, releases []application.ReleaseStatus) {
 			rows = append(rows, []string{string(res.Kind), res.Name, "unexpected (orphaned)", "", "", ""})
 		}
 		_, _ = fmt.Fprintf(out, "\n%s drift:\n", r.Name)
+		if len(rows) == 0 {
+			// The state and its message are the whole record. Said as a sentence
+			// rather than a one-row table for the reason printRollbacks gives:
+			// this message is a daemon's account of a read that failed, and a
+			// cell wide enough for one would be a table of nothing else.
+			_, _ = fmt.Fprintf(out, "  %s%s\n", state(r.Drift.State), driftMessage(r.Drift.Message))
+			continue
+		}
+		// A record can carry both, and the message is then a caveat on the table
+		// rather than the record: a sweeping application whose manifest would not
+		// resolve — a config a settled release mounts, deleted by hand — loses its
+		// field comparison and still reports the orphans the sweep found, so the
+		// state reads Detected with the failed read's message still on it. What
+		// follows is what was found; this line is what could not be looked for.
+		// Without it the table reads as the whole answer.
+		if r.Drift.Message != "" {
+			_, _ = fmt.Fprintf(out, "  %s\n", r.Drift.Message)
+		}
 		table(out, []string{"KIND", "NAME", "REASON", "FIELD", "DESIRED", "LIVE"}, rows)
 		printRollbacks(out, r.Drift.Services)
 	}
