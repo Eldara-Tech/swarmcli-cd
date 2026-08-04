@@ -17,6 +17,12 @@ export default defineConfig({
   // A smoke run that needs retries to pass is a smoke run that is not telling
   // anybody anything.
   retries: 0,
+  // Four times the default, because the walkthrough waits for a real stack to
+  // deploy on a real swarm before it can watch the application converge. That
+  // is a wait for something that genuinely takes a while, not a wait for a race
+  // to come out the right way — which is why the number moved and `retries`
+  // did not.
+  timeout: 120_000,
   reporter: 'list',
   use: {
     baseURL: 'http://127.0.0.1:8080',

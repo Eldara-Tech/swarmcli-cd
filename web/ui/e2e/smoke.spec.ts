@@ -12,13 +12,26 @@ import { expect, test } from '@playwright/test'
 // at the end of Phase B is deliberate: discovering any of them later means
 // bisecting four merged pull requests.
 //
-// It grows one assertion per screen as the screens land. What it must not grow
-// into is a second component suite: anything provable against a faked fetch
-// belongs in Vitest, where it costs no swarm.
+// It grew one assertion per screen as the screens landed and is now the whole of
+// acceptance criterion 5 (#176): log in, watch an application go from
+// out-of-sync to synced with no page reload, read its diff, read its history,
+// press sync, and see the event arrive. What it must not grow into is a second
+// component suite: anything provable against a faked fetch belongs in Vitest,
+// where it costs no swarm.
 
 const adminToken = process.env.SWARMCLI_CD_ADMIN_TOKEN ?? ''
 
-test('logs in, renders the shell, reads the API and receives an event', async ({ page }) => {
+// The marker a reload would destroy.
+//
+// "Without a page reload" is the half of the criterion that has no natural
+// assertion: every check below passes just as well on a page that reloaded
+// itself between them, and a reload is exactly what a UI polling with
+// location.reload() would do. So the run stamps the window once, after login,
+// and reads it back at the end — client-side navigation between the tabs keeps
+// it, and nothing else in this test can.
+const marker = '__swarmcliCdSmokeLoadId'
+
+test('logs in, watches an application converge without reloading, and reads every screen', async ({ page }) => {
   expect(adminToken, 'SWARMCLI_CD_ADMIN_TOKEN must name the token the controller was started with')
     .not.toBe('')
 
@@ -47,6 +60,13 @@ test('logs in, renders the shell, reads the API and receives an event', async ({
 
   // The shell.
   await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible()
+
+  // Stamped here rather than before the login, because signing in is the last
+  // thing on this path that legitimately could have replaced the document.
+  await page.evaluate((key) => {
+    const w = window as unknown as Record<string, unknown>
+    w[key] = 'stamped'
+  }, marker)
 
   // The free build reads community, and draws none of the licensed shells for
   // it. The badge is the one to check by its absence rather than its text:
@@ -89,6 +109,13 @@ test('logs in, renders the shell, reads the API and receives an event', async ({
   // fixture could not.
   await page.getByRole('link', { name: 'smoke' }).click()
 
+  // The detail header, which is the thing the assertion at the bottom of this
+  // test watches change. Read before the sync so that "went from out-of-sync to
+  // synced" is two observations of the same element rather than one observation
+  // and an assumption.
+  const syncChip = page.locator('.header-chips .chip').first()
+  await expect(syncChip).toHaveText('out-of-sync')
+
   // The engine's own rendering, reaching the colouriser. jsdom proves the
   // parser against strings this repository wrote; only this proves it against
   // the manifest the chart engine actually produces.
@@ -125,6 +152,25 @@ test('logs in, renders the shell, reads the API and receives an event', async ({
   await expect(page.getByTestId('sync-outcome')).toContainText('accepted')
 
   await expect(page.getByTestId('live-last')).toContainText('smoke')
+
+  // The criterion this test exists for, and the only assertion here that
+  // exercises the whole chain end to end: the controller finishes the install,
+  // raises sync-succeeded, the stream this page is holding open delivers it,
+  // api/queries.ts turns it into an invalidation, react-query refetches the
+  // detail, and the chip re-renders. Nothing was pressed and nothing was
+  // reloaded — a break anywhere along it leaves this chip reading out-of-sync
+  // for ever.
+  //
+  // Generously timed rather than retried. What is being waited for is a real
+  // stack deploy on a real swarm; the default five seconds would make this
+  // assert that a swarm is fast, and a smoke run that needs a retry to pass is
+  // telling nobody anything.
+  await expect(syncChip).toHaveText('synced', { timeout: 90_000 })
+
+  // And the document is the one the login produced. Read last, because what it
+  // has to cover is everything above it.
+  const survived = await page.evaluate((key) => (window as unknown as Record<string, unknown>)[key], marker)
+  expect(survived, 'the page reloaded: the convergence above was a fresh load, not a live update').toBe('stamped')
 
   expect(refusals, 'the browser refused something the policy in web.go forbids').toEqual([])
 })
