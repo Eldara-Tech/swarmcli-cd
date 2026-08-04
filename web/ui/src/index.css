@@ -201,3 +201,362 @@ code {
   color: var(--danger);
   margin: 0;
 }
+
+/* Shared by the screens --------------------------------------------------- */
+
+.shell-nav {
+  display: flex;
+  gap: 0.9rem;
+  font-size: 0.95rem;
+}
+
+.shell-nav a {
+  text-decoration: none;
+}
+
+.nav-current {
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.screen-header {
+  align-items: baseline;
+  display: flex;
+  gap: 0.75rem;
+}
+
+.screen-header h1 {
+  font-size: 1.5rem;
+  margin: 0;
+}
+
+.screen-header p {
+  color: var(--ink-muted);
+  margin: 0;
+}
+
+.header-chips,
+.card-chips {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.crumb {
+  margin: 0 0 0.5rem;
+}
+
+.muted {
+  color: var(--ink-muted);
+}
+
+.empty {
+  color: var(--ink-muted);
+}
+
+/* Long free text — a repository URL, a reconcile error, a daemon message —
+   wraps rather than stretching its container. Every one of them is a string
+   this UI does not choose the length of. */
+.wrap {
+  overflow-wrap: anywhere;
+}
+
+/* The dash a question that was never asked renders as. Muted rather than
+   coloured: it is not a finding, and the whole point is that it must not read
+   like one. */
+.not-asked {
+  color: var(--ink-muted);
+}
+
+.chip {
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  display: inline-block;
+  font-size: 0.8rem;
+  padding: 0.05rem 0.5rem;
+  white-space: nowrap;
+}
+
+.chip-good {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chip-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.chip-bad {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.chip-busy {
+  border-color: var(--ink-muted);
+  color: var(--ink-muted);
+}
+
+.chip-muted {
+  color: var(--ink-muted);
+}
+
+/* The notices ------------------------------------------------------------- */
+
+/* Deliberately four appearances rather than one component with a colour prop:
+   the three app-set failures have to be distinguishable at a glance, and the
+   loudest — a set that has never loaded — must not look like the quietest. */
+.notice {
+  border: 1px solid var(--edge);
+  border-radius: 0.3rem;
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+}
+
+.notice h2 {
+  font-size: 1.05rem;
+  margin: 0 0 0.35rem;
+}
+
+.notice p,
+.notice ul {
+  margin: 0.35rem 0;
+}
+
+.notice-reason {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+}
+
+/* Nothing loaded: the only block on any screen with a filled background and a
+   heavy rule, because it is the only state where the screen above it is empty
+   for a reason nothing on the screen can show. */
+.notice-never-loaded {
+  background: var(--panel);
+  border: 1px solid var(--danger);
+  border-left: 0.4rem solid var(--danger);
+}
+
+.notice-never-loaded h2 {
+  color: var(--danger);
+  font-size: 1.3rem;
+}
+
+/* Stale: a rule down the side, no fill. Something is running and it is the
+   wrong version of something. */
+.notice-stale {
+  border-left: 0.4rem solid var(--warn);
+}
+
+.notice-stale h2 {
+  color: var(--warn);
+}
+
+/* Partial: outline only, no side rule. The set loaded; part of it did not
+   land. Its own class rather than a shared "warning" one, so that the three
+   app-set shapes stay the only things wearing these three appearances.
+   notice-reconcile is the detail screen's stale-document banner, which is a
+   different finding that happens to want the same weight. */
+.notice-partial,
+.notice-reconcile {
+  border-color: var(--warn);
+}
+
+.notice-blocking {
+  background: var(--panel);
+  border: 1px solid var(--danger);
+  border-left: 0.4rem solid var(--danger);
+}
+
+.notice-blocking h2 {
+  color: var(--danger);
+}
+
+/* Not a failure at all, so it carries none of the three treatments above. */
+.notice-unwired {
+  color: var(--ink-muted);
+}
+
+/* The applications list --------------------------------------------------- */
+
+.filters {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1rem 0;
+}
+
+.filters label {
+  color: var(--ink-muted);
+  font-size: 0.85rem;
+}
+
+.filters input,
+.filters select,
+.view-toggle {
+  background: var(--page);
+  border: 1px solid var(--edge);
+  border-radius: 0.25rem;
+  color: inherit;
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.25rem 0.4rem;
+}
+
+.view-toggle {
+  cursor: pointer;
+  margin-left: auto;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th {
+  text-align: left;
+}
+
+thead th {
+  border-bottom: 1px solid var(--edge);
+  color: var(--ink-muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+td,
+tbody th {
+  border-bottom: 1px solid var(--edge);
+  font-weight: normal;
+  padding: 0.4rem 0.6rem 0.4rem 0;
+  vertical-align: top;
+}
+
+thead th {
+  padding: 0.3rem 0.6rem 0.3rem 0;
+}
+
+/* The row whose every other cell is the last successful observation. A left
+   rule rather than a background: the cells still have to be readable, because
+   they are still the most recent thing anybody knows. */
+.row-stale th[scope='row'] {
+  border-left: 0.25rem solid var(--danger);
+  padding-left: 0.4rem;
+}
+
+.app-cards {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.4rem;
+  height: 100%;
+  padding: 0.75rem 1rem;
+}
+
+.card-stale {
+  border-left: 0.25rem solid var(--danger);
+}
+
+.card h2 {
+  font-size: 1.1rem;
+  margin: 0 0 0.4rem;
+}
+
+.card-fields,
+.detail-fields {
+  display: grid;
+  gap: 0.15rem 0.75rem;
+  grid-template-columns: max-content 1fr;
+  margin: 0.5rem 0;
+}
+
+.card-fields dt,
+.detail-fields dt {
+  color: var(--ink-muted);
+  font-size: 0.85rem;
+}
+
+.card-fields dd,
+.detail-fields dd {
+  margin: 0;
+  min-width: 0;
+}
+
+.reconcile-errors {
+  border-top: 1px solid var(--edge);
+  margin-top: 1.5rem;
+  padding-top: 0.5rem;
+}
+
+.reconcile-errors h2 {
+  color: var(--danger);
+  font-size: 1rem;
+  margin: 0;
+}
+
+/* The application detail -------------------------------------------------- */
+
+.tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.tree-release {
+  border-left: 2px solid var(--edge);
+  margin: 0.75rem 0;
+  padding-left: 0.9rem;
+}
+
+.tree-head {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.tree-head h3 {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+.drift-panel h2,
+.name-list h2 {
+  font-size: 1.15rem;
+  margin: 1.5rem 0 0.25rem;
+}
+
+.drift-release h3 {
+  font-size: 1rem;
+  margin: 1rem 0 0.25rem;
+}
+
+.drift-more td {
+  color: var(--ink-muted);
+}
+
+.drift-note,
+.drift-message {
+  color: var(--ink-muted);
+  font-size: 0.9rem;
+  margin: 0.4rem 0;
+  overflow-wrap: anywhere;
+}
+
+.drift-rollback {
+  color: var(--ink);
+}
+
+.name-list ul {
+  margin: 0.25rem 0;
+}

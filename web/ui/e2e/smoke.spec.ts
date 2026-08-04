@@ -42,6 +42,15 @@ test('logs in, renders the shell, reads the API and receives an event', async ({
   // guarded endpoint that would answer 401 without it.
   await expect(page.getByTestId('application-count')).toHaveText(/application/)
 
+  // The list itself, not just its count: a row for the fixture application,
+  // carrying the link the detail screen hangs off. It reads out-of-sync because
+  // smoke.yml declares syncPolicy.automated: false — the startup pass plans the
+  // install and stops, which is also what leaves the sync below with real work
+  // to raise an event about.
+  await expect(
+    page.getByRole('row').filter({ has: page.getByRole('link', { name: 'smoke' }) }),
+  ).toContainText('out-of-sync')
+
   // The stream: a real connection, held open, parsed off a real ReadableStream.
   await expect(page.getByTestId('live-state')).toHaveText('live')
 
