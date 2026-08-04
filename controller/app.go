@@ -6,6 +6,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -36,6 +37,10 @@ Commands:
 Options:
   --server <url>       Controller to talk to (default $` + client.EnvServer + `,
                        or ` + client.DefaultServer + `)
+  --ca-cert <path>     PEM certificate to trust for an https --server (default
+                       $` + client.EnvCACert + `). Needed for a self-signed
+                       certificate, which is what a controller given --tls-cert
+                       usually presents
   -o, --output <fmt>   text or json (default text). json is the controller's
                        own response, unmodified
   --wait               sync: wait for the sync to finish, and exit non-zero if
@@ -83,6 +88,7 @@ func appCommand(sub string, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("app "+sub, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	server := fs.String("server", "", "")
+	caCert := fs.String("ca-cert", "", "")
 	output := fs.String("output", "text", "")
 	fs.StringVar(output, "o", "text", "")
 	wait := fs.Bool("wait", false, "")
@@ -116,7 +122,11 @@ func appCommand(sub string, args []string, stdout, stderr io.Writer) int {
 	}
 
 	token, tokenErr := authz.TokenFromEnv(os.Getenv, os.ReadFile)
-	c := client.New(resolveServer(*server, os.Getenv), token)
+	c, err := client.NewWithOptions(resolveServer(*server, os.Getenv), token,
+		client.Options{CACert: resolveCACert(*caCert, os.Getenv)})
+	if err != nil {
+		return fail(stderr, err)
+	}
 	ctx := context.Background()
 
 	var runErr error
@@ -166,10 +176,31 @@ func resolveServer(flagValue string, getenv func(string) string) string {
 	return client.DefaultServer
 }
 
+// resolveCACert prefers the flag, then the environment, then the system pool.
+//
+// The same precedence as resolveServer, and deliberately the same shape: the
+// two are set together — stack.yml's TLS example exports both — so a second
+// precedence rule in this package would be one an operator has to remember.
+func resolveCACert(flagValue string, getenv func(string) string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	return getenv(client.EnvCACert)
+}
+
 // explain turns a rejected request into something actionable. A 401 with no
 // token configured is a different problem from a 401 with the wrong one, and
 // only the API can tell the caller which of the two it saw.
 func explain(err error, tokenErr error) error {
+	// A certificate this client would not accept otherwise arrives as a raw
+	// x509 sentence inside a URL error, naming no remedy at all — and it is
+	// what an operator meets the first time --server points at a controller
+	// running the self-signed certificate stack.yml's TLS example deploys.
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return fmt.Errorf("%w: pass --ca-cert, or set %s, to the certificate that signed it", err, client.EnvCACert)
+	}
+
 	var apiErr *client.Error
 	if !errors.As(err, &apiErr) {
 		return err

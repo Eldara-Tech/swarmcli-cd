@@ -977,57 +977,85 @@ func TestTheApiDoesNotImportTheReconciler(t *testing.T) {
 
 // --- event stream ---
 
+// The h2 row is the cheap companion to D23's drain test. A TLS listener
+// negotiates HTTP/2 whether or not anyone intended it — Server.ServeTLS calls
+// setupHTTP2_ServeTLS — and the event stream is the only handler whose
+// behaviour differs under it, since h2 does its own framing and flow control
+// over one multiplexed connection. A stream that buffered rather than delivered
+// under h2 would reach a browser as a UI that never updates.
 func TestEventStreamDeliversWhatTheNotifierIsGiven(t *testing.T) {
-	s, h := testServer(t, &fakeReconciler{}, nil)
-	srv := httptest.NewServer(h)
-	defer srv.Close()
+	for _, tc := range []struct {
+		name      string
+		h2        bool
+		wantProto string
+	}{
+		{"HTTP/1.1", false, "HTTP/1.1"},
+		{"HTTP/2 over TLS", true, "HTTP/2.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, h := testServer(t, &fakeReconciler{}, nil)
+			srv := httptest.NewUnstartedServer(h)
+			if tc.h2 {
+				srv.EnableHTTP2 = true
+				srv.StartTLS()
+			} else {
+				srv.Start()
+			}
+			defer srv.Close()
 
-	req, err := http.NewRequest("GET", srv.URL+"/api/v1/events", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
+			req, err := http.NewRequest("GET", srv.URL+"/api/v1/events", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// srv.Client() trusts the server's own certificate, so this is one
+			// client for both rows rather than a TLS branch here.
+			resp, err := srv.Client().Do(req.WithContext(ctx))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
 
-	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
-		t.Errorf("content type = %q, want text/event-stream", got)
-	}
+			if resp.Proto != tc.wantProto {
+				t.Fatalf("protocol = %s, want %s; the row proves nothing otherwise", resp.Proto, tc.wantProto)
+			}
+			if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+				t.Errorf("content type = %q, want text/event-stream", got)
+			}
 
-	// Wait for the subscription rather than sleeping on it.
-	for range 200 {
-		if s.events.count() > 0 {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if s.events.count() != 1 {
-		t.Fatal("the request never subscribed")
-	}
+			// Wait for the subscription rather than sleeping on it.
+			for range 200 {
+				if s.events.count() > 0 {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if s.events.count() != 1 {
+				t.Fatal("the request never subscribed")
+			}
 
-	s.Notify(context.Background(), notify.Event{
-		Application: "edge",
-		Type:        notify.SyncSucceeded,
-		Revision:    "abc123",
-		At:          time.Unix(0, 0).UTC(),
-	})
+			s.Notify(context.Background(), notify.Event{
+				Application: "edge",
+				Type:        notify.SyncSucceeded,
+				Revision:    "abc123",
+				At:          time.Unix(0, 0).UTC(),
+			})
 
-	buf := make([]byte, 512)
-	n, err := resp.Body.Read(buf)
-	if err != nil && err != io.EOF {
-		t.Fatalf("reading the stream: %v", err)
-	}
-	frame := string(buf[:n])
-	// The event name is what an EventSource listener binds to.
-	if !strings.Contains(frame, "event: sync-succeeded") {
-		t.Errorf("frame %q carries no event name", frame)
-	}
-	if !strings.Contains(frame, `"application":"edge"`) || !strings.Contains(frame, `"revision":"abc123"`) {
-		t.Errorf("frame %q lost the payload", frame)
+			buf := make([]byte, 512)
+			n, err := resp.Body.Read(buf)
+			if err != nil && err != io.EOF {
+				t.Fatalf("reading the stream: %v", err)
+			}
+			frame := string(buf[:n])
+			// The event name is what an EventSource listener binds to.
+			if !strings.Contains(frame, "event: sync-succeeded") {
+				t.Errorf("frame %q carries no event name", frame)
+			}
+			if !strings.Contains(frame, `"application":"edge"`) || !strings.Contains(frame, `"revision":"abc123"`) {
+				t.Errorf("frame %q lost the payload", frame)
+			}
+		})
 	}
 }
 

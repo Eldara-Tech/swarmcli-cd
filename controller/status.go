@@ -27,6 +27,8 @@ being refused.
 Options:
   --server <url>       Controller to talk to (default $` + client.EnvServer + `,
                        or ` + client.DefaultServer + `)
+  --ca-cert <path>     PEM certificate to trust for an https --server (default
+                       $` + client.EnvCACert + `)
   -o, --output <fmt>   text or json (default text). json is the controller's
                        own response, unmodified
 
@@ -44,6 +46,7 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	server := fs.String("server", "", "")
+	caCert := fs.String("ca-cert", "", "")
 	output := fs.String("output", "text", "")
 	fs.StringVar(output, "o", "text", "")
 
@@ -62,7 +65,11 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	}
 
 	token, tokenErr := authz.TokenFromEnv(os.Getenv, os.ReadFile)
-	c := client.New(resolveServer(*server, os.Getenv), token)
+	c, err := client.NewWithOptions(resolveServer(*server, os.Getenv), token,
+		client.Options{CACert: resolveCACert(*caCert, os.Getenv)})
+	if err != nil {
+		return fail(stderr, err)
+	}
 
 	status, raw, err := c.Status(context.Background())
 	if err != nil {

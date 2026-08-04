@@ -9,7 +9,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/client"
@@ -25,7 +27,11 @@ than a curl because the image carries this binary and need carry nothing else.
 
 Options:
   --server <url>       Controller to probe (default $` + client.EnvServer + `,
-                       or ` + client.DefaultServer + `)
+                       or ` + client.DefaultServer + `). An https URL naming a
+                       loopback address is probed without verifying the
+                       certificate — this asserts liveness, not identity, and
+                       the connection never leaves the host. A controller
+                       serving TLS is probed as https://127.0.0.1:8080
   --timeout <dur>      Give up after this long (default ` + healthcheckTimeout.String() + `)
 `
 
@@ -55,11 +61,45 @@ func runHealthcheck(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
+	target := resolveServer(*server, os.Getenv)
+
 	// No token: /healthz is unauthenticated by design, and a healthcheck that
 	// needed a credential would have to be given one in the stack file.
-	if err := client.New(resolveServer(*server, os.Getenv), "").Health(ctx); err != nil {
+	//
+	// The probe derives its scheme instead of learning the controller's
+	// configuration, which it cannot: this is a separate process invocation and
+	// knows nothing about --tls-cert. Given an https loopback URL it skips
+	// verification; anything else verifies normally. See client.Options.
+	c, err := client.NewWithOptions(target, "", client.Options{SkipVerifyOnLoopback: true})
+	if err != nil {
 		return fail(stderr, err)
+	}
+	if err := c.Health(ctx); err != nil {
+		return fail(stderr, tlsHint(target, err))
 	}
 	_, _ = fmt.Fprintln(stdout, "ok")
 	return 0
+}
+
+// tlsHint names the one failure the status line hides.
+//
+// Go's server answers a plaintext request to a TLS listener with 400 and a body
+// reading "Client sent an HTTP request to an HTTPS server", but client.message
+// falls back to the status line for any non-JSON body — deliberately, because a
+// proxy's HTML error page is the case an operator is far more likely to meet. So
+// without this the operator of a task Swarm is restarting every interval reads
+// "400 bad request" in `docker inspect` and nothing that says TLS, which is the
+// concrete mechanism behind "nothing in the logs says TLS".
+//
+// Targeted at this one path rather than widening message: this is the only
+// caller that knows the request was a liveness probe of a controller that may
+// have been given --tls-cert.
+func tlsHint(server string, err error) error {
+	var apiErr *client.Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest ||
+		!strings.HasPrefix(server, "http://") {
+		return err
+	}
+	return fmt.Errorf("%w: if the controller was given --tls-cert, probe %s instead",
+		err, "https://"+strings.TrimPrefix(server, "http://"))
 }

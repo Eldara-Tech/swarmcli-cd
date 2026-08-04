@@ -55,6 +55,26 @@ services:
     # command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml",
     #           "--prune", "--prune-volumes"]
 
+    # TLS — serve the API over https instead of plaintext, which is what makes
+    # publishing the port at all defensible. Create the pair as secrets first:
+    #   docker secret create swarmcli-cd-tls-cert ./tls.crt
+    #   docker secret create swarmcli-cd-tls-key ./tls.key
+    # Both flags or neither: one alone is refused, because what it would
+    # otherwise produce is a listener serving plaintext while you believe it is
+    # encrypted. The pair is read once at startup, so a renewed certificate
+    # needs a redeploy.
+    #
+    # Turning it on WITHOUT the two SWARMCLI_CD_ variables under `environment:`
+    # below breaks this service: the healthcheck probes http://127.0.0.1:8080 by
+    # default, a TLS listener refuses that, and Swarm restarts a task whose
+    # controller is working perfectly — with nothing in the logs saying TLS.
+    # Uncomment all four commented TLS blocks together: this command, the two
+    # environment variables, the two entries in `secrets:` and the two in the
+    # top-level `secrets:` block.
+    # command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml",
+    #           "--tls-cert", "/run/secrets/swarmcli-cd-tls-cert",
+    #           "--tls-key", "/run/secrets/swarmcli-cd-tls-key"]
+
     healthcheck:
       # The image carries no curl and needs none: the binary probes itself.
       test: ["CMD", "/swarmcli-cd", "healthcheck"]
@@ -86,6 +106,20 @@ services:
       # the raft log and delivered in memory, and never appears in
       # `docker service inspect`.
       SWARMCLI_CD_ADMIN_TOKEN_FILE: /run/secrets/swarmcli-cd-token
+      # With TLS on (see the command above), both of these, together. They are
+      # read by every command this binary runs inside the container — the
+      # healthcheck above, and a `docker exec ... /swarmcli-cd app list`.
+      #
+      # SERVER moves the healthcheck to https, which is the whole of keeping
+      # this task healthy; it needs no certificate, because the probe skips
+      # verification for a loopback https URL only — /healthz discloses nothing,
+      # the connection never leaves the host, and it is asserting liveness
+      # rather than identity. CA_CERT is for `app` and `status`, which do
+      # verify: it names the certificate itself, which works because a
+      # self-signed leaf is its own authority. Without it, every CLI call inside
+      # the container fails on an untrusted certificate.
+      # SWARMCLI_CD_SERVER: https://127.0.0.1:8080
+      # SWARMCLI_CD_CA_CERT: /run/secrets/swarmcli-cd-tls-cert
       # For a private repository, uncomment the two lines below — and with them
       # the two swarmcli-cd-git-token entries further down, in the service's
       # `secrets:` list and in the top-level block. TOKEN_FILE only says where
@@ -114,7 +148,10 @@ services:
     #
     #   ssh -L 8080:127.0.0.1:8080 manager
     #
-    # If it must be published, terminate TLS in front of it.
+    # If it must be published, turn on TLS — either the --tls-cert/--tls-key
+    # block above, or a reverse proxy terminating it in front. The token is the
+    # only thing standing between the port and the swarm, and over plaintext it
+    # is on the wire in every request.
     # ports:
     #   - "8080:8080"
 
@@ -128,6 +165,9 @@ services:
       # The git credential, for a private repository. Create it first:
       #   printf '%s' "$YOUR_GIT_TOKEN" | docker secret create swarmcli-cd-git-token -
       # - swarmcli-cd-git-token
+      # The TLS pair, for the --tls-cert/--tls-key command above.
+      # - swarmcli-cd-tls-cert
+      # - swarmcli-cd-tls-key
       # One per application that pulls from a private registry. The name must
       # match that application's `registryAuth:`, and the default mount path
       # /run/secrets/<name> is where the controller reads it.
@@ -141,6 +181,10 @@ secrets:
   swarmcli-cd-token:
     external: true
   # swarmcli-cd-git-token:
+  #   external: true
+  # swarmcli-cd-tls-cert:
+  #   external: true
+  # swarmcli-cd-tls-key:
   #   external: true
   # swarmcli-cd-regauth-edge:
   #   external: true
