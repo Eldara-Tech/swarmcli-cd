@@ -114,14 +114,14 @@ Confirm the controller is up:
 ```bash
 docker service logs swarmcli-cd_controller
 # A "seams" line reports which implementations loaded — for the OSS build,
-#   msg=seams swarms=local authz=token notify=[log] secrets=plaintext extension=[]
+#   msg=seams swarms=local authz=token notify=[log] secrets=plaintext feature=community extension=[]
 # then a "routes" line naming every path this controller serves, and a
 # "starting" line with the application count and listen address.
 ```
 
-## 4. Reach the API
+## 4. Reach it, in a browser and from the CLI
 
-`stack.yml` **does not publish the API port** — the controller holds
+`stack.yml` **does not publish the port** — the controller holds
 root-equivalent access to the swarm behind one shared bearer token over plaintext
 HTTP, so exposing it on a public node would put the swarm on the internet. Reach
 it from inside the swarm, or tunnel over SSH:
@@ -130,7 +130,17 @@ it from inside the swarm, or tunnel over SSH:
 ssh -L 8080:127.0.0.1:8080 your-manager-host
 ```
 
-Then point the client at it and give it the token you generated:
+One tunnel is enough for both, because there is only one port. Open
+<http://127.0.0.1:8080> and sign in with the token from step 3: the web UI is
+served by the controller itself, out of the same binary, and every screen it
+draws is one call to the same API the commands below use. A page saying the
+binary was built without its web UI means exactly that — a local `go build` with
+no bundle compiled in, where the published image and the release archives have
+one. [The web UI](web-ui.md) covers building it, what it serves, and why the
+port stays unpublished even now that there is something to look at.
+
+For the CLI, point the client at the same tunnel and give it the token you
+generated:
 
 ```bash
 export SWARMCLI_CD_SERVER=http://127.0.0.1:8080
@@ -241,5 +251,7 @@ A ready-made layout is in [`../examples/appset-repo/`](../examples/appset-repo/)
   the applier is not `docker stack deploy`.
 - **[HTTP API](api.md)** — the endpoints behind every command, for scripting and
   for building on.
+- **[The web UI](web-ui.md)** — building it, what the controller serves, and the
+  security posture of a browser holding the admin token.
 - Add `-o json` to any read command for the controller's own response,
   unmodified — the form to script against.

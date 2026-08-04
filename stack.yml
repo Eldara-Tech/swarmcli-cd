@@ -141,17 +141,36 @@ services:
       # config.json using credsStore/credHelpers is refused at startup, and
       # short-lived ECR/GCR tokens must be refreshed out of band.
 
-    # The API is deliberately not published. It holds root-equivalent access to
-    # the swarm behind a single shared bearer token over plaintext HTTP, so
-    # publishing this port on a node with a public address puts the swarm on the
-    # internet. Reach it from inside the swarm, or over an SSH tunnel:
+    # The API — and the web UI on the same port — is deliberately not published
+    # here. The reason is the token rather than the UI: this port carries
+    # root-equivalent access to the swarm behind one shared bearer credential,
+    # so publishing it over plaintext HTTP on a node with a public address puts
+    # the swarm on the internet. The token is on the wire in every request, and
+    # a browser would be typing it into a page anybody on the path could have
+    # rewritten first. Reach it from inside the swarm, or over an SSH tunnel,
+    # which is also how you open the UI in a browser:
     #
     #   ssh -L 8080:127.0.0.1:8080 manager
     #
-    # If it must be published, turn on TLS — either the --tls-cert/--tls-key
-    # block above, or a reverse proxy terminating it in front. The token is the
-    # only thing standing between the port and the swarm, and over plaintext it
-    # is on the wire in every request.
+    # Publishing it is defensible with three things together, and none of the
+    # three is optional:
+    #
+    #   1. TLS on — uncomment the four TLS blocks above, or put a reverse proxy
+    #      in front of this service to terminate it. Without this the other two
+    #      buy nothing.
+    #   2. The token as a Docker secret, which is what it already is above.
+    #      Never SWARMCLI_CD_ADMIN_TOKEN with the value in it: that is in
+    #      `docker service inspect` output for anyone who can reach the daemon.
+    #   3. The port reachable only from where your operators are. Swarm's
+    #      routing mesh publishes it on EVERY node's address, not just this
+    #      manager's, so "the managers are private" is not the control you may
+    #      think it is — use a firewall, or `mode: host` with a placement
+    #      constraint. There is one credential, it never rotates on its own, and
+    #      nothing throttles attempts against it: 32 random bytes from the
+    #      command at the top of this file survive that, and a token somebody
+    #      chose by hand does not.
+    #
+    # See docs/web-ui.md and docs/configuration.md#tls.
     # ports:
     #   - "8080:8080"
 

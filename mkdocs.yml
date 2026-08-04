@@ -10,6 +10,7 @@ nav:
   - Configuration: configuration.md
   - Concepts: concepts.md
   - HTTP API: api.md
+  - Web UI: web-ui.md
   - Extensibility: extensibility.md
 markdown_extensions:
   - toc:
