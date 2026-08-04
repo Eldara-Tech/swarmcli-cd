@@ -3,6 +3,17 @@ SPDX-License-Identifier: Apache-2.0
 Copyright © 2026 Eldara Tech
 */
 
+/* The whole of the UI's styling, and it has to be: `style-src 'self'` with no
+   'unsafe-inline' means React's style prop cannot be used anywhere, because it
+   emits an inline style attribute that a CSP3 browser refuses. That fails only
+   in a real browser — never in jsdom, never in Vitest — so it is enforced by
+   react/forbid-dom-props in eslint.config.js rather than by remembering.
+
+   The theme follows the operating system and has no toggle. Priming a stored
+   preference before first paint needs an inline <script>, which the same policy
+   forbids; a toggle that flashed the wrong theme on every load would be worse
+   than not having one. */
+
 /* System fonts only. A web font is a file to serve, a font-src to argue about
    in the CSP, and a dependency on a foundry's licence; none of that is worth
    paying before the UI has a screen. */
@@ -10,31 +21,183 @@ Copyright © 2026 Eldara Tech
   color-scheme: light dark;
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   line-height: 1.5;
+
+  --page: #ffffff;
+  --panel: #f6f7f9;
+  --ink: #1b1d21;
+  --ink-muted: #5c6169;
+  --edge: #d9dce1;
+  --accent: #1e6b3a;
+  --danger: #b3261e;
+  --warn: #8a5a00;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #16181c;
+    --panel: #1e2126;
+    --ink: #e7e9ec;
+    --ink-muted: #a0a6b0;
+    --edge: #30343b;
+    --accent: #4ec27c;
+    --danger: #f2857c;
+    --warn: #e0a83c;
+  }
 }
 
 body {
   margin: 0;
+  background: var(--page);
+  color: var(--ink);
 }
 
-main {
+a {
+  color: inherit;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+}
+
+.error {
+  color: var(--danger);
+}
+
+/* The shell ------------------------------------------------------------- */
+
+.shell-header {
+  align-items: center;
+  background: var(--panel);
+  border-bottom: 1px solid var(--edge);
+  display: flex;
+  gap: 1rem;
+  padding: 0.75rem 1.25rem;
+}
+
+.brand {
+  font-weight: 700;
+  text-decoration: none;
+}
+
+/* Pushes everything after the indicator to the right-hand end, so the header
+   needs no fixed column widths as later issues add controls between them. */
+.live {
+  margin: 0 auto 0 0;
+}
+
+.shell-main {
   margin: 0 auto;
-  max-width: 48rem;
-  padding: 2rem 1rem;
+  max-width: 72rem;
+  padding: 1.5rem 1.25rem;
 }
 
-h1 {
-  font-size: 1.75rem;
+.sign-out {
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 0.25rem;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0.3rem 0.7rem;
+}
+
+/* The live indicator ---------------------------------------------------- */
+
+.live {
+  align-items: center;
+  color: var(--ink-muted);
+  display: flex;
+  font-size: 0.85rem;
+  gap: 0.5rem;
+}
+
+.live-dot {
+  border-radius: 50%;
+  height: 0.55rem;
+  width: 0.55rem;
+}
+
+.live-live .live-dot {
+  background: var(--accent);
+}
+
+.live-connecting .live-dot,
+.live-reconnecting .live-dot {
+  background: var(--warn);
+}
+
+.live-stopped .live-dot {
+  background: var(--danger);
+}
+
+.live-last {
+  border-left: 1px solid var(--edge);
+  padding-left: 0.5rem;
+}
+
+/* The login screen ------------------------------------------------------ */
+
+.login {
+  display: flex;
+  justify-content: center;
+  padding: 6rem 1rem;
+}
+
+.login-form {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: 26rem;
+  padding: 1.5rem;
+  width: 100%;
+}
+
+.login-form h1 {
+  font-size: 1.5rem;
   margin: 0 0 0.5rem;
 }
 
-.state {
+.login-form label {
   font-weight: 600;
 }
 
-.state-unreachable {
-  color: #b3261e;
+.login-form input {
+  background: var(--page);
+  border: 1px solid var(--edge);
+  border-radius: 0.25rem;
+  color: inherit;
+  font: inherit;
+  padding: 0.5rem;
 }
 
-.state-reachable {
-  color: #1e6b3a;
+.login-form button {
+  background: var(--accent);
+  border: none;
+  border-radius: 0.25rem;
+  color: var(--page);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+}
+
+.login-form button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.login-hint {
+  color: var(--ink-muted);
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.login-error {
+  color: var(--danger);
+  margin: 0;
 }

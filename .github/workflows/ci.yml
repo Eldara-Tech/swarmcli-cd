@@ -135,8 +135,17 @@ jobs:
       - name: Install
         run: npm --prefix web/ui ci
 
+      - name: Lint
+        run: npm --prefix web/ui run lint
+
       - name: Typecheck
         run: npm --prefix web/ui run typecheck
+
+      # Where the generated wire fixtures are checked against the TypeScript
+      # that reads them; see application/fixtures_test.go. tsc has already run
+      # above, which is the half of that check the compiler does.
+      - name: Test
+        run: npm --prefix web/ui run test
 
       - name: Build
         run: npm --prefix web/ui run build
@@ -152,8 +161,12 @@ jobs:
             exit 1
           }
 
+      # ./web and not ./web/... : this is the one job with node_modules on disk,
+      # and a dependency tree contains Go packages of its own — eslint's
+      # `flatted` ships one — which the recursive form would compile as part of
+      # this repository.
       - name: The UI tests, against a real bundle
-        run: go test -count=1 ./web/...
+        run: go test -count=1 ./web
 
   # Builds the image and proves the container runs with no docker binary in it,
   # which is what makes the moby-client backend worth having. It does not push:

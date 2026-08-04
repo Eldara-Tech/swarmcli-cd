@@ -31,21 +31,30 @@ const fs = require("node:fs");
 const shipped = new Set([
   "0BSD",
   "Apache-2.0",
+  "BlueOak-1.0.0",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "CC0-1.0",
   "ISC",
   "MIT",
+  "MIT-0",
   "Python-2.0",
   "Unlicense",
 ]);
 
-// What may merely build it. Wider by exactly one, and deliberately: Vite's CSS
-// transformer (lightningcss) is MPL-2.0. MPL is file-level copyleft on its own
-// source, and a build tool contributes none of its source to the bundle — it
-// transforms ours. Anything stronger still fails here, because a build tool is
-// code we execute on the machine that signs a release.
-const build = new Set([...shipped, "MPL-2.0"]);
+// What may merely build it. Wider by exactly two, and each deliberately.
+//
+// Vite's CSS transformer (lightningcss) is MPL-2.0. MPL is file-level copyleft
+// on its own source, and a build tool contributes none of its source to the
+// bundle — it transforms ours. Anything stronger still fails here, because a
+// build tool is code we execute on the machine that signs a release.
+//
+// caniuse-lite is CC-BY-4.0, and it is browserslist's browser-support *database*
+// rather than code: babel reads it to decide what to compile down to, and none
+// of it is emitted. Attribution attaches to data nothing ships. A CC licence on
+// something in the bundle stays a failure, which is why this is here and not
+// above.
+const build = new Set([...shipped, "MPL-2.0", "CC-BY-4.0"]);
 
 // SPDX expressions: "(MIT OR CC0-1.0)" is a choice, so one permitted
 // alternative is enough; "A AND B" binds us to both. Handled because npm is

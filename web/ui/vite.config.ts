@@ -3,7 +3,12 @@
 
 import { writeFileSync } from 'node:fs'
 import react from '@vitejs/plugin-react'
-import { defineConfig, type Plugin } from 'vite'
+import type { Plugin } from 'vite'
+// vitest/config rather than vite: it is the same defineConfig with the `test`
+// key added. One file, so the tests are built exactly as the bundle is —
+// separate configs would let the two drift, and the drift would show up as a
+// test suite that passes against a transform the browser never sees.
+import { defineConfig } from 'vitest/config'
 
 // keepSentinel puts web/dist/.gitkeep back after every build.
 //
@@ -42,5 +47,16 @@ export default defineConfig({
       '/api': 'http://127.0.0.1:8080',
       '/healthz': 'http://127.0.0.1:8080',
     },
+  },
+  test: {
+    // jsdom because the components under test read and write the DOM and
+    // sessionStorage. What it deliberately does not give them is a CSP, which
+    // is why the style-prop ban is an eslint rule; see eslint.config.js.
+    environment: 'jsdom',
+    // The Playwright specs are run by Playwright, against a real controller.
+    exclude: ['e2e/**', 'node_modules/**'],
+    // No globals: every test imports what it uses, so tsconfig's `types: []`
+    // stays true and a test file reads like the modules it exercises.
+    globals: false,
   },
 })

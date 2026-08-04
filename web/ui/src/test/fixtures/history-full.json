@@ -1,0 +1,17 @@
+{
+  "releases": [
+    {
+      "name": "name",
+      "revisions": [
+        {
+          "revision": 1,
+          "chart": "chart",
+          "version": "version",
+          "status": "status",
+          "created": "created",
+          "owner": "owner"
+        }
+      ]
+    }
+  ]
+}

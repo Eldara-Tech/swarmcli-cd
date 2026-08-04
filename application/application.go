@@ -609,6 +609,28 @@ type ReleaseDiff struct {
 	Diff    string     `json:"diff"`
 }
 
+// DiffResponse is what the diff endpoint answers with.
+//
+// A declared type rather than the map literal the handler used to build. A map
+// carries no JSON tags, and the tags are the only authority a client can be
+// written against: the browser UI's TypeScript types and the fixtures it checks
+// them against are both generated from these declarations, so a response shape
+// stated only as a literal would be mirrored by hand and drift in silence.
+type DiffResponse struct {
+	// Releases is null when nothing would change, and that is the success case,
+	// not an error one: drift.Diffs starts from a nil slice and appends only the
+	// releases a sync would touch, so a converged application has none. An empty
+	// list means the opposite thing — the application has not been reconciled
+	// yet, so there is nothing to compare — and Planned is what says which.
+	//
+	// No omitempty, deliberately: a key that vanished for the converged case
+	// would leave a client unable to tell it from a response that predates the
+	// field.
+	Releases []ReleaseDiff `json:"releases"`
+	// Planned distinguishes "nothing would change" from "nothing is known yet".
+	Planned bool `json:"planned"`
+}
+
 // ServiceStatus is one Swarm service under a release.
 type ServiceStatus struct {
 	Name        string      `json:"name"`

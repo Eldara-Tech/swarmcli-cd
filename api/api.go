@@ -586,14 +586,16 @@ func (s *Server) diff(w http.ResponseWriter, r *http.Request, _ authz.Subject) {
 	switch {
 	case errors.Is(err, application.ErrNotPlanned):
 		// Not an error the caller can fix, and not a 404 either: the
-		// application exists and has simply not been reconciled yet.
-		write(w, http.StatusOK, map[string]any{"releases": []application.ReleaseDiff{}, "planned": false})
+		// application exists and has simply not been reconciled yet. An empty
+		// list rather than the nil one a converged plan produces; see
+		// application.DiffResponse for why the two must stay different.
+		write(w, http.StatusOK, application.DiffResponse{Releases: []application.ReleaseDiff{}})
 		return
 	case err != nil:
 		fail(w, http.StatusNotFound, "no such application")
 		return
 	}
-	write(w, http.StatusOK, map[string]any{"releases": diffs, "planned": true})
+	write(w, http.StatusOK, application.DiffResponse{Releases: diffs, Planned: true})
 }
 
 // history serves every declared release's revisions in one request.
