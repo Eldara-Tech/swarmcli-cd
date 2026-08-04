@@ -56,16 +56,32 @@ Released binaries (Linux and macOS, amd64 and arm64) are attached to each
 image is `eldaratech/swarmcli-cd`. The same binary is both the controller and
 its client, so a laptop needs only the archive.
 
+Each release carries **two** artefacts. `swarmcli-cd` is the default: this
+repository plus licensed code that does nothing until a licence verifies.
+`swarmcli-cd-oss` archives and `eldaratech/swarmcli-cd:<version>-oss` are built
+from this repository alone and are wholly Apache-2.0. The command inside both is
+`swarmcli-cd` and everything below applies to either.
+[docs/editions.md](docs/editions.md) is what each contains and how to tell which
+one you are running.
+
 Building it instead:
 
 ```bash
+npm --prefix web/ui ci && npm --prefix web/ui run build
 go build -o swarmcli-cd ./cmd/swarmcli-cd
 ./swarmcli-cd version
 ```
 
-Requires Go 1.26+. A plain `go build` leaves the chart-engine version unstamped,
-which makes every chart compatibility check report Unknown — fine for
-development, not for anything that deploys. See [RELEASING.md](RELEASING.md).
+Requires Go 1.26+, and Node for the UI. A plain `go build` leaves the
+chart-engine version unstamped, which makes every chart compatibility check
+report Unknown — fine for development, not for anything that deploys. See
+[RELEASING.md](RELEASING.md).
+
+Without the first line — and so with `go install …@latest` too — the build
+succeeds and the binary serves the API normally, but every browser gets a page
+saying it was built without its web UI. That is what keeps this repository
+buildable with no JavaScript toolchain; it also means `go install` is not a way
+to get the UI. The archives and the images have it compiled in.
 
 ## Using it
 

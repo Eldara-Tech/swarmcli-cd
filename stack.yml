@@ -18,6 +18,10 @@
 
 services:
   controller:
+    # The default artefact: this repository plus licensed code that does nothing
+    # until a licence verifies. For the wholly Apache-2.0 build, pin a version
+    # with the -oss suffix — eldaratech/swarmcli-cd:1.2.0-oss — which is
+    # deliberately not a moving tag. See docs/editions.md.
     image: eldaratech/swarmcli-cd:latest
 
     # Mode 1 (default) — the app set is the immutable Docker config mounted

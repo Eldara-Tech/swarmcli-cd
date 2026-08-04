@@ -7,7 +7,39 @@ Copyright © 2026 Eldara Tech
 
 Tagging is the whole trigger. `.github/workflows/release.yml` then drafts the
 notes from PR labels, publishes binary archives with GoReleaser, and pushes a
-multi-arch image to Docker Hub as `eldaratech/swarmcli-cd`.
+multi-arch image to Docker Hub.
+
+**This repository publishes the `-oss` half of a release, not the whole of it.**
+Each release carries two artefacts (D21, [docs/editions.md](docs/editions.md)):
+
+| Artefact | Tagged in | Publishes |
+|---|---|---|
+| `swarmcli-cd` — archives, `eldaratech/swarmcli-cd:<v>`, `:latest` | the private `swarmcli-cd-be` wrapper | into **this** repository's releases, under `RELEASE_TOKEN` |
+| `swarmcli-cd-oss` — archives, `eldaratech/swarmcli-cd:<v>-oss` | here | into this repository's releases |
+
+So a release needs **two tags, one in each repository, carrying the same version
+string** — and the public one first.
+
+- There is no trigger from the public tag. The PAT cannot dispatch a workflow,
+  so nothing starts the private pipeline but a tag pushed there by hand;
+  assuming otherwise produces a release that silently never built its default
+  artefact.
+- The order is not a preference. GoReleaser publishes into a release *named
+  after the tag it was invoked with*, so the public tag creating the release
+  first is what gives the private run something to add to. A private `v1.1.1`
+  against a public `v1.1.0` creates a second release and asks GitHub to invent a
+  tag to hang it from.
+- Nothing collides, and that is by construction rather than by luck: the
+  archives here are `swarmcli-cd-oss_*`, the checksum file is
+  `checksums-oss.txt`, and the image tags carry a `-oss` suffix. The merged
+  pipeline refuses to run if this repository at the pinned tag has gone back to
+  the plain names.
+
+**A tag pushed here on its own no longer moves `:latest`.** `latest=false` in
+the docker job: under D20 `:latest` is the merged artefact, which is what
+`stack.yml` pulls, and two pipelines competing for that tag would leave an
+operator with whichever finished last. A public-only tag therefore publishes the
+OSS archives and the `-oss` image tags and leaves `:latest` where it was.
 
 ## Prerequisites
 
@@ -53,13 +85,17 @@ them prerelease automatically, and `docker/metadata-action` will not move
 ```bash
 gh release view v0.1.0 --repo Eldara-Tech/swarmcli-cd
 
-docker pull eldaratech/swarmcli-cd:0.1.0
-docker run --rm eldaratech/swarmcli-cd:0.1.0 version
+docker pull eldaratech/swarmcli-cd:0.1.0-oss
+docker run --rm eldaratech/swarmcli-cd:0.1.0-oss version
 # swarmcli-cd v0.1.0 (chart engine v1.13.0)
 
 # Both architectures are in the manifest:
-docker buildx imagetools inspect eldaratech/swarmcli-cd:0.1.0
+docker buildx imagetools inspect eldaratech/swarmcli-cd:0.1.0-oss
 ```
+
+`version` prints the same string for both artefacts — one tag produces both, so
+it cannot tell them apart. The `seams` line in the controller's startup log can:
+`feature=community` is this build. See [docs/editions.md](docs/editions.md).
 
 An `unstamped` chart engine in that output means the ldflag did not take, and
 every chart declaring a `swarmcliVersion` floor would be deployed unchecked —
