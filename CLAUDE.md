@@ -24,6 +24,7 @@ golangci-lint run ./...
 npm --prefix web/ui ci
 npm --prefix web/ui run build
 ./scripts/check-npm-licences.sh  # third-party licences, needs the tree installed
+./scripts/check-node-pins.sh     # every pinned Node major is the same one
 ```
 
 ## Conventions
@@ -175,7 +176,7 @@ stack.yml          the in-swarm deploy: manager node, docker.sock, config+secret
 examples/          a commented applications.yaml, a quickstart repo, an app-set
                    repo
 integration-tests/ `-tags integration`, against a real swarm
-scripts/           check-spdx.sh, check-npm-licences.sh
+scripts/           check-spdx.sh, check-npm-licences.sh, check-node-pins.sh
 docs/
 .github/workflows/ ci.yml, check_labels.yml, licence.yml, deps.yml,
                    integration-tests.yml, release.yml

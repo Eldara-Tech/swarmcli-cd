@@ -48,6 +48,15 @@ jobs:
             ui:
               - 'web/**'
               - '.github/workflows/ci.yml'
+              # The three files that decide how the shipped bundle is built,
+              # and none of which is under web/. The `ui` job is the only place
+              # the CSP is asserted against a real bundle, so a change to the
+              # builder that never runs it is the assertion going quiet on
+              # exactly the change most likely to break it. Node's own version
+              # is the other half of that and is check-node-pins.sh's, below.
+              - 'Dockerfile'
+              - '.github/workflows/release.yml'
+              - '.goreleaser.yml'
 
   fmt:
     needs: [changes]
@@ -165,8 +174,26 @@ jobs:
       # and a dependency tree contains Go packages of its own — eslint's
       # `flatted` ships one — which the recursive form would compile as part of
       # this repository.
+      #
+      # The variable is what makes this the one place the CSP assertion cannot
+      # skip. Everywhere else there is no bundle and skipping is correct; here
+      # a skip means the build above produced nothing and the assertion passed
+      # by not running, which is indistinguishable from passing.
       - name: The UI tests, against a real bundle
+        env:
+          SWARMCLI_CD_REQUIRE_UI_BUNDLE: '1'
         run: go test -count=1 ./web
+
+  # No paths filter, deliberately, and the only job here without one. What it
+  # reads is where a Node version is pinned, and a filter would be a second copy
+  # of that list — kept by hand, in the file whose job is to notice when the
+  # first one moved. It is two seds and needs no toolchain.
+  node-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Every Node pin is the same Node
+        run: ./scripts/check-node-pins.sh
 
   # Builds the image and proves the container runs with no docker binary in it,
   # which is what makes the moby-client backend worth having. It does not push:

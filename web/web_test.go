@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -228,9 +229,21 @@ var (
 //
 // It can only run where a real bundle exists, which is why ci.yml's ui job has
 // Go as well as Node: the test job has no Node and always skips here.
+//
+// requireBundle is what stops the skip from being the answer everywhere. Where
+// there is no Node, skipping is correct and is the only reason `go test ./...`
+// works on a fresh checkout. In the one job that built a bundle a skip means
+// something else entirely — that the build produced nothing — and a green run
+// that asserted nothing is indistinguishable from a green run that asserted
+// this. So that job sets the variable, and there the absence is a failure.
+const requireBundle = "SWARMCLI_CD_REQUIRE_UI_BUNDLE"
+
 func TestTheBuiltIndexHasNoInlineScriptOrStyle(t *testing.T) {
 	index, err := fs.ReadFile(Assets, indexFile)
 	if errors.Is(err, fs.ErrNotExist) {
+		if os.Getenv(requireBundle) != "" {
+			t.Fatalf("%s is set and no UI is embedded: this is the job that builds one, so this check ran nowhere", requireBundle)
+		}
 		t.Skip("no UI is embedded in this build; ci.yml's ui job is where this runs")
 	}
 	if err != nil {
