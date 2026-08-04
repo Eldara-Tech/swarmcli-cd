@@ -10,6 +10,24 @@ import type { Plugin } from 'vite'
 // test suite that passes against a transform the browser never sees.
 import { defineConfig } from 'vitest/config'
 
+// Node 26 exposes Web Storage as unflagged globals, and vitest's jsdom
+// environment copies a window property onto globalThis only when there is not
+// one there already — so from 26 on both storages come from the process rather
+// than from the document under test. localStorage is then a getter returning
+// undefined unless --localstorage-file was passed, which is what App.test.tsx's
+// `localStorage.length` reads; and sessionStorage becomes one store shared by
+// every test file, which is where auth/session.ts puts the admin token it
+// documents as living no longer than a tab.
+//
+// Turning Node's off is what lets jsdom's own through, so the storage the
+// sources reach is the document's, as it is in a browser. Set here rather than
+// in the test script because the workers are what must inherit it and a shell
+// prefix is not portable. Guarded on the globals being present at all: Node 24
+// and below have nothing to disable and reject the flag outright.
+if ('localStorage' in globalThis) {
+  process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ?? ''} --no-experimental-webstorage`.trim()
+}
+
 // keepSentinel puts web/dist/.gitkeep back after every build.
 //
 // emptyOutDir wipes the directory first, and that file is the whole reason

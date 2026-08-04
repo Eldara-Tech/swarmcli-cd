@@ -45,11 +45,11 @@ jobs:
       # fail loudly and no release is published — which is the good outcome. The
       # bad one is this step and those hooks both being forgotten: four binaries
       # ship, every check passes, and only a browser ever sees that they serve
-      # web.notBuilt. Node 22 matches ci.yml's ui job, so the release builds the
-      # bundle CI tested.
+      # web.notBuilt. Node 26 matches ci.yml's ui job and the Dockerfile's ui
+      # stage, so the release builds the bundle CI tested.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version: '26'
           cache: npm
           cache-dependency-path: web/ui/package-lock.json
 
