@@ -16,7 +16,14 @@ re-derive them.
 go build -o swarmcli-cd ./cmd/swarmcli-cd
 go test ./...
 golangci-lint run ./...
-./scripts/check-spdx.sh          # CI enforces this on every .go and .sh
+./scripts/check-spdx.sh          # every .go, .sh, .ts, .tsx and .css
+
+# The UI. `go build` alone embeds the committed sentinel and the binary then
+# serves web.notBuilt — which is the normal state for a contributor, and a
+# silent one, so build the bundle before judging what a binary serves.
+npm --prefix web/ui ci
+npm --prefix web/ui run build
+./scripts/check-npm-licences.sh  # third-party licences, needs the tree installed
 ```
 
 ## Conventions
@@ -32,12 +39,14 @@ golangci-lint run ./...
   ```
   A pseudo-version is the normal state between CE releases and builds fine;
   what it costs at release time is in [RELEASING.md](RELEASING.md).
-- **SPDX header** on every `.go` and `.sh` file, or `licence.yml` fails:
+- **SPDX header** on every `.go`, `.sh`, `.ts`, `.tsx` and `.css` file, or
+  `licence.yml` fails:
   ```go
   // SPDX-License-Identifier: Apache-2.0
   // Copyright © 2026 Eldara Tech
   ```
-  `goheader` in `.golangci.yml` enforces the same thing at lint time.
+  `goheader` in `.golangci.yml` enforces the same thing at lint time, for Go
+  only — the UI's files have `check-spdx.sh` and nothing else.
 - **PRs need one label from each of A/B/C** (`check_labels.yml`), mirroring the
   other code repos. Add all three in **one** REST call:
   ```
@@ -163,10 +172,10 @@ stack.yml          the in-swarm deploy: manager node, docker.sock, config+secret
 examples/          a commented applications.yaml, a quickstart repo, an app-set
                    repo
 integration-tests/ `-tags integration`, against a real swarm
-scripts/           check-spdx.sh
+scripts/           check-spdx.sh, check-npm-licences.sh
 docs/
-.github/workflows/ ci.yml, check_labels.yml, licence.yml, integration-tests.yml,
-                   release.yml
+.github/workflows/ ci.yml, check_labels.yml, licence.yml, deps.yml,
+                   integration-tests.yml, release.yml
 ```
 
 Packages land with the code that needs them rather than as empty directories,

@@ -29,6 +29,12 @@ jobs:
             spdx:
               - '**.go'
               - '**.sh'
+              # The UI's sources carry the same header (D17). Without these
+              # three a .tsx added with no header would never be looked at:
+              # the job that would have caught it does not run.
+              - '**.ts'
+              - '**.tsx'
+              - '**.css'
               - '.github/workflows/licence.yml'
 
   spdx:

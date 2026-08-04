@@ -65,6 +65,17 @@ An `unstamped` chart engine in that output means the ldflag did not take, and
 every chart declaring a `swarmcliVersion` floor would be deployed unchecked —
 treat it as a failed release rather than a cosmetic problem.
 
+**Check that an archived binary serves the UI**, which the image job proves for
+itself and the archives do not. GoReleaser's `before.hooks` build the bundle
+`//go:embed` compiles in; if they are ever dropped, `go build` still succeeds
+against the committed sentinel and every archive ships the "built without its
+web UI" page. Nothing else about such a release looks wrong:
+
+```bash
+SWARMCLI_CD_ADMIN_TOKEN=x ./swarmcli-cd controller --config applications.yaml &
+curl -s localhost:8080/ | grep -q 'id="root"' || echo "this archive has no UI"
+```
+
 A binary out of an archive prints the same release **without** the leading `v`:
 GoReleaser stamps `{{.Version}}`, which is the tag with its `v` stripped, while
 the image is built with `github.ref_name` verbatim. So `swarmcli-cd version`
@@ -73,7 +84,11 @@ renderings, not a sign that the wrong thing was built.
 
 ## Locally, without publishing
 
+Needs Node as well as Go: the `before.hooks` run `npm --prefix web/ui ci` and
+`npm --prefix web/ui run build`, and `ENGINE_VERSION` is what the ldflag reads.
+
 ```bash
+export ENGINE_VERSION=$(go list -m -f '{{.Version}}' github.com/Eldara-Tech/swarmcli)
 goreleaser release --snapshot --clean
 docker build -t swarmcli-cd:dev .
 ```

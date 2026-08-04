@@ -1,0 +1,58 @@
+name: Dependency checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: read-all
+
+concurrency:
+  group: deps-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Detect whether the npm tree could have moved; licences gates on the output.
+  # Filtering at the job level (not the workflow trigger) preserves a "skipped"
+  # status that satisfies branch-protection required checks.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      npm: ${{ steps.f.outputs.npm }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: f
+        with:
+          filters: |
+            npm:
+              # The lockfile, because a transitive dependency arriving under an
+              # unchanged package.json is the case this gate exists for.
+              - 'web/ui/package.json'
+              - 'web/ui/package-lock.json'
+              - 'scripts/check-npm-licences.sh'
+              - '.github/workflows/deps.yml'
+
+  # licence.yml checks the headers we write. This checks what we install: the
+  # UI's tree is the first third-party licence obligation this repository has
+  # had, and the package that will breach it is a transitive one nobody chose.
+  licences:
+    needs: [changes]
+    if: needs.changes.outputs.npm == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/ui/package-lock.json
+
+      # `npm query` reports the licence of each installed package; the lockfile
+      # does not record one, so the tree has to be on disk.
+      - name: Install
+        run: npm --prefix web/ui ci
+
+      - name: Check dependency licences
+        run: ./scripts/check-npm-licences.sh
