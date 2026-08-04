@@ -27,6 +27,19 @@ export class ApiError extends Error {
 }
 
 /**
+ * hasStatus reports whether a failed request answered with one status.
+ *
+ * react-query hands a screen an Error, by which point ApiError's type is gone,
+ * so a screen that has something specific to say about one code has to ask. Two
+ * do: a 403 on the diff or history tab is a token without a separately-grantable
+ * action rather than a failure, and a 502 on the history is the swarm refusing
+ * to be read rather than the controller being broken.
+ */
+export function hasStatus(error: unknown, status: number): boolean {
+  return error instanceof ApiError && error.status === status
+}
+
+/**
  * authorized issues a request with the session's credential attached.
  *
  * A 401 clears the token before throwing, which is what returns the tab to the

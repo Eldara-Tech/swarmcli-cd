@@ -2,7 +2,7 @@
 // Copyright © 2026 Eldara Tech
 
 import { useQuery } from '@tanstack/react-query'
-import { Link, useParams } from 'react-router'
+import { Link, NavLink, Outlet, useParams } from 'react-router'
 
 import { apiGet } from '../api/client'
 import { compatStates, decodeEnum, syncActions } from '../api/enums'
@@ -13,20 +13,21 @@ import { CompatChip, DriftCell, HealthChip, SyncChip } from '../components/State
 import { chartRef, destination, serviceCounts, shortRevision } from '../format'
 
 /**
- * One application: what was declared, what was observed, and what no longer
- * matches.
+ * The application's identity, and the three tabs that read it.
  *
- * The tree stops at services because that is where the API stops. ServiceStatus
- * carries mode, running, desired, completed, health, update state and message,
- * and there is no task or container level to descend into — so a screen that
- * offered one would be promising something no endpoint can answer.
+ * A layout route rather than three screens each drawing their own header: the
+ * name and the three chips answer "which application am I looking at, and is it
+ * healthy", and a tab that redrew them could disagree with the one beside it.
+ * It also means the diff and history documents are fetched only while their tab
+ * is open, which is the whole reason they have endpoints of their own — a
+ * manifest must not be dragged along by a screen that is not showing it.
+ *
+ * The tabs are routes and not state, for the reason the applications list gives
+ * about its filters: a tab is then a link somebody can paste.
  */
 export function ApplicationDetail() {
   const { app = '' } = useParams()
-  const detail = useQuery({
-    queryKey: ['applications', app],
-    queryFn: () => apiGet<View>(`/api/v1/applications/${encodeURIComponent(app)}`),
-  })
+  const detail = useApplication(app)
 
   if (detail.isPending) return <p>Loading…</p>
   if (detail.isError) {
@@ -38,8 +39,6 @@ export function ApplicationDetail() {
   }
 
   const { spec, status } = detail.data
-  const releases = status.releases
-  const blocked = (releases ?? []).filter(blocking)
 
   return (
     <section className="screen">
@@ -55,6 +54,65 @@ export function ApplicationDetail() {
         </p>
       </header>
 
+      {/* `.` with `end` is the index route, so "Overview" is current on
+          /applications/edge and not on its children. */}
+      <nav className="tabs">
+        <NavLink to="." end className={tab}>
+          Overview
+        </NavLink>
+        <NavLink to="diff" className={tab}>
+          Diff
+        </NavLink>
+        <NavLink to="history" className={tab}>
+          History
+        </NavLink>
+      </nav>
+
+      <Outlet />
+    </section>
+  )
+}
+
+function tab({ isActive }: { isActive: boolean }): string {
+  return isActive ? 'tab tab-current' : 'tab'
+}
+
+/**
+ * The detail document, read by the layout above and the overview below.
+ *
+ * One query key between them, so the header and the body it sits over cost one
+ * request and can never be two different observations of the same application.
+ */
+function useApplication(app: string) {
+  return useQuery({
+    queryKey: ['applications', app],
+    queryFn: () => apiGet<View>(`/api/v1/applications/${encodeURIComponent(app)}`),
+  })
+}
+
+/**
+ * What was declared, what was observed, and what no longer matches.
+ *
+ * The tree stops at services because that is where the API stops. ServiceStatus
+ * carries mode, running, desired, completed, health, update state and message,
+ * and there is no task or container level to descend into — so a screen that
+ * offered one would be promising something no endpoint can answer.
+ */
+export function ApplicationOverview() {
+  const { app = '' } = useParams()
+  const detail = useApplication(app)
+
+  // No pending or error branch. The layout has already resolved this exact
+  // query — same key, so the cache answers — and would have rendered neither
+  // the tabs nor this outlet if it had not.
+  if (detail.data === undefined) return null
+
+  const { spec, status } = detail.data
+  const releases = status.releases
+  const blocked = (releases ?? []).filter(blocking)
+
+  return (
+    <>
       {/* Above everything, because it is not a property of a row: the reconciler
           refuses the whole plan rather than applying the compatible part of it,
           so nothing below is going to be deployed until the engine moves. */}
@@ -164,7 +222,7 @@ export function ApplicationDetail() {
       )}
 
       <DriftPanel releases={releases ?? []} />
-    </section>
+    </>
   )
 }
 

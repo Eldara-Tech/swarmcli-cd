@@ -590,3 +590,130 @@ thead th {
 .name-list ul {
   margin: 0.25rem 0;
 }
+
+/* The detail screen's tabs ------------------------------------------------ */
+
+.tabs {
+  border-bottom: 1px solid var(--edge);
+  display: flex;
+  gap: 0.25rem;
+  margin: 1rem 0;
+}
+
+.tab {
+  border-bottom: 2px solid transparent;
+  color: var(--ink-muted);
+  padding: 0.35rem 0.75rem;
+  text-decoration: none;
+}
+
+/* Weight as well as colour, for the same reason the diff carries a glyph as
+   well as one: the current tab must be identifiable without seeing the
+   accent. */
+.tab-current {
+  border-bottom-color: var(--accent);
+  color: var(--ink);
+  font-weight: 700;
+}
+
+/* The diff ---------------------------------------------------------------- */
+
+.diff-release h2,
+.history-release h2 {
+  font-size: 1.05rem;
+  margin: 1.25rem 0 0.25rem;
+}
+
+.diff {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.3rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  margin: 0.5rem 0 1rem;
+  /* A rendered manifest has lines nothing here chooses the length of, and the
+     one thing this must not do is widen the page. */
+  overflow-x: auto;
+  padding: 0.4rem 0;
+}
+
+.diff-line {
+  display: flex;
+  gap: 0.6rem;
+  /* max-content so a long line scrolls the block rather than wrapping, and
+     100% so the row's own background — where it has one — reaches the right
+     edge of the scrolled area. */
+  min-width: 100%;
+  padding: 0 0.7rem;
+  width: max-content;
+}
+
+/* Keeps its width when empty, which is every context line: the columns line up
+   without a screen reader being read a space per line. */
+.diff-gutter {
+  color: var(--ink-muted);
+  flex: none;
+  text-align: center;
+  user-select: none;
+  width: 1ch;
+}
+
+/* The manifest's own indentation is inside this span, so it has to survive. */
+.diff-content {
+  white-space: pre;
+}
+
+/* Colour is the emphasis; the glyph in the gutter is the signal. Around 8% of
+   male readers cannot separate these two hues, and a diff encoded only in
+   colour tells them something changed without saying in which direction. */
+.diff-added,
+.diff-added .diff-gutter {
+  color: var(--accent);
+}
+
+.diff-removed,
+.diff-removed .diff-gutter {
+  color: var(--danger);
+}
+
+.diff-added .diff-gutter,
+.diff-removed .diff-gutter {
+  font-weight: 700;
+}
+
+/* The stand-in for the unchanged lines this screen dropped. Muted, because it
+   is the one row that is not manifest. */
+.diff-folded,
+.diff-folded .diff-gutter {
+  color: var(--ink-muted);
+}
+
+.diff-folded .diff-content {
+  font-style: italic;
+}
+
+/* The two answers that are not a document ---------------------------------- */
+
+/* A permission, drawn as one: no rule, no fill, nothing that reads as a
+   failure. */
+.notice-forbidden {
+  color: var(--ink-muted);
+}
+
+/* The swarm would not answer — the controller is fine, so this wears the same
+   weight as the app set's partial failure rather than the never-loaded one. */
+.notice-unreachable {
+  border-color: var(--warn);
+}
+
+.retry {
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 0.25rem;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  margin-top: 0.35rem;
+  padding: 0.3rem 0.7rem;
+}
