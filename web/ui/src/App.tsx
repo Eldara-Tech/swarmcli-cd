@@ -6,7 +6,9 @@ import { BrowserRouter, Route, Routes } from 'react-router'
 
 import { useToken } from './auth/useToken'
 import { Shell } from './Shell'
-import { ApplicationDetail } from './screens/ApplicationDetail'
+import { ApplicationDetail, ApplicationOverview } from './screens/ApplicationDetail'
+import { ApplicationDiff } from './screens/ApplicationDiff'
+import { ApplicationHistory } from './screens/ApplicationHistory'
 import { Applications } from './screens/Applications'
 import { ControllerStatusScreen } from './screens/ControllerStatus'
 import { Login } from './screens/Login'
@@ -58,8 +60,18 @@ export function App() {
               <Route index element={<Applications />} />
               {/* Encoded by the screens that link here, and decoded by
                   useParams, so an application whose name needs escaping is
-                  still one route rather than a special case. */}
-              <Route path="applications/:app" element={<ApplicationDetail />} />
+                  still one route rather than a special case.
+
+                  The three tabs are children rather than state, so each is a
+                  link somebody can paste — and so the diff and the history are
+                  requested only while their own tab is open. Each carries a
+                  whole rendered manifest or a whole revision table, which is
+                  why they are separate endpoints in the first place. */}
+              <Route path="applications/:app" element={<ApplicationDetail />}>
+                <Route index element={<ApplicationOverview />} />
+                <Route path="diff" element={<ApplicationDiff />} />
+                <Route path="history" element={<ApplicationHistory />} />
+              </Route>
               <Route path="status" element={<ControllerStatusScreen />} />
             </Route>
           </Routes>
