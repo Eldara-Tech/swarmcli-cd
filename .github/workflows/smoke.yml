@@ -125,7 +125,23 @@ jobs:
                 revision: main
                 releaseFile: swarmcli-release.yaml
               syncPolicy:
-                automated: true
+                # Manual, and that is the whole reason this fixture works.
+                #
+                # Automated, the controller deploys the application about a
+                # second after startup — long before Playwright has a browser —
+                # and then it is converged. A sync triggered afterwards has
+                # nothing to do and raises no events at all, so the assertion
+                # that one arrives at an already-watching page could never pass.
+                # There is no replay to fall back on: api/stream.go emits no
+                # `id:`, so a subscriber is only ever sent what happens while it
+                # is attached.
+                #
+                # Manual, the startup pass plans, reports out-of-sync and stops.
+                # The install is still waiting when the browser connects, so the
+                # sync the test triggers is real work and raises sync-started and
+                # sync-succeeded at a page that is already watching — which is
+                # exactly what the test claims to prove.
+                automated: false
                 interval: 10s
               driftDetection: manifest
           YAML
