@@ -471,9 +471,12 @@ type ReleaseStatus struct {
 	Wave int `json:"wave,omitempty"`
 
 	// Drift is what the live comparison found for this release, nil when it was
-	// not made: manifest mode, a release the plan would install or upgrade
-	// (there is nothing settled to compare against), or a backend that cannot
-	// read service specs.
+	// not asked for: manifest mode, or a release the plan would install or
+	// upgrade (there is nothing settled to compare against).
+	//
+	// A backend that cannot read service specs is not one of those — the
+	// application asked and cannot be answered, which is what Unknown is for, so
+	// that reports a record rather than nothing (#201).
 	Drift *ReleaseDrift `json:"drift,omitempty"`
 }
 

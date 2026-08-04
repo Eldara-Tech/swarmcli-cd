@@ -870,7 +870,7 @@ func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.
 	}
 	ldb, ok := b.(capability.LiveDrift)
 	if !ok {
-		return nil, nil
+		return unservable(live, plan), nil
 	}
 	// A backend that cannot list the other three kinds still sweeps services.
 	// Losing the half it cannot answer is better than losing both.
@@ -928,6 +928,36 @@ func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.
 	}
 	doomed := r.departed(ctx, e, spec, ldb, engine, plan, views)
 	return withOrphans(drifts, doomed), doomed
+}
+
+// unservable reports the mode itself as unanswerable, for a backend that cannot
+// serve it.
+//
+// The alternative was nil, and nil is the payload of an application that never
+// asked: a dash in the DRIFT column, no Drift line in `app get`, and precisely
+// the display of an operator who did not write driftDetection: live. Unknown is
+// the state kept for asked-and-unanswerable, and a mode no backend under this
+// destination can serve is the plainest case of it there is — it is also the one
+// that never rights itself, so silence here is silence forever (#201).
+//
+// The settled releases and no others, which is the set liveDrift would have
+// compared. A release the plan would install or upgrade reports nothing for
+// reasons of its own, and those do not change because the backend is limited.
+func unservable(live bool, plan *charts.Plan) map[string]*application.ReleaseDrift {
+	if !live {
+		return nil
+	}
+	out := make(map[string]*application.ReleaseDrift, len(plan.Releases))
+	for _, rp := range plan.Releases {
+		if rp.Action != charts.ActionUnchanged {
+			continue
+		}
+		out[rp.Name] = &application.ReleaseDrift{
+			State:   application.DriftStateUnknown,
+			Message: "this backend cannot read service specs, so nothing can be compared against the repository",
+		}
+	}
+	return out
 }
 
 // liveDrift compares each settled release against what is running, for an

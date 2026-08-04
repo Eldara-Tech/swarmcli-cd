@@ -2490,16 +2490,52 @@ func TestManifestModeNeverComparesAgainstTheSwarm(t *testing.T) {
 }
 
 // A backend that cannot read service specs — a remote one reached through the
-// same seam — must leave the axis absent rather than fail the application.
+// same seam — must degrade rather than fail the application. It degrades to
+// unknown and not to nothing: nil is the payload of an application that never
+// asked, so reporting it here gave an operator who wrote driftDetection: live
+// the display of one who did not — a dash in the DRIFT column and no drift line
+// at all, for a mode that will never right itself (#201).
 func TestLiveModeDegradesOnABackendWithoutTheSeam(t *testing.T) {
+	backend := stubBackend{}
+	if _, ok := any(backend).(capability.LiveDrift); ok {
+		t.Fatal("stubBackend implements capability.LiveDrift; it is meant to be the backend that cannot")
+	}
 	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
-	r := newTest(t, []application.Spec{liveSpec("edge", true)}, engine, nil)
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want the reconcile to survive a backend that cannot compare", err)
+	}
+
+	view, _ := r.View("edge")
+	if view.Status.Drift == nil || view.Status.Drift.State != application.DriftStateUnknown {
+		t.Fatalf("drift = %+v, want unknown", view.Status.Drift)
+	}
+	if !strings.Contains(view.Status.Drift.Message, "cannot read service specs") {
+		t.Errorf("message = %q, want it to name what the backend cannot do", view.Status.Drift.Message)
+	}
+	// Unknown is a gap in the reporting and not a finding, so nothing follows
+	// from it: the plan's own verdict stands and nothing is rewritten.
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q, want the plan's own verdict", view.Status.Sync.State)
+	}
+}
+
+// And only for the applications that asked. Manifest mode has no live axis
+// whatever the backend can do, so a sweeping application on the same limited
+// backend reports no drift rather than an unknown it never enabled.
+func TestAManifestModeApplicationReportsNoDriftOnTheSameBackend(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: stubBackend{}})
 
 	if err := r.Sync(context.Background(), "edge"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
 	}
-	if view, _ := r.View("edge"); view.Status.Drift != nil {
-		t.Errorf("drift = %+v, want nil when the backend cannot answer", view.Status.Drift)
+
+	view, _ := r.View("edge")
+	if view.Status.Drift != nil {
+		t.Errorf("drift = %+v, want nil for an application that never asked", view.Status.Drift)
 	}
 }
 
