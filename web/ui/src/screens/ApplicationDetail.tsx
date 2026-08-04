@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { Link, NavLink, Outlet, useParams } from 'react-router'
 
-import { apiGet } from '../api/client'
+import { apiGet, apiPost, hasStatus } from '../api/client'
 import { compatStates, decodeEnum, syncActions } from '../api/enums'
+import { applicationKey } from '../api/queries'
 import type { ReleaseStatus, View } from '../api/types'
 import { DriftPanel } from '../components/DriftPanel'
+import { Forbidden } from '../components/Forbidden'
 import { Instant } from '../components/Instant'
 import { CompatChip, DriftCell, HealthChip, SyncChip } from '../components/StateChip'
 import { chartRef, destination, serviceCounts, shortRevision } from '../format'
@@ -28,6 +30,9 @@ import { chartRef, destination, serviceCounts, shortRevision } from '../format'
 export function ApplicationDetail() {
   const { app = '' } = useParams()
   const detail = useApplication(app)
+  // Above the branches below, because a hook cannot be called conditionally and
+  // the button belongs to the header this component draws either way.
+  const sync = useSync(app)
 
   if (detail.isPending) return <p>Loading…</p>
   if (detail.isError) {
@@ -52,7 +57,25 @@ export function ApplicationDetail() {
           <HealthChip state={status.health.state} />
           <DriftCell drift={status.drift} />
         </p>
+        {/* Disabled while the request is in flight, and that is the whole of
+            what stops a double press becoming two syncs: React does not deliver
+            a click to a disabled button, so the second press of a double-click
+            lands on nothing. It does not need to hold for longer than that —
+            the handler answers 202 in milliseconds, and a press after it has
+            answered is coalesced by the controller onto the sync already
+            queued rather than starting a second one. */}
+        <button
+          type="button"
+          className="sync-button"
+          disabled={sync.isPending}
+          onClick={() => {
+            sync.mutate()
+          }}
+        >
+          Sync
+        </button>
       </header>
+      <SyncOutcome sync={sync} />
 
       {/* `.` with `end` is the index route, so "Overview" is current on
           /applications/edge and not on its children. */}
@@ -85,9 +108,86 @@ function tab({ isActive }: { isActive: boolean }): string {
  */
 function useApplication(app: string) {
   return useQuery({
-    queryKey: ['applications', app],
+    queryKey: applicationKey(app),
     queryFn: () => apiGet<View>(`/api/v1/applications/${encodeURIComponent(app)}`),
   })
+}
+
+/**
+ * The 202 body api.go's sync handler writes.
+ *
+ * Not in api/types.ts: that file mirrors the Go structs a fixture is generated
+ * from, and this one is a map literal built in the handler, so a generated
+ * fixture could not police it.
+ */
+interface SyncAccepted {
+  application: string
+  accepted: boolean
+  /**
+   * Present, and true, when a sync was already queued and this request joined
+   * it rather than adding another. Not an error and not a no-op — see
+   * SyncOutcome.
+   */
+  coalesced?: boolean
+}
+
+/**
+ * The one request this UI makes that writes.
+ *
+ * A mutation rather than a query because it is not idempotent and must never be
+ * retried: react-query retries a *query* on the operator's behalf, and a retried
+ * POST here would be a second sync of a swarm. Mutations default to no retries,
+ * which is the behaviour this wants and is therefore not restated.
+ *
+ * It invalidates nothing on success, deliberately. The response says a sync was
+ * accepted and nothing whatever about its outcome — it runs detached from the
+ * request, for as long as the rollout takes — so refetching the detail here
+ * would refetch a document that has not moved yet. What moves it is the
+ * sync-started the controller raises, through the same invalidation map every
+ * other event goes through; there is no second path into the cache for the one
+ * document an operator is watching hardest.
+ */
+function useSync(app: string) {
+  return useMutation({
+    mutationFn: () => apiPost<SyncAccepted>(`/api/v1/applications/${encodeURIComponent(app)}/sync`),
+  })
+}
+
+/**
+ * What pressing the button did, which is never what the sync did.
+ *
+ * Nothing here reports success or failure of a reconcile: the request is over
+ * long before the sync is. The outcome arrives on the header's chips, refetched
+ * when the controller says so.
+ */
+function SyncOutcome({ sync }: { sync: ReturnType<typeof useSync> }) {
+  if (sync.isError) {
+    // A 403 here is a permission and not a failed sync. authz grants ActionSync
+    // separately from ActionRead — a token that may watch this application may
+    // legitimately be refused the button — and drawing it in red as a failure
+    // would send an operator to the controller's logs looking for a reconcile
+    // that was never started.
+    if (hasStatus(sync.error, 403)) return <Forbidden action="sync" />
+    return (
+      <p className="error" role="alert">
+        {sync.error.message}
+      </p>
+    )
+  }
+  if (sync.data === undefined) return null
+
+  return (
+    <p className="sync-outcome" role="status" data-testid="sync-outcome">
+      {sync.data.coalesced === true
+        ? // Not an error, and not a no-op either: api.go coalesces onto a sync
+          // that is queued and has not read the repository yet, so the state
+          // this operator asked to have reconciled is the state that one will
+          // reconcile. Saying "already running" instead would be the one thing
+          // that is not true.
+          'A sync was already queued for this application, so this one joined it rather than adding another. It has not read the repository yet, so it will reconcile what you asked for.'
+        : 'Sync accepted. It runs detached from this request, so this is not its outcome — the chips above are, once the controller reports.'}
+    </p>
+  )
 }
 
 /**

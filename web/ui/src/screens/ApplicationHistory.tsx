@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useParams } from 'react-router'
 
 import { apiGet, hasStatus } from '../api/client'
+import { historyKey } from '../api/queries'
 import type { History, ReleaseHistory } from '../api/types'
 import { Forbidden } from '../components/Forbidden'
 import { Instant } from '../components/Instant'
@@ -33,8 +34,9 @@ export function ApplicationHistory() {
     // Its own key, for the reason ApplicationDiff's gives — and for one more of
     // its own: notify.go writes no chart revision when a drift converges, so
     // drift-converged must not invalidate this. A key nested under the
-    // application's would make that impossible to express.
-    queryKey: ['history', app],
+    // application's would make that impossible to express. From api/queries.ts,
+    // which is also where that decision is written down.
+    queryKey: historyKey(app),
     queryFn: () => apiGet<History>(`/api/v1/applications/${encodeURIComponent(app)}/history`),
   })
 

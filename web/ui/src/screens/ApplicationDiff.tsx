@@ -6,6 +6,7 @@ import { useParams } from 'react-router'
 
 import { apiGet, hasStatus } from '../api/client'
 import { decodeEnum, syncActions } from '../api/enums'
+import { diffKey } from '../api/queries'
 import type { DiffResponse, ReleaseDiff } from '../api/types'
 import { DiffView } from '../components/DiffView'
 import { Forbidden } from '../components/Forbidden'
@@ -38,11 +39,12 @@ export function ApplicationDiff() {
   const diff = useQuery({
     // Its own key rather than ['applications', app, 'diff']. Invalidation in
     // react-query matches on key prefixes, so nesting under the detail's key
-    // would make every refresh of the document refresh this too — and #174's
+    // would make every refresh of the document refresh this too — and the
     // invalidation map has to keep them apart in the other direction as well:
     // live-drift-detected must not invalidate the diff, because the swarm moved
-    // and the rendered manifest did not.
-    queryKey: ['diff', app],
+    // and the rendered manifest did not. Taken from api/queries.ts rather than
+    // written here, so the screen and the map cannot disagree about it.
+    queryKey: diffKey(app),
     queryFn: () => apiGet<DiffResponse>(`/api/v1/applications/${encodeURIComponent(app)}/diff`),
   })
 

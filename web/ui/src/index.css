@@ -536,6 +536,36 @@ thead th {
 
 /* The application detail -------------------------------------------------- */
 
+/* The one control in this UI that writes, so it is the one that looks like a
+   primary action — the same treatment the Sign in button gets, and nothing else
+   on this screen has. margin-left pushes it to the far end of the header,
+   away from the three tabs directly below it: those read, this one deploys. */
+.sync-button {
+  background: var(--accent);
+  border: none;
+  border-radius: 0.25rem;
+  color: var(--page);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  margin-left: auto;
+  padding: 0.35rem 0.9rem;
+}
+
+.sync-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Muted, because it reports that a request was accepted and not that a sync
+   succeeded. Anything that read as a verdict here would be claiming to know an
+   outcome that is still minutes away. */
+.sync-outcome {
+  color: var(--ink-muted);
+  font-size: 0.9rem;
+  margin: 0.5rem 0 0;
+}
+
 .tree {
   list-style: none;
   margin: 0;

@@ -9,13 +9,14 @@
 // application/fixtures_test.go marshalled from the Go View, because the shape is
 // what drifts.
 
-import { cleanup, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, queryClient } from '../App'
+import type { ControllerEvent } from '../api/events'
 import type { FieldDrift, ReleaseStatus, ResourceDrift, ServiceDrift, View } from '../api/types'
 import { setToken } from '../auth/session'
-import { clone, controller, json, openStream } from '../test/fakeApi'
+import { clone, controller, json, openStream, pushStream } from '../test/fakeApi'
 import viewFull from '../test/fixtures/view-full.json'
 
 function detail(): View {
@@ -80,6 +81,21 @@ function serve(view: View): void {
   controller({
     '/api/v1/applications/edge': () => json(200, view),
     '/api/v1/events': openStream,
+  })
+}
+
+/**
+ * deliver runs work and lets React settle, inside one act.
+ *
+ * The *async* form of act is what flushes the microtasks a pushed frame, the
+ * invalidation it triggers and the refetch that follows all settle in. The
+ * synchronous form returns before any of them have run, which is a test that
+ * asserts against the screen as it was.
+ */
+async function deliver(work: () => void): Promise<void> {
+  await act(async () => {
+    work()
+    await Promise.resolve()
   })
 }
 
@@ -270,5 +286,181 @@ describe('the drift panel', () => {
 
     expect(await screen.findByRole('heading', { name: 'traefik', level: 3 })).toBeDefined()
     expect(screen.queryByRole('heading', { name: 'Drift' })).toBeNull()
+  })
+})
+
+/**
+ * The one control in this UI that writes.
+ *
+ * Every case here is about the gap between the request and the work: the handler
+ * answers 202 as soon as the sync is accepted and the sync itself runs detached
+ * for as long as the rollout takes, so nothing the button can say is ever about
+ * the outcome.
+ */
+describe('the sync button', () => {
+  /** The detail document, plus whatever the sync endpoint should answer. */
+  function servingSync(sync: () => Response | Promise<Response>): void {
+    controller({
+      '/api/v1/applications/edge': () => json(200, detail()),
+      '/api/v1/applications/edge/sync': sync,
+      '/api/v1/events': openStream,
+    })
+  }
+
+  function press(): Promise<HTMLElement> {
+    return screen.findByRole('button', { name: 'Sync' })
+  }
+
+  it('says the sync was accepted, not that it succeeded', async () => {
+    servingSync(() => json(202, { application: 'edge', accepted: true }))
+    render(<App />)
+
+    fireEvent.click(await press())
+
+    const outcome = await screen.findByTestId('sync-outcome')
+    expect(outcome.textContent).toMatch(/accepted/)
+    // The half that matters: a message claiming an outcome here would be
+    // claiming to know one that is still minutes away.
+    expect(outcome.textContent).toMatch(/not its outcome/)
+  })
+
+  // api.go answers this when a sync is already running and another is queued
+  // behind it. The queued one has not read the repository yet, so it will
+  // reconcile what this operator asked for — which is why it is neither an
+  // error nor a press that did nothing.
+  it('reads a coalesced sync as covered rather than as a failure', async () => {
+    servingSync(() => json(202, { application: 'edge', accepted: true, coalesced: true }))
+    render(<App />)
+
+    fireEvent.click(await press())
+
+    const outcome = await screen.findByTestId('sync-outcome')
+    expect(outcome.textContent).toMatch(/already queued/)
+    expect(outcome.textContent).toMatch(/will reconcile what you asked for/)
+    // Announced as a status and not as an alert — the same distinction the
+    // sentence makes, for a reader who is hearing it rather than seeing it.
+    expect(outcome.getAttribute('role')).toBe('status')
+  })
+
+  // The case no OSS deployment can produce — the admin token holds every action
+  // — and the first thing a licensed authorizer will. A red error here would
+  // send an operator to the controller's logs looking for a reconcile that was
+  // never started.
+  it('reads a 403 as not permitted rather than as a failed sync', async () => {
+    servingSync(() => json(403, { error: 'the token may not sync applications' }))
+    render(<App />)
+
+    fireEvent.click(await press())
+
+    const forbidden = await screen.findByTestId('forbidden')
+    expect(forbidden.textContent).toMatch(/do not have permission/)
+    expect(forbidden.textContent).toMatch(/granted separately/)
+    expect(screen.queryByTestId('sync-outcome')).toBeNull()
+  })
+
+  it('cannot be pressed twice into two syncs', async () => {
+    let accept: (response: Response) => void = () => {}
+    const held = new Promise<Response>((resolve) => {
+      accept = resolve
+    })
+    let syncs = 0
+    servingSync(() => {
+      syncs++
+      return held
+    })
+    render(<App />)
+
+    const button = (await press()) as HTMLButtonElement
+    fireEvent.click(button)
+    await waitFor(() => {
+      expect(button.disabled).toBe(true)
+    })
+
+    // React delivers no click to a disabled button, and that is the whole
+    // mechanism: the second press of a double-click lands on nothing.
+    fireEvent.click(button)
+    await deliver(() => {
+      accept(json(202, { application: 'edge', accepted: true }))
+    })
+
+    expect(await screen.findByTestId('sync-outcome')).toBeDefined()
+    expect(syncs).toBe(1)
+    // Enabled again once the request is over: a press after the 202 is coalesced
+    // by the controller onto the sync already queued, so there is nothing left
+    // for this button to defend against.
+    expect(button.disabled).toBe(false)
+  })
+})
+
+/**
+ * The invalidation map, wired.
+ *
+ * queries.test.ts proves the table; these two prove that a frame off a real
+ * parse reaches it and that the keys it names are the keys the screens
+ * registered — the half that cannot be checked by reading either file alone.
+ */
+describe('live updates', () => {
+  function event(overrides: Partial<ControllerEvent>): ControllerEvent {
+    return {
+      application: 'edge',
+      swarm: '',
+      type: 'sync-succeeded',
+      at: '2026-07-22T09:41:10Z',
+      ...overrides,
+    }
+  }
+
+  it('re-reads the document when an event names this application', async () => {
+    const stream = pushStream()
+    const failed = detail()
+    failed.status.error = 'clone https://git.example/apps: connection refused'
+    let reads = 0
+    controller({
+      '/api/v1/applications/edge': () => json(200, reads++ === 0 ? detail() : failed),
+      '/api/v1/events': stream.open,
+    })
+    render(<App />)
+
+    await screen.findByRole('heading', { name: 'edge', level: 1 })
+    expect(screen.queryByText('The last reconcile failed')).toBeNull()
+
+    await deliver(() => {
+      stream.push(event({}))
+    })
+
+    // The banner came from the second read of the endpoint, not from anything
+    // carried on the frame: the event says a document moved and never what it
+    // moved to.
+    expect(await screen.findByText('The last reconcile failed')).toBeDefined()
+  })
+
+  it('leaves this application alone when the event names another', async () => {
+    const stream = pushStream()
+    let reads = 0
+    controller({
+      '/api/v1/applications/edge': () => {
+        reads++
+        return json(200, detail())
+      },
+      '/api/v1/events': stream.open,
+    })
+    render(<App />)
+
+    await screen.findByRole('heading', { name: 'edge', level: 1 })
+    expect(reads).toBe(1)
+
+    await deliver(() => {
+      stream.push(event({ application: 'ingress' }))
+    })
+
+    // Waited for through the indicator, so the count below is read after the
+    // frame was handled rather than before it arrived.
+    await waitFor(() => {
+      expect(screen.getByTestId('live-last').textContent).toMatch(/ingress/)
+    })
+    // ['applications'] is a prefix of ['applications', 'edge'], so a list
+    // invalidation that was not exact would have refetched the document on
+    // screen over an event that said nothing about it.
+    expect(reads).toBe(1)
   })
 })

@@ -5,23 +5,26 @@
 const reads: Record<string, string> = {
   diff: 'the manifest change a sync would make',
   history: "its releases' recorded revisions",
+  sync: 'the right to start one',
 }
 
 /**
- * A 403 on a tab is a permission, not a failure.
+ * A 403 is a permission, not a failure.
  *
- * authz.ActionDiff and authz.ActionHistory are granted separately from
- * ActionRead, and authz.go says why: a diff is the rendered manifest and a
- * history names what installed each revision, so a token that may list
- * applications may legitimately be refused both. Drawing this as an error would
- * send an operator looking for a broken controller.
+ * authz.ActionDiff, ActionHistory and ActionSync are each granted separately
+ * from ActionRead, and authz.go says why: a diff is the rendered manifest, a
+ * history names what installed each revision, and a sync writes to the swarm —
+ * so a token that may list applications may legitimately be refused all three.
+ * Drawing any of them as an error would send an operator looking for a broken
+ * controller; on the sync it would additionally read as a reconcile that failed,
+ * when none was ever started.
  *
  * Nothing here has ever run against the OSS authorizer, which grants its admin
  * token everything. A licensed one is the first thing that will exercise it,
  * which is exactly why it is written now rather than when somebody reports a
  * red banner.
  */
-export function Forbidden({ action }: { action: 'diff' | 'history' }) {
+export function Forbidden({ action }: { action: 'diff' | 'history' | 'sync' }) {
   return (
     <div className="notice notice-forbidden" role="status" data-testid="forbidden">
       <h2>You do not have permission</h2>

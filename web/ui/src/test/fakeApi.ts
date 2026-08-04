@@ -11,8 +11,16 @@
 
 import { vi } from 'vitest'
 
-/** controller fakes the API: a response per path prefix. */
-export function controller(routes: Record<string, () => Response>): void {
+import type { ControllerEvent } from '../api/events'
+
+/**
+ * controller fakes the API: a response per path prefix.
+ *
+ * A route may answer with a promise as well as a response, which is how a test
+ * observes a request that is still in flight — the sync button's disabled state
+ * exists for exactly the window an instantly-resolved fake does not have.
+ */
+export function controller(routes: Record<string, () => Response | Promise<Response>>): void {
   // Longest prefix wins. The detail path extends the list path, so key order
   // would otherwise decide whether GET /api/v1/applications/edge was answered
   // by the detail route or by the list — silently, and differently per test.
@@ -72,6 +80,51 @@ export function openStream(): Response {
     getReader: () => ({ read: () => new Promise<never>(() => {}) }),
   }
   return { ok: true, status: 200, body } as unknown as Response
+}
+
+/**
+ * A stream the test drives: it stays open, and delivers a frame when push is
+ * called.
+ *
+ * Driven rather than pre-loaded because the alternative races: a fake that
+ * emits as soon as it is read emits while the screen's own first request is
+ * still in flight, and an invalidation that lands before there is anything to
+ * invalidate is a test that passes for the wrong reason on a fast machine and
+ * fails on a slow one.
+ *
+ * push is not wrapped in act here — the caller does that, since only it knows
+ * what it is then waiting for.
+ */
+export function pushStream(): { open: () => Response; push: (event: ControllerEvent) => void } {
+  const encoder = new TextEncoder()
+  const queued: Uint8Array[] = []
+  let waiting: ((chunk: { done: boolean; value: Uint8Array }) => void) | null = null
+
+  function read(): Promise<{ done: boolean; value?: Uint8Array }> {
+    const next = queued.shift()
+    if (next !== undefined) return Promise.resolve({ done: false, value: next })
+    return new Promise((resolve) => {
+      waiting = resolve
+    })
+  }
+
+  return {
+    open: () => ({ ok: true, status: 200, body: { getReader: () => ({ read }) } }) as unknown as Response,
+    push: (event) => {
+      // The wire api/stream.go writes: the event name, the payload, a blank
+      // line. The name is discarded by the parser — the payload repeats it —
+      // and it is sent anyway so the fake is not a shape the controller never
+      // produces.
+      const frame = encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+      if (waiting === null) {
+        queued.push(frame)
+        return
+      }
+      const deliver = waiting
+      waiting = null
+      deliver({ done: false, value: frame })
+    },
+  }
 }
 
 /**

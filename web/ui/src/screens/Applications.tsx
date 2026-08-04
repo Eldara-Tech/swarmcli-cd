@@ -8,6 +8,7 @@ import { appSetShape } from '../api/appset'
 import { apiGet } from '../api/client'
 import { useFeature } from '../api/discovery'
 import { decodeEnum, driftStates, healthStates, syncStates } from '../api/enums'
+import { controllerKey, listKey } from '../api/queries'
 import type { ApplicationList, ControllerStatus, View } from '../api/types'
 import { DriftCell, HealthChip, SyncChip } from '../components/StateChip'
 import { Instant } from '../components/Instant'
@@ -42,13 +43,13 @@ export function Applications() {
   const showSwarm = useFeature('multi-swarm')
 
   const applications = useQuery({
-    queryKey: ['applications'],
+    queryKey: listKey,
     queryFn: () => apiGet<ApplicationList>('/api/v1/applications'),
   })
   // The controller's own state, for the banner below. Same query key as the
   // controller screen, so opening that screen from here costs no request.
   const controller = useQuery({
-    queryKey: ['status'],
+    queryKey: controllerKey,
     queryFn: () => apiGet<ControllerStatus>('/api/v1/status'),
   })
 

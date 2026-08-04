@@ -112,13 +112,17 @@ test('logs in, renders the shell, reads the API and receives an event', async ({
   // converged, and a tick with nothing to do raises nothing at all, so the wait
   // could only ever time out.
   //
-  // Through page.request rather than a button: the sync control is a later
-  // issue's, and this assertion is about the transport, not the screen. When the
-  // button lands, this becomes a click and the rest of the test is unchanged.
-  const sync = await page.request.post('/api/v1/applications/smoke/sync', {
-    headers: { Authorization: `Bearer ${adminToken}` },
-  })
-  expect(sync.ok(), `triggering the sync failed: ${sync.status()}`).toBe(true)
+  // Pressed rather than posted: this is the only place the button is exercised
+  // against a controller that really starts a sync — the bearer header the
+  // browser attaches to a write, the 202 body the screen reads, and the events
+  // that write lands on the stream this same page is holding open. The fixture
+  // is declared `automated: false` in smoke.yml precisely so this press has real
+  // work to do; converged, it would raise nothing.
+  await page.getByRole('button', { name: 'Sync' }).click()
+
+  // Accepted, which is all the response can say: the sync runs detached from the
+  // request and the outcome arrives below, on the stream.
+  await expect(page.getByTestId('sync-outcome')).toContainText('accepted')
 
   await expect(page.getByTestId('live-last')).toContainText('smoke')
 

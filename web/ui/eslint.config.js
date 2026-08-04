@@ -57,6 +57,27 @@ export default tseslint.config(
           ],
         },
       ],
+      // The second rule that is not a matter of taste, and it fails the same
+      // way the first one does: silently, and worst when it matters most.
+      //
+      // api/stream.go drops frames for a subscriber that is not keeping up —
+      // subscriberBuffer is 64, and publish selects with a `default:` that logs
+      // and discards — so a cache written from the event sequence diverges from
+      // the controller precisely when the controller is busiest, and nothing on
+      // screen says it has. An event is a hint that a document should be
+      // refetched; the document is the answer. See api/queries.ts.
+      //
+      // A syntax selector rather than no-restricted-properties, which matches on
+      // the object's name: the writer is whatever a component happened to call
+      // its client.
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "MemberExpression[property.name=/^setQuer(y|ies)Data$/]",
+          message:
+            'The event stream drops frames by design, so a cache written from events diverges silently. Invalidate the query and let the refetch read the authoritative document; see api/queries.ts.',
+        },
+      ],
       'react-hooks/rules-of-hooks': 'error',
       // An error rather than a warning: a stale closure in the event stream's
       // effect is a tab that stops receiving events while still saying it is
