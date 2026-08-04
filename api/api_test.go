@@ -1067,6 +1067,66 @@ func TestTheStreamCarriesTheEventsDestination(t *testing.T) {
 	}
 }
 
+// The one omitempty judgement on wire that a later reader is most likely to
+// "fix" into consistency with the swarm key beside it.
+//
+// An absent actor is a genuine absence — the controller acted on its own — so
+// the key goes, exactly as revision and message do. swarm is deliberately the
+// opposite, because empty is its answer. Both directions are asserted here,
+// because the missing key is the half that looks like the bug it is not.
+func TestTheStreamNamesTheActorOnlyWhenThereWasOne(t *testing.T) {
+	t.Run("a sync somebody pressed", func(t *testing.T) {
+		data := firstEventFrame(t, notify.Event{
+			Application: "edge",
+			Type:        notify.SyncStarted,
+			Actor:       "alice",
+			At:          time.Unix(0, 0).UTC(),
+		})
+		if data["actor"] != "alice" {
+			t.Errorf("frame %v carries actor %v, want alice", data, data["actor"])
+		}
+	})
+	t.Run("the controller on its own", func(t *testing.T) {
+		data := firstEventFrame(t, notify.Event{
+			Application: "edge",
+			Type:        notify.DriftDetected,
+			At:          time.Unix(0, 0).UTC(),
+		})
+		// The key, not the value: "actor":"" would assert that somebody
+		// triggered this and declined to say who.
+		if _, ok := data["actor"]; ok {
+			t.Errorf("frame %v carries an actor key for an event nobody asked for", data)
+		}
+	})
+}
+
+// The subject the guard resolved has to reach the events the sync raises, and
+// the only route that does not widen Reconciler is the context the detached sync
+// runs under. A handler that marked the request's context instead would lose it
+// at detach, and every manual sync would look like the controller's own.
+func TestASyncMarksItsContextWithTheSubject(t *testing.T) {
+	got := make(chan string, 1)
+	rec := &ctxCapturingReconciler{
+		fakeReconciler: &fakeReconciler{views: []application.View{view("edge")}},
+		capture:        func(c context.Context) { got <- notify.ActorFrom(c) },
+	}
+	_, h := testServer(t, rec, nil)
+
+	if rr := do(t, h, "POST", "/api/v1/applications/edge/sync"); rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rr.Code)
+	}
+	select {
+	case actor := <-got:
+		// allowAll authenticates as "tester"; the point is that it is the
+		// authorizer's answer and not a header the caller chose.
+		if actor != "tester" {
+			t.Errorf("the sync ran as %q, want the authenticated subject 'tester'", actor)
+		}
+	default:
+		t.Fatal("the sync never ran")
+	}
+}
+
 // firstEventFrame raises e on a running server's event stream and returns the
 // `data` object of the frame a subscriber receives, decoded into a map.
 //

@@ -563,17 +563,25 @@ func withAllowedReferences(b charts.Backend, allow application.Allow) charts.Bac
 	return b
 }
 
-// dispatch sends one event, stamped with the application it is about and the
-// destination it concerns.
+// dispatch sends one event, stamped with the application it is about, the
+// destination it concerns and whoever asked for the work that raised it.
 //
 // Every event this package raises goes through here rather than through
-// notify.Dispatch directly, and that is the whole of the fix for #131. Both
-// fields it fills are properties of the *application* rather than of the thing
-// that happened, so every literal had to remember them — and Event.Swarm was
-// declared, documented and then left empty at all thirteen of them, because an
-// Apache-2.0 build resolves one swarm and nothing it can test would ever notice.
-// The companion that routes production alerts to one channel and staging to
-// another is what notices, by which time the literals are somewhere else.
+// notify.Dispatch directly, and that is the whole of the fix for #131. The two
+// fields it takes from the spec are properties of the *application* rather than
+// of the thing that happened, so every literal had to remember them — and
+// Event.Swarm was declared, documented and then left empty at all thirteen of
+// them, because an Apache-2.0 build resolves one swarm and nothing it can test
+// would ever notice. The companion that routes production alerts to one channel
+// and staging to another is what notices, by which time the literals are
+// somewhere else.
+//
+// Event.Actor is here for the same reason and comes from the context, because it
+// is a property of neither: it belongs to whoever asked, and the API's sync
+// handler is what marks their sync. Everything that sync then set off is theirs
+// — its own events, and any prune or drift correction it performed — while a
+// tick of the loop marks nothing and so names nobody. A dispatch site added
+// later inherits both rules by existing here.
 //
 // Nothing else is filled in. At is the moment the event describes, which is not
 // always now — a sync's outcome carries the time the sync finished — and a
@@ -581,6 +589,7 @@ func withAllowedReferences(b charts.Backend, allow application.Allow) charts.Bac
 func dispatch(ctx context.Context, spec application.Spec, e notify.Event) {
 	e.Application = spec.Name
 	e.Swarm = spec.Destination.Swarm
+	e.Actor = notify.ActorFrom(ctx)
 	notify.Dispatch(ctx, e)
 }
 

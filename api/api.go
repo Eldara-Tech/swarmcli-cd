@@ -46,6 +46,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/extension"
+	"github.com/Eldara-Tech/swarmcli-cd/notify"
 )
 
 // Reconciler is what the API serves. *reconcile.Reconciler implements it.
@@ -586,7 +587,14 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request, _ authz.Subject
 // reconciled — by the sync already waiting, which has not read the repository
 // yet. The response says which of the two happened rather than claiming a sync
 // was started that was not.
-func (s *Server) sync(w http.ResponseWriter, r *http.Request, _ authz.Subject) {
+//
+// This is the only handler that starts work, so it is the only one with an actor
+// to record, and it records it on the sync's context rather than through
+// AcceptSync. Reconciler is an interface so that an alternative reconciler can
+// implement it; widening a method there to carry an attribution label would
+// break every implementation for something none of them has to understand. See
+// notify.WithActor.
+func (s *Server) sync(w http.ResponseWriter, r *http.Request, subject authz.Subject) {
 	app := r.PathValue("app")
 
 	run, err := s.rec.AcceptSync(app)
@@ -600,7 +608,9 @@ func (s *Server) sync(w http.ResponseWriter, r *http.Request, _ authz.Subject) {
 	}
 
 	s.syncing(app, func(ctx context.Context) {
-		if err := run(ctx); err != nil {
+		// Marked here rather than on r.Context(): detach severs the request's
+		// context, so a value put on it would never reach the sync it was for.
+		if err := run(notify.WithActor(ctx, subject.Name)); err != nil {
 			// Already recorded on the application's status and dispatched as a
 			// sync-failed event; this is the log line that says a manual one
 			// was what failed.

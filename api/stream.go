@@ -136,7 +136,26 @@ type wire struct {
 	Type     string `json:"type"`
 	Revision string `json:"revision,omitempty"`
 	Message  string `json:"message,omitempty"`
-	At       string `json:"at"`
+	// Actor is omitempty, where Swarm above deliberately is not. That is the
+	// opposite call on the same struct, and it is the point rather than an
+	// inconsistency to tidy up: the question is never "is the string empty", it
+	// is "does empty mean something".
+	//
+	// For Swarm, empty is the answer — "the swarm the controller runs in" — so
+	// dropping the key would tell a consumer the event has no destination when
+	// every event has one. An absent actor is a genuine absence: the controller
+	// acted on its own, on its own tick, correcting drift or sweeping something
+	// git stopped declaring, and nobody pressed anything. That puts it with
+	// Revision and Message, whose keys are omitted because the event has no
+	// answer to give — and "actor":"" on every controller-raised frame would
+	// assert that somebody triggered it and declined to say who.
+	//
+	// The argument that keeps Swarm present does not reach here either. A client
+	// meets this field the first time an operator syncs from the UI, which is a
+	// thing that happens in every build including this one, so there is no
+	// licensed shape it could be surprised by.
+	Actor string `json:"actor,omitempty"`
+	At    string `json:"at"`
 }
 
 // stream serves server-sent events.
@@ -200,6 +219,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, subject authz.Su
 				Type:        string(e.Type),
 				Revision:    e.Revision,
 				Message:     e.Message,
+				Actor:       e.Actor,
 				At:          e.At.UTC().Format("2006-01-02T15:04:05Z07:00"),
 			})
 			if err != nil {

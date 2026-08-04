@@ -4328,6 +4328,59 @@ func TestEveryEventNamesTheDestinationItConcerns(t *testing.T) {
 	}
 }
 
+// ------------------------------------------- every event names who asked (#180)
+
+// Events raised by work a request set off name the caller; events the controller
+// raised on its own name nobody. The two cases run the identical sync and differ
+// only in whether the context was marked, because the whole of the feature is
+// that the mark is the only difference.
+//
+// Asserted across the spread of event types the destination test uses, and for
+// the same reason: the actor is stamped in dispatch, so a run that raised one
+// event type would pass this while a dispatch site added later went
+// unattributed. The empty case is the load-bearing half — an actor leaking onto
+// the loop's own ticks would name whoever last pressed sync as the person who
+// deleted a stack nobody touched.
+func TestEventsNameWhoAskedForTheWork(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		actor string
+	}{
+		{"a sync somebody pressed", "alice"},
+		{"the controller on its own", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := listen(t)
+			spec := sweepingSpec("edge", application.DriftLive)
+
+			backend := refusingSweep()
+			backend.live["whoami"]["whoami_app"] = swarm.Service{ID: "id-app", Spec: serviceSpec("whoami_app", 3)}
+			engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+			r := newTestWith(t, []application.Spec{spec}, engine, nil, fakeRegistry{backend: backend})
+
+			ctx := context.Background()
+			if tc.actor != "" {
+				ctx = notify.WithActor(ctx, tc.actor)
+			}
+			if err := r.Sync(ctx, "edge"); err != nil {
+				t.Fatalf("Sync = %v, want nil", err)
+			}
+
+			seen := map[notify.EventType]struct{}{}
+			for _, e := range rec.events() {
+				seen[e.Type] = struct{}{}
+				if e.Actor != tc.actor {
+					t.Errorf("event %s carries actor %q, want %q", e.Type, e.Actor, tc.actor)
+				}
+			}
+			if len(seen) < 5 {
+				t.Errorf("saw %d event types (%v), want the spread this test is built to cover — "+
+					"a run that stopped raising events would pass every assertion above", len(seen), rec.types())
+			}
+		})
+	}
+}
+
 // ------------------------- a rollback that is already history (#130)
 
 // rolledBackTo is the "whoami" release running a service that Swarm rolled back,
