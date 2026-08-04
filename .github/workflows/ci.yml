@@ -121,6 +121,12 @@ jobs:
       - name: Build
         run: go build -v -o swarmcli-cd ./cmd/swarmcli-cd
 
+      # The same check .goreleaser.yml runs on each published binary. Here so
+      # that the day something private reaches the module graph is the day a PR
+      # goes red, rather than the day a release is tagged.
+      - name: The artefact this repository publishes carries nothing private
+        run: ./scripts/check-oss-artefact.sh ./swarmcli-cd
+
   # The only job that has a real bundle, and so the only one that can run the
   # tests needing one: TestTheBuiltIndexHasNoInlineScriptOrStyle greps the
   # embedded index and skips wherever nothing was built, which in the `test` job

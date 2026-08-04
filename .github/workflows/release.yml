@@ -95,8 +95,26 @@ jobs:
         id: meta
         with:
           images: eldaratech/swarmcli-cd
-          # latest=auto: a prerelease tag does not become :latest, so an rc
-          # cannot become what stack.yml pulls by default.
+          # -oss, and no moving tag at all (D21).
+          #
+          # Under D20 the unsuffixed tags and :latest belong to the merged
+          # artefact, which is built from the private wrapper and pushed to this
+          # same repository on Docker Hub. Two pipelines writing
+          # eldaratech/swarmcli-cd:1.2.0 would leave an operator with whichever
+          # finished last, and stack.yml pulls :latest.
+          #
+          # latest=false rather than latest=auto: this build must never become
+          # what stack.yml pulls by default, and the consequence — a public tag
+          # on its own no longer moves :latest — is stated in RELEASING.md
+          # rather than discovered.
+          #
+          # No :oss either. An Apache-2.0-only deployment pins a version, which
+          # is what an air-gapped or compliance-reviewed one does anyway, and a
+          # moving tag on the artefact whose whole point is being verifiable is
+          # a way to be surprised by what is running.
+          flavor: |
+            latest=false
+            suffix=-oss
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

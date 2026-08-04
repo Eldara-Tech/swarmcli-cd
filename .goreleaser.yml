@@ -54,11 +54,29 @@ builds:
       # without it charts.EngineVersion() is empty and every chart's declared
       # floor goes unchecked.
       - -X github.com/Eldara-Tech/swarmcli/charts.engineVersion={{.Env.ENGINE_VERSION}}
+    hooks:
+      # On each of the four binaries actually being published, rather than on a
+      # stand-in built somewhere else. What it asserts is what the -oss name
+      # claims: the main module is this repository and nothing private is linked
+      # (D21). ci.yml runs the same script on every change, so it is not a gate
+      # that only ever fires on a tag.
+      post:
+        - ./scripts/check-oss-artefact.sh "{{ .Path }}"
 
 archives:
-  - id: default
+  # swarmcli-cd-oss, not swarmcli-cd (D21). Under D20 the plain name belongs to
+  # the merged artefact, which is built from the private wrapper and published
+  # into this repository's releases — so both pipelines write into the same
+  # GitHub release, and leaving the plain name here would have them overwrite
+  # each other's archives with whichever finished last.
+  #
+  # The binary *inside* is still `swarmcli-cd`. It is the same command: renaming
+  # it would make every documented invocation, stack.yml's entrypoint and the
+  # container healthcheck differ between the two builds. What tells them apart
+  # is what the build says about itself — see docs/editions.md.
+  - id: oss
     name_template: >-
-      {{ .ProjectName }}_
+      {{ .ProjectName }}-oss_
       {{- title .Os }}_
       {{- if eq .Arch "amd64" }}x86_64
       {{- else }}{{ .Arch }}{{ end }}
@@ -67,8 +85,11 @@ archives:
       - README.md
       - stack.yml
 
+# For the same reason, one word longer. A release carries two checksum files
+# because it carries two sets of artefacts, and a single `checksums.txt` would
+# be the one file in which the two pipelines silently disagree.
 checksum:
-  name_template: 'checksums.txt'
+  name_template: 'checksums-oss.txt'
 
 snapshot:
   version_template: "{{ incpatch .Version }}-next"

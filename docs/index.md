@@ -21,6 +21,8 @@ it is and why; the pages here are how to use it.
   for building on.
 - **[Web UI](web-ui.md)** — reaching it, building it, and what it means that a
   browser holds the admin token.
+- **[Editions](editions.md)** — the two artefacts every release publishes, which
+  one you are running, and what a licence changes.
 
 ## Examples
 
