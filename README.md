@@ -169,6 +169,7 @@ output and in argv.
 | `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config |
 | `--listen` | `:8080` | API listen address |
 | `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume |
+| `--ui` | on | serve the embedded web UI at `/`; `--ui=false` answers its routes with `404` |
 | `--appset-repo` `--appset-revision` `--appset-path` | — | source the application set from a git repository instead |
 | `--appset-dir` | — | source it from a directory a git-sync sidecar keeps current |
 | `--appset-interval` | `3m` | how often the application set is re-read |

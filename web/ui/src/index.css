@@ -1,0 +1,40 @@
+/*
+SPDX-License-Identifier: Apache-2.0
+Copyright © 2026 Eldara Tech
+*/
+
+/* System fonts only. A web font is a file to serve, a font-src to argue about
+   in the CSP, and a dependency on a foundry's licence; none of that is worth
+   paying before the UI has a screen. */
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 48rem;
+  padding: 2rem 1rem;
+}
+
+h1 {
+  font-size: 1.75rem;
+  margin: 0 0 0.5rem;
+}
+
+.state {
+  font-weight: 600;
+}
+
+.state-unreachable {
+  color: #b3261e;
+}
+
+.state-reachable {
+  color: #1e6b3a;
+}

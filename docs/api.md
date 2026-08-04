@@ -27,6 +27,8 @@ so the quickest way to see any shape below is to run the matching command with
 | `GET` | `/api/v1/applications/{app}/history` | each release's revisions |
 | `POST` | `/api/v1/applications/{app}/sync` | trigger a reconcile-and-apply |
 | `GET` | `/api/v1/events` | a live event stream, so a UI never polls |
+| `GET` | `/` | the web UI, and the fallback for its client-side routes |
+| `GET` | `/assets/{path...}` | the UI's hashed build output |
 
 The paths are nouns so that writable applications can be added later without any
 of them moving. Applications are read-only over the API in both directions of the
@@ -77,6 +79,28 @@ whole collection.
 the process and cannot carry one without putting it in the stack file and in
 `docker inspect` output. What it discloses — that something is listening — a TCP
 connect already tells you.
+
+The two UI routes are unauthenticated for a related reason: a browser has no
+credential until the login screen it is asking for has loaded, and what they
+serve is the build's own bytes, which say nothing about the swarm. `--ui=false`
+answers both with `404`; it does not remove them.
+
+## What an unmatched path answers
+
+`GET /` matches every path no more specific route claimed, because every such
+path is a route belonging to the router in the browser. Two consequences, both
+deliberate:
+
+- **A mistyped endpoint under `/api/` is still a JSON `404`**, not the UI's
+  index. Without that, a typo would answer `200 text/html` and become a parse
+  error a long way from the mistake.
+- **A wrong method is now a `405` or a `404`, not the old `405` in both cases.**
+  `POST /api/v1/typo` is `405` with `Allow: GET, HEAD`, because with `GET /`
+  registered every path matches under `GET`; and `GET …/sync`, which used to be
+  `405 Allow: POST`, is the JSON `404` above. Accepted rather than solved:
+  additionally registering a methodless `/api/` pattern would make the first a
+  JSON `404` too, but it cannot bring the second back — a pattern matching every
+  method takes the request before the `POST` route can report itself.
 
 ## Response shapes
 

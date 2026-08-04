@@ -23,6 +23,7 @@ jobs:
     outputs:
       code: ${{ steps.f.outputs.code }}
       image: ${{ steps.f.outputs.image }}
+      ui: ${{ steps.f.outputs.ui }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
@@ -40,6 +41,12 @@ jobs:
               - 'go.mod'
               - 'go.sum'
               - 'Dockerfile'
+              # The image is where the two halves are proved to compose, so a
+              # UI-only change must not skip the only job that builds both.
+              - 'web/**'
+              - '.github/workflows/ci.yml'
+            ui:
+              - 'web/**'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -104,6 +111,49 @@ jobs:
         run: go test -race -count=1 -timeout 5m ./...
       - name: Build
         run: go build -v -o swarmcli-cd ./cmd/swarmcli-cd
+
+  # The only job that has a real bundle, and so the only one that can run the
+  # tests needing one: TestTheBuiltIndexHasNoInlineScriptOrStyle greps the
+  # embedded index and skips wherever nothing was built, which in the `test` job
+  # is always — it has no Node. Without Go here, the CSP is asserted nowhere.
+  ui:
+    needs: [changes]
+    if: needs.changes.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/ui/package-lock.json
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install
+        run: npm --prefix web/ui ci
+
+      - name: Typecheck
+        run: npm --prefix web/ui run typecheck
+
+      - name: Build
+        run: npm --prefix web/ui run build
+
+      # emptyOutDir wipes web/dist on every build, and a Vite plugin puts the
+      # sentinel back. If that ever stops working the failure lands somewhere
+      # else entirely: every `go build` on a machine with no Node stops
+      # compiling, on somebody else's PR.
+      - name: The embed sentinel survived the build
+        run: |
+          test -f web/dist/.gitkeep || {
+            echo "web/dist/.gitkeep is gone; keepSentinel in vite.config.ts is what restores it"
+            exit 1
+          }
+
+      - name: The UI tests, against a real bundle
+        run: go test -count=1 ./web/...
 
   # Builds the image and proves the container runs with no docker binary in it,
   # which is what makes the moby-client backend worth having. It does not push:

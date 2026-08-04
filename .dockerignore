@@ -1,0 +1,26 @@
+# The build context feeds two stages — the UI build and the Go build — and
+# nothing else belongs in it.
+
+# The UI stage builds this from source. A developer's local build must never be
+# what the image serves, and its absence here is what makes a missing
+# `COPY --from=ui` in the Dockerfile a compile failure rather than an image that
+# silently serves the not-built page.
+web/dist
+
+# Reinstalled by `npm ci`, and a host's copy can be for another platform.
+**/node_modules
+
+# History and tooling metadata. No stage reads any of it, and .git is the
+# largest thing in the tree.
+.git
+.github
+.devcontainer
+.vscode
+.idea
+
+# Local build output and the in-tree caches the devcontainer keeps.
+/dist
+/swarmcli-cd
+.go
+.cache
+site

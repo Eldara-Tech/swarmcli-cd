@@ -34,6 +34,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/secrets"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
+	"github.com/Eldara-Tech/swarmcli-cd/web"
 
 	swarmlog "github.com/Eldara-Tech/swarmcli/utils/log"
 )
@@ -79,6 +80,10 @@ Options:
   --config <path>   Applications file (default ` + defaultConfigPath + `)
   --listen <addr>   API listen address (default ` + defaultListen + `)
   --data <dir>      Repository clones and chart cache (default ` + defaultDataDir + `)
+
+  --ui              Serve the web UI at / (default true). It is embedded in
+                    this binary, so nothing is fetched and no second port is
+                    opened; --ui=false answers its routes with 404 instead
 
   --reconcile-interval <dur>
                     How often an application is reconciled, for those that do
@@ -139,6 +144,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.configPath, "config", defaultConfigPath, "")
 	fs.StringVar(&o.listen, "listen", defaultListen, "")
 	fs.StringVar(&o.dataDir, "data", defaultDataDir, "")
+	fs.BoolVar(&o.ui, "ui", true, "")
 	fs.DurationVar(&o.interval, "reconcile-interval", reconcile.DefaultInterval, "")
 	fs.StringVar(&o.appSetRepo, "appset-repo", "", "")
 	fs.StringVar(&o.appSetRevision, "appset-revision", "", "")
@@ -208,6 +214,12 @@ type options struct {
 	configPath string
 	listen     string
 	dataDir    string
+
+	// ui serves the embedded web UI. On by default (D15) and off is still two
+	// registered routes answering 404, not two routes that disappear: what a
+	// build serves has to be the same list every time, or an extension could
+	// claim GET / in the gap.
+	ui bool
 
 	// interval is how often an application that names no syncPolicy.interval is
 	// reconciled. Controller-wide and deliberately not floored by
@@ -415,7 +427,14 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		Reclaimer: reclaim.New(reclaim.Options{Roots: []string{repos, chartCache}, Log: log}),
 	})
 
-	srv := api.New(rec, api.Options{Log: log, Controller: loop})
+	// The UI is built here and passed in, so that api stays data-only and
+	// nothing importing it links an embedded asset tree. With --ui=false the
+	// handler is absent rather than the routes: api.New answers them with a 404.
+	apiOpts := api.Options{Log: log, Controller: loop}
+	if o.ui {
+		apiOpts.UI = web.Handler(web.Assets, web.Options{Log: log})
+	}
+	srv := api.New(rec, apiOpts)
 	// api.New deliberately does not do this itself: notify is a seam.List that
 	// appends, so a self-registering server would leave one live event stream
 	// behind per server ever constructed.

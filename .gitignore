@@ -4,11 +4,24 @@
 
 # Build output. `go build ./...` writes each main package's binary into the
 # working directory, so cmd/<name> becomes ./<name> at the repo root.
-dist/
+#
+# Anchored. Unanchored it also matched web/dist, and git does not descend into
+# an excluded directory — so the un-ignore below could not have rescued the
+# sentinel, and a checkout with no Node would have failed to compile with
+# "pattern all:dist: no matching files found".
+/dist/
 /swarmcli-cd
 
 # Nothing named /controller belongs here: the entry point is the `controller`
 # package at the repository root, and ignoring that path would silently drop it.
+
+# The UI's build output, except the sentinel: `//go:embed all:dist` needs the
+# directory to be non-empty on a tree that has never run Vite, and `all:` is
+# what makes a dotfile count towards that. Plus the dependency tree, which
+# `npm ci` reinstalls from the committed lockfile.
+web/dist/*
+!web/dist/.gitkeep
+web/ui/node_modules/
 
 # Editors
 .vscode/
