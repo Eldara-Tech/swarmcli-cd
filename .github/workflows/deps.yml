@@ -52,7 +52,20 @@ jobs:
       # `npm query` reports the licence of each installed package; the lockfile
       # does not record one, so the tree has to be on disk.
       - name: Install
-        run: npm --prefix web/ui ci
+        run: npm --prefix web/ui ci --ignore-scripts
 
       - name: Check dependency licences
         run: ./scripts/check-npm-licences.sh
+
+  # The only job here with no paths filter, deliberately. What it guards against
+  # is a new `npm ci` written somewhere nobody thought of — a workflow, a
+  # Dockerfile stage, a helper script — and a filter listing the places it may
+  # appear would be the same list this check exists because nobody maintains. It
+  # is a grep, it needs no toolchain, and the failure it catches lets a third
+  # party run code in the job that publishes releases.
+  lifecycle-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Third-party lifecycle scripts are off
+        run: ./scripts/check-npm-scripts.sh
