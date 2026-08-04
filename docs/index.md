@@ -19,6 +19,8 @@ it is and why; the pages here are how to use it.
   chart compatibility, and why the applier is not `docker stack deploy`.
 - **[HTTP API](api.md)** — the endpoints behind every command, for scripting and
   for building on.
+- **[Web UI](web-ui.md)** — reaching it, building it, and what it means that a
+  browser holds the admin token.
 
 ## Examples
 

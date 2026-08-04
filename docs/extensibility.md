@@ -218,6 +218,43 @@ process serves, and the module that put it there, in the controller's own
 startup output — readable by an operator who has neither the companion's source
 nor a reason to trust its documentation.
 
+### Reserved paths
+
+The web UI is in this repository; part of what it draws is not. A licensed
+build's login button navigates to `/auth/login` and its project switcher fetches
+`/api/v1/projects`, neither of which exists in this tree — so the paths are
+fixed here, in the open half, before anything serves them:
+
+| Path | | Serves |
+|---|---|---|
+| `GET /auth/login` | public | where an SSO login starts |
+| `GET /auth/callback` | public | where the identity provider comes back to |
+| `GET /api/v1/licence` | guarded | the whole licence record, beyond the summary `/api/v1/capabilities` carries |
+| `GET /api/v1/projects` | guarded | the projects a subject may see, and their membership |
+| `GET /api/v1/audit` | guarded | the audit log, paged |
+| `GET /api/v1/notifications` | guarded | the notification destinations configured |
+
+**Reserved means documented, and nothing else.** The core registers none of
+them, nothing refuses a companion that serves something different, and on a
+build with no companion they are exactly what any other unclaimed path is — a
+JSON `404` under `/api/`, and whatever `GET /` serves everywhere else (see
+[api § what an unmatched path answers](api.md#what-an-unmatched-path-answers)).
+The list is as strong as the seam contracts on this page already are, and in the
+same way: a document the companion is written against, and the public UI with
+it.
+
+**A reserved path must never be added to `coreRoutes`.** That reads backwards
+until the mechanism is said out loud, so here it is: the collision check above
+refuses an extension pattern equal to a core route, so listing
+`/api/v1/projects` there would make the core reject the one module that exists
+to serve it. Reserving a path is not registering it. Nothing belongs in
+`coreRoutes` that this repository does not itself answer.
+
+Reserving now is cheap and reserving later is not, because that same check is an
+exact-string one. The day a companion ships `/api/v1/audit-log`, that spelling
+is frozen, and the public UI has to be changed to match a private module's
+choice of name.
+
 ### Optional interfaces beside a seam
 
 A companion does not have to answer everything at once. Where a capability may
@@ -294,6 +331,16 @@ must start refusing from the inside. Replacing it in the slot would be seen by
 the consumers that re-read and not by the ones holding the old value — and the
 ones that did see it would see it mid-flight, which for `swarms` means handing
 a half-finished sync a different daemon.
+
+For `extension` that has one shape worth naming outright: **a companion may
+declare no routes at all, and an unlicensed build that does is working
+correctly.** `Routes()` and `PublicRoutes()` both returning nil is how
+entitlement reaches the mux — the only way it can, since the mux is built once
+and no route can be withdrawn from it afterwards. What that buys is something an
+operator can check: the same binary, unlicensed, serves the route set a build
+with no companion linked serves, logs the same `routes` line, and emits no
+public-route `WARN`. The cost is the other half of the same fact — installing a
+licence needs a restart before its endpoints exist.
 
 ## Writing a companion package
 
