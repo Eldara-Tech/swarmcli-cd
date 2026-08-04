@@ -265,6 +265,20 @@ policy is automated. It returns as soon as the sync is accepted; the sync itself
 runs detached. Follow it by polling the detail view, or watch `/events`. This is
 the only endpoint that writes, and the only one guarded by the `sync` action.
 
+It answers `202` with what it did, and there are two answers:
+
+```json
+{ "application": "edge", "accepted": true }
+{ "application": "edge", "accepted": true, "coalesced": true }
+```
+
+`coalesced` means a sync was already running and another was already queued
+behind it, so this request joined that one rather than adding a third. It is
+still a `202` and it is not a no-op: the queued sync has not read the repository
+yet, so the state you asked to have reconciled is the state it will reconcile.
+A client that drew it as an error, or as a press that did nothing, would be
+wrong in both directions.
+
 It is also the only one with a caller to record: the subject it authenticated is
 carried as the `actor` of every event that sync raises. Nothing else names one,
 because nothing else starts work.

@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { appSetShape, type AppSetShape } from '../api/appset'
 import { apiGet } from '../api/client'
+import { controllerKey } from '../api/queries'
 import type { AppSetStatus, ControllerStatus as Status } from '../api/types'
 import { Instant } from '../components/Instant'
 import { shortRevision } from '../format'
@@ -25,7 +26,7 @@ import { shortRevision } from '../format'
  */
 export function ControllerStatusScreen() {
   const status = useQuery({
-    queryKey: ['status'],
+    queryKey: controllerKey,
     queryFn: () => apiGet<Status>('/api/v1/status'),
   })
 
