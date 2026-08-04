@@ -57,6 +57,26 @@ export async function apiGet<T>(path: string): Promise<T> {
   return (await response.json()) as T
 }
 
+/**
+ * publicGet reads one JSON document with no credential attached.
+ *
+ * The one reader that deliberately does not go through `authorized`, and both
+ * halves of that matter. It sends no bearer, because the only document it reads
+ * is /ui/bootstrap.json — what the login screen needs *before* anyone is
+ * authenticated, at a moment when the session holds nothing to send. And it does
+ * not treat a 401 as an authentication failure, because a public endpoint
+ * answering one is a misconfigured proxy rather than a rejected credential:
+ * clearing the token there would sign an operator out of a working session over
+ * a document that never needed their credential.
+ */
+export async function publicGet<T>(path: string): Promise<T> {
+  const response = await fetch(path)
+  if (!response.ok) {
+    throw new ApiError(response.status, await failureMessage(response))
+  }
+  return (await response.json()) as T
+}
+
 /** apiPost triggers work. The only endpoint that takes one today is sync. */
 export async function apiPost<T>(path: string): Promise<T> {
   const response = await authorized(path, { method: 'POST' })

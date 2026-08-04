@@ -14,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, queryClient } from './App'
 import { getToken, setToken } from './auth/session'
-import { clone, controller, json, openStream } from './test/fakeApi'
+import { clone, communityDiscovery, controller, json, openStream } from './test/fakeApi'
 import viewFull from './test/fixtures/view-full.json'
 
 /** Two applications, shaped as the generated fixture, named apart. */
@@ -51,15 +51,20 @@ afterEach(() => {
 })
 
 describe('the shell', () => {
-  it('asks for a token when there is none', () => {
-    controller({})
+  // Awaited rather than read synchronously: since C2 the screen asks
+  // /ui/bootstrap.json what a browser may sign in with before it draws
+  // anything, so a box that is present on the first paint would mean the
+  // document was not consulted at all.
+  it('asks for a token when there is none', async () => {
+    controller(communityDiscovery())
     render(<App />)
 
-    expect(screen.getByLabelText('Admin token')).toBeDefined()
+    expect(await screen.findByLabelText('Admin token')).toBeDefined()
   })
 
   it('signs in with a token the controller accepts and makes its one request', async () => {
     controller({
+      ...communityDiscovery(),
       '/api/v1/status': () => json(200, healthyStatus),
       '/api/v1/applications': () => json(200, twoApplications()),
       '/api/v1/events': openStream,
@@ -69,7 +74,7 @@ describe('the shell', () => {
     // fireEvent rather than setting .value and dispatching by hand: React
     // tracks the last value it wrote, so a direct assignment looks like no
     // change at all and the handler never runs.
-    fireEvent.change(screen.getByLabelText('Admin token'), { target: { value: 'right' } })
+    fireEvent.change(await screen.findByLabelText('Admin token'), { target: { value: 'right' } })
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }))
 
     expect(await screen.findByTestId('application-count')).toBeDefined()
@@ -78,10 +83,10 @@ describe('the shell', () => {
   })
 
   it('says so and stays put when the controller rejects the token', async () => {
-    controller({ '/api/v1/status': () => json(401, { error: 'unauthorized' }) })
+    controller({ ...communityDiscovery(), '/api/v1/status': () => json(401, { error: 'unauthorized' }) })
     render(<App />)
 
-    fireEvent.change(screen.getByLabelText('Admin token'), { target: { value: 'wrong' } })
+    fireEvent.change(await screen.findByLabelText('Admin token'), { target: { value: 'wrong' } })
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }))
 
     expect(await screen.findByRole('alert')).toBeDefined()
@@ -97,6 +102,7 @@ describe('the shell', () => {
   it('returns to the login screen when a request 401s after signing in', async () => {
     setToken('was-valid')
     controller({
+      ...communityDiscovery(),
       '/api/v1/status': () => json(200, healthyStatus),
       '/api/v1/applications': () => json(401, { error: 'unauthorized' }),
       '/api/v1/events': openStream,
@@ -110,6 +116,7 @@ describe('the shell', () => {
   it('forgets the credential when the operator signs out', async () => {
     setToken('good')
     controller({
+      ...communityDiscovery(),
       '/api/v1/status': () => json(200, healthyStatus),
       '/api/v1/applications': () => json(200, { applications: [] }),
       '/api/v1/events': openStream,
@@ -121,12 +128,13 @@ describe('the shell', () => {
     await waitFor(() => {
       expect(getToken()).toBeNull()
     })
-    expect(screen.getByLabelText('Admin token')).toBeDefined()
+    expect(await screen.findByLabelText('Admin token')).toBeDefined()
   })
 
   it('never writes the credential to localStorage', async () => {
     setToken('good')
     controller({
+      ...communityDiscovery(),
       '/api/v1/status': () => json(200, healthyStatus),
       '/api/v1/applications': () => json(200, { applications: [] }),
       '/api/v1/events': openStream,

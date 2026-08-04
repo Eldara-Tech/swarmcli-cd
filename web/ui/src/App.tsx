@@ -4,12 +4,14 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, Route, Routes } from 'react-router'
 
+import { useFeature } from './api/discovery'
 import { useToken } from './auth/useToken'
 import { Shell } from './Shell'
 import { ApplicationDetail } from './screens/ApplicationDetail'
 import { Applications } from './screens/Applications'
 import { ControllerStatusScreen } from './screens/ControllerStatus'
 import { Login } from './screens/Login'
+import { Projects } from './screens/Projects'
 
 /**
  * One cache for the tab, exported so that a test can empty it between renders —
@@ -48,23 +50,34 @@ export function App() {
   const token = useToken()
 
   return (
-    <QueryClientProvider client={queryClient}>
-      {token === null ? (
-        <Login />
-      ) : (
-        <BrowserRouter>
-          <Routes>
-            <Route element={<Shell />}>
-              <Route index element={<Applications />} />
-              {/* Encoded by the screens that link here, and decoded by
-                  useParams, so an application whose name needs escaping is
-                  still one route rather than a special case. */}
-              <Route path="applications/:app" element={<ApplicationDetail />} />
-              <Route path="status" element={<ControllerStatusScreen />} />
-            </Route>
-          </Routes>
-        </BrowserRouter>
-      )}
-    </QueryClientProvider>
+    <QueryClientProvider client={queryClient}>{token === null ? <Login /> : <SignedIn />}</QueryClientProvider>
+  )
+}
+
+/**
+ * The router, in its own component because the route table is now capability-
+ * driven and a hook reading the capability document has to run *inside* the
+ * provider above rather than in the component that renders it.
+ */
+function SignedIn() {
+  // False in a build with no capability endpoint, so the free build's route
+  // table is exactly the one Phase B shipped — no route, and no nav item in the
+  // shell that could reach it.
+  const projects = useFeature('projects')
+
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route element={<Shell />}>
+          <Route index element={<Applications />} />
+          {/* Encoded by the screens that link here, and decoded by
+              useParams, so an application whose name needs escaping is
+              still one route rather than a special case. */}
+          <Route path="applications/:app" element={<ApplicationDetail />} />
+          <Route path="status" element={<ControllerStatusScreen />} />
+          {projects && <Route path="projects" element={<Projects />} />}
+        </Route>
+      </Routes>
+    </BrowserRouter>
   )
 }
