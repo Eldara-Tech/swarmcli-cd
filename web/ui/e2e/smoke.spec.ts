@@ -54,6 +54,24 @@ test('logs in, renders the shell, reads the API and receives an event', async ({
   // The stream: a real connection, held open, parsed off a real ReadableStream.
   await expect(page.getByTestId('live-state')).toHaveText('live')
 
+  // The two read tabs, before the sync below and not after — which is the whole
+  // reason smoke.yml declares `automated: false`. Un-deployed, the plan is an
+  // install, so the diff is a real rendered manifest and the chart engine has no
+  // revisions at all; deployed, both tabs go quiet and neither says anything a
+  // fixture could not.
+  await page.getByRole('link', { name: 'smoke' }).click()
+
+  // The engine's own rendering, reaching the colouriser. jsdom proves the
+  // parser against strings this repository wrote; only this proves it against
+  // the manifest the chart engine actually produces.
+  await page.getByRole('link', { name: 'Diff' }).click()
+  await expect(page.getByTestId('release-diff')).toContainText(/busybox/)
+
+  // `"revisions": null` from the controller rather than from a fixture: the
+  // payload .map() throws on, on the one screen that has to survive it.
+  await page.getByRole('link', { name: 'History' }).click()
+  await expect(page.getByTestId('release-history')).toContainText(/never deployed/)
+
   // One event, and the stream has to be open before it is raised — that is the
   // whole assertion. There is no replay: api/stream.go emits no `id:`, so there
   // is no Last-Event-ID and a subscriber is only ever sent what happens while it
