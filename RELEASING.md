@@ -32,8 +32,9 @@ string** — and the public one first.
 - Nothing collides, and that is by construction rather than by luck: the
   archives here are `swarmcli-cd-oss_*`, the checksum file is
   `checksums-oss.txt`, and the image tags carry a `-oss` suffix. The merged
-  pipeline refuses to run if this repository at the pinned tag has gone back to
-  the plain names.
+  pipeline writes `swarmcli-cd_*`, `checksums-merged.txt` and the unsuffixed
+  image tags, and it refuses to run if this repository at the pinned tag has
+  gone back to the plain archive names.
 
 **A tag pushed here on its own no longer moves `:latest`.** `latest=false` in
 the docker job: under D20 `:latest` is the merged artefact, which is what

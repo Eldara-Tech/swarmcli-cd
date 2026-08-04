@@ -120,7 +120,9 @@ verifiably-Apache-2.0 artefact pins a version, which is what an air-gapped or
 compliance-reviewed deployment does anyway — and a moving tag on the artefact
 whose whole point is being checkable is a way to be surprised by what is
 running. `checksums-oss.txt` in each release covers these artefacts;
-`checksums.txt` covers the merged ones.
+`checksums-merged.txt` covers the merged ones. Neither is named plain
+`checksums.txt`: a release carries two sets of artefacts, and an unqualified
+name would not say which set it verified.
 
 Building it yourself is the same thing, with one caveat:
 
