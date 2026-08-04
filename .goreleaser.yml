@@ -87,7 +87,11 @@ archives:
 
 # For the same reason, one word longer. A release carries two checksum files
 # because it carries two sets of artefacts, and a single `checksums.txt` would
-# be the one file in which the two pipelines silently disagree.
+# be the one file in which the two pipelines silently disagree — the second run
+# to finish replacing the first's manifest, leaving half the release unverified
+# by the file that claims to cover it. The merged pipeline writes
+# `checksums-merged.txt`; neither side takes the unqualified name, so no
+# checksum file in a release is ambiguous about which artefacts it verified.
 checksum:
   name_template: 'checksums-oss.txt'
 
