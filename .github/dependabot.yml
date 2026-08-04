@@ -23,6 +23,24 @@ updates:
       - C0-breaks-nothing
       - D0-dependency
 
+  # The UI's tree. Grouped like the Go one, so a week's patch bumps are one PR
+  # and a major arrives on its own — a React or Vite major is a change to review,
+  # not to merge on green. deps.yml re-runs the licence allowlist on every one of
+  # these, which is the point: what breaches it is a transitive dependency that
+  # appears in the lockfile diff and nowhere else.
+  - package-ecosystem: npm
+    directory: /web/ui
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    labels:
+      - B0-low-priority
+      - C0-breaks-nothing
+      - D0-dependency
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

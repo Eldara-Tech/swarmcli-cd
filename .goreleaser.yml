@@ -6,6 +6,16 @@ before:
   hooks:
     - go mod download
     - go mod verify
+    # Vite writes web/dist, which //go:embed reads while compiling — so the
+    # bundle has to exist before the first of the four builds starts. Hooks run
+    # once, so all four embed the same bytes.
+    #
+    # `go build` alone does not do this and does not complain: web/dist holds a
+    # committed sentinel, so a release built without these two hooks succeeds,
+    # publishes four correctly-sized binaries, serves the API normally, and
+    # answers every browser with web.notBuilt. Nothing fails.
+    - npm --prefix web/ui ci
+    - npm --prefix web/ui run build
 
 release:
   prerelease: auto

@@ -40,6 +40,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # .goreleaser.yml's before.hooks build the UI bundle that //go:embed
+      # compiles in, and this runner has no Node otherwise. Missing, the hooks
+      # fail loudly and no release is published — which is the good outcome. The
+      # bad one is this step and those hooks both being forgotten: four binaries
+      # ship, every check passes, and only a browser ever sees that they serve
+      # web.notBuilt. Node 22 matches ci.yml's ui job, so the release builds the
+      # bundle CI tested.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/ui/package-lock.json
+
       # The chart engine's version is the swarmcli release go.mod pins, which is
       # not this binary's tag. Reading it here rather than hard-coding it is what
       # keeps the stamp from drifting away from what is actually compiled in.
