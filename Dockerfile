@@ -1,7 +1,7 @@
 # The UI is built from this commit's sources rather than taken from the build
 # context: .dockerignore excludes web/dist precisely so that a developer's stale
 # local build cannot become what the image serves.
-FROM node:22-alpine AS ui
+FROM node:26-alpine AS ui
 WORKDIR /src/web/ui
 # The manifests on their own first, so that editing a component does not re-run
 # the install.
