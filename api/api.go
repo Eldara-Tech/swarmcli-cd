@@ -498,8 +498,16 @@ func (s *Server) guard(act authz.Action, h guarded) http.Handler {
 // back — a pattern matching every method takes the request before the POST
 // route can report itself — so it buys one status code for a second claim on
 // /api/. See docs/api.md.
+// The comparison is case-insensitive and takes the bare /api as well, which is
+// wider than the routes it is protecting: ServeMux matches case-sensitively, so
+// /API/v1/status reaches no handler and there is no authorisation to bypass
+// here. What is at stake is only the discipline — GET /API/v1/typo and GET /api
+// answered 200 text/html, which is exactly the parse-error-a-long-way-away this
+// exists to prevent, and a client that got the case wrong is the client most in
+// need of being told.
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/api/") {
+	path := strings.ToLower(r.URL.Path)
+	if path == "/api" || strings.HasPrefix(path, "/api/") {
 		fail(w, http.StatusNotFound, "no such endpoint")
 		return
 	}

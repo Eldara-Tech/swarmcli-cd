@@ -97,7 +97,10 @@ type Options struct {
 	// discloses nothing and the connection never leaves the host.
 	//
 	// It is deliberately not --insecure. The exception is decided here, against
-	// the parsed URL, so no caller passing it can reach another host unverified.
+	// the parsed URL, so no caller passing it can reach another host unverified
+	// — which takes two things, because the decision is taken once and the
+	// connection can be moved afterwards: the predicate below, and the refusal
+	// to follow a redirect while the exception is in force.
 	SkipVerifyOnLoopback bool
 }
 
@@ -138,6 +141,24 @@ func NewWithOptions(server, token string, opts Options) (*Client, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = cfg
 	c.http.Transport = tr
+
+	if skip {
+		// A client that will not check a certificate must not be repointed by
+		// the thing it is not checking.
+		//
+		// The exception is decided once, against the URL the caller named. A
+		// transport is installed on the whole Client, and a Client follows
+		// redirects — so without this, a loopback https server answering 302 to
+		// any other TLS host is fetched with verification off, and the
+		// predicate that was so careful about the first host never sees the
+		// second. Nothing reachable today does that: /healthz is the only URL
+		// fetched with the flag and it does not redirect. But stack.yml
+		// recommends a reverse proxy in front, and a proxy canonicalising a URL
+		// is ordinary.
+		c.http.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+			return fmt.Errorf("refusing a redirect to '%s': this connection does not verify certificates, so it may not be repointed", req.URL.Redacted())
+		}
+	}
 	return c, nil
 }
 

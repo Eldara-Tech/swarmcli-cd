@@ -1282,7 +1282,12 @@ a loopback **address**, it skips verification, because `/healthz` discloses
 nothing, the connection never leaves the host, and the probe asserts liveness
 rather than identity. A non-loopback `https://` verifies normally, and a
 *hostname* that merely resolves to the loopback does not qualify — the rule is
-decided from the URL's text and never from a resolver's answer.
+decided from the URL's text and never from a resolver's answer. And because that
+decision is taken once, against the URL you named, the probe also refuses to
+follow a redirect while it is skipping verification: a client that will not check
+a certificate must not be repointed by the thing it is not checking. A reverse
+proxy in front that answers `/healthz` with a redirect will fail the probe rather
+than be followed.
 
 **Every CLI call inside the container.** `SWARMCLI_CD_SERVER` is read by `app`
 and `status` too, and those do verify. A certificate from a real CA just works;

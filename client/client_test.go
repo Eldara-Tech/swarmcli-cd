@@ -254,6 +254,55 @@ func TestHealthOverLoopbackTLSNeedsNoCertificate(t *testing.T) {
 	}
 }
 
+// The other half of "no caller passing it can reach another host unverified".
+// The predicate decides once, against the URL the caller named; an http.Client
+// follows redirects, and the transport carrying InsecureSkipVerify is installed
+// on the whole client — so a loopback https server answering 302 elsewhere
+// would otherwise be followed to a host nothing ever looked at, with
+// verification off.
+//
+// The second server is what makes this a test rather than a ritual: it is a TLS
+// server this client has no certificate for, so following the redirect is the
+// only way the request could succeed, and before the guard landed it did.
+func TestTheLoopbackExceptionDoesNotFollowARedirect(t *testing.T) {
+	elsewhere := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
+	}))
+	t.Cleanup(elsewhere.Close)
+
+	loopback := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+"/healthz", http.StatusFound)
+	}))
+	t.Cleanup(loopback.Close)
+
+	c, err := NewWithOptions(loopback.URL, "", Options{SkipVerifyOnLoopback: true})
+	if err != nil {
+		t.Fatalf("NewWithOptions = %v, want nil", err)
+	}
+	err = c.Health(context.Background())
+	if err == nil {
+		t.Fatal("Health = nil: the redirect was followed with verification off")
+	}
+	if !strings.Contains(err.Error(), "may not be repointed") {
+		t.Errorf("Health = %v, want the refusal to name the redirect", err)
+	}
+
+	// And the exception still does what it exists for, against the same server
+	// answering for itself — so the guard above is about redirects and not
+	// about having broken the loopback path.
+	direct := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
+	}))
+	t.Cleanup(direct.Close)
+	c, err = NewWithOptions(direct.URL, "", Options{SkipVerifyOnLoopback: true})
+	if err != nil {
+		t.Fatalf("NewWithOptions = %v, want nil", err)
+	}
+	if err := c.Health(context.Background()); err != nil {
+		t.Errorf("Health = %v, want nil", err)
+	}
+}
+
 func TestACACertIsWhatMakesASelfSignedControllerReachable(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{}`))
