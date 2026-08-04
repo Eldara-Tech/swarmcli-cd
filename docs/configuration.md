@@ -1249,6 +1249,7 @@ line that shows exactly what the controller is following is worth having in
 | `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config. Static mode |
 | `--listen` | `:8080` | API listen address |
 | `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume so a restart does not re-clone everything. An application that leaves the set has both reclaimed, one app-set interval after it goes |
+| `--ui` | on | serve the web UI at `/`. It is embedded in the binary, so nothing is fetched and no port is opened beyond `--listen`. `--ui=false` does not remove the routes; it answers them with `404` |
 | `--reconcile-interval` | `3m` | how often an application that sets no [`syncPolicy.interval`](#syncpolicy-optional) is reconciled. Every tick is a git fetch, a full render and a read of the swarm's release records, per application. Unlike the per-application field it has no floor: the app set is the untrusted tier, and this one is set by whoever runs the controller |
 | `--appset-repo` | — | pull the app set from this repository. Selects **git** mode |
 | `--appset-revision` | — | branch, tag or SHA to track. Required with `--appset-repo`; an unpinned app set would follow whatever the default branch happens to point at |

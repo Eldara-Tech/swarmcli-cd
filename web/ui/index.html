@@ -1,0 +1,20 @@
+<!doctype html>
+<!--
+SPDX-License-Identifier: Apache-2.0
+Copyright © 2026 Eldara Tech
+
+Nothing in this document may be inline: the policy web.go sends allows scripts
+and styles from 'self' only, because this page holds the swarm's root
+credential. A test in that package fails the build on one.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>swarmcli-cd</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

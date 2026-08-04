@@ -444,6 +444,28 @@ func TestControllerTakesAReconcileInterval(t *testing.T) {
 	}
 }
 
+// D15: the UI is served unless an operator says otherwise, and saying
+// otherwise is a supported configuration rather than a usage error.
+func TestControllerTakesTheUiFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run = %d, want 0", code)
+	}
+	for _, want := range []string{"--ui", "default true"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout = %q, want it to mention %q", stdout.String(), want)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	// Accepted, and failing later on the unconfigured authorizer, which is exit
+	// 1 rather than the 2 a usage error gives.
+	if code := run([]string{"controller", "--ui=false", "--data", t.TempDir()}, &stdout, &stderr); code == 2 {
+		t.Errorf("run = 2 (%s), want --ui=false to be accepted", stderr.String())
+	}
+}
+
 // Prune is the one destructive setting, so the help has to say both that it
 // exists and what turning it on costs.
 func TestControllerHelpNamesThePruneFlags(t *testing.T) {

@@ -16,6 +16,12 @@
 //	GET  /api/v1/applications/{app}/history      the history view
 //	POST /api/v1/applications/{app}/sync         the sync button
 //	GET  /api/v1/events                          live updates, so nothing polls
+//	GET  /                                       the web UI, and the fallback
+//	                                             for its client-side routes
+//	GET  /assets/{path...}                       the UI's hashed build output
+//
+// The last two serve whatever the caller passed as Options.UI, and this package
+// neither embeds nor imports it — see package web.
 //
 // Applications are read-only: they are declared in the app set, which is either
 // mounted at deploy time or committed to git, and changing them means changing
@@ -35,6 +41,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
@@ -74,7 +81,9 @@ type Server struct {
 	controller Controller
 	authz      authz.Authorizer
 	log        *slog.Logger
-	events     *stream
+	// ui serves the browser UI. Never nil; see Options.UI.
+	ui     http.Handler
+	events *stream
 	// syncing runs a sync detached from the request that asked for it.
 	// Overridable in tests, which otherwise have to race a goroutine.
 	syncing func(app string, run func(context.Context))
@@ -93,6 +102,13 @@ type Options struct {
 	// like. A status endpoint that 404s is a status endpoint a monitor cannot
 	// tell from a dead controller.
 	Controller Controller
+	// UI is what the two public UI routes serve; web.Handler is what production
+	// passes. Absent — a build run with --ui=false, and every test that
+	// constructs a zero Options — they answer 404, because the routes are
+	// registered either way and only the response differs. New defaults it for
+	// the same reason Handler refuses a nil extension handler: the alternative
+	// is a panic on the first request that reaches it.
+	UI http.Handler
 }
 
 // New returns a Server over rec.
@@ -107,7 +123,10 @@ func New(rec Reconciler, o Options) *Server {
 	if o.Log == nil {
 		o.Log = slog.Default()
 	}
-	s := &Server{rec: rec, controller: o.Controller, authz: o.Authorizer, log: o.Log, events: newStream(o.Log)}
+	if o.UI == nil {
+		o.UI = http.NotFoundHandler()
+	}
+	s := &Server{rec: rec, controller: o.Controller, authz: o.Authorizer, log: o.Log, ui: o.UI, events: newStream(o.Log)}
 	s.syncing = s.detach
 	return s
 }
@@ -135,6 +154,11 @@ var coreRoutes = []RegisteredRoute{
 	{Pattern: "GET /api/v1/applications/{app}/history"},
 	{Pattern: "POST /api/v1/applications/{app}/sync"},
 	{Pattern: "GET /api/v1/events"},
+	// Public because a browser has no credential until the login screen it is
+	// asking for has loaded. What they serve is the build's own bytes, which
+	// disclose nothing about the swarm.
+	{Pattern: "GET /", Public: true},
+	{Pattern: "GET /assets/{path...}", Public: true},
 }
 
 // Handler returns the router.
@@ -174,6 +198,13 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.Handle("GET /api/v1/applications/{app}/history", s.guard(authz.ActionHistory, s.history))
 	mux.Handle("POST /api/v1/applications/{app}/sync", s.guard(authz.ActionSync, s.sync))
 	mux.Handle("GET /api/v1/events", s.guard(authz.ActionRead, s.stream))
+
+	// The UI, and the hashed build output the document it serves asks for.
+	// Registered whether or not anything was embedded and whether or not --ui
+	// is on, so that coreRoutes stays a static list of literals and no
+	// extension can ever claim GET /.
+	mux.HandleFunc("GET /", s.root)
+	mux.HandleFunc("GET /assets/{path...}", s.ui.ServeHTTP)
 
 	routes := append([]RegisteredRoute(nil), coreRoutes...)
 
@@ -408,6 +439,32 @@ func (s *Server) guard(act authz.Action, h guarded) http.Handler {
 		}
 		h(w, r, subject)
 	})
+}
+
+// root serves the UI, and stops it answering for the API.
+//
+// "GET /" matches every path no more specific pattern claimed, so an
+// unregistered /api/v1/typo would otherwise reach the SPA and answer 200
+// text/html — turning a client's typo into a parse error somewhere far away
+// rather than into the 404 the mux used to give. The prefix is checked on the
+// decoded path, so an escaped spelling of it lands in the same place.
+//
+// What this cannot recover is the method. ServeMux answers a request that
+// matched no pattern by reporting which methods would have matched, and with
+// GET / registered every path matches under GET — so POST /api/v1/typo is a 405
+// naming GET and HEAD rather than a 404, and GET …/sync, which used to be a 405
+// naming POST, is the JSON 404 above. Both are accepted rather than solved, and
+// both are pinned by a test. Additionally registering a methodless /api/
+// pattern would make the first a JSON 404 too and would not bring the second
+// back — a pattern matching every method takes the request before the POST
+// route can report itself — so it buys one status code for a second claim on
+// /api/. See docs/api.md.
+func (s *Server) root(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		fail(w, http.StatusNotFound, "no such endpoint")
+		return
+	}
+	s.ui.ServeHTTP(w, r)
 }
 
 // status serves the controller's own state: where the app set came from, when

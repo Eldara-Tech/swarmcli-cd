@@ -449,13 +449,12 @@ func TestTriggeredSyncOutlivesTheRequest(t *testing.T) {
 	}
 }
 
-// openRoutes are the patterns that are deliberately not behind the guard. One,
-// and it is argued for where it is registered: a container healthcheck runs
-// beside the process and cannot carry a credential.
-//
-// Anything else added to Handler() is guarded or this test fails, which is the
-// whole point of deriving the list rather than writing it down.
-var openRoutes = map[string]bool{"GET /healthz": true}
+// registration is one route this package registers on the mux, beside whether
+// the registration put it behind the guard.
+type registration struct {
+	pattern string
+	guarded bool
+}
 
 // registeredRoutes reads the routes Handler() registers out of this package's
 // own source, so that adding one to the mux adds it to this test too.
@@ -473,7 +472,15 @@ var openRoutes = map[string]bool{"GET /healthz": true}
 // neither and fails closed in both directions: a call this cannot see is a route
 // that is not registered, and a source tree it cannot parse fails outright below
 // rather than silently yielding nothing to check.
-func registeredRoutes(t *testing.T) []string {
+//
+// Whether a route is guarded is read from the same registration, and not from a
+// list of exemptions kept beside it. An exemption list is the thing that stops
+// being true: three public routes would have meant three hand-written entries,
+// each of which is a place to write "public" about something that should not
+// have been. The handler argument cannot lie about it — guard is what
+// authenticates a request, so a registration that does not call it is a route
+// nothing authenticates, whatever anything else says.
+func registeredRoutes(t *testing.T) []registration {
 	t.Helper()
 
 	fset := token.NewFileSet()
@@ -484,12 +491,12 @@ func registeredRoutes(t *testing.T) []string {
 		t.Fatalf("parsing this package: %v", err)
 	}
 
-	var out []string
+	var out []registration
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
 			ast.Inspect(file, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
-				if !ok || len(call.Args) == 0 {
+				if !ok || len(call.Args) != 2 {
 					return true
 				}
 				// Any x.Handle / x.HandleFunc, not just one named receiver: a
@@ -507,7 +514,7 @@ func registeredRoutes(t *testing.T) []string {
 				if err != nil {
 					return true
 				}
-				out = append(out, pattern)
+				out = append(out, registration{pattern: pattern, guarded: isGuardCall(call.Args[1])})
 				return true
 			})
 		}
@@ -518,11 +525,44 @@ func registeredRoutes(t *testing.T) []string {
 	if len(out) == 0 {
 		t.Fatal("no routes found in this package's source; the registrations moved and this test stopped checking anything")
 	}
-	for pattern := range openRoutes {
-		if !slices.Contains(out, pattern) {
-			t.Fatalf("routes %v do not include the exempted %q; either it is gone or these are not the registrations", out, pattern)
+	// And a scan that recognised no guard at all would report every route as
+	// public, which every check below would then agree with.
+	if !slices.ContainsFunc(out, func(r registration) bool { return r.guarded }) {
+		t.Fatalf("no registration in %v was recognised as guarded; guard was renamed or the registrations changed shape", out)
+	}
+	return out
+}
+
+// isGuardCall reports whether a handler argument is a call to guard.
+//
+// That call is the whole of what authentication and authorisation are here, so
+// it is the only thing "this route is guarded" can mean. A handler wrapped in
+// anything else — a func literal, a method value, an extension's handler — is
+// served to whoever reaches the port.
+func isGuardCall(arg ast.Expr) bool {
+	call, ok := arg.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	switch fun := call.Fun.(type) {
+	case *ast.SelectorExpr: // s.guard(…)
+		return fun.Sel.Name == "guard"
+	case *ast.Ident: // guard(…), were it ever to stop being a method
+		return fun.Name == "guard"
+	}
+	return false
+}
+
+// declaredPublic is every pattern coreRoutes says is served with no credential.
+// It is what Routes() reports to the startup log, and so what an operator reads.
+func declaredPublic() []string {
+	var out []string
+	for _, rt := range coreRoutes {
+		if rt.Public {
+			out = append(out, rt.Pattern)
 		}
 	}
+	slices.Sort(out)
 	return out
 }
 
@@ -552,14 +592,14 @@ func request(pattern string) route {
 // shipping.
 func TestEveryApiEndpointIsGuarded(t *testing.T) {
 	var paths []route
-	for _, pattern := range registeredRoutes(t) {
-		if openRoutes[pattern] {
+	for _, rt := range registeredRoutes(t) {
+		if !rt.guarded {
 			continue
 		}
-		paths = append(paths, request(pattern))
+		paths = append(paths, request(rt.pattern))
 	}
 	if len(paths) == 0 {
-		t.Fatal("every registered route is exempted; this test checks nothing")
+		t.Fatal("no registered route is guarded; this test checks nothing")
 	}
 
 	t.Run("authentication", func(t *testing.T) {
@@ -587,6 +627,31 @@ func TestEveryApiEndpointIsGuarded(t *testing.T) {
 			t.Error("a rejected request still reached the reconciler")
 		}
 	})
+}
+
+// The routes registered without the guard are exactly the ones coreRoutes
+// declares public — read from the registrations themselves, not from a list of
+// exemptions somebody has to remember to keep true.
+//
+// Both directions catch a different mistake, and both are silent today.
+// A route registered unguarded without being declared public is an
+// unauthenticated endpoint on a process holding the docker socket, and it is
+// also invisible to the WARN the startup log exists to print. A route declared
+// public while actually registered behind the guard makes Routes() lie to that
+// same log in the other direction, and makes TestEveryApiEndpointIsGuarded skip
+// a route it should have been testing.
+func TestTheUnguardedRoutesAreExactlyTheDeclaredPublicOnes(t *testing.T) {
+	var unguarded []string
+	for _, rt := range registeredRoutes(t) {
+		if !rt.guarded {
+			unguarded = append(unguarded, rt.pattern)
+		}
+	}
+	slices.Sort(unguarded)
+
+	if want := declaredPublic(); !slices.Equal(unguarded, want) {
+		t.Errorf("registered with no guard: %v\ndeclared Public in coreRoutes: %v", unguarded, want)
+	}
 }
 
 // Every endpoint asks its own question, and an application-scoped request
@@ -758,6 +823,112 @@ func TestHealthzIsOpenAndSaysNothing(t *testing.T) {
 	}
 	if strings.Contains(rr.Body.String(), "edge") {
 		t.Errorf("body %q discloses something about the deployment", rr.Body.String())
+	}
+}
+
+// uiServer is a router whose UI routes serve a stand-in for the web package's
+// handler, so that "the UI is what answered, and with what path" is something a
+// test can see. api never imports web; this is the whole of what it knows.
+func uiServer(t *testing.T) http.Handler {
+	t.Helper()
+	s := New(&fakeReconciler{views: []application.View{view("edge")}}, Options{
+		Authorizer: &allowAll{},
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		UI: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "ui:"+r.URL.Path)
+		}),
+	})
+	h, err := s.Handler()
+	if err != nil {
+		t.Fatalf("building the router: %v", err)
+	}
+	return h
+}
+
+// Everything the mux did not claim is the UI, because everything the mux did
+// not claim is a route belonging to the router in the browser.
+func TestTheUiServesTheRootAndTheAssets(t *testing.T) {
+	h := uiServer(t)
+
+	for _, path := range []string{"/", "/applications", "/applications/edge", "/assets/app-a1b2c3.js"} {
+		rr := do(t, h, "GET", path)
+		if rr.Code != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200", path, rr.Code)
+		}
+		if got, want := rr.Body.String(), "ui:"+path; got != want {
+			t.Errorf("GET %s served %q, want %q", path, got, want)
+		}
+	}
+}
+
+// A GET pattern matches HEAD as well, so the UI handler sees two methods where
+// the route table names one.
+func TestTheUiIsAlsoReachedByHead(t *testing.T) {
+	if rr := do(t, uiServer(t), "HEAD", "/"); rr.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+}
+
+// GET / matches every path no more specific pattern claimed, so without the
+// prefix check in root a mistyped endpoint would answer 200 text/html and
+// become a parse error a long way from the mistake. The API answers about the
+// API, in the shape everything else in it answers.
+func TestAnUnknownApiPathIsAJsonNotFound(t *testing.T) {
+	h := uiServer(t)
+
+	// The last is the same path with an escaped 'a': the check is on the
+	// decoded path, so a spelling cannot walk around it.
+	for _, path := range []string{"/api/", "/api/v1/typo", "/api/v1/applications/edge/typo", "/%61pi/v1/typo"} {
+		rr := do(t, h, "GET", path)
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404: body %q", path, rr.Code, rr.Body.String())
+		}
+		if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Errorf("GET %s Content-Type = %q, want JSON", path, ct)
+		}
+		if got := decode[map[string]string](t, rr); got["error"] == "" {
+			t.Errorf("GET %s answered %q, which carries no error message", path, rr.Body.String())
+		}
+	}
+}
+
+// Two things the SPA fallback costs, recorded here rather than discovered
+// later. ServeMux answers a request that matched no pattern by reporting the
+// methods that would have matched, and with GET / registered every path now
+// matches under GET.
+//
+// Accepted rather than solved. Additionally registering a methodless /api/
+// pattern would turn the first case into a JSON 404 and would not recover the
+// second, since a pattern matching every method takes the request either way.
+func TestTheFallbackChangesWhatAWrongMethodAnswers(t *testing.T) {
+	h := uiServer(t)
+
+	rr := do(t, h, "POST", "/api/v1/typo")
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /api/v1/typo = %d, want 405", rr.Code)
+	}
+	if allow := rr.Header().Get("Allow"); !strings.Contains(allow, "GET") {
+		t.Errorf("Allow = %q, want the methods GET / registered", allow)
+	}
+
+	// And a wrong method on a route that does exist is the JSON 404 above
+	// rather than the 405 naming POST that it used to be.
+	rr = do(t, h, "GET", "/api/v1/applications/edge/sync")
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("GET …/sync = %d, want 404", rr.Code)
+	}
+}
+
+// Three test files in this repository construct api.Options{}, and every
+// deployment run with --ui=false does the same thing. A nil handler would panic
+// on the first request a browser made.
+func TestWithNoUiTheRoutesStillAnswer(t *testing.T) {
+	_, h := testServer(t, &fakeReconciler{}, nil)
+
+	for _, path := range []string{"/", "/assets/app-a1b2c3.js"} {
+		if rr := do(t, h, "GET", path); rr.Code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404", path, rr.Code)
+		}
 	}
 }
 
@@ -1530,18 +1701,27 @@ func TestZeroExtensionsChangesNothing(t *testing.T) {
 
 	s, h := testServer(t, &fakeReconciler{views: []application.View{view("edge")}}, nil)
 
+	// What the source registers, and whether it registered it behind the guard:
+	// Routes() is what the startup log reads, so its Public has to be the
+	// registration's rather than an intention recorded next to it.
+	var want []string
+	unguarded := make(map[string]bool)
+	for _, rt := range registeredRoutes(t) {
+		want = append(want, rt.pattern)
+		unguarded[rt.pattern] = !rt.guarded
+	}
+
 	var got []string
 	for _, rt := range s.Routes() {
 		if rt.Extension != "" {
 			t.Errorf("route %q names extension %q with nothing registered", rt.Pattern, rt.Extension)
 		}
-		if rt.Public != openRoutes[rt.Pattern] {
-			t.Errorf("route %q public = %v, want %v", rt.Pattern, rt.Public, openRoutes[rt.Pattern])
+		if rt.Public != unguarded[rt.Pattern] {
+			t.Errorf("route %q reports Public = %v, which is not what its registration does", rt.Pattern, rt.Public)
 		}
 		got = append(got, rt.Pattern)
 	}
 
-	want := registeredRoutes(t)
 	slices.Sort(got)
 	slices.Sort(want)
 	if !slices.Equal(got, want) {

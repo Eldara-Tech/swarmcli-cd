@@ -1,8 +1,27 @@
+# The UI is built from this commit's sources rather than taken from the build
+# context: .dockerignore excludes web/dist precisely so that a developer's stale
+# local build cannot become what the image serves.
+FROM node:22-alpine AS ui
+WORKDIR /src/web/ui
+# The manifests on their own first, so that editing a component does not re-run
+# the install.
+COPY web/ui/package.json web/ui/package-lock.json ./
+RUN npm ci
+COPY web/ui/ ./
+# Writes ../dist, which is /src/web/dist — the directory the Go build embeds.
+RUN npm run build
+
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+
+# Before the build, because //go:embed compiles it into the binary. web/dist is
+# not in the build context, so dropping this line fails the build with "pattern
+# all:dist: no matching files found" rather than quietly shipping an image that
+# serves the not-built page.
+COPY --from=ui /src/web/dist ./web/dist
 
 ARG VERSION=dev
 
