@@ -4,9 +4,10 @@
 FROM node:26-alpine AS ui
 WORKDIR /src/web/ui
 # The manifests on their own first, so that editing a component does not re-run
-# the install.
-COPY web/ui/package.json web/ui/package-lock.json ./
-RUN npm ci
+# the install. .npmrc comes with them: it is what turns third-party lifecycle
+# scripts off, and only the files named here exist when the install runs.
+COPY web/ui/package.json web/ui/package-lock.json web/ui/.npmrc ./
+RUN npm ci --ignore-scripts
 COPY web/ui/ ./
 # Writes ../dist, which is /src/web/dist — the directory the Go build embeds.
 RUN npm run build

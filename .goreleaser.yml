@@ -14,7 +14,13 @@ before:
     # committed sentinel, so a release built without these two hooks succeeds,
     # publishes four correctly-sized binaries, serves the API normally, and
     # answers every browser with web.notBuilt. Nothing fails.
-    - npm --prefix web/ui ci
+    #
+    # --ignore-scripts because this hook runs in the release job, whose
+    # environment carries GITHUB_TOKEN with contents: write. web/ui/.npmrc says
+    # the same thing for an invocation nobody flagged; both, because which
+    # .npmrc npm treats as the project's is decided from the working directory
+    # and this runs from the repository root.
+    - npm --prefix web/ui ci --ignore-scripts
     - npm --prefix web/ui run build
 
 release:

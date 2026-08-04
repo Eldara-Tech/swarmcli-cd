@@ -142,7 +142,7 @@ jobs:
           cache: true
 
       - name: Install
-        run: npm --prefix web/ui ci
+        run: npm --prefix web/ui ci --ignore-scripts
 
       - name: Lint
         run: npm --prefix web/ui run lint

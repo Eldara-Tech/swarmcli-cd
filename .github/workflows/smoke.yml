@@ -77,7 +77,7 @@ jobs:
         run: docker pull busybox:1.36
 
       - name: Install
-        run: npm --prefix web/ui ci
+        run: npm --prefix web/ui ci --ignore-scripts
 
       # The binary the browser talks to has the bundle embedded in it, which is
       # the only configuration this test is about. A Vite dev server proxying to
