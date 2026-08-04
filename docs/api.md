@@ -216,10 +216,20 @@ here rather than "none" — the engine rejects a release file declaring none.
 { "planned": true, "releases": [ { "release": "traefik", "action": "upgrade", "diff": "..." } ] }
 ```
 
-`planned` distinguishes "nothing would change" (`planned: true`, empty
-`releases`) from "not reconciled yet, nothing to compare" (`planned: false`). The
-`diff` is a manifest-level text diff, carried here and nowhere else because a
-list view must not drag whole manifests along.
+`planned` distinguishes "nothing would change" from "not reconciled yet, nothing
+to compare", and the two carry **different empties**, which is worth reading
+twice because the useful one is the null:
+
+- `{"planned": true, "releases": null}` — reconciled, and a sync would change
+  nothing. Only the releases a sync would touch are listed, so a converged
+  application lists none.
+- `{"planned": false, "releases": []}` — nothing has been reconciled, so there is
+  no plan to compare against.
+
+The `diff` is a manifest-level text diff, carried here and nowhere else because a
+list view must not drag whole manifests along. It is line-oriented with `-`, `+`
+and space prefixes and has no hunk headers, so each one carries the whole
+rendered manifest as context.
 
 ### History — `GET /api/v1/applications/{app}/history`
 

@@ -1,0 +1,20 @@
+{
+  "appSet": {
+    "mode": "mode",
+    "source": "source",
+    "revision": "revision",
+    "loadedAt": "2026-07-22T09:41:10Z",
+    "error": "error",
+    "stale": true,
+    "orphaned": [
+      "orphaned"
+    ],
+    "pruned": [
+      "pruned"
+    ],
+    "pruneHeldBy": [
+      "pruneHeldBy"
+    ]
+  },
+  "applications": 1
+}

@@ -1,0 +1,10 @@
+{
+  "releases": [
+    {
+      "release": "release",
+      "action": "upgrade",
+      "diff": "diff"
+    }
+  ],
+  "planned": true
+}

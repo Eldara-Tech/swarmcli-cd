@@ -37,6 +37,15 @@ linters:
       checks:
         - "default"
         - "-QF1008"
+  exclusions:
+    paths:
+      # An npm dependency tree contains Go packages of its own — eslint's
+      # `flatted` ships one — and they are neither ours to header nor ours to
+      # lint. The CI lint job never installs them, so without this the finding
+      # appears only on a contributor's machine, naming a file that is not in
+      # the repository. check-spdx.sh excludes the same directory for the same
+      # reason.
+      - web/ui/node_modules
 
 formatters:
   enable:

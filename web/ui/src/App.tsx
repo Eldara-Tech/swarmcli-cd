@@ -1,45 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
-import { useEffect, useState } from 'react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { BrowserRouter, Route, Routes } from 'react-router'
 
-// reachability is what this page can say about the controller behind it.
-type reachability = 'checking' | 'reachable' | 'unreachable'
+import { useToken } from './auth/useToken'
+import { Shell } from './Shell'
+import { Applications } from './screens/Applications'
+import { Login } from './screens/Login'
 
-// App is the whole of the UI in phase A: enough to prove that the controller
-// serves this bundle and that the browser can reach the API it came from.
-//
-// /healthz is the only endpoint it can ask. Everything under /api/v1 needs the
-// admin token, which the login screen collects in B1, and the version this page
-// would rather show belongs to the public discovery document of C1. Asking for
-// either now would mean an endpoint designed around one screen and frozen the
-// day it shipped.
+/**
+ * One cache for the tab, exported so that a test can empty it between renders —
+ * a browser gets a fresh one by loading the page, and a test process does not.
+ */
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // The compensator for a stream that died silently. There is no keepalive
+      // on the wire and deliberately no idle timer in the client, so this floor
+      // is what bounds how long a screen can be wrong: a tab left open against a
+      // controller it can no longer reach is at most half a minute stale rather
+      // than indefinitely.
+      staleTime: 30_000,
+      refetchInterval: 30_000,
+      // No retries. The one failure worth retrying — a connection that dropped —
+      // is covered by the refetch above, and the one that must not be is a 401:
+      // the fetch wrapper has already cleared the token by the time the error
+      // arrives here, so three more attempts would each be made with no
+      // credential and each answer 401 before the login screen appeared.
+      retry: false,
+    },
+  },
+})
+
+/**
+ * The whole application: a credential, or the screen that collects one.
+ *
+ * The token is read through the store rather than held in state here, so that
+ * the 401 path is one rule in one place. Anything that meets a 401 — a query, a
+ * mutation, the event stream — clears the store, this re-renders with no
+ * credential, and the shell is replaced by the login screen. There is no error
+ * boundary, no redirect and no route to keep consistent with it.
+ */
 export function App() {
-  const [controller, setController] = useState<reachability>('checking')
-
-  useEffect(() => {
-    // The component can unmount before the answer arrives — StrictMode runs
-    // this twice in development — and setting state afterwards is a warning
-    // nobody can act on.
-    let mounted = true
-    const settle = (state: reachability) => {
-      if (mounted) setController(state)
-    }
-    fetch('/healthz')
-      .then((response) => settle(response.ok ? 'reachable' : 'unreachable'))
-      .catch(() => settle('unreachable'))
-    return () => {
-      mounted = false
-    }
-  }, [])
+  const token = useToken()
 
   return (
-    <main>
-      <h1>swarmcli-cd</h1>
-      <p>GitOps continuous delivery for Docker Swarm.</p>
-      <p>
-        controller: <span className={`state state-${controller}`}>{controller}</span>
-      </p>
-    </main>
+    <QueryClientProvider client={queryClient}>
+      {token === null ? (
+        <Login />
+      ) : (
+        <BrowserRouter>
+          <Routes>
+            <Route element={<Shell />}>
+              <Route index element={<Applications />} />
+            </Route>
+          </Routes>
+        </BrowserRouter>
+      )}
+    </QueryClientProvider>
   )
 }

@@ -1,0 +1,156 @@
+{
+  "spec": {
+    "name": "name",
+    "source": {
+      "repoURL": "repoURL",
+      "revision": "revision",
+      "releaseFile": "releaseFile",
+      "chart": {
+        "release": "release",
+        "path": "path",
+        "ref": "ref",
+        "version": "version",
+        "values": [
+          "values"
+        ],
+        "repositories": [
+          {
+            "name": "name",
+            "url": "url"
+          }
+        ]
+      }
+    },
+    "registryAuth": "registryAuth",
+    "allow": {
+      "hostPaths": [
+        "hostPaths"
+      ],
+      "secrets": [
+        "secrets"
+      ],
+      "configs": [
+        "configs"
+      ],
+      "volumes": [
+        "volumes"
+      ],
+      "networks": [
+        "networks"
+      ]
+    },
+    "destination": {
+      "swarm": "swarm"
+    },
+    "syncPolicy": {
+      "automated": true,
+      "interval": "1m30s",
+      "wait": true,
+      "timeout": "1m30s",
+      "historyMax": 1,
+      "prune": true,
+      "pruneVolumes": true,
+      "pruneResources": true,
+      "pruneFirst": true
+    },
+    "driftDetection": "live"
+  },
+  "status": {
+    "sync": {
+      "state": "out-of-sync",
+      "revision": "revision",
+      "summary": {
+        "install": 1,
+        "upgrade": 1,
+        "unchanged": 1,
+        "drifted": 1
+      },
+      "lastSync": {
+        "revision": "revision",
+        "startedAt": "2026-07-22T09:41:10Z",
+        "finishedAt": "2026-07-22T09:41:10Z",
+        "succeeded": true,
+        "error": "error"
+      }
+    },
+    "health": {
+      "state": "degraded",
+      "message": "message",
+      "services": {
+        "healthy": 1,
+        "total": 1
+      }
+    },
+    "drift": {
+      "state": "detected",
+      "services": 1,
+      "resources": 1,
+      "message": "message"
+    },
+    "releases": [
+      {
+        "name": "name",
+        "chart": "chart",
+        "version": "version",
+        "revision": 1,
+        "action": "upgrade",
+        "sync": "out-of-sync",
+        "health": {
+          "state": "degraded",
+          "message": "message",
+          "services": {
+            "healthy": 1,
+            "total": 1
+          }
+        },
+        "services": [
+          {
+            "name": "name",
+            "mode": "mode",
+            "running": 1,
+            "desired": 1,
+            "completed": 1,
+            "health": "degraded",
+            "updateState": "updateState",
+            "message": "message"
+          }
+        ],
+        "compat": {
+          "status": "incompatible",
+          "required": "required",
+          "engine": "engine",
+          "reason": "reason"
+        },
+        "wave": 1,
+        "drift": {
+          "state": "detected",
+          "services": [
+            {
+              "name": "name",
+              "reason": "modified",
+              "fields": [
+                {
+                  "field": "field",
+                  "desired": "desired",
+                  "live": "live"
+                }
+              ],
+              "truncated": 1,
+              "orphaned": true,
+              "message": "message"
+            }
+          ],
+          "resources": [
+            {
+              "kind": "network",
+              "name": "name"
+            }
+          ],
+          "message": "message"
+        }
+      }
+    ],
+    "error": "error",
+    "observedAt": "2026-07-22T09:41:10Z"
+  }
+}

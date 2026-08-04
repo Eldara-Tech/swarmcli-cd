@@ -1,0 +1,33 @@
+{
+  "spec": {
+    "name": "",
+    "source": {
+      "repoURL": "",
+      "revision": ""
+    },
+    "allow": {},
+    "destination": {},
+    "syncPolicy": {
+      "automated": false
+    },
+    "driftDetection": "unknown"
+  },
+  "status": {
+    "sync": {
+      "state": "unknown",
+      "summary": {
+        "install": 0,
+        "upgrade": 0,
+        "unchanged": 0
+      }
+    },
+    "health": {
+      "state": "unknown",
+      "services": {
+        "healthy": 0,
+        "total": 0
+      }
+    },
+    "observedAt": "0001-01-01T00:00:00Z"
+  }
+}
