@@ -45,10 +45,27 @@ test('logs in, renders the shell, reads the API and receives an event', async ({
   // The stream: a real connection, held open, parsed off a real ReadableStream.
   await expect(page.getByTestId('live-state')).toHaveText('live')
 
-  // One event. The controller reconciles the fixture application on its own
-  // tick, so nothing here presses anything — the frame arrives at a page that
-  // was already watching, which is what "without a page reload" means.
-  await expect(page.getByTestId('live-last')).toContainText('smoke', { timeout: 180_000 })
+  // One event, and the stream has to be open before it is raised — that is the
+  // whole assertion. There is no replay: api/stream.go emits no `id:`, so there
+  // is no Last-Event-ID and a subscriber is only ever sent what happens while it
+  // is attached.
+  //
+  // So the sync is triggered here rather than waited for. An earlier version
+  // waited for the controller's own tick, on the reasoning that it reconciles
+  // the fixture application unprompted — and it does, about a second after
+  // startup, long before Playwright has a browser. After that the application is
+  // converged, and a tick with nothing to do raises nothing at all, so the wait
+  // could only ever time out.
+  //
+  // Through page.request rather than a button: the sync control is a later
+  // issue's, and this assertion is about the transport, not the screen. When the
+  // button lands, this becomes a click and the rest of the test is unchanged.
+  const sync = await page.request.post('/api/v1/applications/smoke/sync', {
+    headers: { Authorization: `Bearer ${adminToken}` },
+  })
+  expect(sync.ok(), `triggering the sync failed: ${sync.status()}`).toBe(true)
+
+  await expect(page.getByTestId('live-last')).toContainText('smoke')
 
   expect(refusals, 'the browser refused something the policy in web.go forbids').toEqual([])
 })
