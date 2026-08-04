@@ -82,6 +82,55 @@ type Event struct {
 	// a companion loaded. It is not "unknown": the reconciler stamps every event
 	// it raises with the application's own destination, whatever that is (#131).
 	Swarm string
+	// Actor is who asked for the work this event came out of: the authenticated
+	// subject's name, as the API's guard resolved it. Empty means the controller
+	// acted on its own — a tick of the reconcile loop, a drift correction, a
+	// sweep nobody triggered.
+	//
+	// Everything one request set off carries it, not only that request's own
+	// sync-started and sync-succeeded: a prune or a drift correction performed
+	// during a manual sync was started by the person who pressed the button, and
+	// an audit log saying otherwise would name nobody for the one event that
+	// reports something deleted.
+	//
+	// Empty is a *genuine absence*, and that is what decides the wire shape:
+	// api's wire tags it omitempty, alongside Revision and Message, whose keys
+	// are dropped because the event has no answer to give. Swarm is the exact
+	// opposite on the same struct — empty is itself the answer, "the swarm the
+	// controller runs in" — which is why it is stated on every frame. The
+	// inconsistency between those two tags is the point rather than something to
+	// tidy up; see api's wire for the long version.
+	Actor string
+}
+
+// actorKey is what an actor travels under. Unexported, and of an unexported
+// type, so nothing outside this package can put a value there.
+type actorKey struct{}
+
+// WithActor marks ctx as work one identified caller asked for. Every event
+// raised under it names them; see Event.Actor.
+//
+// A context value rather than a parameter because the events are raised deep
+// inside a reconcile, and the only other route is api.Reconciler — an interface
+// stated so that an alternative reconciler can implement it, which would then
+// have to carry an attribution label through a method signature for something it
+// need not understand. A reconciler that ignores this raises events with no
+// actor, which is exactly what an unattributed sync should look like.
+//
+// It carries the name and not the authz.Subject, deliberately. api.guard hands
+// its subject to handlers as a parameter precisely so that no authorisation
+// decision is ever taken on a context lookup that may have come back empty; a
+// bare display string cannot be mistaken for one, and the only thing that ever
+// reads it is a label on an event.
+func WithActor(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, actorKey{}, name)
+}
+
+// ActorFrom returns the actor ctx was marked with, or "" for work the controller
+// started itself — which is what Event.Actor documents empty to mean.
+func ActorFrom(ctx context.Context) string {
+	name, _ := ctx.Value(actorKey{}).(string)
+	return name
 }
 
 // Notifier receives events.
@@ -143,6 +192,13 @@ func (logNotifier) Notify(ctx context.Context, e Event) {
 	}
 	if e.Message != "" {
 		attrs = append(attrs, slog.String("message", e.Message))
+	}
+	// With revision and message rather than with swarm, and the wire agrees for
+	// once: an absent actor is nobody having pressed anything, which is most
+	// lines in this log. actor="" on all of them would read as a request whose
+	// caller went unrecorded — the opposite of what happened.
+	if e.Actor != "" {
+		attrs = append(attrs, slog.String("actor", e.Actor))
 	}
 
 	level := slog.LevelInfo

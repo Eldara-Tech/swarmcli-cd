@@ -244,6 +244,10 @@ policy is automated. It returns as soon as the sync is accepted; the sync itself
 runs detached. Follow it by polling the detail view, or watch `/events`. This is
 the only endpoint that writes, and the only one guarded by the `sync` action.
 
+It is also the only one with a caller to record: the subject it authenticated is
+carried as the `actor` of every event that sync raises. Nothing else names one,
+because nothing else starts work.
+
 ## Event stream — `GET /api/v1/events`
 
 Server-Sent Events, so a UI gets live updates without polling. Each event is an
@@ -258,7 +262,27 @@ data: {"application":"edge","swarm":"","type":"sync-succeeded","revision":"9f3c1
 `application`, `swarm`, `type` and `at` are always present. `revision` and
 `message` appear only on the events they apply to: a `sync-succeeded` resolved a
 commit and has nothing to say, a `resources-pruned` names what went and has no
-revision of its own.
+revision of its own. `actor` appears only when there was one.
+
+`actor` names whoever asked for the work the event came out of — the
+authenticated subject of the request that called `POST
+/api/v1/applications/{app}/sync`:
+
+```
+event: resources-pruned
+data: {"application":"edge","swarm":"","type":"resources-pruned","message":"pruned legacy-api","actor":"alice","at":"2026-07-22T09:41:12Z"}
+
+```
+
+It appears on **every** event that sync raised, not only its `sync-started` and
+`sync-succeeded`: a prune or a drift correction performed during a manual sync
+was started by the person who pressed the button.
+
+It is **absent** when the controller acted on its own — a tick of the reconcile
+loop, drift converging, a sweep of something git stopped declaring — because
+then nobody pressed anything. That is a genuine absence, which is why the key
+goes rather than being sent empty, exactly as `revision` and `message` do.
+`swarm` on the same frame is deliberately the opposite: see below.
 
 `swarm` is the destination the event concerns, as the application's
 [`destination.swarm`](configuration.md#destination-optional) names it, and is
@@ -268,11 +292,12 @@ reconcile rather than raising events from somewhere else. A licensed multi-swarm
 build fills it, which is what lets a client tell production events from staging
 ones without parsing prose.
 
-It is present even when empty, where `revision` and `message` are not, for two
-reasons. An absent key would say the event has no destination, and every event
-has one. And a client written against this build would otherwise never see the
-field at all — it would meet it for the first time pointed at a controller that
-fills it, which is exactly the client that must not be surprised.
+It is present even when empty, where `revision`, `message` and `actor` are not,
+for two reasons. An absent key would say the event has no destination, and every
+event has one — empty *is* the answer here, rather than an absence. And a client
+written against this build would otherwise never see the field at all — it would
+meet it for the first time pointed at a controller that fills it, which is
+exactly the client that must not be surprised.
 
 The event name is the `type` verbatim, because that is what an `EventSource`
 listener binds to. There are eight of them and no others: `sync-started`,

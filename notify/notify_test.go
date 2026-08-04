@@ -46,6 +46,18 @@ func TestRegisterAppendsAndDispatchReachesAll(t *testing.T) {
 	}
 }
 
+// The actor travels on the context so that api.Reconciler does not have to
+// carry it: an implementation that never heard of this raises events with an
+// empty actor, which is exactly what an unattributed sync should look like.
+func TestActorTravelsOnTheContext(t *testing.T) {
+	if got := ActorFrom(context.Background()); got != "" {
+		t.Errorf("ActorFrom on an unmarked context = %q, want empty — the controller acted on its own", got)
+	}
+	if got := ActorFrom(WithActor(context.Background(), "alice")); got != "alice" {
+		t.Errorf("ActorFrom = %q, want alice", got)
+	}
+}
+
 func TestLogNotifierWritesTheEvent(t *testing.T) {
 	var buf bytes.Buffer
 	restore := slog.Default()
@@ -57,10 +69,11 @@ func TestLogNotifierWritesTheEvent(t *testing.T) {
 		Type:        SyncFailed,
 		Revision:    "9f3c1ab",
 		Message:     "chart digest mismatch",
+		Actor:       "alice",
 	})
 
 	got := buf.String()
-	for _, want := range []string{"application=edge", "event=sync-failed", "revision=9f3c1ab", "level=ERROR", "chart digest mismatch"} {
+	for _, want := range []string{"application=edge", "event=sync-failed", "revision=9f3c1ab", "level=ERROR", "chart digest mismatch", "actor=alice"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("log line is missing %q: %s", want, got)
 		}
@@ -113,7 +126,10 @@ func TestLogNotifierOmitsEmptyFields(t *testing.T) {
 	logNotifier{}.Notify(context.Background(), Event{Application: "edge", Type: SyncStarted})
 
 	got := buf.String()
-	for _, unwanted := range []string{"revision=", "message="} {
+	// actor is on this list and not on the swarm test's, because it is the one
+	// field both the log and the wire omit: an event the controller raised on its
+	// own has nobody to name.
+	for _, unwanted := range []string{"revision=", "message=", "actor="} {
 		if strings.Contains(got, unwanted) {
 			t.Errorf("log line contains %q for an empty field: %s", unwanted, got)
 		}
