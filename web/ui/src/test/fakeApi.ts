@@ -32,6 +32,40 @@ export function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status })
 }
 
+/**
+ * The two documents an Apache-2.0 controller serves from api/discovery.go: one
+ * login method, no licence, every feature off.
+ *
+ * Hand-written rather than generated, unlike the fixtures below, because they
+ * are what the *free build* answers and that is the thing under test — a
+ * fixture regenerated from a licensed reporter would quietly turn the
+ * acceptance criterion of #178 into an assertion about something else.
+ */
+export const tokenBootstrap = { login: [{ id: 'token', label: 'Admin token' }] }
+
+export const communityCapabilities = {
+  version: '1.2.0',
+  edition: 'community',
+  features: { 'multi-swarm': false, sso: false, projects: false, audit: false, notifications: false },
+  licence: null,
+  seams: {
+    swarms: 'local',
+    authz: 'token',
+    notify: ['log', 'api'],
+    secrets: 'plaintext',
+    feature: 'community',
+    extension: [],
+  },
+}
+
+/** The discovery half of a free controller's route map, to spread into controller(). */
+export function communityDiscovery(): Record<string, () => Response> {
+  return {
+    '/ui/bootstrap.json': () => json(200, tokenBootstrap),
+    '/api/v1/capabilities': () => json(200, communityCapabilities),
+  }
+}
+
 /** A stream that stays open and says nothing, which is a healthy controller. */
 export function openStream(): Response {
   const body = {

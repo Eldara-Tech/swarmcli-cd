@@ -202,6 +202,36 @@ code {
   margin: 0;
 }
 
+/* A login method the browser navigates to rather than types into — the SSO
+   button. Styled as the Sign in button is, because it is the same affordance:
+   pressing it is how you sign in. */
+.login-start {
+  background: var(--accent);
+  border-radius: 0.25rem;
+  color: var(--page);
+  font-weight: 600;
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  text-align: center;
+  text-decoration: none;
+}
+
+/* The licence badge ------------------------------------------------------- */
+
+/* Sits in the header beside the live indicator, and is absent entirely in a
+   build with no licence to report; see components/LicenceBadge.tsx. */
+.licence {
+  align-items: center;
+  display: flex;
+  font-size: 0.85rem;
+  gap: 0.4rem;
+  margin: 0;
+}
+
+.licence-detail {
+  color: var(--ink-muted);
+}
+
 /* Shared by the screens --------------------------------------------------- */
 
 .shell-nav {

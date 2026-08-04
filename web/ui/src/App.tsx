@@ -4,6 +4,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, Route, Routes } from 'react-router'
 
+import { useFeature } from './api/discovery'
 import { useToken } from './auth/useToken'
 import { Shell } from './Shell'
 import { ApplicationDetail, ApplicationOverview } from './screens/ApplicationDetail'
@@ -12,6 +13,7 @@ import { ApplicationHistory } from './screens/ApplicationHistory'
 import { Applications } from './screens/Applications'
 import { ControllerStatusScreen } from './screens/ControllerStatus'
 import { Login } from './screens/Login'
+import { Projects } from './screens/Projects'
 
 /**
  * One cache for the tab, exported so that a test can empty it between renders —
@@ -50,33 +52,44 @@ export function App() {
   const token = useToken()
 
   return (
-    <QueryClientProvider client={queryClient}>
-      {token === null ? (
-        <Login />
-      ) : (
-        <BrowserRouter>
-          <Routes>
-            <Route element={<Shell />}>
-              <Route index element={<Applications />} />
-              {/* Encoded by the screens that link here, and decoded by
-                  useParams, so an application whose name needs escaping is
-                  still one route rather than a special case.
+    <QueryClientProvider client={queryClient}>{token === null ? <Login /> : <SignedIn />}</QueryClientProvider>
+  )
+}
 
-                  The three tabs are children rather than state, so each is a
-                  link somebody can paste — and so the diff and the history are
-                  requested only while their own tab is open. Each carries a
-                  whole rendered manifest or a whole revision table, which is
-                  why they are separate endpoints in the first place. */}
-              <Route path="applications/:app" element={<ApplicationDetail />}>
-                <Route index element={<ApplicationOverview />} />
-                <Route path="diff" element={<ApplicationDiff />} />
-                <Route path="history" element={<ApplicationHistory />} />
-              </Route>
-              <Route path="status" element={<ControllerStatusScreen />} />
-            </Route>
-          </Routes>
-        </BrowserRouter>
-      )}
-    </QueryClientProvider>
+/**
+ * The router, in its own component because the route table is now capability-
+ * driven and a hook reading the capability document has to run *inside* the
+ * provider above rather than in the component that renders it.
+ */
+function SignedIn() {
+  // False in a build with no capability endpoint, so the free build's route
+  // table is exactly the one Phase B shipped — no route, and no nav item in the
+  // shell that could reach it.
+  const projects = useFeature('projects')
+
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route element={<Shell />}>
+          <Route index element={<Applications />} />
+          {/* Encoded by the screens that link here, and decoded by
+              useParams, so an application whose name needs escaping is
+              still one route rather than a special case.
+
+              The three tabs are children rather than state, so each is a
+              link somebody can paste — and so the diff and the history are
+              requested only while their own tab is open. Each carries a
+              whole rendered manifest or a whole revision table, which is
+              why they are separate endpoints in the first place. */}
+          <Route path="applications/:app" element={<ApplicationDetail />}>
+            <Route index element={<ApplicationOverview />} />
+            <Route path="diff" element={<ApplicationDiff />} />
+            <Route path="history" element={<ApplicationHistory />} />
+          </Route>
+          <Route path="status" element={<ControllerStatusScreen />} />
+          {projects && <Route path="projects" element={<Projects />} />}
+        </Route>
+      </Routes>
+    </BrowserRouter>
   )
 }

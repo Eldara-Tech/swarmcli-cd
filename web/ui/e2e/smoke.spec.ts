@@ -32,11 +32,39 @@ test('logs in, renders the shell, reads the API and receives an event', async ({
 
   await page.goto('/')
 
+  // The login screen is now drawn from /ui/bootstrap.json, which a real browser
+  // fetches with no credential — the one request in this application that must
+  // not carry the bearer, and the only place that can be observed end to end.
+  // A free controller advertises exactly one method, so exactly one box and no
+  // start link: an SSO button here would mean the public document had grown a
+  // method the Apache-2.0 authorizer does not offer.
+  await expect(page.getByLabel('Admin token')).toBeVisible()
+  await expect(page.locator('.login-form input')).toHaveCount(1)
+  await expect(page.locator('.login-start')).toHaveCount(0)
+
   await page.getByLabel('Admin token').fill(adminToken)
   await page.getByRole('button', { name: 'Sign in' }).click()
 
   // The shell.
   await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible()
+
+  // The free build reads community, and draws none of the licensed shells for
+  // it. The badge is the one to check by its absence rather than its text:
+  // `licence` is null in a build with no licensed module, and a chip that
+  // rendered anyway would be the dead control #178's acceptance criterion
+  // forbids. The document is asserted directly because it is the thing the
+  // shells are gated on, and a UI that hid everything for the wrong reason —
+  // a 404, a rejected read — would look identical from the outside.
+  const capabilities = await page.request.get('/api/v1/capabilities', {
+    headers: { Authorization: `Bearer ${adminToken}` },
+  })
+  expect(capabilities.ok(), `reading the capability document failed: ${capabilities.status()}`).toBe(true)
+  const build = (await capabilities.json()) as { edition: string; features: Record<string, boolean> }
+  expect(build.edition).toBe('community')
+  expect(Object.values(build.features).some(Boolean)).toBe(false)
+  await expect(page.getByTestId('licence-badge')).toHaveCount(0)
+  await expect(page.getByRole('link', { name: 'Projects' })).toHaveCount(0)
+  await expect(page.getByRole('columnheader', { name: 'Swarm' })).toHaveCount(0)
 
   // One API call, with the bearer header the browser attached, against a
   // guarded endpoint that would answer 401 without it.

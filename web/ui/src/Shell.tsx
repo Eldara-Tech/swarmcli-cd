@@ -3,8 +3,10 @@
 
 import { Link, NavLink, Outlet } from 'react-router'
 
+import { useFeature } from './api/discovery'
 import { useEventStream } from './api/useEventStream'
 import { clearToken } from './auth/session'
+import { LicenceBadge } from './components/LicenceBadge'
 import { LiveIndicator } from './components/LiveIndicator'
 
 /**
@@ -18,6 +20,9 @@ import { LiveIndicator } from './components/LiveIndicator'
  */
 export function Shell() {
   const live = useEventStream()
+  // False in a build with no capability endpoint, so this header is the one
+  // Phase B shipped until a companion says otherwise; see api/discovery.ts.
+  const projects = useFeature('projects')
 
   return (
     <div className="shell">
@@ -32,11 +37,19 @@ export function Shell() {
           <NavLink to="/" end className={({ isActive }) => (isActive ? 'nav-current' : undefined)}>
             Applications
           </NavLink>
+          {projects && (
+            <NavLink to="/projects" className={({ isActive }) => (isActive ? 'nav-current' : undefined)}>
+              Projects
+            </NavLink>
+          )}
           <NavLink to="/status" className={({ isActive }) => (isActive ? 'nav-current' : undefined)}>
             Controller
           </NavLink>
         </nav>
         <LiveIndicator {...live} />
+        {/* Renders nothing at all in a build with no licence to report, which
+            is what keeps the free header identical to Phase B's. */}
+        <LicenceBadge />
         <button type="button" className="sign-out" onClick={clearToken}>
           Sign out
         </button>

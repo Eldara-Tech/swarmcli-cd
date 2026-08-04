@@ -6,11 +6,12 @@ import { Link, useSearchParams } from 'react-router'
 
 import { appSetShape } from '../api/appset'
 import { apiGet } from '../api/client'
+import { useFeature } from '../api/discovery'
 import { decodeEnum, driftStates, healthStates, syncStates } from '../api/enums'
 import type { ApplicationList, ControllerStatus, View } from '../api/types'
 import { DriftCell, HealthChip, SyncChip } from '../components/StateChip'
 import { Instant } from '../components/Instant'
-import { plural, serviceCounts, shortRevision } from '../format'
+import { destination, plural, serviceCounts, shortRevision } from '../format'
 
 /**
  * The applications list: every application the token may see, in one request.
@@ -36,6 +37,9 @@ import { plural, serviceCounts, shortRevision } from '../format'
  */
 export function Applications() {
   const [params, setParams] = useSearchParams()
+  // False in a build with no capability endpoint — see api/discovery.ts — so
+  // the free build's table has the columns Phase B shipped and no others.
+  const showSwarm = useFeature('multi-swarm')
 
   const applications = useQuery({
     queryKey: ['applications'],
@@ -189,7 +193,7 @@ export function Applications() {
 
       {all.length === 0 && <p className="empty">No applications.</p>}
       {all.length > 0 && shown.length === 0 && <p className="empty">No application matches these filters.</p>}
-      {shown.length > 0 && (cards ? <Cards views={shown} /> : <Table views={shown} />)}
+      {shown.length > 0 && (cards ? <Cards views={shown} /> : <Table views={shown} showSwarm={showSwarm} />)}
 
       <ReconcileErrors views={shown} />
     </section>
@@ -252,8 +256,17 @@ function stale(view: View): boolean {
  * Both are computed over every application rather than over the filtered rows:
  * a column that appeared and disappeared as somebody typed in the search box
  * would be a table that changes shape under the reader.
+ *
+ * Swarm is the third conditional column and the one with a different condition:
+ * it is on the build rather than on the data. Every spec carries
+ * destination.swarm and a single-swarm build resolves every one of them to the
+ * swarm the controller runs in, so the column would say the same thing on every
+ * row — which is why it is gated on features["multi-swarm"] and not on the rows
+ * having anything to distinguish. The CLI has no counterpart yet; its
+ * multi-swarm surface is its own issue, and until then this is the one place
+ * the two tables differ.
  */
-function Table({ views }: { views: View[] }) {
+function Table({ views, showSwarm }: { views: View[]; showSwarm: boolean }) {
   const showDrift = views.some((v) => v.status.drift !== undefined)
   const showError = views.some(stale)
 
@@ -262,6 +275,7 @@ function Table({ views }: { views: View[] }) {
       <thead>
         <tr>
           <th scope="col">Name</th>
+          {showSwarm && <th scope="col">Swarm</th>}
           <th scope="col">Sync</th>
           {showDrift && <th scope="col">Drift</th>}
           <th scope="col">Health</th>
@@ -276,6 +290,7 @@ function Table({ views }: { views: View[] }) {
             <th scope="row">
               <Link to={detailPath(view.spec.name)}>{view.spec.name}</Link>
             </th>
+            {showSwarm && <td>{destination(view.spec.destination)}</td>}
             <td>
               <SyncChip state={view.status.sync.state} />
             </td>
