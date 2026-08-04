@@ -6,7 +6,9 @@ import { BrowserRouter, Route, Routes } from 'react-router'
 
 import { useToken } from './auth/useToken'
 import { Shell } from './Shell'
+import { ApplicationDetail } from './screens/ApplicationDetail'
 import { Applications } from './screens/Applications'
+import { ControllerStatusScreen } from './screens/ControllerStatus'
 import { Login } from './screens/Login'
 
 /**
@@ -54,6 +56,11 @@ export function App() {
           <Routes>
             <Route element={<Shell />}>
               <Route index element={<Applications />} />
+              {/* Encoded by the screens that link here, and decoded by
+                  useParams, so an application whose name needs escaping is
+                  still one route rather than a special case. */}
+              <Route path="applications/:app" element={<ApplicationDetail />} />
+              <Route path="status" element={<ControllerStatusScreen />} />
             </Route>
           </Routes>
         </BrowserRouter>

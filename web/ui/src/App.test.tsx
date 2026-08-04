@@ -6,37 +6,31 @@
 // The fake is installed at globalThis.fetch rather than at a mocked module, so
 // the bearer header, the 401 rule and the event stream's own parser all sit
 // under the seam and are really run. Mocking src/api/client.ts would test the
-// screens against a client that cannot be wrong.
+// screens against a client that cannot be wrong. It is shared with the screen
+// suites; see src/test/fakeApi.ts.
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, queryClient } from './App'
 import { getToken, setToken } from './auth/session'
+import { clone, controller, json, openStream } from './test/fakeApi'
+import viewFull from './test/fixtures/view-full.json'
 
-/** answer is the faked controller: a status code and body per path prefix. */
-function controller(routes: Record<string, () => Response>) {
-  vi.stubGlobal(
-    'fetch',
-    // A string, because that is all src/api ever passes; see client.test.ts.
-    vi.fn((url: string) => {
-      const route = Object.keys(routes).find((path) => url.startsWith(path))
-      if (route === undefined) return Promise.reject(new Error(`nothing faked for ${url}`))
-      return Promise.resolve(routes[route]())
-    }),
-  )
+/** Two applications, shaped as the generated fixture, named apart. */
+function twoApplications(): unknown {
+  const applications = ['edge', 'ingress'].map((name) => {
+    const view = clone(viewFull)
+    view.spec.name = name
+    return view
+  })
+  return { applications }
 }
 
-function json(status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), { status })
-}
-
-/** A stream that stays open and says nothing, which is a healthy controller. */
-function openStream(): Response {
-  const body = {
-    getReader: () => ({ read: () => new Promise<never>(() => {}) }),
-  }
-  return { ok: true, status: 200, body } as unknown as Response
+/** A controller with an app set that loaded and is not stale. */
+const healthyStatus = {
+  appSet: { mode: 'static', loadedAt: '2026-07-22T09:41:10Z', stale: false },
+  applications: 2,
 }
 
 beforeEach(() => {
@@ -66,8 +60,8 @@ describe('the shell', () => {
 
   it('signs in with a token the controller accepts and makes its one request', async () => {
     controller({
-      '/api/v1/status': () => json(200, { appSet: { mode: 'static' }, applications: 2 }),
-      '/api/v1/applications': () => json(200, { applications: [{}, {}] }),
+      '/api/v1/status': () => json(200, healthyStatus),
+      '/api/v1/applications': () => json(200, twoApplications()),
       '/api/v1/events': openStream,
     })
     render(<App />)
@@ -103,6 +97,7 @@ describe('the shell', () => {
   it('returns to the login screen when a request 401s after signing in', async () => {
     setToken('was-valid')
     controller({
+      '/api/v1/status': () => json(200, healthyStatus),
       '/api/v1/applications': () => json(401, { error: 'unauthorized' }),
       '/api/v1/events': openStream,
     })
@@ -115,6 +110,7 @@ describe('the shell', () => {
   it('forgets the credential when the operator signs out', async () => {
     setToken('good')
     controller({
+      '/api/v1/status': () => json(200, healthyStatus),
       '/api/v1/applications': () => json(200, { applications: [] }),
       '/api/v1/events': openStream,
     })
@@ -131,6 +127,7 @@ describe('the shell', () => {
   it('never writes the credential to localStorage', async () => {
     setToken('good')
     controller({
+      '/api/v1/status': () => json(200, healthyStatus),
       '/api/v1/applications': () => json(200, { applications: [] }),
       '/api/v1/events': openStream,
     })

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
-import { Link, Outlet } from 'react-router'
+import { Link, NavLink, Outlet } from 'react-router'
 
 import { useEventStream } from './api/useEventStream'
 import { clearToken } from './auth/session'
@@ -25,6 +25,17 @@ export function Shell() {
         <Link className="brand" to="/">
           swarmcli-cd
         </Link>
+        {/* The controller screen is reachable from here as well as from the
+            list's banner: an operator who suspects the app set has to be able
+            to look without a failing application to click through from. */}
+        <nav className="shell-nav">
+          <NavLink to="/" end className={({ isActive }) => (isActive ? 'nav-current' : undefined)}>
+            Applications
+          </NavLink>
+          <NavLink to="/status" className={({ isActive }) => (isActive ? 'nav-current' : undefined)}>
+            Controller
+          </NavLink>
+        </nav>
         <LiveIndicator {...live} />
         <button type="button" className="sign-out" onClick={clearToken}>
           Sign out
