@@ -26,6 +26,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/backend"
 	"github.com/Eldara-Tech/swarmcli-cd/config"
 	"github.com/Eldara-Tech/swarmcli-cd/extension"
+	"github.com/Eldara-Tech/swarmcli-cd/feature"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 	"github.com/Eldara-Tech/swarmcli-cd/prune"
@@ -348,6 +349,11 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		"authz", authz.Active(),
 		"notify", notify.Active(),
 		"secrets", secrets.Active(),
+		// Reads "community" until a licensed reporter registers, and then names
+		// that reporter whether or not a licence verified — which is what tells
+		// a missing module apart from a missing licence when the capability
+		// document still says the edition is community.
+		"feature", feature.Active(),
 		// Which modules registered routes, not which routes: what is actually
 		// served cannot be known until the mux is built, which is a different
 		// moment and one that can fail. See the "routes" line below.
@@ -457,7 +463,10 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// The UI is built here and passed in, so that api stays data-only and
 	// nothing importing it links an embedded asset tree. With --ui=false the
 	// handler is absent rather than the routes: api.New answers them with a 404.
-	apiOpts := api.Options{Log: log, Controller: loop}
+	// version rather than a second symbol for the companion to stamp: it is the
+	// package variable goreleaser and the Dockerfile already set, and a build
+	// that stamped one of two would report the wrong one somewhere.
+	apiOpts := api.Options{Log: log, Controller: loop, Version: version}
 	if o.ui {
 		apiOpts.UI = web.Handler(web.Assets, web.Options{Log: log})
 	}

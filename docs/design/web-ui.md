@@ -604,7 +604,7 @@ type Set map[Name]bool
 
 type Licence struct {
     Tier      string     // "be", "trial"
-    Status    string     // "valid", "expired", "invalid", "absent"
+    Status    Status     // valid | grace | expired | invalid | absent (D25)
     ExpiresAt *time.Time // nil when perpetual or absent
 }
 

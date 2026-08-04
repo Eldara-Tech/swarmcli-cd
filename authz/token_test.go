@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -163,6 +164,54 @@ func TestRegisterReplaces(t *testing.T) {
 	if _, ok := Get().(stubAuthorizer); !ok {
 		t.Errorf("Get returned %T, want the companion's", Get())
 	}
+}
+
+// The fallback and the token authorizer are two spellings of the same login
+// box, and this is what stops them drifting: MethodsFor answers for an
+// authorizer that names none of its own, and the default authorizer names one,
+// and an operator meeting a different label depending on which path answered
+// would have no way to tell which of the two was wrong.
+func TestTheFallbackMatchesTheTokenAuthorizer(t *testing.T) {
+	tok := newToken(env(map[string]string{EnvToken: "s3cret"}), nil)
+
+	implemented := MethodsFor(tok)
+	// stubAuthorizer implements Authorizer and not LoginMethods, which is every
+	// authorizer written before this interface existed.
+	fallback := MethodsFor(stubAuthorizer{})
+
+	if !slices.Equal(implemented, fallback) {
+		t.Errorf("the token authorizer offers %+v, the fallback offers %+v", implemented, fallback)
+	}
+	if len(implemented) != 1 || implemented[0].ID != "token" {
+		t.Fatalf("MethodsFor = %+v, want exactly the token box", implemented)
+	}
+	// No Start: the credential is typed in, and a login screen that navigated
+	// somewhere first would have nowhere to go.
+	if implemented[0].Start != "" {
+		t.Errorf("the token method names a start URL %q", implemented[0].Start)
+	}
+	if implemented[0].Label == "" {
+		t.Error("the token method has no label; the login screen has nothing to draw")
+	}
+}
+
+// The point of the interface: a deployment that has moved to SSO must not offer
+// a box for a credential it no longer issues. An authorizer that names its own
+// methods replaces the fallback rather than adding to it.
+func TestAnAuthorizerThatNamesItsOwnMethodsReplacesTheBox(t *testing.T) {
+	want := []LoginMethod{{ID: "sso", Label: "Sign in with SSO", Start: "/auth/login"}}
+	got := MethodsFor(ssoAuthorizer{})
+	if !slices.Equal(got, want) {
+		t.Errorf("MethodsFor = %+v, want only the authorizer's own: %+v", got, want)
+	}
+}
+
+// ssoAuthorizer is the shape a companion has: it issues no token, so the token
+// box would be a dead end.
+type ssoAuthorizer struct{ stubAuthorizer }
+
+func (ssoAuthorizer) LoginMethods() []LoginMethod {
+	return []LoginMethod{{ID: "sso", Label: "Sign in with SSO", Start: "/auth/login"}}
 }
 
 type stubAuthorizer struct{}

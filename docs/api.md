@@ -20,6 +20,7 @@ so the quickest way to see any shape below is to run the matching command with
 | Method | Path | |
 |---|---|---|
 | `GET` | `/healthz` | unauthenticated liveness; says nothing but "something is listening" |
+| `GET` | `/ui/bootstrap.json` | unauthenticated: how a browser may log in, and nothing else |
 | `GET` | `/api/v1/status` | the controller's own state — where the app set came from and whether it is loading |
 | `GET` | `/api/v1/applications` | the list view — one row's worth of state per application |
 | `GET` | `/api/v1/applications/{app}` | the detail view — releases and their services |
@@ -27,6 +28,7 @@ so the quickest way to see any shape below is to run the matching command with
 | `GET` | `/api/v1/applications/{app}/history` | each release's revisions |
 | `POST` | `/api/v1/applications/{app}/sync` | trigger a reconcile-and-apply |
 | `GET` | `/api/v1/events` | a live event stream, so a UI never polls |
+| `GET` | `/api/v1/capabilities` | what this build is, what it grants, and which seam implementations are live |
 | `GET` | `/` | the web UI, and the fallback for its client-side routes |
 | `GET` | `/assets/{path...}` | the UI's hashed build output |
 
@@ -79,6 +81,15 @@ whole collection.
 the process and cannot carry one without putting it in the stack file and in
 `docker inspect` output. What it discloses — that something is listening — a TCP
 connect already tells you.
+
+`/ui/bootstrap.json` is unauthenticated because a login screen has to know
+whether to draw a token box or an SSO button *before* anyone has a credential to
+present. It is under `/ui/` rather than `/api/v1/` precisely so that the sentence
+at the top of this section stays true without exceptions: a public route under
+the API prefix would make an operator check each one before believing it. It
+carries no version string — an unauthenticated caller does not need the build
+number — and is served `Cache-Control: no-store`, because installing a licence
+or loading an SSO module changes what it says.
 
 The two UI routes are unauthenticated for a related reason: a browser has no
 credential until the login screen it is asking for has loaded, and what they
@@ -247,6 +258,44 @@ the only endpoint that writes, and the only one guarded by the `sync` action.
 It is also the only one with a caller to record: the subject it authenticated is
 carried as the `actor` of every event that sync raises. Nothing else names one,
 because nothing else starts work.
+
+### Discovery — `GET /ui/bootstrap.json` and `GET /api/v1/capabilities`
+
+Two documents, deliberately asymmetric: what a login screen needs before anyone
+is authenticated, and what an operator holding the token may read about the
+build. The first is as small as it can be.
+
+```json
+{ "login": [ { "id": "token", "label": "Admin token" } ] }
+```
+
+`start` appears only on a method the browser has to navigate to — an SSO button
+carries `"start": "/auth/login"`, a typed-in credential carries nothing. The
+list comes from the authorizer, so a deployment that has moved to SSO stops
+offering a box for a credential it no longer issues.
+
+The capability document is guarded by `read`:
+
+```json
+{
+  "version": "1.2.0",
+  "edition": "community",
+  "features": { "multi-swarm": false, "sso": false, "projects": false,
+                "audit": false, "notifications": false },
+  "licence": null,
+  "seams": { "swarms": "local", "authz": "token", "notify": ["log", "api"],
+             "secrets": "plaintext", "feature": "community", "extension": [] }
+}
+```
+
+`features` always carries every key the build knows about, whatever the reporter
+put in its own map, so a UI hiding a control on `features["sso"]` can tell
+`false` from absent. `licence` is `null` in a build with no licensed module
+linked — which is a different thing from a licensed build with no licence
+installed, which reports a status of `absent`; the other four statuses are
+`valid`, `grace` (expired, still granting, renew before it stops), `expired` and
+`invalid`. `seams` is the startup `seams` log line, readable by an operator who
+has the token but not the logs.
 
 ## Event stream — `GET /api/v1/events`
 
