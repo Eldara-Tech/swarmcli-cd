@@ -523,7 +523,10 @@ it has no open streams — which is exactly what `srv.Drain` closes. It should
 compose, but it is not what today's drain test exercises, so the TLS variant of
 `TestTheListenerIsDrainedBeforeTheReconcilerStops` is the proof. If it does not
 hold, restricting `Server.Protocols` to HTTP/1.1 is the escape hatch — and it
-must be a decision, not a default. **Open (§9.7).**
+must be a decision, not a default. **Settled: D23 (§9.7) — h2 stays on**, and
+the drain test's TLS row passes, so `Protocols` is left alone. The companion
+check is `TestEventStreamDeliversWhatTheNotifierIsGiven`, now a table over
+HTTP/1.1 and h2 over TLS, both asserting the protocol they claim to test.
 
 **`SWARMCLI_CD_SERVER` is shared by all four commands.** `resolveServer` serves
 `app`, `status` and `healthcheck` alike, so the moment `stack.yml` sets it to
@@ -532,7 +535,9 @@ must be a decision, not a default. **Open (§9.7).**
 `client.DefaultServer`'s own doc comment names — starts failing with a
 certificate error, because `app` verifies and the certificate is self-signed.
 The design's own resolution reintroduces a failure through another door.
-**Open (§9.8).**
+**Settled: D24 (§9.8) — `SWARMCLI_CD_CA_CERT`**, read by `app` and `status`,
+flag then environment then unset, exactly as `resolveServer` resolves the
+server. `stack.yml`'s TLS block sets it beside `SWARMCLI_CD_SERVER`.
 
 **`client.message` swallows the one sentence that explains the restart loop.**
 Go's server answers a plaintext request to a TLS listener with `400` and a body
@@ -907,8 +912,8 @@ the Actions UI.
 ## 9. Decisions settled at review — 2026-08-04
 
 Items 1–6 are closed and are D14–D19 in §2; the reasoning is kept so it is not
-re-derived. Items 7 and 8 were **opened** by planning A3 (§4.8) and are not yet
-settled.
+re-derived. Items 7 and 8 were **opened** by planning A3 (§4.8) and are settled
+below, in the second round.
 
 1. **TLS: add `--tls-cert` / `--tls-key`** (D14). The alternative was a
    documented reverse proxy, which is what a real deployment should still do —

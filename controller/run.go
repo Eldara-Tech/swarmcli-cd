@@ -5,6 +5,7 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -81,6 +82,14 @@ Options:
   --listen <addr>   API listen address (default ` + defaultListen + `)
   --data <dir>      Repository clones and chart cache (default ` + defaultDataDir + `)
 
+  --tls-cert <path> Serve the API over TLS with this certificate, and
+  --tls-key <path>  this key. Both or neither: one alone is refused, because
+                    what it otherwise produces is a listener that came up in
+                    plaintext while the operator believed it had not. The pair
+                    is read once at startup, so a renewed certificate needs a
+                    restart. With TLS on, the container healthcheck must be
+                    pointed at https://127.0.0.1:8080 — see stack.yml
+
   --ui              Serve the web UI at / (default true). It is embedded in
                     this binary, so nothing is fetched and no second port is
                     opened; --ui=false answers its routes with 404 instead
@@ -144,6 +153,8 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.configPath, "config", defaultConfigPath, "")
 	fs.StringVar(&o.listen, "listen", defaultListen, "")
 	fs.StringVar(&o.dataDir, "data", defaultDataDir, "")
+	fs.StringVar(&o.tlsCert, "tls-cert", "", "")
+	fs.StringVar(&o.tlsKey, "tls-key", "", "")
 	fs.BoolVar(&o.ui, "ui", true, "")
 	fs.DurationVar(&o.interval, "reconcile-interval", reconcile.DefaultInterval, "")
 	fs.StringVar(&o.appSetRepo, "appset-repo", "", "")
@@ -214,6 +225,13 @@ type options struct {
 	configPath string
 	listen     string
 	dataDir    string
+
+	// tlsCert and tlsKey serve the API over TLS. Validate refuses one without
+	// the other: a controller that silently ignored half a pair would be
+	// serving plaintext on a listener its operator believes is encrypted, and
+	// nothing about the running process would say so.
+	tlsCert string
+	tlsKey  string
 
 	// ui serves the embedded web UI. On by default (D15) and off is still two
 	// registered routes answering 404, not two routes that disappear: what a
@@ -310,6 +328,15 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// spending its timeout before refusing for an unrelated reason helps nobody.
 	if err := authz.Get().Ready(); err != nil {
 		return fmt.Errorf("authorizer '%s': %w", authz.Active(), err)
+	}
+
+	// Beside it, and for the same reason: an unreadable or unparseable pair
+	// found by ListenAndServeTLS would arrive through runUntilStopped's error
+	// channel with the reconciler already running and already deploying, which
+	// is a worse thing to unwind than a startup that refused and said why.
+	tlsConfig, err := tlsConfigFor(o)
+	if err != nil {
+		return err
 	}
 
 	// So that an operator can tell from the logs whether the companion loaded,
@@ -482,7 +509,16 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		// The controller holds write access to the swarm. An unbounded header
 		// read is the cheapest way to tie up a connection slot on something
 		// that valuable.
+		//
+		// It is also the TLS handshake timeout, which is the reason not to
+		// "tidy" it away: Server.tlsHandshakeTimeout returns the smallest
+		// positive of ReadHeaderTimeout, ReadTimeout and WriteTimeout, and this
+		// is the only one of the three that is set. Removing it would unbound
+		// the handshake as well as the header read.
 		ReadHeaderTimeout: 10 * time.Second,
+		// nil without --tls-cert, which is what listenAndServe reads to decide
+		// whether to bind plaintext.
+		TLSConfig: tlsConfig,
 	}
 
 	// Shutdown waits for connections to go idle and an event stream never does,
@@ -490,11 +526,47 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// and then reported a failure that had not happened.
 	httpSrv.RegisterOnShutdown(srv.Drain)
 
+	// tls is on this line because it is the line an operator greps when the task
+	// will not stay up: a healthcheck still probing http against a TLS listener
+	// restarts the task forever with everything else working perfectly.
 	log.Info("starting",
-		"applications", len(cfg.Applications), "listen", o.listen,
+		"applications", len(cfg.Applications), "listen", o.listen, "tls", o.tlsCert != "",
 		"mode", mode, "appSet", sourceDesc,
 		"prune", o.prune, "pruneVolumes", o.pruneVolumes, "controllerID", o.controllerID)
 	return runUntilStopped(ctx, rec, loop, httpSrv, log)
+}
+
+// tlsConfigFor loads the certificate pair, or returns nil for a controller that
+// was given none. The pair is read here, once — a renewed certificate needs a
+// restart, which is stated in the usage text rather than left to be discovered.
+// The fix is a tls.Config.GetCertificate re-reading on handshake, and it is a
+// follow-up rather than part of this.
+func tlsConfigFor(o options) (*tls.Config, error) {
+	if o.tlsCert == "" {
+		return nil, nil
+	}
+	cert, err := tls.LoadX509KeyPair(o.tlsCert, o.tlsKey)
+	if err != nil {
+		return nil, fmt.Errorf("--tls-cert/--tls-key: %w", err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
+}
+
+// listenAndServe binds the listener the server was configured for.
+//
+// Protocols is deliberately left alone, so a TLS listener negotiates HTTP/2
+// (D23): one connection then carries the event stream and every API call, which
+// matters for a UI holding a stream open against a browser's six-per-origin
+// limit. What that costs is h2's graceful shutdown going through the bundled
+// http2 server's GOAWAY hook rather than closeIdleConns, which
+// TestTheListenerIsDrainedBeforeTheReconcilerStops covers over both protocols.
+//
+// The pair is already in TLSConfig, so ListenAndServeTLS is given no paths.
+func listenAndServe(srv *http.Server) error {
+	if srv.TLSConfig != nil {
+		return srv.ListenAndServeTLS("", "")
+	}
+	return srv.ListenAndServe()
 }
 
 // The modes the bootstrap can select, as the status endpoint reports them.
@@ -552,6 +624,14 @@ func (o options) validate() error {
 		return errors.New("--reconcile-interval must be positive")
 	case application.ValidateControllerID(o.controllerID) != nil:
 		return fmt.Errorf("--controller-id: %w", application.ValidateControllerID(o.controllerID))
+	case o.tlsCert != "" && o.tlsKey == "":
+		// The missing half first, because that is the flag the operator has to
+		// add. Refused rather than defaulted to plaintext for the reason above
+		// the fields: a listener silently serving http is the failure this
+		// whole check exists to prevent.
+		return errors.New("--tls-key is missing: --tls-cert alone would serve plaintext on a listener you believe is encrypted")
+	case o.tlsKey != "" && o.tlsCert == "":
+		return errors.New("--tls-cert is missing: --tls-key alone would serve plaintext on a listener you believe is encrypted")
 	case o.pruneVolumes && !o.prune:
 		// Refused rather than resolved either way. Read as "prune with volumes"
 		// it destroys data nobody asked to lose; read as "prune nothing" it
@@ -648,7 +728,7 @@ func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, loop *appse
 	}()
 
 	go func() {
-		err := httpSrv.ListenAndServe()
+		err := listenAndServe(httpSrv)
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}

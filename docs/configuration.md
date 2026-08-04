@@ -1249,6 +1249,7 @@ line that shows exactly what the controller is following is worth having in
 | `--config` | `/etc/swarmcli-cd/applications.yaml` | the applications file, delivered as a Docker config. Static mode |
 | `--listen` | `:8080` | API listen address |
 | `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume so a restart does not re-clone everything. An application that leaves the set has both reclaimed, one app-set interval after it goes |
+| `--tls-cert`, `--tls-key` | — | serve the API over TLS. Both or neither; see [TLS](#tls) |
 | `--ui` | on | serve the web UI at `/`. It is embedded in the binary, so nothing is fetched and no port is opened beyond `--listen`. `--ui=false` does not remove the routes; it answers them with `404` |
 | `--reconcile-interval` | `3m` | how often an application that sets no [`syncPolicy.interval`](#syncpolicy-optional) is reconciled. Every tick is a git fetch, a full render and a read of the swarm's release records, per application. Unlike the per-application field it has no floor: the app set is the untrusted tier, and this one is set by whoever runs the controller |
 | `--appset-repo` | — | pull the app set from this repository. Selects **git** mode |
@@ -1261,6 +1262,39 @@ line that shows exactly what the controller is following is worth having in
 | `--controller-id` | `default` | this controller's identity, stamped on every release it installs. Two controllers on one swarm must be given different ones; see [two controllers on one swarm](#two-controllers-on-one-swarm) |
 | `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
 | `--log-format` | `text` | `text` or `json` |
+
+### TLS
+
+`--tls-cert` and `--tls-key` serve the API over https. **Both or neither**: one
+alone refuses to start, because what it would otherwise produce is a listener
+serving plaintext while you believe it is encrypted. The pair is read once, at
+startup, so a renewed certificate needs a controller restart.
+
+Turning it on breaks two things that fail as something else entirely, and
+`stack.yml`'s commented TLS block sets both remedies together.
+
+**The container healthcheck.** `swarmcli-cd healthcheck` probes
+`http://127.0.0.1:8080` unless told otherwise, a TLS listener refuses that, and
+Swarm then restarts a task whose controller is working perfectly — with nothing
+in the logs saying TLS. Set `SWARMCLI_CD_SERVER=https://127.0.0.1:8080` and it
+stays healthy. The probe needs no certificate: given an https URL whose host is
+a loopback **address**, it skips verification, because `/healthz` discloses
+nothing, the connection never leaves the host, and the probe asserts liveness
+rather than identity. A non-loopback `https://` verifies normally, and a
+*hostname* that merely resolves to the loopback does not qualify — the rule is
+decided from the URL's text and never from a resolver's answer.
+
+**Every CLI call inside the container.** `SWARMCLI_CD_SERVER` is read by `app`
+and `status` too, and those do verify. A certificate from a real CA just works;
+a self-signed one needs `--ca-cert`, or `SWARMCLI_CD_CA_CERT`, naming the
+certificate itself — a self-signed leaf is its own authority. There is
+deliberately no `--insecure`: a flag disabling verification on the client that
+reads diffs and triggers syncs is a worse thing to have than one more argument.
+
+```
+swarmcli-cd app list --server https://controller.example.com:8080 \
+                     --ca-cert /run/secrets/swarmcli-cd-tls-cert
+```
 
 ### Logs
 
@@ -1308,7 +1342,8 @@ does, so it does not make either kind of line easier to read.
 | `SWARMCLI_CD_GIT_USERNAME` | git username; forges often ignore it, GitHub wants it non-empty (`x-access-token`) |
 | `SWARMCLI_CD_GIT_TOKEN_FILE` | git password or token, read from a file — the Docker-secret form |
 | `SWARMCLI_CD_GIT_TOKEN` | git password or token, given directly |
-| `SWARMCLI_CD_SERVER` | *client only* — which controller the `app` commands talk to (default `http://127.0.0.1:8080`) |
+| `SWARMCLI_CD_SERVER` | *client only* — which controller the `app`, `status` and `healthcheck` commands talk to (default `http://127.0.0.1:8080`) |
+| `SWARMCLI_CD_CA_CERT` | *client only* — PEM certificate to trust for an `https` server; `--ca-cert` wins over it. See [TLS](#tls) |
 
 The controller **refuses to start** with no admin token configured: an authorizer
 that merely rejected every request would be indistinguishable, from the outside,

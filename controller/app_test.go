@@ -7,9 +7,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -22,11 +25,39 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/client"
 )
 
-// start runs the real API server over rec and returns the arguments that point
-// the CLI at it. Testing against the actual server rather than a hand-written
-// stub is what makes these tests cover the guard, the envelopes and the status
-// codes as well as the rendering.
+// start runs the real API server over rec and returns the address that points
+// the CLI at it.
 func start(t *testing.T, rec *stubReconciler) string {
+	t.Helper()
+	srv := httptest.NewServer(apiHandler(t, rec))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// startTLS is start over a TLS listener, returning its https URL and the
+// server's certificate written out as the PEM file --ca-cert takes.
+//
+// httptest's certificate already carries 127.0.0.1 and ::1 as SANs, so the URL
+// is a loopback https one — which is what stack.yml's TLS example probes — and
+// it is self-signed, so it is its own authority and the same file serves as the
+// CA the CLI is pointed at.
+func startTLS(t *testing.T, rec *stubReconciler) (server, caCert string) {
+	t.Helper()
+	srv := httptest.NewTLSServer(apiHandler(t, rec))
+	t.Cleanup(srv.Close)
+
+	path := filepath.Join(t.TempDir(), "controller.pem")
+	block := &pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return srv.URL, path
+}
+
+// apiHandler builds the real API server over rec. Testing against the actual
+// server rather than a hand-written stub is what makes these tests cover the
+// guard, the envelopes and the status codes as well as the rendering.
+func apiHandler(t *testing.T, rec *stubReconciler) http.Handler {
 	t.Helper()
 	t.Setenv(authz.EnvTokenFile, "")
 	t.Setenv(authz.EnvToken, "s3cret")
@@ -40,9 +71,7 @@ func start(t *testing.T, rec *stubReconciler) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(h)
-	t.Cleanup(srv.Close)
-	return srv.URL
+	return h
 }
 
 // cli runs one command against the server and returns its exit code.
@@ -588,6 +617,85 @@ func TestHealthcheckNeedsNoToken(t *testing.T) {
 
 	if code, _, stderr := cli(t, server, "healthcheck"); code != 0 {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+}
+
+// The loopback exception must not leak out of the healthcheck. `app` reads
+// diffs and triggers syncs, so it verifies — and against the self-signed
+// certificate stack.yml's TLS example deploys, that means it needs the
+// certificate, which is the whole reason --ca-cert exists rather than
+// --insecure.
+func TestAppVerifiesTheControllersCertificate(t *testing.T) {
+	server, caCert := startTLS(t, &stubReconciler{view: syncedView()})
+	t.Setenv(client.EnvCACert, "")
+
+	code, _, stderr := cli(t, server, "app", "list")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 without --ca-cert", code)
+	}
+	// The raw x509 sentence names no remedy, and this is the first thing an
+	// operator meets after turning TLS on.
+	if !strings.Contains(stderr, "--ca-cert") {
+		t.Errorf("stderr = %q, want it to name the flag that fixes it", stderr)
+	}
+
+	code, stdout, stderr := cli(t, server, "app", "list", "--ca-cert", caCert)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 with --ca-cert (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "edge") {
+		t.Errorf("stdout = %q, want the application", stdout)
+	}
+}
+
+// D24. SWARMCLI_CD_SERVER is shared by all four commands, so pointing it at
+// https://127.0.0.1:8080 to keep the healthcheck alive would otherwise break
+// `docker exec … swarmcli-cd app list` inside the controller — the use case
+// client.DefaultServer's own doc comment names. stack.yml sets both variables
+// together, so this is the path that deployment actually takes.
+func TestTheCACertMayComeFromTheEnvironment(t *testing.T) {
+	server, caCert := startTLS(t, &stubReconciler{view: syncedView()})
+	t.Setenv(client.EnvCACert, caCert)
+
+	for _, command := range [][]string{{"app", "list"}, {"status"}} {
+		t.Run(command[0], func(t *testing.T) {
+			if code, _, stderr := cli(t, server, command...); code != 0 {
+				t.Errorf("exit = %d, want 0 (stderr: %s)", code, stderr)
+			}
+		})
+	}
+}
+
+func TestResolveCACert(t *testing.T) {
+	env := func(string) string { return "/from/env.pem" }
+	if got := resolveCACert("/from/flag.pem", env); got != "/from/flag.pem" {
+		t.Errorf("resolveCACert = %q, want the flag to win", got)
+	}
+	if got := resolveCACert("", env); got != "/from/env.pem" {
+		t.Errorf("resolveCACert = %q, want the environment", got)
+	}
+	// Unset rather than a default: the system pool is what verifies a
+	// certificate from a real CA, and naming a file nobody installed would
+	// break that.
+	if got := resolveCACert("", func(string) string { return "" }); got != "" {
+		t.Errorf("resolveCACert = %q, want it unset", got)
+	}
+}
+
+// The restart loop, named. Go's server answers a plaintext request to a TLS
+// listener with a 400 whose body says exactly what happened, and client.message
+// drops it for the status line — so without tlsHint the operator of a task
+// Swarm restarts every interval reads "400 bad request" and nothing else.
+func TestHealthcheckSaysTLSWhenItProbedATLSListenerOverHTTP(t *testing.T) {
+	server, _ := startTLS(t, &stubReconciler{view: syncedView()})
+	plaintext := "http://" + strings.TrimPrefix(server, "https://")
+
+	code, _, stderr := cli(t, plaintext, "healthcheck")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "--tls-cert") || !strings.Contains(stderr, "https://") {
+		t.Errorf("stderr = %q, want it to name TLS and the URL to probe instead", stderr)
 	}
 }
 

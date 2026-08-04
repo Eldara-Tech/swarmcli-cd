@@ -198,3 +198,63 @@ jobs:
           echo "$out"
           echo "$out" | grep -q 'no admin token configured' || {
             echo "expected it to refuse to start"; exit 1; }
+
+      # The criterion issue #171 exists for, asserted where it actually bites:
+      # Docker running the health command inside the container with the
+      # container's own environment, which is the mechanism the whole resolution
+      # rests on and the one nothing below the image can exercise. stack.yml's
+      # healthcheck probes http://127.0.0.1:8080 unless the environment says
+      # otherwise; a TLS listener refuses that, and Swarm then restarts a task
+      # whose controller is working perfectly, with nothing in the logs saying
+      # TLS.
+      #
+      # The negative control is what makes this a test rather than a ritual:
+      # without SWARMCLI_CD_SERVER the same image must go *unhealthy*. Without
+      # it, "healthy" cannot be told apart from a probe that always passes.
+      - name: The container healthcheck stays healthy with TLS on
+        run: |
+          printf 'applications:\n  - name: edge\n    source:\n      repoURL: https://example.com/x.git\n      revision: main\n      releaseFile: r.yaml\n' > applications.yaml
+          openssl req -x509 -newkey rsa:2048 -noenc -days 1 \
+            -subj '/CN=localhost' \
+            -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' \
+            -keyout tls.key -out tls.crt 2>/dev/null
+
+          start() {
+            docker run -d "$@" \
+              -v "$PWD/applications.yaml:/etc/swarmcli-cd/applications.yaml:ro" \
+              -v "$PWD/tls.crt:/tls/tls.crt:ro" \
+              -v "$PWD/tls.key:/tls/tls.key:ro" \
+              -e SWARMCLI_CD_ADMIN_TOKEN=ci-token \
+              --health-cmd '/swarmcli-cd healthcheck' \
+              --health-interval 3s --health-retries 3 --health-start-period 1s \
+              swarmcli-cd:ci controller \
+                --config /etc/swarmcli-cd/applications.yaml \
+                --tls-cert /tls/tls.crt --tls-key /tls/tls.key
+          }
+
+          # Waits for Docker to reach a verdict, then waits three more intervals
+          # before reading it: a probe that passed once and then stopped would
+          # restart the task just the same, and would satisfy a single read.
+          settle() {
+            for _ in $(seq 30); do
+              [ "$(docker inspect -f '{{.State.Health.Status}}' "$1")" = starting ] || break
+              sleep 1
+            done
+            sleep 10
+            docker inspect -f '{{.State.Health.Status}}' "$1"
+          }
+
+          tls=$(start -e SWARMCLI_CD_SERVER=https://127.0.0.1:8080)
+          control=$(start)
+          trap 'docker rm -f "$tls" "$control" >/dev/null 2>&1 || true' EXIT
+
+          got=$(settle "$tls")
+          echo "with SWARMCLI_CD_SERVER: $got"
+          [ "$got" = healthy ] || {
+            docker logs "$tls"
+            echo "the healthcheck did not stay healthy with TLS on"; exit 1; }
+
+          got=$(settle "$control")
+          echo "negative control, no SWARMCLI_CD_SERVER: $got"
+          [ "$got" = unhealthy ] || {
+            echo "the control is $got; the probe is not really being run"; exit 1; }

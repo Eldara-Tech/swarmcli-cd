@@ -17,11 +17,15 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -31,6 +35,13 @@ import (
 // EnvServer names the controller to talk to, so that a shell exports it once
 // rather than repeating --server on every command.
 const EnvServer = "SWARMCLI_CD_SERVER"
+
+// EnvCACert names a PEM file whose certificates are trusted for an https
+// server. It exists beside EnvServer because the two are set together: the
+// moment a deployment points EnvServer at its own TLS listener, every command
+// run inside the controller — the case DefaultServer's doc comment names —
+// meets a certificate no public authority signed.
+const EnvCACert = "SWARMCLI_CD_CA_CERT"
 
 // DefaultServer is the controller on this host, which is where a `docker exec`
 // into the controller's own container finds it.
@@ -63,6 +74,96 @@ func New(server, token string) *Client {
 		token:  token,
 		http:   &http.Client{Timeout: requestTimeout},
 	}
+}
+
+// Options configure the TLS New leaves at the standard library's defaults.
+//
+// A second constructor rather than two more parameters on New: this is an
+// exported package of a released v1 module, and widening New would break every
+// caller for the sake of the two commands that pass these.
+type Options struct {
+	// CACert is a PEM file whose certificates are the ones trusted for an https
+	// server, for a controller presenting a certificate no public authority
+	// signed. Empty verifies against the system pool, which is what a
+	// certificate from a real CA needs.
+	CACert string
+
+	// SkipVerifyOnLoopback skips certificate verification when — and only when —
+	// the server is an https URL whose host is syntactically a loopback address.
+	//
+	// It exists for the container healthcheck, which runs beside the controller
+	// as a separate process invocation, cannot be told the controller's
+	// --tls-cert, and is asserting liveness rather than identity: /healthz
+	// discloses nothing and the connection never leaves the host.
+	//
+	// It is deliberately not --insecure. The exception is decided here, against
+	// the parsed URL, so no caller passing it can reach another host unverified.
+	SkipVerifyOnLoopback bool
+}
+
+// NewWithOptions is New with the TLS configuration opts describes.
+func NewWithOptions(server, token string, opts Options) (*Client, error) {
+	c := New(server, token)
+
+	skip := opts.SkipVerifyOnLoopback && loopbackTLS(c.server)
+	if opts.CACert == "" && !skip {
+		// Nothing to configure, so this is exactly New's client — including for
+		// a caller that asked for the loopback exception and named a host that
+		// is not one. That identity is the whole statement that this is not
+		// --insecure: there is no route from these options to an unverified
+		// connection to anywhere else.
+		return c, nil
+	}
+
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: skip}
+	if opts.CACert != "" {
+		pemBytes, err := os.ReadFile(opts.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("reading the CA certificate: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pemBytes) {
+			// Named rather than ignored: AppendCertsFromPEM reports failure by
+			// returning false, so a file of the wrong kind would otherwise
+			// produce an empty pool and a verification error naming the
+			// controller's certificate instead of the operator's file.
+			return nil, fmt.Errorf("%s: no PEM certificate found in it", opts.CACert)
+		}
+		cfg.RootCAs = pool
+	}
+
+	// Cloned from the default rather than built here, so proxy handling, the
+	// dial timeouts and connection reuse stay whatever the standard library
+	// currently does rather than a snapshot of it taken on this line.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = cfg
+	c.http.Transport = tr
+	return c, nil
+}
+
+// loopbackTLS reports whether server is an https URL naming this host, written
+// as an address rather than as a name that merely resolves to one.
+//
+// The predicate never resolves, deliberately. Deciding whether to verify a
+// certificate by first asking a resolver would put the trust decision in DNS,
+// which is the one thing TLS exists not to depend on — and the answer can
+// differ between the lookup that decided and the dial that connected. An
+// operator with such a name puts it in the certificate's SANs, or probes
+// https://127.0.0.1:8080, which is what stack.yml does.
+func loopbackTLS(server string) bool {
+	u, err := url.Parse(server)
+	if err != nil || u.Scheme != "https" {
+		return false
+	}
+	// Not an address, but RFC 6761 reserves it: a resolver may not answer
+	// "localhost" with anything but the loopback interface.
+	if strings.EqualFold(u.Hostname(), "localhost") {
+		return true
+	}
+	// Covers 127.0.0.0/8, ::1 and the v4-in-v6 form, which is what IsLoopback
+	// is for — a hand-written 127.0.0.1 comparison would miss the other three.
+	ip := net.ParseIP(u.Hostname())
+	return ip != nil && ip.IsLoopback()
 }
 
 // Error is a non-2xx response, carrying the API's own message.

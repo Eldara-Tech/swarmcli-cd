@@ -6,9 +6,17 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -249,6 +257,11 @@ func TestAppSetSelectorsAreValidated(t *testing.T) {
 		{"a controller id with a slash", valid(options{controllerID: "a/b"}), "--controller-id"},
 		{"a controller id with a colon", valid(options{controllerID: "a:b"}), "--controller-id"},
 		{"volumes without prune", valid(options{pruneVolumes: true}), "--prune-volumes"},
+		// Each names the half that is missing, because that is the flag the
+		// operator has to add — and because half a pair accepted would serve
+		// plaintext on a listener nobody would think to check.
+		{"a certificate with no key", valid(options{tlsCert: "/tls/tls.crt"}), "--tls-key"},
+		{"a key with no certificate", valid(options{tlsKey: "/tls/tls.key"}), "--tls-cert"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.o.validate()
@@ -618,6 +631,180 @@ func TestTheControllerRoutesCELogsThroughItsHandler(t *testing.T) {
 	}
 }
 
+// Criterion 13. One flag without the other refuses to start, exit 2, naming the
+// missing half first — the failure it otherwise produces is a listener that came
+// up in plaintext while the operator believed it had not.
+func TestControllerRefusesHalfATLSPair(t *testing.T) {
+	for _, tc := range []struct{ given, missing string }{
+		{"--tls-cert", "--tls-key"},
+		{"--tls-key", "--tls-cert"},
+	} {
+		t.Run(tc.given, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"controller", tc.given, "/tls/half", "--data", t.TempDir()}, &stdout, &stderr)
+			if code != 2 {
+				t.Fatalf("run = %d, want 2", code)
+			}
+			if !strings.HasPrefix(stderr.String(), "Error: "+tc.missing) {
+				t.Errorf("stderr = %q, want it to name %s first", stderr.String(), tc.missing)
+			}
+		})
+	}
+}
+
+func TestControllerHelpNamesTheTLSFlags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run = %d, want 0", code)
+	}
+	// The restart is the part an operator cannot guess: the pair is read once,
+	// so a renewed certificate is not picked up until the controller is
+	// restarted.
+	for _, want := range []string{"--tls-cert", "--tls-key", "restart"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout = %q, want it to mention %q", stdout.String(), want)
+		}
+	}
+}
+
+// The pair is loaded before the listener is built, so a path that is not there
+// is a named startup error beside the authorizer check — not one arriving
+// through runUntilStopped's channel with the reconciler already deploying.
+func TestServeRefusesAnUnreadableTLSPair(t *testing.T) {
+	swapAuthorizer(t, readyAuthorizer{})
+
+	o := staticOptions(writeConfig(t), t.TempDir())
+	o.listen = freePort(t)
+	o.tlsCert = filepath.Join(t.TempDir(), "absent.crt")
+	o.tlsKey = filepath.Join(t.TempDir(), "absent.key")
+
+	err := serve(context.Background(), o, discardLog())
+	if err == nil {
+		t.Fatal("serve = nil, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "--tls-cert") {
+		t.Errorf("serve = %v, want it to name the flags", err)
+	}
+	// And it refused before binding, which is what makes the refusal worth
+	// anything: binding the address ourselves succeeds only if nothing holds it.
+	ln, bindErr := net.Listen("tcp", o.listen)
+	if bindErr != nil {
+		t.Fatalf("something is listening on %s: %v", o.listen, bindErr)
+	}
+	_ = ln.Close()
+}
+
+// TestTheHealthcheckStaysHealthyWithTLSOn is the criterion issue #171 exists
+// for, and it is asserted end to end: the real serve(), a real TLS listener and
+// the real healthcheck subcommand.
+//
+// stack.yml runs `swarmcli-cd healthcheck`, which probes client.DefaultServer —
+// http://127.0.0.1:8080, hard-coded. Against a TLS listener that probe fails, so
+// Swarm marks the task unhealthy and restarts it, forever, with the controller
+// working perfectly throughout and nothing in the logs saying TLS.
+//
+// Three probes rather than one because the stack file's healthcheck declares
+// retries: 3 — a probe that passed once and then failed would restart the task
+// just the same, and would pass a single-shot test.
+func TestTheHealthcheckStaysHealthyWithTLSOn(t *testing.T) {
+	swapAuthorizer(t, readyAuthorizer{})
+	certPath, keyPath := selfSignedPair(t)
+
+	o := staticOptions(writeOfflineConfig(t), t.TempDir())
+	o.listen = freePort(t)
+	o.tlsCert, o.tlsKey = certPath, keyPath
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() { stopped <- serve(ctx, o, discardLog()) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-stopped:
+			if err != nil {
+				t.Errorf("serve = %v, want nil", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("serve did not return")
+		}
+	})
+
+	// The URL stack.yml's TLS example sets SWARMCLI_CD_SERVER to. Nothing tells
+	// the probe about the certificate: the loopback rule is what carries it.
+	server := "https://" + o.listen
+	waitListening(t, o.listen)
+
+	for probe := range 3 {
+		code, stdout, stderr := cli(t, server, "healthcheck")
+		if code != 0 {
+			t.Fatalf("probe %d: exit = %d, want 0 (stderr: %s)", probe, code, stderr)
+		}
+		if !strings.Contains(stdout, "ok") {
+			t.Errorf("probe %d: stdout = %q, want ok", probe, stdout)
+		}
+	}
+}
+
+// waitListening blocks until the server under test has finished binding, so the
+// first probe is not racing the listener it is aimed at. Accepting a connection
+// is the right signal for both protocols: ListenAndServeTLS wraps the listener
+// before it starts accepting, so a TCP connect that succeeds means TLS is up.
+func waitListening(t *testing.T, addr string) {
+	t.Helper()
+	for range 500 {
+		conn, err := net.Dial("tcp", addr)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("nothing is listening on %s", addr)
+}
+
+// selfSignedPair writes the certificate and key an operator following
+// stack.yml's TLS example creates. The loopback SANs are what let a client that
+// was handed the certificate verify it at all.
+func selfSignedPair(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "swarmcli-cd test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+		DNSNames:              []string{"localhost"},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "tls.crt")
+	keyPath = filepath.Join(dir, "tls.key")
+	write := func(path, blockType string, body []byte) {
+		if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: body}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(certPath, "CERTIFICATE", der)
+	write(keyPath, "PRIVATE KEY", keyDER)
+	return certPath, keyPath
+}
+
 // testListen binds an ephemeral port on the loopback: the tests need a real
 // listener but must not collide with anything, least of all each other.
 const testListen = "127.0.0.1:0"
@@ -635,6 +822,27 @@ func staticOptions(configPath, dataDir string) options {
 }
 
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// writeOfflineConfig is writeConfig for a test that lets the controller run
+// rather than cancelling it at once: the source is a path on this machine, so
+// the reconcile that fires at startup fails locally and instantly instead of
+// reaching for a repository on the internet. A set with no applications is not
+// the alternative — the static loader refuses one.
+func writeOfflineConfig(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "applications.yaml")
+	body := "applications:\n" +
+		"  - name: edge\n" +
+		"    source:\n" +
+		"      repoURL: " + filepath.Join(dir, "no-such-repo.git") + "\n" +
+		"      revision: main\n" +
+		"      releaseFile: swarmcli-release.yaml\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
 
 // writeConfig writes the smallest applications file the loader accepts.
 func writeConfig(t *testing.T) string {
@@ -689,76 +897,132 @@ func (f *countingFetcher) Fetch(_ context.Context, app string, _ application.Sou
 //
 // What is asserted is the inverse: while a request is still in flight and the
 // listener is therefore still draining, the reconciler has not been stopped.
+//
+// The TLS row is also the evidence D23 stands on. Server.ServeTLS calls
+// setupHTTP2_ServeTLS, so Go's client negotiates h2 against the API and the
+// event stream runs over it — and h2's graceful shutdown goes through the
+// bundled http2 server's GOAWAY hook rather than closeIdleConns, with an h2
+// connection counting as idle only once it has no open streams, which is
+// exactly what srv.Drain closes. The protocol is asserted rather than assumed,
+// because a row that silently fell back to HTTP/1.1 would prove nothing about
+// the thing enabling TLS turns on.
 func TestTheListenerIsDrainedBeforeTheReconcilerStops(t *testing.T) {
-	fetcher := &countingFetcher{}
-	rec := reconcile.New([]application.Spec{{
-		Name:           "edge",
-		Source:         application.Source{RepoURL: "https://example.com/x.git", Revision: "main"},
-		DriftDetection: application.DriftManifest,
-	}}, reconcile.Options{
-		Fetcher:  fetcher,
-		Builder:  failingBuilder{},
-		Interval: 5 * time.Millisecond,
-		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	for _, tc := range []struct {
+		name      string
+		tls       bool
+		wantProto string
+	}{
+		{"plaintext", false, "HTTP/1.1"},
+		{"TLS, and therefore h2", true, "HTTP/2.0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fetcher := &countingFetcher{}
+			rec := reconcile.New([]application.Spec{{
+				Name:           "edge",
+				Source:         application.Source{RepoURL: "https://example.com/x.git", Revision: "main"},
+				DriftDetection: application.DriftManifest,
+			}}, reconcile.Options{
+				Fetcher:  fetcher,
+				Builder:  failingBuilder{},
+				Interval: 5 * time.Millisecond,
+				Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
 
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, defaultAppSetFile), []byte("applications: []\n"), 0o600); err != nil {
-		t.Fatal(err)
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, defaultAppSetFile), []byte("applications: []\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loop := appset.NewLoop(appset.NewPath(appset.PathConfig{Dir: dir, Path: defaultAppSetFile}), rec,
+				appset.LoopOptions{Interval: time.Hour, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+
+			entered, release := make(chan struct{}), make(chan struct{})
+			mux := http.NewServeMux()
+			mux.HandleFunc("/hold", func(w http.ResponseWriter, _ *http.Request) {
+				close(entered)
+				<-release
+				_, _ = w.Write([]byte("done"))
+			})
+
+			// runUntilStopped is what binds — it calls listenAndServe — so the
+			// address goes on the server rather than the test serving a listener
+			// of its own. An http.Server runs once, and doing both left Addr
+			// empty, which means ":80" and is not bindable on a CI runner.
+			addr := freePort(t)
+			httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: time.Second}
+			scheme, probeClient := "http", http.DefaultClient
+			if tc.tls {
+				certPath, keyPath := selfSignedPair(t)
+				cfg, err := tlsConfigFor(options{tlsCert: certPath, tlsKey: keyPath})
+				if err != nil {
+					t.Fatal(err)
+				}
+				httpSrv.TLSConfig = cfg
+				scheme, probeClient = "https", loopbackTLSClient()
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			stopped := make(chan error, 1)
+			go func() {
+				stopped <- runUntilStopped(ctx, rec, loop, httpSrv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			}()
+
+			probed := make(chan string, 1)
+			go func() {
+				resp, err := waitForGet(probeClient, scheme+"://"+addr+"/hold")
+				if err != nil {
+					probed <- "no response: " + err.Error()
+					return
+				}
+				_ = resp.Body.Close()
+				probed <- resp.Proto
+			}()
+			<-entered
+
+			// The signal, with a request still in flight.
+			cancel()
+
+			// The reconciler must keep going while the listener drains. Measured
+			// as progress rather than as a state, because progress is what a
+			// stopped loop cannot fake.
+			before := fetcher.calls.Load()
+			time.Sleep(200 * time.Millisecond)
+			if after := fetcher.calls.Load(); after == before {
+				t.Fatalf("the reconciler stopped at %d fetches while the listener was still draining", after)
+			}
+
+			close(release)
+			select {
+			case err := <-stopped:
+				if err != nil {
+					t.Fatalf("runUntilStopped = %v, want nil", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("runUntilStopped did not return")
+			}
+
+			select {
+			case got := <-probed:
+				if got != tc.wantProto {
+					t.Errorf("the in-flight request finished as %s, want %s", got, tc.wantProto)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("the in-flight request never finished, so it was not drained")
+			}
+		})
 	}
-	loop := appset.NewLoop(appset.NewPath(appset.PathConfig{Dir: dir, Path: defaultAppSetFile}), rec,
-		appset.LoopOptions{Interval: time.Hour, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+}
 
-	entered, release := make(chan struct{}), make(chan struct{})
-	mux := http.NewServeMux()
-	mux.HandleFunc("/hold", func(w http.ResponseWriter, _ *http.Request) {
-		close(entered)
-		<-release
-		_, _ = w.Write([]byte("done"))
-	})
-
-	// runUntilStopped is what binds — it calls ListenAndServe — so the address
-	// goes on the server rather than the test serving a listener of its own. An
-	// http.Server runs once, and doing both left Addr empty, which means ":80"
-	// and is not bindable on a CI runner.
-	addr := freePort(t)
-	httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: time.Second}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	stopped := make(chan error, 1)
-	go func() {
-		stopped <- runUntilStopped(ctx, rec, loop, httpSrv, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	}()
-
-	go func() {
-		resp, err := waitForGet("http://" + addr + "/hold")
-		if err == nil {
-			_ = resp.Body.Close()
-		}
-	}()
-	<-entered
-
-	// The signal, with a request still in flight.
-	cancel()
-
-	// The reconciler must keep going while the listener drains. Measured as
-	// progress rather than as a state, because progress is what a stopped loop
-	// cannot fake.
-	before := fetcher.calls.Load()
-	time.Sleep(200 * time.Millisecond)
-	if after := fetcher.calls.Load(); after == before {
-		t.Fatalf("the reconciler stopped at %d fetches while the listener was still draining", after)
-	}
-
-	close(release)
-	select {
-	case err := <-stopped:
-		if err != nil {
-			t.Fatalf("runUntilStopped = %v, want nil", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("runUntilStopped did not return")
-	}
+// loopbackTLSClient talks to the test's own self-signed listener. It is not
+// client.NewWithOptions: this test is about the drain and the protocol, and
+// borrowing the production client would make a failure here ambiguous between
+// the two.
+func loopbackTLSClient() *http.Client {
+	return &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
+		// What makes the row an h2 row: without it the transport offers only
+		// http/1.1 in ALPN and the server, which does support h2, agrees.
+		ForceAttemptHTTP2: true,
+	}}
 }
 
 // failingBuilder ends every reconcile immediately after the fetch, so the loop
@@ -788,11 +1052,11 @@ func freePort(t *testing.T) string {
 
 // waitForGet retries until the server under test has finished binding, so the
 // request is not racing the listener it is aimed at.
-func waitForGet(url string) (*http.Response, error) {
+func waitForGet(c *http.Client, url string) (*http.Response, error) {
 	var err error
 	for range 200 {
 		var resp *http.Response
-		if resp, err = http.Get(url); err == nil {
+		if resp, err = c.Get(url); err == nil {
 			return resp, nil
 		}
 		time.Sleep(10 * time.Millisecond)
