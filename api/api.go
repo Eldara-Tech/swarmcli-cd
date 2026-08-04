@@ -9,6 +9,8 @@
 // is one request, and every action a user can take is one endpoint:
 //
 //	GET  /healthz                                unauthenticated liveness
+//	GET  /ui/bootstrap.json                      what the login screen needs,
+//	                                             before anyone is authenticated
 //	GET  /api/v1/status                          the controller's own state
 //	GET  /api/v1/applications                    the list view
 //	GET  /api/v1/applications/{app}              the detail view
@@ -16,6 +18,7 @@
 //	GET  /api/v1/applications/{app}/history      the history view
 //	POST /api/v1/applications/{app}/sync         the sync button
 //	GET  /api/v1/events                          live updates, so nothing polls
+//	GET  /api/v1/capabilities                    what this build is and grants
 //	GET  /                                       the web UI, and the fallback
 //	                                             for its client-side routes
 //	GET  /assets/{path...}                       the UI's hashed build output
@@ -46,6 +49,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
 	"github.com/Eldara-Tech/swarmcli-cd/extension"
+	"github.com/Eldara-Tech/swarmcli-cd/feature"
 	"github.com/Eldara-Tech/swarmcli-cd/notify"
 )
 
@@ -81,6 +85,8 @@ type Server struct {
 	rec        Reconciler
 	controller Controller
 	authz      authz.Authorizer
+	features   feature.Reporter
+	version    string
 	log        *slog.Logger
 	// ui serves the browser UI. Never nil; see Options.UI.
 	ui     http.Handler
@@ -110,6 +116,21 @@ type Options struct {
 	// the same reason Handler refuses a nil extension handler: the alternative
 	// is a panic on the first request that reaches it.
 	UI http.Handler
+	// Version is the build's own version, reported by the capability document.
+	// The controller passes the string goreleaser and the Dockerfile stamp.
+	// Absent, the document reports an empty string rather than inventing a
+	// number: a caller reading "" knows nobody stamped one, and a caller
+	// reading "unknown" has to be told what that means.
+	Version string
+	// Features reports what this build grants, for the capability document.
+	// Absent, the seam in force answers — which is the only thing production
+	// ever wants, and is a field only so that a test can install a report
+	// without registering one process-wide.
+	//
+	// Read once here because the seam is a Slot and a Slot is settled by the
+	// end of init(). What settles is who answers: Report is still called per
+	// request, so a licence that lapses stops being reported without a restart.
+	Features feature.Reporter
 }
 
 // New returns a Server over rec.
@@ -127,7 +148,10 @@ func New(rec Reconciler, o Options) *Server {
 	if o.UI == nil {
 		o.UI = http.NotFoundHandler()
 	}
-	s := &Server{rec: rec, controller: o.Controller, authz: o.Authorizer, log: o.Log, ui: o.UI, events: newStream(o.Log)}
+	if o.Features == nil {
+		o.Features = feature.Get()
+	}
+	s := &Server{rec: rec, controller: o.Controller, authz: o.Authorizer, features: o.Features, version: o.Version, log: o.Log, ui: o.UI, events: newStream(o.Log)}
 	s.syncing = s.detach
 	return s
 }
@@ -148,6 +172,13 @@ func New(rec Reconciler, o Options) *Server {
 // collision check with a hole in it.
 var coreRoutes = []RegisteredRoute{
 	{Pattern: "GET /healthz", Public: true},
+	// Public because a login screen has to know whether to draw a token box or
+	// an SSO button before anyone has a credential to authenticate with. Under
+	// /ui/ rather than /api/v1/ because docs/api.md states that every
+	// /api/v1/… endpoint requires the admin token, and that invariant is worth
+	// more than the tidiness of one path: a public route under the API prefix
+	// would make an operator check each one before believing it.
+	{Pattern: "GET /ui/bootstrap.json", Public: true},
 	{Pattern: "GET /api/v1/status"},
 	{Pattern: "GET /api/v1/applications"},
 	{Pattern: "GET /api/v1/applications/{app}"},
@@ -155,6 +186,7 @@ var coreRoutes = []RegisteredRoute{
 	{Pattern: "GET /api/v1/applications/{app}/history"},
 	{Pattern: "POST /api/v1/applications/{app}/sync"},
 	{Pattern: "GET /api/v1/events"},
+	{Pattern: "GET /api/v1/capabilities"},
 	// Public because a browser has no credential until the login screen it is
 	// asking for has loaded. What they serve is the build's own bytes, which
 	// disclose nothing about the swarm.
@@ -192,6 +224,11 @@ func (s *Server) Handler() (http.Handler, error) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
+	// Unauthenticated for the reason coreRoutes gives, and it discloses only
+	// how one may authenticate — which a caller staring at the login screen is
+	// about to be told anyway.
+	mux.HandleFunc("GET /ui/bootstrap.json", s.bootstrap)
+
 	mux.Handle("GET /api/v1/status", s.guard(authz.ActionRead, s.status))
 	mux.Handle("GET /api/v1/applications", s.guard(authz.ActionRead, s.list))
 	mux.Handle("GET /api/v1/applications/{app}", s.guard(authz.ActionRead, s.detail))
@@ -199,6 +236,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.Handle("GET /api/v1/applications/{app}/history", s.guard(authz.ActionHistory, s.history))
 	mux.Handle("POST /api/v1/applications/{app}/sync", s.guard(authz.ActionSync, s.sync))
 	mux.Handle("GET /api/v1/events", s.guard(authz.ActionRead, s.stream))
+	mux.Handle("GET /api/v1/capabilities", s.guard(authz.ActionRead, s.capabilities))
 
 	// The UI, and the hashed build output the document it serves asks for.
 	// Registered whether or not anything was embedded and whether or not --ui

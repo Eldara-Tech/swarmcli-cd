@@ -156,7 +156,7 @@ reclaim/           deletes the on-disk caches — clone and chart cache — of a
                    did, so nothing racing the removal reads a deleted tree
 regauth/           per-application registry credentials, from Docker secrets
 
-seam/              the init()-registration mechanism the five seams share (D6)
+seam/              the init()-registration mechanism the six seams share (D6)
 swarms/            seam — which swarm a destination resolves to
 swarms/local/      its OSS default, blank-imported by cmd/ so that the seam
                    stays a contract and importing it does not link backend/
@@ -166,6 +166,9 @@ secrets/           seam — secret material read from an application's own tree
 extension/         seam — HTTP routes a companion adds to the API; appends, and
                    the only seam with no OSS default, because no route is the
                    right behaviour for a build with no companion loaded
+feature/           seam — what the build grants, for display only. api is its
+                   one consumer and a test enforces that: it is a report, and a
+                   gate on it would ask the licensed module for permission
 
 Dockerfile         alpine, no docker binary; stamps both version ldflags
 stack.yml          the in-swarm deploy: manager node, docker.sock, config+secret
@@ -210,11 +213,11 @@ Both are established, with reproductions, in issue #1:
 
 Per D6 the private `swarmcli-cd-be` companion is deferred to Phase 3, but the
 **seams ship from day one**: `SwarmRegistry`, `Authorizer`, `Notifier`,
-`SecretProvider` and `Extension`, each replaced via Go `init()` self-registration
-(the mechanism swarmcli-be already uses — see its `docs/extensibility.md`). No
-build tags, no stubbed files in the public tree.
+`SecretProvider`, `Extension` and `feature.Reporter`, each replaced via Go
+`init()` self-registration (the mechanism swarmcli-be already uses — see its
+`docs/extensibility.md`). No build tags, no stubbed files in the public tree.
 
-The first four have a working OSS default. `Extension` does not, and that is the
+All but one have a working OSS default. `Extension` does not, and that is the
 one place the rule bends rather than breaks: it *adds* routes rather than
 replacing a behaviour, so the empty list is already the correct OSS build, and a
 default would be a route nobody asked for. A seam that replaces something must

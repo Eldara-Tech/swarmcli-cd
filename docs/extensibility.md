@@ -7,8 +7,8 @@ Copyright © 2026 Eldara Tech
 
 swarmcli-cd is open core. This repository is the whole product — reconcile,
 diff, health, API, CLI and, later, the web UI — and a private `swarmcli-cd-be`
-companion replaces four specific behaviours with licensed ones and, through a
-fifth seam, **adds** HTTP routes of its own rather than replacing anything. Per
+companion replaces five specific behaviours with licensed ones and, through a
+sixth seam, **adds** HTTP routes of its own rather than replacing anything. Per
 D6 the companion arrives in Phase 3, but the seams ship from day one so that
 nothing in the public tree has to move when it does.
 
@@ -24,7 +24,7 @@ package registers its OSS default in its own `init()`; a companion package
 registers its replacement in *its* `init()`, which necessarily runs later. The
 companion always wins, and nothing has to coordinate the order.
 
-**That argument covers three of the four defaults.** It holds because the
+**That argument covers four of the five defaults.** It holds because the
 default lives in the very package the companion must import, which is what
 makes "later" guaranteed. `swarms`' default does not — it is in `swarms/local`,
 so that the seam does not drag the Docker applier in behind it — and two
@@ -38,7 +38,7 @@ So `swarms/local` registers **only if nothing has**, which is order-independent
 and makes "the companion always wins" true unconditionally. A default outside
 its seam package must do the same; one inside it never needs to.
 
-## The five seams
+## The six seams
 
 | Package | Interface | OSS default | What the companion brings |
 |---|---|---|---|
@@ -46,9 +46,10 @@ its seam package must do the same; one inside it never needs to.
 | `authz` | `Authorizer` | `token` — one shared bearer token | SSO, projects and RBAC |
 | `notify` | `Notifier` | `log` — a structured line per event | Slack, webhooks, e-mail |
 | `secrets` | `Provider` | `plaintext` — passes material through, refuses what it cannot decrypt | SOPS decryption |
+| `feature` | `Reporter` | `community` — nothing granted, no licence | what a verified licence grants, for the badge and the UI |
 | `extension` | `Extension` | none — no route is the right OSS behaviour | SSO login and callback, `/api/v1/projects`, entitlement endpoints |
 
-Three of them **replace**: there is exactly one answer to "which swarm registry
+Four of them **replace**: there is exactly one answer to "which swarm registry
 is in force". `notify` and `extension` **append**. `notify` does because a
 companion adding Slack must not remove the log notifier — and because the HTTP
 API's own event stream is itself a registered notifier, so replacing would
@@ -62,6 +63,24 @@ appending is the only sensible composition.
 contract and nothing importing it links the Docker applier. A build that takes
 neither the default nor a companion registers `none`, which says so in the
 startup line below and errors naming the missing import.
+
+`feature` replaces for the same reason `authz` does: there is exactly one answer
+to "what does this build grant", and the only composition rule available for a
+set of booleans is OR — under which one module's report would turn on another
+module's feature.
+
+### `feature` is a report, never an enforcement point
+
+Nothing in this repository reads a feature `Set` to decide whether to do
+something, and nothing may. A `Reporter` is supplied by the very module a gate
+would be constraining, so gating on one asks the licensed module for permission
+to limit it. Entitlement is enforced from inside the implementation whose
+entitlement lapsed — the same rule "When registration is over" states for a
+`Slot` — and that is the only place holding both the licence and the operation.
+
+`api` is the seam's one consumer, and a test in `feature` reads the repository's
+source to keep it that way: the doc comment is what somebody reads once, and the
+test is what fails the day somebody does not.
 
 ### Adding routes to the API
 
@@ -211,6 +230,14 @@ do not, and the caller degrades rather than failing.
 |---|---|---|
 | `swarms.Lister` | enumerate the swarms this registry resolves | there is one, and the caller is on it |
 | `swarms.NodeReach` | a handle to each *node's* own daemon | a Swarm node does not expose its daemon; this controller holds one socket |
+| `authz.LoginMethods` | how a browser may authenticate, for the public login document | it does implement it — it names the token box, and that same value is the fallback for an authorizer that names none |
+
+`authz.LoginMethods` is the one whose absence fails *harmlessly*, which is why
+it is beside the seam rather than on it: an authorizer that does not implement
+it is presented as a token box, which is what every authorizer before it was.
+`authz.Visible` is on the interface for exactly the opposite reason — the
+fallback for a missing narrowing is to return everything, and authorisation may
+only degrade closed.
 
 `NodeReach` is what makes a volume purge complete. A stack's ordinary named
 volumes live on whichever nodes ran its tasks and the daemon's volume list
@@ -366,9 +393,17 @@ log.Info("seams",
     "authz", authz.Active(),
     "notify", notify.Active(),        // a list: every notifier is live
     "secrets", secrets.Active(),
+    "feature", feature.Active(),
     "extension", extension.Active(),  // a list too: every extension is served
 )
 ```
+
+The same names are served by `GET /api/v1/capabilities`, for an operator who has
+the admin token but not the logs, and the two must not disagree. `feature` there
+is not redundant with the edition it reports beside: a licensed reporter that is
+linked but has no valid licence names itself here while the edition still reads
+`community`, and that pair is what tells "the module is not loaded" apart from
+"the licence is missing".
 
 `extension` reports which modules registered routes, not which routes. What is
 actually served is a second line, logged after the mux is built — which is a

@@ -97,6 +97,15 @@ func (t *token) Authenticate(r *http.Request) (Subject, error) {
 // administrator, so there is nothing left to decide.
 func (t *token) Authorize(_ context.Context, _ Subject, _ Action, _ string) error { return nil }
 
+// tokenLogin is the box the login screen draws for this authorizer, and the
+// fallback MethodsFor hands out for an authorizer that names none of its own.
+// One value, so that the two cannot say different things about the same box.
+var tokenLogin = LoginMethod{ID: "token", Label: "Admin token"}
+
+// LoginMethods implements LoginMethods. No Start: the credential is typed in,
+// so there is nowhere for the browser to go first.
+func (t *token) LoginMethods() []LoginMethod { return []LoginMethod{tokenLogin} }
+
 // Visible implements Authorizer. There is one subject and it may see
 // everything, so there is nothing to narrow — the applications come back as
 // they went in, including a nil, which is the empty list a caller ranges over

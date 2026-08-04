@@ -135,6 +135,56 @@ type Authorizer interface {
 	Visible(ctx context.Context, s Subject, act Action, applications []string) ([]string, error)
 }
 
+// LoginMethod is one way to obtain a credential this authorizer accepts.
+//
+// It is a struct for the reason Subject and secrets.Request are: an
+// implementation outside this repository receives it, so a field added later —
+// an icon, an ordering hint — costs it nothing.
+type LoginMethod struct {
+	// ID is what the UI branches on: "token", "sso".
+	ID string
+	// Label is what the login screen shows on the box or the button.
+	Label string
+	// Start is where the browser goes to begin, and is empty for a credential
+	// the operator types in. An SSO authorizer points it at the login route it
+	// declared through extension.PublicRoutes.
+	Start string
+}
+
+// LoginMethods is the optional interface an Authorizer implements to say how a
+// browser may authenticate.
+//
+// It is beside the seam rather than on it, which is the shape swarms.Lister and
+// swarms.NodeReach use and the opposite of the call made for Visible. The test
+// is always which way the absence fails, and here it fails harmlessly: an
+// authorizer that does not implement this is presented as a token box, which is
+// what every authorizer before this one was. Visible is on the interface
+// precisely because its absence would make a list disclose more, and
+// authorisation may only degrade closed.
+//
+// **The default authorizer implements it**, and returns the token box. An
+// SSO-only companion returns only its own method, so the box disappears — which
+// is the point: a deployment that has moved to SSO should not offer a box for a
+// credential it no longer issues.
+type LoginMethods interface {
+	// LoginMethods names every way a browser may obtain a credential, in the
+	// order the login screen should offer them.
+	LoginMethods() []LoginMethod
+}
+
+// MethodsFor reports how a browser may authenticate against a.
+//
+// A function here rather than a type assertion at the call site, because the
+// fallback is a *value* and not merely "do less": written in api it would put
+// this package's label for this package's authorizer somewhere that has no
+// business spelling it, and the two spellings of the same box would drift.
+func MethodsFor(a Authorizer) []LoginMethod {
+	if lm, ok := a.(LoginMethods); ok {
+		return lm.LoginMethods()
+	}
+	return []LoginMethod{tokenLogin}
+}
+
 var slot seam.Slot[Authorizer]
 
 // Register installs a as the authorizer, replacing whatever was there. Call it
