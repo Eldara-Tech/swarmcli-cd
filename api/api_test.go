@@ -889,9 +889,17 @@ func TestTheUiIsAlsoReachedByHead(t *testing.T) {
 func TestAnUnknownApiPathIsAJsonNotFound(t *testing.T) {
 	h := uiServer(t)
 
-	// The last is the same path with an escaped 'a': the check is on the
-	// decoded path, so a spelling cannot walk around it.
-	for _, path := range []string{"/api/", "/api/v1/typo", "/api/v1/applications/edge/typo", "/%61pi/v1/typo"} {
+	// /%61pi is the same path with an escaped 'a': the check is on the decoded
+	// path, so a spelling cannot walk around it. The last three are the ones
+	// that used to fall through to the SPA — the check is case-insensitive and
+	// takes the bare /api, which is wider than the routes behind it, and
+	// deliberately: ServeMux matches case-sensitively so /API/v1/status reaches
+	// nothing, and the client most in need of a JSON 404 is the one that got
+	// the spelling wrong.
+	for _, path := range []string{
+		"/api/", "/api/v1/typo", "/api/v1/applications/edge/typo", "/%61pi/v1/typo",
+		"/API/v1/typo", "/Api/v1/applications", "/api",
+	} {
 		rr := do(t, h, "GET", path)
 		if rr.Code != http.StatusNotFound {
 			t.Errorf("GET %s = %d, want 404: body %q", path, rr.Code, rr.Body.String())
@@ -901,6 +909,17 @@ func TestAnUnknownApiPathIsAJsonNotFound(t *testing.T) {
 		}
 		if got := decode[map[string]string](t, rr); got["error"] == "" {
 			t.Errorf("GET %s answered %q, which carries no error message", path, rr.Body.String())
+		}
+	}
+
+	// The negative control, and the reason the check is a prefix of "/api/" and
+	// an equality with "/api" rather than a prefix of "/api". Without these,
+	// every case above passes for a check that has quietly claimed a whole
+	// family of client routes and answers them JSON.
+	for _, path := range []string{"/apiary", "/applications", "/api-docs"} {
+		rr := do(t, h, "GET", path)
+		if rr.Code != http.StatusOK || !strings.HasPrefix(rr.Body.String(), "ui:") {
+			t.Errorf("GET %s = %d %q, want the SPA", path, rr.Code, rr.Body.String())
 		}
 	}
 }

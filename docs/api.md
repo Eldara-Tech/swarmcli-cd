@@ -117,7 +117,10 @@ deliberate:
 
 - **A mistyped endpoint under `/api/` is still a JSON `404`**, not the UI's
   index. Without that, a typo would answer `200 text/html` and become a parse
-  error a long way from the mistake.
+  error a long way from the mistake. The check is case-insensitive and takes the
+  bare `/api` as well, which is wider than the routes behind it — the router
+  matches case-sensitively, so `/API/v1/status` reaches no handler — because the
+  client most in need of being told is the one that got the spelling wrong.
 - **A wrong method is now a `405` or a `404`, not the old `405` in both cases.**
   `POST /api/v1/typo` is `405` with `Allow: GET, HEAD`, because with `GET /`
   registered every path matches under `GET`; and `GET …/sync`, which used to be
