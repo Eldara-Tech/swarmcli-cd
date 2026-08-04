@@ -514,12 +514,133 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 // commit, a validation error naming applications — is exactly what an
 // unauthenticated caller should not be able to enumerate about a controller that
 // holds the docker socket.
-func (s *Server) status(w http.ResponseWriter, _ *http.Request, _ authz.Subject) {
-	if s.controller == nil {
-		write(w, http.StatusOK, application.ControllerStatus{Applications: len(s.rec.Views())})
+//
+// That argument is about an unauthenticated caller and it is not the only one
+// this endpoint needs. The document answers about every application at once, so
+// the guard's single unscoped decision is a decision about the collection rather
+// than about its members — the reason Visible exists — and it carries three
+// application-name lists plus the app set's own identity. A tenant scoped to one
+// project would otherwise read the names of applications in every other, and the
+// repository the whole fleet is deployed from.
+//
+// So it is narrowed twice over. The name lists go through Visible exactly as the
+// list endpoint's rows do, always, since a name is a per-application fact
+// whatever else the subject may read. The controller-wide fields — source,
+// revision, the total count, and the error text that names applications — are
+// ActionController's, and a subject the authorizer will not grant it gets a
+// document with those removed rather than a 403: the list screen reads this on
+// every load, and an authorizer that predates the action refuses it.
+func (s *Server) status(w http.ResponseWriter, r *http.Request, subject authz.Subject) {
+	views := s.rec.Views()
+	st := application.ControllerStatus{Applications: len(views)}
+	if s.controller != nil {
+		st = s.controller.Status()
+	}
+
+	// One Visible call, over every name this response could carry rather than
+	// over the views alone. Orphaned and Pruned name applications that have
+	// *left* the set: by construction they are not among the views, so asking
+	// only about those would drop the two lists for every subject including an
+	// admin — which is what the test for this endpoint caught.
+	reachable := dedupe(viewNames(views), st.AppSet.Orphaned, st.AppSet.Pruned, st.AppSet.PruneHeldBy)
+	visible, err := s.visibleNames(r, subject, reachable)
+	if err != nil {
+		fail(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	write(w, http.StatusOK, s.controller.Status())
+	st.AppSet.Orphaned = keepVisible(st.AppSet.Orphaned, visible)
+	st.AppSet.Pruned = keepVisible(st.AppSet.Pruned, visible)
+	st.AppSet.PruneHeldBy = keepVisible(st.AppSet.PruneHeldBy, visible)
+
+	if s.authz.Authorize(r.Context(), subject, authz.ActionController, "") != nil {
+		st.AppSet.Source = ""
+		st.AppSet.Revision = ""
+		// Replaced rather than blanked. Stale is not narrowed and says a newer
+		// set is being refused, but the other failure this field reports — a set
+		// that loaded and could not be applied in full — is stale false, and
+		// blanking the text is what turns that one into a controller reporting
+		// itself healthy. The sentence carries the fact without the names.
+		if st.AppSet.Error != "" {
+			st.AppSet.Error = "the app set has an error; ask an administrator"
+		}
+		// How many this subject can see, not how many there are: the total is
+		// the size of the fleet. Counted over the views rather than off
+		// len(visible), which also holds the departed names asked about above
+		// and would report a count no list can produce.
+		st.Applications = len(keepVisible(viewNames(views), visible))
+	}
+	write(w, http.StatusOK, st)
+}
+
+// viewNames is the applications in views, in the reconciler's order.
+func viewNames(views []application.View) []string {
+	names := make([]string, 0, len(views))
+	for _, v := range views {
+		names = append(names, v.Spec.Name)
+	}
+	return names
+}
+
+// dedupe is the union of several name lists, first occurrence winning, so that
+// one Visible call can answer for all of them. Asking twice about a name an
+// authorizer backs with a policy engine is a round trip bought for nothing.
+func dedupe(lists ...[]string) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(lists[0]))
+	for _, list := range lists {
+		for _, name := range list {
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// visibleNames asks the authorizer which of names this subject may read, as a
+// set.
+//
+// One call for the whole collection, which is what Visible documents and what
+// keeps an authorizer backing it with a policy engine to one round trip for a
+// list rather than one per row. It takes the names rather than reading the
+// views again, so the answer is about the collection the caller is holding —
+// two reads could disagree, and the caller is about to serialise one of them.
+//
+// A name Visible returned that was never offered cannot conjure anything: both
+// callers use the result to filter a list they already had.
+func (s *Server) visibleNames(r *http.Request, subject authz.Subject, names []string) (map[string]struct{}, error) {
+	allowed, err := s.authz.Visible(r.Context(), subject, authz.ActionRead, names)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		set[name] = struct{}{}
+	}
+	return set, nil
+}
+
+// keepVisible drops the names that are not in allowed, preserving order and
+// preserving the difference between "none" and "not reported": omitempty is on
+// all three of the lists this narrows, and a subject who may see nothing in one
+// gets the key absent rather than an empty array claiming the sweep found
+// nothing.
+func keepVisible(names []string, allowed map[string]struct{}) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, ok := allowed[name]; ok {
+			out = append(out, name)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // list serves the list view: every application the caller may see, with its
@@ -544,19 +665,10 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request, _ authz.Subject)
 // back, not the names.
 func (s *Server) list(w http.ResponseWriter, r *http.Request, subject authz.Subject) {
 	views := s.rec.Views()
-	names := make([]string, 0, len(views))
-	for _, v := range views {
-		names = append(names, v.Spec.Name)
-	}
-
-	visible, err := s.authz.Visible(r.Context(), subject, authz.ActionRead, names)
+	allowed, err := s.visibleNames(r, subject, viewNames(views))
 	if err != nil {
 		fail(w, http.StatusForbidden, "forbidden")
 		return
-	}
-	allowed := make(map[string]struct{}, len(visible))
-	for _, name := range visible {
-		allowed[name] = struct{}{}
 	}
 
 	out := make([]application.View, 0, len(allowed))

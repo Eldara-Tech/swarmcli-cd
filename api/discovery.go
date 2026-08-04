@@ -93,12 +93,25 @@ type seamsDocument struct {
 
 // capabilities serves the build's own capability report.
 //
-// Guarded with ActionRead, which is the widest action this API has: a companion
-// implementing projects will hand it to tenants, and what is disclosed here is
-// every seam implementation loaded into a process holding the docker socket. If
-// that turns out to be too wide the fix is an action of its own, and adding one
-// after this endpoint ships is a change to every authorizer.
-func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, _ authz.Subject) {
+// Reachable with ActionRead, and split. Every subject that may read anything
+// gets the edition and the feature map, because that is what the browser draws
+// the UI from and a control that vanished for a tenant would be the dead
+// control #178's criterion forbids. Everything else is ActionController's:
+//
+//   - version, which bootstrap.json deliberately withholds from an
+//     unauthenticated caller on the stated grounds that handing out a build
+//     number is free CVE matching. Handing it to every subject with `read` —
+//     the widest action this API has, and the one an authorizer implementing
+//     projects gives ordinary tenants — gives that argument away.
+//   - licence, which is the deployment's commercial state.
+//   - seams, which names every implementation loaded into a process holding the
+//     docker socket, companion extension modules included. That is a map of the
+//     deployment.
+//
+// A narrowed document rather than a 403 because an authorizer that predates
+// ActionController refuses it, as authz.Action's contract requires, and the
+// shell reads this on every load.
+func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, subject authz.Subject) {
 	report := s.features.Report(r.Context())
 
 	// The keys come from feature.All rather than from the report, so that a
@@ -111,12 +124,18 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, _ authz.Su
 		features[name] = report.Features[name]
 	}
 
-	write(w, http.StatusOK, capabilityDocument{
-		Version:  s.version,
+	doc := capabilityDocument{
 		Edition:  report.Edition,
 		Features: features,
-		Licence:  report.Licence,
-		Seams: seamsDocument{
+		// The same shape whichever half this is, so that a client reads one
+		// document type: the two name lists are [] rather than null for the
+		// reason orEmpty exists.
+		Seams: seamsDocument{Notify: []string{}, Extension: []string{}},
+	}
+	if s.authz.Authorize(r.Context(), subject, authz.ActionController, "") == nil {
+		doc.Version = s.version
+		doc.Licence = report.Licence
+		doc.Seams = seamsDocument{
 			Swarms:  swarms.Active(),
 			Authz:   authz.Active(),
 			Notify:  orEmpty(notify.Active()),
@@ -127,8 +146,9 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, _ authz.Su
 			// module read from the route table would vanish from this document
 			// in exactly the state an operator is trying to diagnose.
 			Extension: orEmpty(extension.Active()),
-		},
-	})
+		}
+	}
+	write(w, http.StatusOK, doc)
 }
 
 // orEmpty makes a seam's name list safe to iterate in a browser: the List seams

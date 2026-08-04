@@ -130,6 +130,15 @@ with `r.PathValue("app")` as the scope, exactly as the core routes are, so a
 pattern with no `{app}` wildcard authorises with an empty application: "not
 scoped to one application", which is already what `GET /api/v1/status` does.
 
+That rule cuts both ways, and the core's own `authz.ActionController` is the
+worked example. It was added after the actions before it, so an authorizer
+compiled against the older set refuses it — correctly. The two endpoints that
+ask therefore treat a refusal as **less to disclose** rather than as a `403`:
+both stay reachable with `read` and answer a document with the controller-wide
+fields removed. An action added to a *read* is safe to add for exactly that
+reason; one added to a route is not, which is why a route's action is fixed at
+registration and a companion's own action is the companion's to recognise.
+
 The registration is the core's, and that is the whole of the design:
 
 ```go

@@ -172,6 +172,70 @@ func TestCapabilitiesReportsTheFreeBuild(t *testing.T) {
 	}
 }
 
+// #206: the three fields a tenant has no business reading, and the two it must
+// keep reading.
+//
+// ActionRead is the widest action this API has and the one an authorizer
+// implementing projects hands to ordinary tenants. What was behind it here is
+// the build number — which bootstrap.json deliberately withholds from an
+// unauthenticated caller on the grounds that it is free CVE matching — the
+// deployment's licence, and the name of every seam implementation loaded into a
+// process holding the docker socket, companion modules included.
+//
+// projectAuthorizer refuses an action it was not written for, as authz.Action's
+// contract requires, so it is exactly an authorizer that predates
+// ActionController — and the answer is a narrowed document rather than a 403,
+// because the shell reads this on every load.
+func TestCapabilitiesIsNarrowedForASubjectThatMayNotReadTheController(t *testing.T) {
+	expires := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	h := discoveryServer(t, Options{
+		Version:    "1.2.0",
+		Authorizer: projectAuthorizer{visible: "edge"},
+		Features: reporter{report: feature.Report{
+			Edition:  "business",
+			Features: feature.Set{feature.SSO: true},
+			Licence:  &feature.Licence{Tier: "be", Status: feature.StatusValid, ExpiresAt: &expires},
+		}},
+	})
+
+	rr := do(t, h, "GET", "/api/v1/capabilities")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: a narrowed subject gets less, not a refusal", rr.Code)
+	}
+	got := decode[capabilityDocument](t, rr)
+
+	if got.Version != "" {
+		t.Errorf("version = %q, want it withheld", got.Version)
+	}
+	if got.Licence != nil {
+		t.Errorf("licence = %+v, want it withheld", *got.Licence)
+	}
+	if got.Seams.Authz != "" || got.Seams.Swarms != "" || got.Seams.Secrets != "" || got.Seams.Feature != "" {
+		t.Errorf("seams = %+v, want no implementation named", got.Seams)
+	}
+	if len(got.Seams.Notify) != 0 || len(got.Seams.Extension) != 0 {
+		t.Errorf("seams = %+v, want no module named", got.Seams)
+	}
+	// Still the same document type, so a client reads one shape: the lists are
+	// [] rather than null whichever half this is.
+	if body := rr.Body.String(); strings.Contains(body, `"extension":null`) || strings.Contains(body, `"notify":null`) {
+		t.Errorf("a seam list marshalled as null: %s", body)
+	}
+
+	// And what a tenant must keep: this is what the UI decides what to draw
+	// from, and a control that vanished for a tenant would be the dead control
+	// #178's criterion forbids.
+	if got.Edition != "business" {
+		t.Errorf("edition = %q, want the reporter's", got.Edition)
+	}
+	if !got.Features[feature.SSO] {
+		t.Error("the reporter granted sso and the narrowed document does not say so")
+	}
+	if len(got.Features) != len(feature.All()) {
+		t.Errorf("features = %v, want exactly feature.All()'s keys", got.Features)
+	}
+}
+
 // The document's key set is feature.All()'s, not the reporter's. A UI hiding a
 // control on features["sso"] has to tell false from absent, and a reporter that
 // dropped a key would make the control vanish rather than grey out — while one

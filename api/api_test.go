@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -141,6 +142,13 @@ func (denyAuthn) Authenticate(*http.Request) (authz.Subject, error) {
 // Both its methods refuse a subject that is not the one Authenticate returned,
 // so a guard that dropped the subject on the way to a handler fails these tests
 // as a 403 rather than passing them by accident.
+//
+// It also refuses an action outside the set it was written for, which is what
+// authz.Action's contract requires of every authorizer and what makes this the
+// fixture for ActionController: a companion built before that action existed
+// refuses it, and the two endpoints that ask must answer it a narrowed document
+// rather than a 403. A fake that granted every unscoped action would pass those
+// tests while modelling an authorizer no companion is allowed to be.
 type projectAuthorizer struct{ visible string }
 
 func (projectAuthorizer) Ready() error { return nil }
@@ -149,9 +157,14 @@ func (projectAuthorizer) Authenticate(*http.Request) (authz.Subject, error) {
 	return authz.Subject{Name: "tenant", Groups: []string{"project-a"}}, nil
 }
 
-func (p projectAuthorizer) Authorize(_ context.Context, s authz.Subject, _ authz.Action, app string) error {
+func (p projectAuthorizer) Authorize(_ context.Context, s authz.Subject, act authz.Action, app string) error {
 	if s.Name != "tenant" {
 		return errors.New("the subject the guard authenticated did not reach the decision")
+	}
+	switch act {
+	case authz.ActionRead, authz.ActionDiff, authz.ActionHistory, authz.ActionSync:
+	default:
+		return fmt.Errorf("this authorizer was not written to grant '%s'", act)
 	}
 	// An empty application is the unscoped question the guard asks for a
 	// collection endpoint, which this tenant is allowed to ask.
@@ -1360,6 +1373,132 @@ func TestStatusServesTheControllerState(t *testing.T) {
 	}
 	if got.Applications != 2 {
 		t.Errorf("applications = %d, want 2", got.Applications)
+	}
+}
+
+// statusWithOrphans is the status a controller reports when everything this
+// endpoint can disclose is present at once: the app set's own identity, an
+// error naming an application, and all three name lists — two of which name
+// applications that have already left the set and are therefore not among the
+// reconciler's views.
+func statusWithOrphans() application.ControllerStatus {
+	return application.ControllerStatus{
+		AppSet: application.AppSetStatus{
+			Mode:        "git",
+			Source:      "https://github.com/your-org/apps.git @ main (applications.yaml)",
+			Revision:    strings.Repeat("b", 40),
+			LoadedAt:    time.Date(2026, 7, 27, 9, 12, 4, 0, time.UTC),
+			Error:       `applications[1]: duplicate application name "core"`,
+			Orphaned:    []string{"legacy-api", "edge"},
+			Pruned:      []string{"old-core"},
+			PruneHeldBy: []string{"edge", "core"},
+		},
+		Applications: 2,
+	}
+}
+
+// The whole of #205 in one test: what a tenant scoped to one project reads from
+// an endpoint that answers about every application at once.
+//
+// The guard authorises this endpoint once, with an empty application, which is
+// a decision about the collection and not about its members — so without this
+// the tenant read the names of applications in every other project, plus the
+// repository the whole fleet is deployed from.
+func TestStatusIsNarrowedForASubjectThatMayNotSeeTheCollection(t *testing.T) {
+	views := []application.View{view("edge"), view("core")}
+	s, h := testServer(t, &fakeReconciler{views: views}, projectAuthorizer{visible: "edge"})
+	s.controller = &fakeController{status: statusWithOrphans()}
+
+	rr := do(t, h, "GET", "/api/v1/status")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/status = %d, want 200: a narrowed subject gets less, not a refusal", rr.Code)
+	}
+	got := decode[application.ControllerStatus](t, rr)
+
+	// The controller-wide half, which is ActionController's and which this
+	// authorizer was not written to grant.
+	if got.AppSet.Source != "" || got.AppSet.Revision != "" {
+		t.Errorf("app set = %+v, want no source and no revision", got.AppSet)
+	}
+	if strings.Contains(got.AppSet.Error, "core") {
+		t.Errorf("error = %q, still names an application this subject may not see", got.AppSet.Error)
+	}
+	if got.AppSet.Error == "" {
+		t.Error("error = \"\": stale is false here, so blanking it reports a broken app set as healthy")
+	}
+	if got.Applications != 1 {
+		t.Errorf("applications = %d, want 1 — the count is the size of the fleet", got.Applications)
+	}
+
+	// The three name lists, each narrowed to the one application this subject
+	// may see. Orphaned and PruneHeldBy prove the two directions: a departed
+	// application it may see survives, and one it may not is gone.
+	if !slices.Equal(got.AppSet.Orphaned, []string{"edge"}) {
+		t.Errorf("orphaned = %v, want [edge]", got.AppSet.Orphaned)
+	}
+	if !slices.Equal(got.AppSet.PruneHeldBy, []string{"edge"}) {
+		t.Errorf("pruneHeldBy = %v, want [edge]", got.AppSet.PruneHeldBy)
+	}
+	// omitempty, so a list narrowed to nothing is absent rather than an empty
+	// array claiming the sweep pruned nothing.
+	if got.AppSet.Pruned != nil {
+		t.Errorf("pruned = %v, want the key absent", got.AppSet.Pruned)
+	}
+	if strings.Contains(rr.Body.String(), `"pruned"`) {
+		t.Errorf("body carries a pruned key: %s", rr.Body.String())
+	}
+
+	// And what is not narrowed, because none of it names anything: the shape
+	// the list screen reads to explain why its rows may be wrong.
+	if got.AppSet.Mode != "git" || got.AppSet.LoadedAt.IsZero() {
+		t.Errorf("app set = %+v, want mode and loadedAt intact", got.AppSet)
+	}
+}
+
+// The other side of the same test, and the reason it is not vacuous: an
+// authorizer that grants ActionController reads every one of those fields.
+//
+// It is also the regression for the bug the existing status test caught — a
+// narrowing asked about the reconciler's views alone drops Orphaned and Pruned
+// for everybody, admin included, because a departed application is by
+// construction not among the views.
+func TestStatusIsWholeForASubjectThatMaySeeTheCollection(t *testing.T) {
+	want := statusWithOrphans()
+	s, h := testServer(t, &fakeReconciler{views: []application.View{view("edge"), view("core")}}, nil)
+	s.controller = &fakeController{status: want}
+
+	rr := do(t, h, "GET", "/api/v1/status")
+	got := decode[application.ControllerStatus](t, rr)
+
+	if got.AppSet.Source != want.AppSet.Source || got.AppSet.Revision != want.AppSet.Revision {
+		t.Errorf("app set = %+v, want %+v", got.AppSet, want.AppSet)
+	}
+	if got.AppSet.Error != want.AppSet.Error {
+		t.Errorf("error = %q, want the controller's own", got.AppSet.Error)
+	}
+	if got.Applications != want.Applications {
+		t.Errorf("applications = %d, want %d", got.Applications, want.Applications)
+	}
+	if !slices.Equal(got.AppSet.Orphaned, want.AppSet.Orphaned) {
+		t.Errorf("orphaned = %v, want %v — a departed application is not among the views", got.AppSet.Orphaned, want.AppSet.Orphaned)
+	}
+	if !slices.Equal(got.AppSet.Pruned, want.AppSet.Pruned) {
+		t.Errorf("pruned = %v, want %v", got.AppSet.Pruned, want.AppSet.Pruned)
+	}
+	if !slices.Equal(got.AppSet.PruneHeldBy, want.AppSet.PruneHeldBy) {
+		t.Errorf("pruneHeldBy = %v, want %v", got.AppSet.PruneHeldBy, want.AppSet.PruneHeldBy)
+	}
+}
+
+// An authorizer that cannot answer the per-member question refuses the request
+// rather than serving the collection, which is the rule the list endpoint
+// already follows and the only one that degrades closed.
+func TestStatusRefusesWhenTheAuthorizerCannotNarrow(t *testing.T) {
+	s, h := testServer(t, &fakeReconciler{views: []application.View{view("edge")}}, refuseVisible{&allowAll{}})
+	s.controller = &fakeController{status: statusWithOrphans()}
+
+	if rr := do(t, h, "GET", "/api/v1/status"); rr.Code != http.StatusForbidden {
+		t.Errorf("GET /api/v1/status = %d, want 403: body %q", rr.Code, rr.Body.String())
 	}
 }
 
