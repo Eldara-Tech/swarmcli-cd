@@ -29,9 +29,10 @@ import { expect, test } from '@playwright/test'
 // (swarmcli-cd-be#7).
 //
 // So the walkthrough is parameterised rather than copied. SWARMCLI_CD_EDITION
-// says which build is on the other end, and only the login and the four
-// capability assertions branch on it — everything from the application list
-// down is one path, which is the whole argument for doing it this way. A
+// says which build is on the other end, and only the login and the capability
+// assertions branch on it — everything from the application list down is one
+// path, which is the whole argument for doing it this way. The licence badge
+// branches on neither: see where it is asserted for why it is a third thing. A
 // licensed spec in the private repository could not have shared it, and the two
 // would have drifted the first time a screen changed.
 //
@@ -172,16 +173,16 @@ test('logs in, watches an application converge without reloading, and reads ever
     edition === 'community' ? { headers: { Authorization: `Bearer ${adminToken}` } } : {},
   )
   expect(capabilities.ok(), `reading the capability document failed: ${capabilities.status()}`).toBe(true)
-  const build = (await capabilities.json()) as { edition: string; features: Record<string, boolean> }
+  const build = (await capabilities.json()) as {
+    edition: string
+    features: Record<string, boolean>
+    licence: unknown
+  }
   expect(build.edition).toBe(edition)
 
   if (edition === 'community') {
-    // The free build draws none of the licensed shells. The badge is the one to
-    // check by its absence rather than its text: `licence` is null in a build
-    // with no licensed module, and a chip that rendered anyway would be the
-    // dead control #178's acceptance criterion forbids.
+    // The free build draws none of the licensed shells.
     expect(Object.values(build.features).some(Boolean)).toBe(false)
-    await expect(page.getByTestId('licence-badge')).toHaveCount(0)
     await expect(page.getByRole('link', { name: 'Projects' })).toHaveCount(0)
     await expect(page.getByRole('columnheader', { name: 'Swarm' })).toHaveCount(0)
   } else {
@@ -192,7 +193,6 @@ test('logs in, watches an application converge without reloading, and reads ever
     for (const granted of ['sso', 'projects', 'multi-swarm']) {
       expect(build.features[granted], `${granted} is not granted: ${JSON.stringify(build.features)}`).toBe(true)
     }
-    await expect(page.getByTestId('licence-badge')).toBeVisible()
     await expect(page.getByRole('link', { name: 'Projects' })).toBeVisible()
     await expect(page.getByRole('columnheader', { name: 'Swarm' })).toBeVisible()
     // The claim out of the ID token, all the way through: the provider minted
@@ -200,6 +200,28 @@ test('logs in, watches an application converge without reloading, and reads ever
     // /ui/bootstrap.json, and the header drew it. A shell that mounted without
     // this is one that believed a session it could not describe.
     await expect(page.locator('.session-name')).toHaveText(ssoUser)
+  }
+
+  // The badge is on a different axis from the edition, and running this against
+  // a merged build is what made that concrete: it asks whether a licensed
+  // *module* is linked, not what the licence currently grants.
+  //
+  // The Apache-2.0 binary reports `licence: null` and draws nothing, which is
+  // #178's acceptance criterion — a chip that could only ever read one word is a
+  // dead control the free product must not grow. The merged binary can never
+  // report null, because under D20 the module is always linked; with no licence
+  // installed it reports `absent`, and the badge says "no licence, install one
+  // to turn the licensed features on". Both are community builds. Both are
+  // right.
+  //
+  // So it is derived from the document rather than from the edition, which also
+  // makes it the stronger assertion: the badge renders exactly when the
+  // controller reports something to put in it.
+  const badge = page.getByTestId('licence-badge')
+  if (build.licence === null) {
+    await expect(badge).toHaveCount(0)
+  } else {
+    await expect(badge).toBeVisible()
   }
 
   // One API call, with the bearer header the browser attached, against a
