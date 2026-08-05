@@ -20,9 +20,17 @@ export default tseslint.config(
   { ignores: ['../dist/**'] },
   js.configs.recommended,
   {
-    // Type-aware rules over the bundle's own sources, which are the files
-    // tsconfig.json describes. Anything outside it has no program to consult.
-    files: ['src/**/*.{ts,tsx}'],
+    // Type-aware rules over everything a tsconfig describes: the bundle's own
+    // sources, and the browser run through e2e/tsconfig.json. Two programs
+    // rather than one, for the reason that file gives, and the project service
+    // picks each file's by walking up from it.
+    //
+    // e2e earns these more than src does. no-floating-promises is the one: a
+    // Playwright expect that nobody awaited resolves to a pending promise and
+    // the assertion never runs, so the spec passes while checking nothing —
+    // which is precisely the failure this whole browser run exists to stop
+    // happening elsewhere.
+    files: ['src/**/*.{ts,tsx}', 'e2e/**/*.ts'],
     extends: [tseslint.configs.recommendedTypeChecked],
     languageOptions: {
       parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
