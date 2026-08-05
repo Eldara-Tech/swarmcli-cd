@@ -1,0 +1,20 @@
+// The browser run, which the tsconfig above deliberately does not describe.
+//
+// A second program rather than one more entry in that file's `include`, and the
+// reason is `types: []`: nothing in src/ may see an ambient Node global, because
+// that bundle runs in a browser where `process` is a ReferenceError only
+// production finds. env.d.ts beside this declares the one global the spec reads,
+// and adding e2e/ to the app's program would hand that declaration to src/ too.
+//
+// Here rather than ../tsconfig.e2e.json so that typescript-eslint's project
+// service finds it: it resolves the nearest tsconfig.json walking up from each
+// file, which is also what gives the spec its type-aware rules — no-floating-
+// promises most of all, since a missing await on an expect is a Playwright
+// assertion that silently passes.
+//
+// Everything else is inherited, so the strictness the bundle is held to is the
+// strictness the spec is held to, which is the point of covering it at all.
+{
+  "extends": "../tsconfig.json",
+  "include": ["."]
+}
