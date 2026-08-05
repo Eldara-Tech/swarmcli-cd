@@ -3,9 +3,9 @@
 
 import { Link, NavLink, Outlet } from 'react-router'
 
-import { useFeature } from './api/discovery'
+import { signOutPath, useFeature, useSession } from './api/discovery'
 import { useEventStream } from './api/useEventStream'
-import { clearToken } from './auth/session'
+import { clearSession } from './auth/session'
 import { LicenceBadge } from './components/LicenceBadge'
 import { LiveIndicator } from './components/LiveIndicator'
 
@@ -50,13 +50,49 @@ export function Shell() {
         {/* Renders nothing at all in a build with no licence to report, which
             is what keeps the free header identical to Phase B's. */}
         <LicenceBadge />
-        <button type="button" className="sign-out" onClick={clearToken}>
-          Sign out
-        </button>
+        <SignOut />
       </header>
       <main className="shell-main">
         <Outlet />
       </main>
     </div>
+  )
+}
+
+/**
+ * Signing out, which is two different acts depending on what signed you in.
+ *
+ * A token is the tab's own: dropping it is enough, it happens without a round
+ * trip, and this is the control the free build has always had — rendered
+ * identically, because `session` is absent in every build that issues no cookie.
+ *
+ * A cookie is the controller's, and no amount of clearing anything here ends it:
+ * the credential is `HttpOnly` and outlives the click by twelve hours. So this
+ * is a link rather than a button, to the path docs/extensibility.md reserves for
+ * exactly this, and the store is cleared on the way out as well — a tab can hold
+ * both at once, and a sign-out that ended one of them would leave the operator
+ * signed in by the other having been told they were not.
+ */
+function SignOut() {
+  const session = useSession()
+
+  if (session === undefined) {
+    return (
+      <button type="button" className="sign-out" onClick={clearSession}>
+        Sign out
+      </button>
+    )
+  }
+  return (
+    <>
+      {/* Who the identity provider said this is. The controller logs the same
+          name against every sync this session asks for, and an operator who
+          signed in through their company's provider and landed on a shell that
+          could not say who they were would have been signed in as nobody. */}
+      <span className="session-name">{session.name}</span>
+      <a className="sign-out" href={signOutPath} onClick={clearSession}>
+        Sign out
+      </a>
+    </>
   )
 }

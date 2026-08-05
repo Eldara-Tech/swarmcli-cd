@@ -10,7 +10,7 @@
 // globalThis.fetch, which puts all three *under* the seam and exercises them
 // from every screen test rather than only from this file's own.
 
-import { clearToken, getToken } from '../auth/session'
+import { clearSession, getToken } from '../auth/session'
 
 /** The endpoint the login screen probes; see verify. */
 export const probePath = '/api/v1/status'
@@ -42,20 +42,25 @@ export function hasStatus(error: unknown, status: number): boolean {
 /**
  * authorized issues a request with the session's credential attached.
  *
- * A 401 clears the token before throwing, which is what returns the tab to the
- * login screen: useToken is subscribed to the store, so every component
- * re-renders with no credential and the shell is replaced. Doing it here rather
- * than in a query's error handler is what makes it true of the event stream and
- * of the sync button as well as of the reads.
+ * Or with none, which is not the same as sending nothing: the browser attaches a
+ * companion's session cookie to a same-origin request whether or not this file
+ * knows about it, so a tab signed in through an identity provider authenticates
+ * here with an empty Authorization header and a cookie it cannot see.
  *
- * Nothing else is treated as an authentication failure. A 403 is a token that is
- * genuinely not permitted this action — an authorizer implementing projects —
- * and signing the operator out over it would lose a working credential.
+ * A 401 ends the session before throwing, which is what returns the tab to the
+ * login screen: useToken and useCookieSessionRefused are subscribed to the
+ * store, so every component re-renders with no credential and the shell is
+ * replaced. Doing it here rather than in a query's error handler is what makes
+ * it true of the event stream and of the sync button as well as of the reads.
+ *
+ * Nothing else is treated as an authentication failure. A 403 is a credential
+ * that is genuinely not permitted this action — an authorizer implementing
+ * projects — and signing the operator out over it would lose a working one.
  */
 export async function authorized(path: string, init?: RequestInit): Promise<Response> {
   const response = await fetch(path, withBearer(init, getToken()))
   if (response.status === 401) {
-    clearToken()
+    clearSession()
     throw new ApiError(401, 'the controller rejected the token')
   }
   return response

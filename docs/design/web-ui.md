@@ -359,10 +359,27 @@ server proxies `/api`, `/ui` and `/healthz` to a running controller, so
 development needs no server-side change either. A cross-origin UI would be a
 separate decision with its own threat model; nothing here anticipates one.
 
-The licensed path grows from here without moving anything: an SSO authorizer
-sets and reads its own cookie inside `Authenticate(r *http.Request)`, serves its
-login and callback through `extension.PublicRoutes`, and advertises itself
-through §4.6's public document. Core learns nothing about OIDC.
+The licensed path grows from here, and exactly one thing moves. An SSO
+authorizer sets and reads its own cookie inside `Authenticate(r *http.Request)`,
+serves its login and callback through `extension.PublicRoutes`, and advertises
+itself through §4.6's public document; core learns nothing about OIDC. But it
+does have to learn that a request *authenticated*, because the paragraph above
+is what the UI's own signed-in gate rests on — the token is in `sessionStorage`
+and the UI is the thing that put it there — and a cookie the UI cannot read
+takes that away. `HttpOnly` is not negotiable here, so the server is the only
+side that can see both credentials and it has to say which arrived.
+
+So §4.6's public document reports `session` when the request it arrives on
+already authenticates, and `/auth/logout` joins §5.3's reserved paths so that
+signing out of a cookie session has somewhere to go. No cookie type enters the
+core, and no session store: it asks the authorizer a question it could already
+answer.
+
+*Corrected 2026-08-05.* This paragraph used to end at "Core learns nothing about
+OIDC", which is true of the server and was read as settling the feature. It
+settles half of it. SSO shipped in v1.1.0 with a login that completed and a UI
+that never noticed, and pressing the button returned the browser to the login
+screen for ever — [#217](https://github.com/Eldara-Tech/swarmcli-cd/issues/217).
 
 ### 4.5 Live updates without EventSource
 
@@ -403,9 +420,27 @@ operator check each one before believing it.
              { "id": "sso",   "label": "Sign in with SSO", "start": "/auth/login" } ] }
 ```
 
-Nothing else. In particular **no version string**: an unauthenticated caller
-does not need the build number, and handing one out is free CVE matching. The
-version is in the guarded document.
+Nothing else — except, for a request that *already* authenticates, who it
+belongs to:
+
+```json
+{ "login": [ … ], "session": { "name": "alice" } }
+```
+
+The key is absent otherwise, which is every request a browser makes to it in a
+build whose only credential is the admin token: the UI reads this through
+`publicGet` and attaches nothing, so the document a free deployment serves does
+not move. It is here rather than behind the token because the question it
+answers — "am I already signed in?" — is asked by a tab that does not yet know,
+and §4.4 has the rest of the argument.
+
+In particular **no version string**: an unauthenticated caller does not need the
+build number, and handing one out is free CVE matching. The version is in the
+guarded document. Two costs come with the session that did not come with the
+login list: this endpoint now answers differently per request, and a bearer sent
+to it gets a valid-or-not answer. The second is an oracle `client.verify`
+already offers on `/api/v1/status`, unthrottled, so it is a second door rather
+than a new room — but it should be counted as a door.
 
 It is fed by an optional interface beside `authz`, which is where "how does one
 authenticate here" belongs:
@@ -645,6 +680,7 @@ them:
 | Path | Public | Serves |
 | --- | --- | --- |
 | `GET /auth/login`, `GET /auth/callback` | yes | SSO start and callback |
+| `GET /auth/logout` | yes | where a session ends — see below |
 | `GET /api/v1/licence` | no | the full licence record, beyond the badge |
 | `GET /api/v1/projects` | no | project list and membership |
 | `GET /api/v1/audit` | no | the audit log, paged |

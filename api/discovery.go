@@ -34,6 +34,34 @@ type loginOption struct {
 	Start string `json:"start,omitempty"`
 }
 
+// bootstrapDocument is what a login screen needs before anyone is
+// authenticated: how to sign in, and — when the caller already has — who they
+// are.
+type bootstrapDocument struct {
+	Login []loginOption `json:"login"`
+	// Session is omitted for every request that did not authenticate, which is
+	// every request a browser makes to this endpoint in a build whose only
+	// credential is the admin token: the UI reads it through publicGet, which
+	// attaches nothing.
+	Session *sessionDocument `json:"session,omitempty"`
+}
+
+// sessionDocument is who the request already belongs to.
+//
+// It exists because a browser cannot answer that question for itself once a
+// companion authenticates it. The token is in sessionStorage and the UI put it
+// there, so the UI knows about it; an SSO session is an HttpOnly cookie, which
+// is unreadable from script on purpose — that is the whole of its defence for a
+// credential to a process holding the docker socket. So the one side that can
+// see both credentials says which, if either, arrived.
+//
+// The name and nothing more. Subject.Groups is what the projects slice will
+// scope on and no screen renders it yet, and a field on a document is much
+// easier to add than to take back.
+type sessionDocument struct {
+	Name string `json:"name"`
+}
+
 // bootstrap serves what a login screen needs before anyone is authenticated,
 // and nothing else.
 //
@@ -44,8 +72,10 @@ type loginOption struct {
 // no-store because installing a licence, or loading an SSO companion, changes
 // what this says — and a login screen cached from before that offers a box for
 // a credential the deployment no longer issues, with no way for the operator to
-// tell that the browser is the thing that is wrong.
-func (s *Server) bootstrap(w http.ResponseWriter, _ *http.Request) {
+// tell that the browser is the thing that is wrong. The session below makes the
+// header load-bearing rather than merely correct: it is now the one thing here
+// that differs between two requests to the same controller.
+func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	methods := authz.MethodsFor(s.authz)
 	// Sized rather than nil, so an authorizer that names no method at all
 	// marshals as [] and a UI can iterate it. A null there is a TypeError in
@@ -54,8 +84,29 @@ func (s *Server) bootstrap(w http.ResponseWriter, _ *http.Request) {
 	for _, m := range methods {
 		login = append(login, loginOption{ID: m.ID, Label: m.Label, Start: m.Start})
 	}
+
+	doc := bootstrapDocument{Login: login}
+	// The only line on this endpoint that reads the request, and the reason it
+	// is worth the two costs below: without it a browser that completed an SSO
+	// login has a working session it cannot detect, and renders the login
+	// screen it just came back from.
+	//
+	// The first cost is that a public endpoint now answers differently per
+	// request. The second is that a bearer sent here gets a valid-or-not answer
+	// — but client.verify already probes /api/v1/status for exactly that, and
+	// neither is throttled, so this is a second door to a room that is open
+	// rather than a new room.
+	//
+	// What it is not is a way in. Nothing downstream reads this, every guarded
+	// route authenticates for itself, and an error here omits the key rather
+	// than failing the request: a login screen that could not be drawn because
+	// the caller had no credential would be a strange way to ask for one.
+	if subject, err := s.authz.Authenticate(r); err == nil {
+		doc.Session = &sessionDocument{Name: subject.Name}
+	}
+
 	w.Header().Set("Cache-Control", "no-store")
-	write(w, http.StatusOK, map[string]any{"login": login})
+	write(w, http.StatusOK, doc)
 }
 
 // capabilityDocument is what an operator holding the token can read about the

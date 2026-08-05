@@ -42,7 +42,13 @@ func discoveryServer(t *testing.T, o Options) http.Handler {
 
 // ssoOnly is the companion shape: it issues no admin token, so the token box
 // would be a dead end.
-type ssoOnly struct{ authz.Authorizer }
+//
+// It embeds denyAuthn rather than the bare interface, because the bootstrap
+// handler now authenticates the request it is given and a nil embedded
+// Authorizer panics there. Denying is also what a real one does with the
+// credential-less request a login screen makes; the session case has its own
+// fake below.
+type ssoOnly struct{ denyAuthn }
 
 func (ssoOnly) LoginMethods() []authz.LoginMethod {
 	return []authz.LoginMethod{{ID: "sso", Label: "Sign in with SSO", Start: "/auth/login"}}
@@ -50,9 +56,18 @@ func (ssoOnly) LoginMethods() []authz.LoginMethod {
 
 // noMethods names nothing at all, which is the case that decides whether the
 // document marshals [] or null.
-type noMethods struct{ authz.Authorizer }
+type noMethods struct{ denyAuthn }
 
 func (noMethods) LoginMethods() []authz.LoginMethod { return nil }
+
+// cookieSession is the companion after a browser has completed an SSO login:
+// it advertises the same start link, and it authenticates the request from
+// something the browser cannot show the UI itself.
+type cookieSession struct{ ssoOnly }
+
+func (cookieSession) Authenticate(*http.Request) (authz.Subject, error) {
+	return authz.Subject{Name: "alice", Groups: []string{"platform"}}, nil
+}
 
 // reporter answers with what it was built with, including keys feature.All
 // never mentions.
@@ -111,6 +126,54 @@ func TestBootstrapReportsTheAuthorizersOwnMethods(t *testing.T) {
 	want := []loginOption{{ID: "sso", Label: "Sign in with SSO", Start: "/auth/login"}}
 	if !slices.Equal(got.Login, want) {
 		t.Errorf("login = %+v, want only the authorizer's own: %+v", got.Login, want)
+	}
+}
+
+// The half a browser cannot answer for itself. An SSO session is an HttpOnly
+// cookie, so a UI holding one has no way to know it is signed in — it reads
+// this document, and this is where it finds out.
+func TestBootstrapNamesTheSessionARequestAlreadyHas(t *testing.T) {
+	h := discoveryServer(t, Options{Authorizer: cookieSession{}})
+
+	rr := do(t, h, "GET", "/ui/bootstrap.json")
+	got := decode[struct {
+		Login   []loginOption    `json:"login"`
+		Session *sessionDocument `json:"session"`
+	}](t, rr)
+
+	if got.Session == nil {
+		t.Fatalf("no session in %s: a browser holding one would render the login screen it just came back from", rr.Body)
+	}
+	if got.Session.Name != "alice" {
+		t.Errorf("session.name = %q, want the subject the authorizer returned", got.Session.Name)
+	}
+	// The methods are still advertised. Signing out returns this tab to a login
+	// screen that has to know how to sign in again, and it reads this same
+	// document to find out.
+	if len(got.Login) != 1 {
+		t.Errorf("login = %+v, want the authorizer's own method alongside the session", got.Login)
+	}
+	// Exactly the name. Subject.Groups is what the projects slice will scope on
+	// and nothing renders it, and a field is much easier to add here than to
+	// take back.
+	fields := decode[struct {
+		Session map[string]json.RawMessage `json:"session"`
+	}](t, rr).Session
+	if len(fields) != 1 {
+		t.Errorf("session has fields %v, want only name", slices.Sorted(maps.Keys(fields)))
+	}
+}
+
+// And the other half, which is the one that must never regress: a caller with
+// no credential gets the document the free build has always served. A browser
+// reads this through publicGet and attaches nothing, so this is every request
+// the login screen makes in a build whose only credential is the admin token.
+func TestBootstrapCarriesNoSessionForACallerWithNone(t *testing.T) {
+	h := discoveryServer(t, Options{Authorizer: ssoOnly{}})
+
+	keys := decode[map[string]json.RawMessage](t, do(t, h, "GET", "/ui/bootstrap.json"))
+	if len(keys) != 1 {
+		t.Errorf("the unauthenticated document has keys %v, want only login", slices.Sorted(maps.Keys(keys)))
 	}
 }
 
