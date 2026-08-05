@@ -238,6 +238,7 @@ fixed here, in the open half, before anything serves them:
 |---|---|---|
 | `GET /auth/login` | public | where an SSO login starts |
 | `GET /auth/callback` | public | where the identity provider comes back to |
+| `GET /auth/logout` | public | where a session ends: expire the credential and redirect to `/` |
 | `GET /api/v1/licence` | guarded | the whole licence record, beyond the summary `/api/v1/capabilities` carries |
 | `GET /api/v1/projects` | guarded | the projects a subject may see, and their membership |
 | `GET /api/v1/audit` | guarded | the audit log, paged |
@@ -251,6 +252,20 @@ JSON `404` under `/api/`, and whatever `GET /` serves everywhere else (see
 The list is as strong as the seam contracts on this page already are, and in the
 same way: a document the companion is written against, and the public UI with
 it.
+
+**One of them is an obligation rather than an offer.** An authorizer whose
+`Authenticate` honours something the browser cannot see — a session cookie,
+which is what SSO issues and what `HttpOnly` is for — **must** serve
+`GET /auth/logout`. The UI's sign-out otherwise clears a credential that was
+never in the tab and leaves the operator signed in until the cookie expires on
+its own. It is the same shape of contract as the other five and enforced the
+same way, which is to say not at all; what makes it different is that a
+companion can meet every other one and still ship a button that does nothing.
+
+The corresponding half in this repository is `/ui/bootstrap.json`, which reports
+`session` when the request it arrives on already authenticates. That is how a
+tab holding a cookie discovers it is signed in, and it is why a companion that
+authenticates cookies gets a working UI without contributing a line of it.
 
 **A reserved path must never be added to `coreRoutes`.** That reads backwards
 until the mechanism is said out loud, so here it is: the collision check above

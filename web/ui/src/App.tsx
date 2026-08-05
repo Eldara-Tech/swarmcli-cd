@@ -4,8 +4,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, Route, Routes } from 'react-router'
 
-import { useFeature } from './api/discovery'
-import { useToken } from './auth/useToken'
+import { useBootstrap, useFeature, useSignedIn } from './api/discovery'
 import { Shell } from './Shell'
 import { ApplicationDetail, ApplicationOverview } from './screens/ApplicationDetail'
 import { ApplicationDiff } from './screens/ApplicationDiff'
@@ -42,18 +41,60 @@ export const queryClient = new QueryClient({
 /**
  * The whole application: a credential, or the screen that collects one.
  *
- * The token is read through the store rather than held in state here, so that
- * the 401 path is one rule in one place. Anything that meets a 401 — a query, a
- * mutation, the event stream — clears the store, this re-renders with no
- * credential, and the shell is replaced by the login screen. There is no error
- * boundary, no redirect and no route to keep consistent with it.
+ * The gate is a child rather than this component, because deciding it now needs
+ * a query — see Authenticated — and a hook reading one has to run inside the
+ * provider rather than in the component that renders it. That is the same move
+ * SignedIn already made when the route table became capability-driven.
  */
 export function App() {
-  const token = useToken()
-
   return (
-    <QueryClientProvider client={queryClient}>{token === null ? <Login /> : <SignedIn />}</QueryClientProvider>
+    <QueryClientProvider client={queryClient}>
+      <Authenticated />
+    </QueryClientProvider>
   )
+}
+
+/**
+ * Whether this tab is signed in, and with which of the two credentials.
+ *
+ * The token is read through the store rather than held in state here, so that
+ * the 401 path is one rule in one place. Anything that meets a 401 — a query, a
+ * mutation, the event stream — ends the session in the store, this re-renders
+ * with no credential, and the shell is replaced by the login screen. There is no
+ * error boundary, no redirect and no route to keep consistent with it.
+ *
+ * A token needs nothing confirmed and is answered first, which keeps the free
+ * build's path exactly what it was: no document is waited for, and a tab that
+ * has one renders the shell immediately.
+ *
+ * A cookie is the other case and the reason this is not one line. The browser
+ * will not show it to script, so the only way to know it is there is that the
+ * controller says so — and it says so on the document the login screen was
+ * going to block on anyway, which is why waiting here costs nothing. Rendering
+ * nothing meanwhile rather than the login screen: drawing one and taking it
+ * away is how an operator who is already signed in gets shown a box asking them
+ * to sign in.
+ */
+function Authenticated() {
+  const signedIn = useSignedIn()
+  const bootstrap = useBootstrap()
+
+  // First, and so a token never waits: useSignedIn answers true on one the
+  // moment the store has it, whatever the document is doing.
+  if (signedIn) return <SignedIn />
+
+  // "Has the controller ever answered", not "is a request in flight", and the
+  // difference is a loop rather than a nicety. A query that has failed refetches
+  // when a new observer mounts, and Login is a new observer — so gating on
+  // isPending unmounts the screen that had just mounted, which settles the
+  // query, which mounts it again. It spun bootstrap.json for ever without
+  // drawing anything.
+  if (!bootstrap.isFetched) return null
+
+  // A document that could not be read is not a controller saying "no session".
+  // It lands here, on Login, which has its own answer for that case and offers
+  // the token box rather than a screen with no way in.
+  return <Login />
 }
 
 /**
