@@ -5,8 +5,9 @@ Copyright © 2026 Eldara Tech
 
 # HTTP API
 
-The controller serves one HTTP API, and everything else is a client of it. The
-`swarmcli-cd app` commands go through it; a TUI view and a web UI will too. It is
+The controller serves one HTTP API, and everything else is a client of it: the
+`swarmcli-cd app` commands go through it, and so does the
+[web UI](web-ui.md) the same process serves. It is
 designed UI-first (decision D1): every screen a UI has is one request, and every
 action a user can take is one endpoint. That makes it equally the interface to
 script against.
