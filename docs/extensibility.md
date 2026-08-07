@@ -6,11 +6,12 @@ Copyright © 2026 Eldara Tech
 # Extensibility: the seams a private companion replaces, and the one it adds to
 
 swarmcli-cd is open core. This repository is the whole product — reconcile,
-diff, health, API, CLI and, later, the web UI — and a private `swarmcli-cd-be`
+diff, health, API, CLI and the web UI — and a private `swarmcli-cd-be`
 companion replaces five specific behaviours with licensed ones and, through a
 sixth seam, **adds** HTTP routes of its own rather than replacing anything. Per
-D6 the companion arrives in Phase 3, but the seams ship from day one so that
-nothing in the public tree has to move when it does.
+D6 the seams shipped from day one, before the companion existed, so that nothing
+in the public tree had to move when it arrived. The first replacement it made is
+the authorizer: [single sign-on](sso.md).
 
 The mechanism is the one `swarmcli-be` already uses against `swarmcli`: `init()`
 self-registration and a blank import. **No build tags, and no stubbed files in

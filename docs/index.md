@@ -17,12 +17,16 @@ it is and why; the pages here are how to use it.
   plus the controller's flags and environment.
 - **[Concepts](concepts.md)** — sync versus health, drift, ownership, rollback,
   chart compatibility, and why the applier is not `docker stack deploy`.
+- **[Running it in production](operations.md)** — upgrading, restarting, what is
+  state and what is cache, what to back up, and what to alert on.
 - **[HTTP API](api.md)** — the endpoints behind every command, for scripting and
   for building on.
 - **[Web UI](web-ui.md)** — reaching it, building it, and what it means that a
   browser holds the admin token.
 - **[Editions](editions.md)** — the two artefacts every release publishes, which
   one you are running, and what a licence changes.
+- **[Single sign-on](sso.md)** — the licensed browser login: configuring a
+  provider, what a licence changes, and what it deliberately does not.
 
 ## Examples
 
@@ -36,6 +40,8 @@ it is and why; the pages here are how to use it.
 
 ## For contributors
 
+- **[CONTRIBUTING.md](../CONTRIBUTING.md)** — building, testing, what a change
+  needs, and the labels every PR carries.
 - **[Extensibility](extensibility.md)** — the open-core seams and how the private
   companion replaces one.
 - **[RELEASING.md](../RELEASING.md)** — tagging, the image, and the engine-version

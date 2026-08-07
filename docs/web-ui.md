@@ -144,8 +144,11 @@ One thing the UI does not add is identity. Signing in with the shared admin
 token makes every operator the same subject, so the `actor` on a sync event
 names that one subject and not a person; see
 [api § authentication](api.md#authentication). Per-user login is a licensed
-capability, and the paths it will serve are already fixed in
-[extensibility § reserved paths](extensibility.md#reserved-paths).
+capability — [single sign-on](sso.md), which replaces the token box on this
+login screen with a provider's — and the paths it serves are the ones reserved
+in [extensibility § reserved paths](extensibility.md#reserved-paths). Everything
+in this section is about a deployment that has not enabled it, which includes
+every OSS build.
 
 ## Why the port is still not published by default
 

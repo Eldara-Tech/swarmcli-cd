@@ -384,8 +384,8 @@ destination:
 
 Names the swarm to deploy to, resolved through the swarm-registry seam. The OSS
 build resolves exactly one — the swarm the controller runs in — so any non-empty
-name is unreachable and the sync fails naming it. Multi-swarm is a licensed
-capability (Phase 3); see [extensibility.md](extensibility.md).
+name is unreachable and the sync fails naming it. Multi-swarm is a planned
+licensed capability; see [extensibility.md](extensibility.md).
 
 ### `syncPolicy` (optional)
 
@@ -1359,6 +1359,11 @@ For a public repository, the git variables are unnecessary. For a private one,
 set `SWARMCLI_CD_GIT_USERNAME` and a token via `SWARMCLI_CD_GIT_TOKEN_FILE`. The
 same credential is used for the app-set repository in git mode — one credential
 for the controller, not one per repository.
+
+A licensed build reads five more, `SWARMCLI_CD_OIDC_*`, which configure the
+identity provider browsers sign in against. They are set together or not at all —
+a half-configured provider refuses to start — and they are documented with the
+rest of that feature in [single sign-on](sso.md).
 
 ## See also
 

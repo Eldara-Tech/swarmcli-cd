@@ -280,11 +280,12 @@ in that repository can say otherwise. See
 
 Four behaviours are pluggable through interfaces with working OSS defaults —
 swarm registry, authorizer, notifier, secret provider — replaced by a private
-companion in Phase 3, and a fifth seam through which that companion adds HTTP
-routes rather than replacing anything. The public build is a complete product;
-the seams just mark where the licensed edition swaps multi-swarm, SSO/RBAC,
-Slack notifications and SOPS decryption in, and where it adds the endpoints
-those need. This is developer-facing detail; it lives in
+companion, and a fifth seam through which that companion adds HTTP routes rather
+than replacing anything. The public build is a complete product; the seams just
+mark where the licensed edition swaps multi-swarm, SSO/RBAC, Slack notifications
+and SOPS decryption in, and where it adds the endpoints those need. The
+authorizer is the one that has been replaced so far — see
+[single sign-on](sso.md). This is developer-facing detail; it lives in
 [extensibility.md](extensibility.md).
 
 ## See also

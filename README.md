@@ -3,17 +3,20 @@
 GitOps continuous delivery for Docker Swarm — reconcile your swarm from Git, the
 way Argo CD does for Kubernetes.
 
-> **Status: Phase 2, first stable release.** The pull loop works end to end —
-> fetch, render, plan, diff, apply, prune, drift detection and health — and is
+> **Status: stable, and shipping.** The pull loop works end to end — fetch,
+> render, plan, diff, apply, prune, drift detection and health — and is
 > exercised against a real swarm by the integration tests. `driftDetection:
 > live` has landed: a `docker service update` made behind the controller's back
 > is seen, and on an automated application corrected. So have app-of-apps, which
 > puts the application set itself in git, and sync waves, which order the
-> releases within an application. Webhook triggers are the rest of Phase 2; the
-> licensed companion is Phase 3. **`v1.0.0` is the first stable tag**, so
-> `:latest` now resolves to a release and `stack.yml` works as written — pin the
-> tag you deploy anyway if you would rather choose when you upgrade. The design,
-> decisions and phase plan live in
+> releases within an application. **The web UI shipped in `v1.1.0`**, served
+> from the same binary and the same port as the API, and with it the first
+> licensed capability — [single sign-on](docs/sso.md), compiled into the default
+> artefact and inert until a licence verifies.
+> [Webhook triggers](https://github.com/Eldara-Tech/swarmcli-cd/issues/65) are
+> what Phase 2 still wants. Pin the tag you deploy rather than tracking
+> `:latest`, so that upgrading is a moment you chose. The design, decisions and
+> phase plan live in
 > [issue #1](https://github.com/Eldara-Tech/swarmcli-cd/issues/1).
 >
 > **New here?** Start with the [getting-started guide](docs/getting-started.md).
@@ -87,8 +90,8 @@ to get the UI. The archives and the images have it compiled in.
 
 One binary runs the controller and talks to it. The controller reconciles and
 serves the API; every command that inspects it is a client of that API, so
-anything the CLI can show, the TUI view and the web UI will show through the
-same endpoints.
+anything the CLI can show, the [web UI](docs/web-ui.md) shows through the same
+endpoints.
 
 ```bash
 # In the swarm, on a manager node, with docker.sock mounted:
@@ -124,7 +127,15 @@ Run `swarmcli-cd controller --help` or `swarmcli-cd app help` for the rest.
   plus the controller's flags and environment.
 - [Concepts](docs/concepts.md) — sync versus health, drift, ownership, rollback,
   chart compatibility.
+- [Running it in production](docs/operations.md) — upgrading, restarting, what
+  to back up, and what to alert on.
+- [Web UI](docs/web-ui.md) — reaching it, and what it means that a browser holds
+  the admin token.
 - [HTTP API](docs/api.md) — the endpoints behind every command.
+- [Editions](docs/editions.md) — the two artefacts every release publishes, and
+  which one you are running. [Single sign-on](docs/sso.md) is the licensed
+  capability that ships today.
+- [Extensibility](docs/extensibility.md) — the open-core seams, for contributors.
 - Examples: a commented [`applications.yaml`](examples/applications.yaml), a
   ready-to-push [quickstart repository](examples/quickstart-repo/), and an
   [app-set repository](examples/appset-repo/) for the git-sourced layout.
@@ -221,13 +232,25 @@ The engine version is stamped into the image from the swarmcli release this
 module pins. A plain `go build` leaves it empty, and every compatibility check
 then reports Unknown rather than blocking.
 
+## Contributing
+
+Bug reports, features and patches are welcome — [CONTRIBUTING.md](CONTRIBUTING.md)
+is what a change has to satisfy, and
+[docs/extensibility.md](docs/extensibility.md) is how the open-core seams fit
+together. Read [issue #1](https://github.com/Eldara-Tech/swarmcli-cd/issues/1)
+before proposing anything architectural.
+
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE).
 
-Multi-swarm, projects/RBAC, SSO, notifications and managed secret rotation are
-planned as licensed capabilities in a separate private companion; everything in
-this repository — including the web UI — stays Apache-2.0.
+Everything in this repository — including the web UI — stays Apache-2.0, and the
+whole product is here: reconcile, diff, drift, health, prune, the API, the CLI
+and the browser. What a licence adds is built in a separate private companion
+and reaches you inside the default artefact, inert until it verifies.
+[Single sign-on](docs/sso.md) is the first of those and ships today; multi-swarm,
+projects/RBAC, notifications and managed secret rotation are planned.
+[docs/editions.md](docs/editions.md) is what each artefact contains.
 
 ## Security
 

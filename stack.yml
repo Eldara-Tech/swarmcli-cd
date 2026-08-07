@@ -20,7 +20,7 @@ services:
   controller:
     # The default artefact: this repository plus licensed code that does nothing
     # until a licence verifies. For the wholly Apache-2.0 build, pin a version
-    # with the -oss suffix — eldaratech/swarmcli-cd:1.2.0-oss — which is
+    # with the -oss suffix — eldaratech/swarmcli-cd:<version>-oss — which is
     # deliberately not a moving tag. See docs/editions.md.
     image: eldaratech/swarmcli-cd:latest
 
@@ -144,6 +144,20 @@ services:
       # Static credentials only: the image ships no credential helpers, so a
       # config.json using credsStore/credHelpers is refused at startup, and
       # short-lived ECR/GCR tokens must be refreshed out of band.
+      #
+      # Single sign-on, on a licensed deployment: five variables, and the
+      # swarmcli-cd-oidc-secret entries further down. All of them or none —
+      # a half-configured identity provider refuses to start, naming what is
+      # missing, because one that merely rejected every login would look
+      # exactly like a wrong password. The redirect URL must end in
+      # /auth/callback and must be registered with the provider under that
+      # exact spelling. The admin token above stays required either way: it is
+      # what the CLI and the healthcheck send, and what a lapsed licence falls
+      # back to. See docs/sso.md.
+      # SWARMCLI_CD_OIDC_ISSUER: https://sso.example.com/realms/ops
+      # SWARMCLI_CD_OIDC_CLIENT_ID: swarmcli-cd
+      # SWARMCLI_CD_OIDC_CLIENT_SECRET_FILE: /run/secrets/swarmcli-cd-oidc-secret
+      # SWARMCLI_CD_OIDC_REDIRECT_URL: https://cd.example.com/auth/callback
 
     # The API — and the web UI on the same port — is deliberately not published
     # here. The reason is the token rather than the UI: this port carries
@@ -191,6 +205,10 @@ services:
       # The TLS pair, for the --tls-cert/--tls-key command above.
       # - swarmcli-cd-tls-cert
       # - swarmcli-cd-tls-key
+      # The OIDC client secret, for the SSO variables above. Create it first:
+      #   printf '%s' "$THE_CLIENT_SECRET" | docker secret create swarmcli-cd-oidc-secret -
+      # A public client has no secret and is protected by PKCE; omit both.
+      # - swarmcli-cd-oidc-secret
       # One per application that pulls from a private registry. The name must
       # match that application's `registryAuth:`, and the default mount path
       # /run/secrets/<name> is where the controller reads it.
@@ -208,6 +226,8 @@ secrets:
   # swarmcli-cd-tls-cert:
   #   external: true
   # swarmcli-cd-tls-key:
+  #   external: true
+  # swarmcli-cd-oidc-secret:
   #   external: true
   # swarmcli-cd-regauth-edge:
   #   external: true

@@ -91,6 +91,11 @@ redeploy the stack). The startup log's `routes` lines are where to check that it
 took: an unlicensed build declares **no** licensed routes at all, so `/auth/*`
 appearing there is the licence having been read.
 
+What a licence grants today is [single sign-on](sso.md), which is where that
+`/auth/*` comes from. Multi-swarm, projects and RBAC, notifications and managed
+secret rotation are the rest of the plan; the seams they will arrive through are
+in [extensibility.md](extensibility.md).
+
 ## The rule this model depends on
 
 **Nothing AGPL may ever be linked into either artefact.** `swarmcli-rbac-proxy`
@@ -108,11 +113,11 @@ or if anything private is linked.
 ## Getting the OSS build
 
 ```bash
-# The archive, from any release:
-curl -sSLO https://github.com/Eldara-Tech/swarmcli-cd/releases/download/v1.2.0/swarmcli-cd-oss_Linux_x86_64.tar.gz
+# The archive, from any release — pick <version> from the releases page:
+curl -sSLO https://github.com/Eldara-Tech/swarmcli-cd/releases/download/v<version>/swarmcli-cd-oss_Linux_x86_64.tar.gz
 
 # Or the image:
-docker pull eldaratech/swarmcli-cd:1.2.0-oss
+docker pull eldaratech/swarmcli-cd:<version>-oss
 ```
 
 There is deliberately no moving `:oss` tag. A deployment that wants the

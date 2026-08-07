@@ -249,6 +249,8 @@ A ready-made layout is in [`../examples/appset-repo/`](../examples/appset-repo/)
   applications file, plus the controller's flags and environment.
 - **[Concepts](concepts.md)** — sync versus health, drift, ownership, and why
   the applier is not `docker stack deploy`.
+- **[Running it in production](operations.md)** — the things this walkthrough
+  skipped: pinning a version, upgrading, what to back up, and what to alert on.
 - **[HTTP API](api.md)** — the endpoints behind every command, for scripting and
   for building on.
 - **[The web UI](web-ui.md)** — building it, what the controller serves, and the
