@@ -14,6 +14,11 @@ unlocked by a licence. This page is what each of them is.
 | `swarmcli-cd` archives, `eldaratech/swarmcli-cd:<version>`, `:latest` | a private build wrapper around this repository | this repository, plus licensed code that is **inert** without a licence | this repository's code is Apache-2.0; the licensed code is proprietary |
 | `swarmcli-cd-oss` archives, `eldaratech/swarmcli-cd:<version>-oss` | `cmd/swarmcli-cd` in this repository, nothing else | this repository, and nothing else | wholly Apache-2.0 |
 
+This starts with `v1.1.0`. `v1.0.0` and the release candidates before it
+published the plain names only, and a single `checksums.txt` — there was one set
+of artefacts to verify — so those releases have no `-oss` archive and no `-oss`
+image to download.
+
 The command inside both archives is `swarmcli-cd`. Every invocation in these
 docs, `stack.yml`'s entrypoint and the container healthcheck are identical for
 the two, deliberately: the difference between them is what the build contains,
@@ -113,7 +118,7 @@ or if anything private is linked.
 ## Getting the OSS build
 
 ```bash
-# The archive, from any release — pick <version> from the releases page:
+# The archive — pick <version> from the releases page (v1.1.0 or later):
 curl -sSLO https://github.com/Eldara-Tech/swarmcli-cd/releases/download/v<version>/swarmcli-cd-oss_Linux_x86_64.tar.gz
 
 # Or the image:
