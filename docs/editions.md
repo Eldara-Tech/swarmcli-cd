@@ -12,12 +12,19 @@ unlocked by a licence. This page is what each of them is.
 | | Built from | Contains | Licence |
 |---|---|---|---|
 | `swarmcli-cd` archives, `eldaratech/swarmcli-cd:<version>`, `:latest` | a private build wrapper around this repository | this repository, plus licensed code that is **inert** without a licence | this repository's code is Apache-2.0; the licensed code is proprietary |
-| `swarmcli-cd-oss` archives, `eldaratech/swarmcli-cd:<version>-oss` | `cmd/swarmcli-cd` in this repository, nothing else | this repository, and nothing else | wholly Apache-2.0 |
+| `swarmcli-cd_*_oss` archives, `eldaratech/swarmcli-cd:<version>-oss` | `cmd/swarmcli-cd` in this repository, nothing else | this repository, and nothing else | wholly Apache-2.0 |
 
-This starts with `v1.1.0`. `v1.0.0` and the release candidates before it
+Two artefacts start with `v1.1.0`. `v1.0.0` and the release candidates before it
 published the plain names only, and a single `checksums.txt` — there was one set
-of artefacts to verify — so those releases have no `-oss` archive and no `-oss`
-image to download.
+of artefacts to verify — so those releases have no Apache-2.0 archive and no
+`-oss` image to download.
+
+The archive name in the table is the one from the release *after* `v1.1.0`
+onwards. `v1.1.0` itself carries the qualifier at the front —
+`swarmcli-cd-oss_Linux_x86_64.tar.gz` — which sorted every Apache-2.0 archive
+above every merged one on the release page, since GitHub renders assets sorted
+by `lower(name)` and gives no other control. Only the asset name moved; the
+image tag is `<version>-oss` throughout.
 
 The command inside both archives is `swarmcli-cd`. Every invocation in these
 docs, `stack.yml`'s entrypoint and the container healthcheck are identical for
@@ -118,8 +125,10 @@ or if anything private is linked.
 ## Getting the OSS build
 
 ```bash
-# The archive — pick <version> from the releases page (v1.1.0 or later):
-curl -sSLO https://github.com/Eldara-Tech/swarmcli-cd/releases/download/v<version>/swarmcli-cd-oss_Linux_x86_64.tar.gz
+# The archive — pick <version> from the releases page. This name is the one from
+# the release after v1.1.0 onwards; on v1.1.0 itself the asset is
+# swarmcli-cd-oss_Linux_x86_64.tar.gz:
+curl -sSLO https://github.com/Eldara-Tech/swarmcli-cd/releases/download/v<version>/swarmcli-cd_Linux_x86_64_oss.tar.gz
 
 # Or the image:
 docker pull eldaratech/swarmcli-cd:<version>-oss
