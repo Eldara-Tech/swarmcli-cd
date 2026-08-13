@@ -15,7 +15,7 @@ Each release carries two artefacts (D21, [docs/editions.md](docs/editions.md)):
 | Artefact | Tagged in | Publishes |
 |---|---|---|
 | `swarmcli-cd` — archives, `eldaratech/swarmcli-cd:<v>`, `:latest` | the private `swarmcli-cd-be` wrapper | into **this** repository's releases, under `RELEASE_TOKEN` |
-| `swarmcli-cd-oss` — archives, `eldaratech/swarmcli-cd:<v>-oss` | here | into this repository's releases |
+| `swarmcli-cd_*_oss` archives, `eldaratech/swarmcli-cd:<v>-oss` | here | into this repository's releases |
 
 So a release needs **two tags, one in each repository, carrying the same version
 string** — and the public one first.
@@ -30,11 +30,16 @@ string** — and the public one first.
   against a public `v1.1.0` creates a second release and asks GitHub to invent a
   tag to hang it from.
 - Nothing collides, and that is by construction rather than by luck: the
-  archives here are `swarmcli-cd-oss_*`, the checksum file is
+  archives here are `swarmcli-cd_*_oss`, the checksum file is
   `checksums-oss.txt`, and the image tags carry a `-oss` suffix. The merged
   pipeline writes `swarmcli-cd_*`, `checksums-merged.txt` and the unsuffixed
   image tags, and it refuses to run if this repository at the pinned tag has
   gone back to the plain archive names.
+- The qualifier is a **suffix** on the archives, and moving it to the front
+  would be a regression rather than a tidy-up. GitHub renders a release's assets
+  sorted by lower(name) in codepoint order, so `swarmcli-cd-oss_…` — which is
+  what `v1.1.0` published — put every archive from this repository above every
+  artefact of the default build. `.goreleaser.yml` carries the arithmetic.
 
 **A tag pushed here on its own no longer moves `:latest`.** `latest=false` in
 the docker job: under D20 `:latest` is the merged artefact, which is what

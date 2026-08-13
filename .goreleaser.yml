@@ -64,11 +64,21 @@ builds:
         - ./scripts/check-oss-artefact.sh "{{ .Path }}"
 
 archives:
-  # swarmcli-cd-oss, not swarmcli-cd (D21). Under D20 the plain name belongs to
-  # the merged artefact, which is built from the private wrapper and published
-  # into this repository's releases — so both pipelines write into the same
-  # GitHub release, and leaving the plain name here would have them overwrite
-  # each other's archives with whichever finished last.
+  # `_oss` at the end, not `swarmcli-cd-oss` at the front (D21). Under D20 the
+  # plain name belongs to the merged artefact, which is built from the private
+  # wrapper and published into this repository's releases — so both pipelines
+  # write into the same GitHub release, and leaving the plain name here would
+  # have them overwrite each other's archives with whichever finished last.
+  #
+  # Where the qualifier sits decides what a release page shows first. GitHub
+  # renders assets sorted by lower(name) in codepoint order — upload order and
+  # which pipeline finished last do not enter into it — so a `swarmcli-cd-oss_`
+  # prefix put every Apache-2.0 archive above every merged one (`-` is 0x2D, `_`
+  # is 0x5F). As a suffix, `.` (0x2E) precedes `_` (0x5F), so each merged
+  # archive sorts immediately above its own oss twin and the first artefact row
+  # is the default build. Same change as Eldara-Tech/swarmcli#569, and verified
+  # the same way: probe assets uploaded in the opposite order still list
+  # `probe_Linux_x86_64.tar.gz` before `probe_Linux_x86_64_oss.tar.gz`.
   #
   # The binary *inside* is still `swarmcli-cd`. It is the same command: renaming
   # it would make every documented invocation, stack.yml's entrypoint and the
@@ -76,10 +86,10 @@ archives:
   # is what the build says about itself — see docs/editions.md.
   - id: oss
     name_template: >-
-      {{ .ProjectName }}-oss_
+      {{ .ProjectName }}_
       {{- title .Os }}_
       {{- if eq .Arch "amd64" }}x86_64
-      {{- else }}{{ .Arch }}{{ end }}
+      {{- else }}{{ .Arch }}{{ end }}_oss
     files:
       - LICENSE*
       - README.md
