@@ -52,7 +52,7 @@ template: |
   | | Contains | Licence |
   |---|---|---|
   | `swarmcli-cd_<os>_<arch>.tar.gz`, `eldaratech/swarmcli-cd:<version>`, `:latest` | this repository, plus licensed code that is inert until a licence verifies | this repository's code is Apache-2.0; the licensed code is proprietary |
-  | `swarmcli-cd-oss_<os>_<arch>.tar.gz`, `eldaratech/swarmcli-cd:<version>-oss` | this repository, and nothing else | wholly Apache-2.0 |
+  | `swarmcli-cd_<os>_<arch>_oss.tar.gz`, `eldaratech/swarmcli-cd:<version>-oss` | this repository, and nothing else | wholly Apache-2.0 |
 
   The command inside both is `swarmcli-cd`, and they differ in what the build
   contains rather than in how it is driven. `checksums-merged.txt` verifies the
