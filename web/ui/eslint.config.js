@@ -2,6 +2,11 @@
 // Copyright © 2026 Eldara Tech
 
 import js from '@eslint/js'
+// package.json overrides this one's `eslint` peer. 7.37.5 is the plugin's
+// latest and its range stops at ^9.7, so npm refuses the tree under ESLint 10 —
+// but the two rules below were checked against 10.8.1 and still fire, so the
+// range is stale rather than a break. Drop the override when the plugin
+// publishes a version that names 10.
 import react from 'eslint-plugin-react'
 import reactHooks from 'eslint-plugin-react-hooks'
 import tseslint from 'typescript-eslint'
