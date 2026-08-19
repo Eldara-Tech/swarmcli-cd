@@ -133,6 +133,14 @@ unattended for weeks, which is exactly the deployment where an activation
 quietly runs out. A renewed lease reaches a running controller the same way an
 installed licence does — on the next restart.
 
+**The controller says so before it stops.** Two weeks before a licence expires
+it starts logging a warning naming the date, the days left and the remedy, and
+it keeps warning through the grace period and after; the badge in the web UI
+turns amber over the same window rather than reading healthy until the morning
+the features stop. Neither can fail a reconcile: the check runs on its own
+goroutine, only logs, and survives a licence reporter that panics. A build with
+no licensed module says nothing at all — there is no licence there to lapse.
+
 What a licence grants today is [single sign-on](sso.md), which is where that
 `/auth/*` comes from. Multi-swarm, projects and RBAC, notifications and managed
 secret rotation are the rest of the plan; the seams they will arrive through are

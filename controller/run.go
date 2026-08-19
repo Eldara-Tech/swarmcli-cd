@@ -535,6 +535,13 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// and then reported a failure that had not happened.
 	httpSrv.RegisterOnShutdown(srv.Drain)
 
+	// Nothing about licensing may stop the controller converging, which is why
+	// this is a goroutine that only logs: an expiring licence used to produce
+	// no warning anywhere an operator looks, and then SSO stopped — locking out
+	// the people who would have noticed (#233). Silent in a build with no
+	// licensed module.
+	go feature.WatchLicence(ctx, log, time.Now)
+
 	// tls is on this line because it is the line an operator greps when the task
 	// will not stay up: a healthcheck still probing http against a TLS listener
 	// restarts the task forever with everything else working perfectly.
