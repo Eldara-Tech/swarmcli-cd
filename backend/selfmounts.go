@@ -34,6 +34,11 @@ type selfMounts struct {
 	// round trip for a label sitting beside one this already reads would be two
 	// caches to keep honest instead of one (#102).
 	namespace string
+	// serviceID is this controller's own service, which is how a deploy of the
+	// stack it runs as tells the one service it must not write from the rest.
+	// Read off the task container's own label, so it is this process's service
+	// and not a name that happens to match.
+	serviceID string
 	secrets   map[string]struct{}
 	configs   map[string]struct{}
 	// binds names the host paths Swarm has bind-mounted into this controller —
@@ -187,7 +192,7 @@ func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 	// out to be: the namespace is a label on the service, so a controller running
 	// under a runtime this applier does not model still gets the name that must
 	// not be deployed or removed.
-	out := selfMounts{namespace: svc.Spec.Labels[convert.LabelNamespace]}
+	out := selfMounts{namespace: svc.Spec.Labels[convert.LabelNamespace], serviceID: svc.ID}
 
 	cs := svc.Spec.TaskTemplate.ContainerSpec
 	if cs == nil {

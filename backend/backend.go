@@ -660,6 +660,309 @@ func (b *Backend) rejectSelfMismatch(ctx context.Context, release string) error 
 	return nil
 }
 
+// The three things this controller cannot get back, and the one that would
+// leave two of it running. Everything else a self manifest drops is survivable,
+// because a controller that is still reconciling is one commit away from being
+// fixed; these four are not, and each has to be refused before anything is
+// written rather than diagnosed afterwards from a stack that no longer has a
+// controller in it.
+const (
+	whyNoService = "the manifest declares no service under that name, so applying it would leave the running " +
+		"controller untouched and start a second one beside it — applying deletes nothing, and two controllers " +
+		"reconciling one app set write over each other every interval"
+	whyNoBind = "the manifest drops the bind '%s', which this controller is running with. The socket is how it " +
+		"reaches the swarm at all, so a controller without it can reconcile nothing — including the commit that " +
+		"would put it back"
+	whyNoToken = "the manifest drops the secret '%s', which SWARMCLI_CD_ADMIN_TOKEN_FILE names. Without it the " +
+		"API and the healthcheck stop answering, and swarm restarts a controller whose only fault is that it " +
+		"cannot prove who is calling"
+	whyNoAppSet = "the manifest drops '%s', which is where this controller reads its app set. Without it there is " +
+		"nothing to reconcile and nothing that would notice a correction"
+)
+
+// rejectSelfLoss refuses a self manifest that would leave this controller unable
+// to fix itself.
+//
+// Adopting self-management means the chart is now the definition, and anything
+// the chart cannot express is dropped on the first apply. Most of that is
+// survivable: a deployment that loses TLS or SSO is still running, still
+// reconciling, and one commit away from having them back — so those are said out
+// loud and applied. Four losses are not survivable, and they are the ones here.
+//
+// The asymmetry is the whole rule. This is not a check that the manifest matches
+// the running spec — it is meant not to, that is what an upgrade is. It is a
+// check that what performs the next reconcile survives this one.
+//
+// Read against the service as it is now rather than against the cached self-read
+// (selfMounts): that cache is derived once for the life of the process and is
+// the right shape for a name comparison, while this is asking what a write would
+// take away from what is actually running. A controller somebody has since
+// changed by hand is the case where the two differ, and the current spec is the
+// honest side of that comparison.
+func (b *Backend) rejectSelfLoss(ctx context.Context, stack *cdcompose.Stack) error {
+	if !b.selfRelease {
+		return nil
+	}
+	mine, err := b.mounts(ctx)
+	if err != nil {
+		return err
+	}
+	// Unreachable: rejectSelfMismatch has already refused a self release on a
+	// controller that is not a swarm service. Kept because what follows would
+	// otherwise compare against a zero spec and refuse everything.
+	if mine.serviceID == "" {
+		return nil
+	}
+	live, _, err := b.api.ServiceInspectWithRaw(ctx, mine.serviceID, swarm.ServiceInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("reading this controller's own service to see what this release would change: %w", err)
+	}
+	from := live.Spec.TaskTemplate.ContainerSpec
+	if from == nil {
+		return nil
+	}
+
+	want := serviceNamed(stack, live.Spec.Name)
+	if want == nil {
+		return selfLoss(live.Spec.Name, whyNoService)
+	}
+	to := want.Spec.TaskTemplate.ContainerSpec
+	if to == nil {
+		return selfLoss(live.Spec.Name, whyNoService)
+	}
+
+	// Every bind, not the socket by name. A bind on this controller is the
+	// socket in practice, and a rule that went looking for one path would miss a
+	// daemon socket somebody put somewhere else while claiming to have checked.
+	kept := bindSources(to)
+	for _, src := range bindSources(from) {
+		if !slices.Contains(kept, src) {
+			return selfLoss(live.Spec.Name, fmt.Sprintf(whyNoBind, src))
+		}
+	}
+
+	if name, ok := mountedSecretFor(from, adminTokenFileEnv); ok && !mountsSecret(to, name) {
+		return selfLoss(live.Spec.Name, fmt.Sprintf(whyNoToken, name))
+	}
+
+	if err := checkAppSetSource(live.Spec.Name, from, to); err != nil {
+		return err
+	}
+
+	b.warnSelfDrops(live.Spec.Name, from, to)
+	return nil
+}
+
+// adminTokenFileEnv names the file the controller reads its admin token from.
+// The value is a path under the secrets mount, so it identifies a secret by its
+// mount *target*, which is the indirection mountedSecretFor undoes.
+const adminTokenFileEnv = "SWARMCLI_CD_ADMIN_TOKEN_FILE"
+
+// appSetFlags are the three ways a controller is told where its app set is, and
+// what else each one needs to survive with it: a mounted config for the file, a
+// mounted directory for the published one, and nothing for the repository the
+// controller fetches itself.
+var appSetFlags = []struct {
+	flag  string
+	needs func(cs *swarm.ContainerSpec, value string) bool
+}{
+	{"--config", mountsConfigAt},
+	{"--appset-dir", mountsPathAt},
+	{"--appset-repo", nil},
+}
+
+// checkAppSetSource refuses a manifest that drops the flag this controller is
+// reading its app set through, or the thing that flag points at.
+//
+// Both halves, because either alone is the same outage. A command that keeps
+// `--config /etc/swarmcli-cd/applications.yaml` while the manifest stops mounting
+// the config that puts a file there starts a controller that exits before its
+// listener binds, which from the outside is indistinguishable from a bad app set.
+func checkAppSetSource(service string, from, to *swarm.ContainerSpec) error {
+	argv := commandLine(from)
+	for _, src := range appSetFlags {
+		value, ok := flagValue(argv, src.flag)
+		if !ok {
+			continue
+		}
+		if _, still := flagValue(commandLine(to), src.flag); !still {
+			return selfLoss(service, fmt.Sprintf(whyNoAppSet, src.flag))
+		}
+		if src.needs != nil && !src.needs(to, value) {
+			return selfLoss(service, fmt.Sprintf(whyNoAppSet, value))
+		}
+	}
+	return nil
+}
+
+// warnSelfDrops says what this release takes away that the controller can live
+// without: TLS, single sign-on, a registry credential, a cache volume.
+//
+// Said rather than refused, and the difference is whether the controller is
+// still there to be corrected. It is, for all of these — a deployment that loses
+// its OIDC secret still reconciles, still serves the API to the admin token, and
+// is one commit away from having SSO back. Refusing them would also refuse an
+// operator legitimately turning one off, which is a decision the app set is
+// entitled to make.
+//
+// At Warn because it is the definition of "something an operator must see that
+// did not stop the loop", and because the first self-apply is where a
+// deployment's TLS quietly stops existing if the chart cannot express it.
+func (b *Backend) warnSelfDrops(service string, from, to *swarm.ContainerSpec) {
+	for _, kind := range []struct {
+		what string
+		was  []string
+		now  []string
+	}{
+		{"secrets", secretNames(from), secretNames(to)},
+		{"configs", configNames(from), configNames(to)},
+		{"volumes", volumeNames(from), volumeNames(to)},
+	} {
+		var dropped []string
+		for _, name := range kind.was {
+			if !slices.Contains(kind.now, name) {
+				dropped = append(dropped, name)
+			}
+		}
+		if len(dropped) > 0 {
+			b.log.Warn("this release stops mounting something this controller is running with; "+
+				"whatever it was configuring stops working when the new task starts",
+				"service", service, "kind", kind.what, "dropped", dropped)
+		}
+	}
+}
+
+func selfLoss(service, why string) error {
+	return fmt.Errorf("refusing to replace this controller's own service '%s': %s", service, why)
+}
+
+// serviceNamed finds the converted service a scoped name belongs to. The stack
+// carries unscoped names beside specs that carry scoped ones, and the scoped one
+// is what a live service is called.
+func serviceNamed(stack *cdcompose.Stack, name string) *cdcompose.Service {
+	for i := range stack.Services {
+		if stack.Services[i].Spec.Name == name || stack.Namespace.Scope(stack.Services[i].Name) == name {
+			return &stack.Services[i]
+		}
+	}
+	return nil
+}
+
+// commandLine is the whole of what a task is started with: compose's
+// `entrypoint:` lands in Command and its `command:` in Args, and a flag can be
+// written in either.
+func commandLine(cs *swarm.ContainerSpec) []string {
+	return append(slices.Clone(cs.Command), cs.Args...)
+}
+
+// flagValue reads `--flag value` out of an argv. Separate words only, which is
+// what convert produces from a compose list and what every one of these is
+// written as; `--flag=value` is not accepted anywhere this reads from.
+func flagValue(argv []string, flag string) (string, bool) {
+	for i, a := range argv {
+		if a == flag && i+1 < len(argv) {
+			return argv[i+1], true
+		}
+	}
+	return "", false
+}
+
+// mountedSecretFor maps an environment variable holding a path under the secrets
+// mount to the name of the secret that puts a file there.
+//
+// The indirection is compose's long form: `{source: swarmcli-cd-token, target:
+// token}` delivers the admin token to /run/secrets/token, so the path names the
+// mount target and the manifest names the source. Comparing the paths instead
+// would call a renamed target a dropped secret, and comparing the sources would
+// need a name the environment variable does not carry.
+func mountedSecretFor(cs *swarm.ContainerSpec, env string) (string, bool) {
+	path, ok := envValue(cs.Env, env)
+	if !ok {
+		return "", false
+	}
+	target, ok := strings.CutPrefix(path, regauth.DefaultSecretsDir+"/")
+	if !ok {
+		return "", false
+	}
+	for _, ref := range cs.Secrets {
+		if ref.File != nil && ref.File.Name == target {
+			return ref.SecretName, true
+		}
+	}
+	return "", false
+}
+
+func envValue(env []string, name string) (string, bool) {
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, name+"="); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func mountsSecret(cs *swarm.ContainerSpec, name string) bool {
+	return slices.Contains(secretNames(cs), name)
+}
+
+// mountsConfigAt reports whether a config is delivered to exactly this path.
+func mountsConfigAt(cs *swarm.ContainerSpec, path string) bool {
+	for _, ref := range cs.Configs {
+		if ref.File != nil && ref.File.Name == path {
+			return true
+		}
+	}
+	return false
+}
+
+// mountsPathAt reports whether anything is mounted at this path — a volume, a
+// bind, either. What the app set is published by is the writer's business; that
+// something arrives here is this controller's.
+func mountsPathAt(cs *swarm.ContainerSpec, path string) bool {
+	for _, m := range cs.Mounts {
+		if m.Target == path {
+			return true
+		}
+	}
+	return false
+}
+
+func secretNames(cs *swarm.ContainerSpec) []string {
+	out := make([]string, 0, len(cs.Secrets))
+	for _, ref := range cs.Secrets {
+		out = append(out, ref.SecretName)
+	}
+	return out
+}
+
+func configNames(cs *swarm.ContainerSpec) []string {
+	out := make([]string, 0, len(cs.Configs))
+	for _, ref := range cs.Configs {
+		out = append(out, ref.ConfigName)
+	}
+	return out
+}
+
+func volumeNames(cs *swarm.ContainerSpec) []string {
+	out := make([]string, 0, len(cs.Mounts))
+	for _, m := range cs.Mounts {
+		if m.Type == mount.TypeVolume && m.Source != "" {
+			out = append(out, m.Source)
+		}
+	}
+	return out
+}
+
+func bindSources(cs *swarm.ContainerSpec) []string {
+	out := make([]string, 0, len(cs.Mounts))
+	for _, m := range cs.Mounts {
+		if m.Type == mount.TypeBind && m.Source != "" {
+			out = append(out, m.Source)
+		}
+	}
+	return out
+}
+
 // rejectOwnNamespace refuses a release whose name is the stack namespace this
 // controller itself was deployed under.
 //
@@ -795,6 +1098,13 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 	// it works — the chart engine pre-flights those before it calls this, and
 	// says so for the same reason.
 	if err := b.rejectForbiddenResources(ctx, unresolved); err != nil {
+		return err
+	}
+	// And, for the one release that replaces this controller, before the write
+	// that does it: a manifest that would leave nothing able to perform the next
+	// reconcile is refused rather than applied and then diagnosed from a swarm
+	// with no controller on it.
+	if err := b.rejectSelfLoss(ctx, unresolved); err != nil {
 		return err
 	}
 	// The networks, secrets and configs are read from the unresolved pass
