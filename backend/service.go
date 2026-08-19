@@ -138,6 +138,15 @@ func (b *Backend) ApplyServices(ctx context.Context, stack *cdcompose.Stack, res
 	if err := b.rejectForeignNamespace(ctx, stack.Namespace.Name(), existing); err != nil {
 		return err
 	}
+	// Which of these services is this process. Memoised for the life of the
+	// controller, and asked for only when it can matter — every other deploy
+	// writes every service it declares and has nothing to hold back.
+	var mine selfMounts
+	if b.selfRelease {
+		if mine, err = b.mounts(ctx); err != nil {
+			return err
+		}
+	}
 
 	for _, svc := range stack.Services {
 		name := stack.Namespace.Scope(svc.Name)
@@ -148,11 +157,54 @@ func (b *Backend) ApplyServices(ctx context.Context, stack *cdcompose.Stack, res
 			}
 			continue
 		}
+		if b.deferSelf(mine, name, cur, svc.Spec, resolve) {
+			continue
+		}
 		if err := b.updateService(ctx, name, cur, svc.Spec, resolve); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// deferSelf hands back the write that replaces this controller instead of making
+// it, and reports whether it did.
+//
+// It is the whole of why a self release can be deployed at all. Swarm's default
+// update order is stop-first, so the moment this controller's own service is
+// updated the task performing the update is killed — and the chart engine writes
+// the release record *after* the deploy returns (charts.Engine.install). Made in
+// place, this write would therefore leave a stack with no record of the revision
+// that produced it, which rejectForeignNamespace then refuses for ever: the
+// controller would upgrade itself exactly once and never reconcile again.
+//
+// So the write is not made here. It is handed to the caller, which issues it
+// after everything else in the pass — the deploy, the record, any drift
+// correction, the sweeps — has already happened. The controller replaces itself
+// last, with the pass it was performing already durable.
+//
+// Matched by service id rather than by name. The name is what the manifest and
+// the namespace produce and is therefore the chart's to choose; the id came off
+// this task container's own label, so it is this process's service and not one
+// that happens to be called the same thing.
+//
+// The spec is captured and the service re-read when the write is finally made,
+// because time passes in between: the pass carries on, and a compare-and-swap
+// against a version read before all of it would lose to any other write in the
+// meantime and report a conflict for a stale read of our own making.
+func (b *Backend) deferSelf(mine selfMounts, name string, cur swarm.Service, spec swarm.ServiceSpec, resolve string) bool {
+	if !b.selfRelease || mine.serviceID == "" || cur.ID != mine.serviceID {
+		return false
+	}
+	b.holdSelf(func(ctx context.Context) error {
+		live, _, err := b.api.ServiceInspectWithRaw(ctx, mine.serviceID, swarm.ServiceInspectOptions{})
+		if err != nil {
+			return fmt.Errorf("re-reading this controller's own service before replacing it: %w", err)
+		}
+		b.log.Info("replacing this controller with the revision just applied", "service", name)
+		return b.updateService(ctx, name, live, spec, resolve)
+	})
+	return true
 }
 
 // stackServices returns the swarm's services for one namespace, by name.

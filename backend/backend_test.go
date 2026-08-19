@@ -4,6 +4,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1290,6 +1291,36 @@ volumes:
   swarmcli-cd-data: {}
 `
 
+// bootstrappedStack is what the swarmcli-cd chart renders for a controller
+// deployed the way stack.yml deploys it — every part of which bootstrappedController
+// is already running with, so it drops nothing and is the baseline the losses below
+// are written against.
+const bootstrappedStack = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml"]
+    environment:
+      SWARMCLI_CD_ADMIN_TOKEN_FILE: /run/secrets/token
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - swarmcli-cd-data:/var/lib/swarmcli-cd
+    secrets:
+      - source: swarmcli-cd-token
+        target: token
+    configs:
+      - source: swarmcli-cd-applications
+        target: /etc/swarmcli-cd/applications.yaml
+secrets:
+  swarmcli-cd-token:
+    external: true
+configs:
+  swarmcli-cd-applications:
+    external: true
+volumes:
+  swarmcli-cd-data: {}
+`
+
 // selfAPI is a swarm holding the controller's own credentials, as an operator's
 // `docker secret create` left them: cluster-global names with no stack of their
 // own, which is exactly why a reference to one carries no namespace.
@@ -1430,11 +1461,14 @@ func TestASelfReleaseMountsTheControllersUnscopedVolume(t *testing.T) {
 	spec.TaskTemplate.ContainerSpec.Mounts = append(spec.TaskTemplate.ContainerSpec.Mounts,
 		mount.Mount{Type: mount.TypeVolume, Source: "swarmcli-cd-appset", Target: "/etc/swarmcli-cd/appset"})
 	api.selfSpec = spec
+	// The socket with it: a manifest that dropped it would be refused by
+	// rejectSelfLoss before this got as far as the volume.
 	const manifest = `
 services:
   controller:
     image: eldaratech/swarmcli-cd:1.2.0
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - swarmcli-cd-appset:/etc/swarmcli-cd/appset:ro
 volumes:
   swarmcli-cd-appset:
@@ -1527,6 +1561,224 @@ func TestTheSelfReleaseStillCannotRemoveOrPurgeTheController(t *testing.T) {
 	}
 	if _, err := self.StackVolumes(t.Context(), "swarmcli-cd"); err == nil {
 		t.Error("StackVolumes = nil, want the controller's own volumes still refused")
+	}
+}
+
+// ---------------------------------------- written last, and what it may not drop (#235)
+
+// bootstrappedController is the controller as stack.yml actually deploys it:
+// the socket, its admin token behind a renamed mount target, and the app set as
+// a Docker config named on the command line. controllerService alone carries
+// neither the environment nor the command, so the losses those two describe are
+// invisible against it.
+func bootstrappedController() swarm.ServiceSpec {
+	spec := controllerService()
+	cs := spec.TaskTemplate.ContainerSpec
+	cs.Args = []string{"controller", "--config", "/etc/swarmcli-cd/applications.yaml"}
+	cs.Env = []string{"SWARMCLI_CD_ADMIN_TOKEN_FILE=/run/secrets/token"}
+	return spec
+}
+
+// runningController is that spec as a service already on the swarm, under the id
+// this process's own container reports — which is what makes it *this*
+// controller rather than one that happens to share a name.
+func runningController(api *fakeAPI) *fakeAPI {
+	api.selfSpec = bootstrappedController()
+	api.existing = append(api.existing, swarm.Service{ID: api.selfServiceID, Spec: api.selfSpec})
+	return api
+}
+
+// The whole reason a self release can be deployed at all. Swarm's update order is
+// stop-first, so writing this service kills the task doing the writing — and the
+// chart engine records the revision *after* the deploy returns. Made in place,
+// the write would leave a stack with no record of the revision that produced it,
+// which rejectForeignNamespace then refuses for ever.
+func TestTheControllersOwnServiceIsWrittenLastAndNotByTheDeploy(t *testing.T) {
+	api := runningController(selfAPI())
+	var deferred func(context.Context) error
+	b := testBackend(t, api, nil).WithSelfRelease(func(apply func(context.Context) error) { deferred = apply })
+
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: bootstrappedStack, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want nil", err)
+	}
+	if len(api.updated) != 0 {
+		t.Fatalf("the deploy wrote %d services; this controller's own must not be one of them", len(api.updated))
+	}
+	if deferred == nil {
+		t.Fatal("no write was handed back, so nothing would ever replace this controller")
+	}
+
+	if err := deferred(t.Context()); err != nil {
+		t.Fatalf("the deferred write = %v, want nil", err)
+	}
+	if len(api.updated) != 1 || api.updated[0].spec.Name != "swarmcli-cd_controller" {
+		t.Errorf("the deferred write updated %d services, want this controller's own", len(api.updated))
+	}
+}
+
+// Only this controller's own service is held back. Everything else the stack
+// declares — the git-sync sidecar in the SSH app-set mode, anything an operator
+// added — is written by the deploy, so the pass that hands the last write back
+// has already done all of its other work.
+func TestOnlyTheControllersOwnServiceIsDeferred(t *testing.T) {
+	api := runningController(selfAPI())
+	api.existing = append(api.existing, swarm.Service{ID: "sidecar", Spec: swarm.ServiceSpec{
+		Annotations: swarm.Annotations{Name: "swarmcli-cd_git-sync", Labels: map[string]string{convert.LabelNamespace: "swarmcli-cd"}},
+	}})
+	const withSidecar = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml"]
+    environment:
+      SWARMCLI_CD_ADMIN_TOKEN_FILE: /run/secrets/token
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    secrets:
+      - source: swarmcli-cd-token
+        target: token
+    configs:
+      - source: swarmcli-cd-applications
+        target: /etc/swarmcli-cd/applications.yaml
+  git-sync:
+    image: alpine/git:2.45.2
+secrets:
+  swarmcli-cd-token:
+    external: true
+configs:
+  swarmcli-cd-applications:
+    external: true
+`
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: withSidecar, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want nil", err)
+	}
+	if len(api.updated) != 1 || api.updated[0].spec.Name != "swarmcli-cd_git-sync" {
+		t.Errorf("the deploy wrote %d services, want only the sidecar", len(api.updated))
+	}
+}
+
+// The four losses a controller cannot recover from, because each one takes away
+// the thing that would perform the next reconcile. Refused before any resource
+// is created, so a swarm is never left with the answer half applied.
+func TestASelfManifestMayNotDropWhatWouldFixIt(t *testing.T) {
+	for name, tc := range map[string]struct{ manifest, want string }{
+		"the socket": {`
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml"]
+    environment:
+      SWARMCLI_CD_ADMIN_TOKEN_FILE: /run/secrets/token
+    secrets:
+      - source: swarmcli-cd-token
+        target: token
+    configs:
+      - source: swarmcli-cd-applications
+        target: /etc/swarmcli-cd/applications.yaml
+secrets:
+  swarmcli-cd-token:
+    external: true
+configs:
+  swarmcli-cd-applications:
+    external: true
+`, "/var/run/docker.sock"},
+
+		"the admin token": {`
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml"]
+    environment:
+      SWARMCLI_CD_ADMIN_TOKEN_FILE: /run/secrets/token
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    configs:
+      - source: swarmcli-cd-applications
+        target: /etc/swarmcli-cd/applications.yaml
+configs:
+  swarmcli-cd-applications:
+    external: true
+`, "swarmcli-cd-token"},
+
+		"the app-set flag": {`
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    command: ["controller"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    secrets:
+      - source: swarmcli-cd-token
+        target: token
+    environment:
+      SWARMCLI_CD_ADMIN_TOKEN_FILE: /run/secrets/token
+secrets:
+  swarmcli-cd-token:
+    external: true
+`, "--config"},
+
+		"the app set the flag names": {`
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    command: ["controller", "--config", "/etc/swarmcli-cd/applications.yaml"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    secrets:
+      - source: swarmcli-cd-token
+        target: token
+    environment:
+      SWARMCLI_CD_ADMIN_TOKEN_FILE: /run/secrets/token
+secrets:
+  swarmcli-cd-token:
+    external: true
+`, "/etc/swarmcli-cd/applications.yaml"},
+
+		"the controller itself": {`
+services:
+  something-else:
+    image: eldaratech/swarmcli-cd:1.2.0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+`, "declares no service under that name"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := runningController(selfAPI())
+			b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+
+			err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: tc.manifest, Resolve: ResolveNever})
+			if err == nil {
+				t.Fatalf("DeployStack = nil, want the loss of %s refused", name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not name %q", err, tc.want)
+			}
+			if len(api.created)+len(api.updated) > 0 {
+				t.Error("wrote services for a refused release; the refusal must come before anything is created")
+			}
+		})
+	}
+}
+
+// And what it may drop. A deployment that loses TLS or single sign-on is still
+// running, still reconciling, and one commit away from having them back — so the
+// loss is said out loud and applied. Refusing it would also refuse an operator
+// legitimately turning one off, which the app set is entitled to decide.
+func TestASelfManifestMayDropWhatTheControllerCanLiveWithout(t *testing.T) {
+	api := runningController(selfAPI())
+	api.selfSpec.TaskTemplate.ContainerSpec.Secrets = append(api.selfSpec.TaskTemplate.ContainerSpec.Secrets,
+		&swarm.SecretReference{SecretName: "swarmcli-cd-oidc-secret", File: &swarm.SecretReferenceFileTarget{Name: "swarmcli-cd-oidc-secret"}})
+	api.existing[0].Spec = api.selfSpec
+
+	var logged bytes.Buffer
+	b := New(api, Options{Log: slog.New(slog.NewTextHandler(&logged, nil))}).WithSelfRelease(noDeferral)
+
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: bootstrappedStack, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want a survivable loss applied", err)
+	}
+	if !strings.Contains(logged.String(), "swarmcli-cd-oidc-secret") {
+		t.Errorf("log %q does not say what stopped being mounted", logged.String())
 	}
 }
 
