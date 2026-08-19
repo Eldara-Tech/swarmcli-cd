@@ -44,6 +44,31 @@ type Spec struct {
 	// short form `secrets: [<name>]` in stack.yml does exactly that.
 	RegistryAuth string `json:"registryAuth,omitempty" yaml:"registryAuth,omitempty"`
 
+	// Self marks the one application that deploys the stack this controller
+	// itself runs as, so that upgrading the controller is a commit like every
+	// other deployment's rather than a `docker stack deploy` somebody has to
+	// remember.
+	//
+	// It is the highest privilege this file grants. Every other application is
+	// refused the controller's own secrets, configs, volume and networks
+	// whatever Allow says; the one marked here is not, because for it those are
+	// the release's own — the release namespace *is* the controller's namespace,
+	// and what hides that is only that a cluster-global secret carries no
+	// namespace prefix to say so. Marking an application whose chart is not this
+	// controller's therefore hands that chart the admin token, which is
+	// root-equivalent on the swarm. That is not a new boundary — Allow.HostPaths
+	// can already grant the docker socket, and the app set has always been
+	// root-equivalent for that reason — but it is a sharper one, and it is the
+	// reason this is a field of Spec and not something a chart can ask for.
+	//
+	// What a file can say about it is checked by the config loader: at most one
+	// application, a chart source rather than a release file, and live drift.
+	// The rest cannot be: the release name has to be the stack namespace the
+	// controller was actually deployed under, which only a backend holding a
+	// daemon can answer, so it is refused at deploy time instead. That half, and
+	// everything the guards above do about this field, is swarmcli-cd#235.
+	Self bool `json:"self,omitempty" yaml:"self,omitempty"`
+
 	// Allow is what this application's charts may reach outside the releases
 	// they install. Absent means nothing, which is the safe reading of a field
 	// nobody wrote.
@@ -158,7 +183,10 @@ func ValidRepositoryName(name string) bool { return repoNameRE.MatchString(name)
 //
 // It cannot name the controller's own secrets, configs, volume or network, or
 // the chart engine's release records. Those are refused before this is consulted
-// (backend.rejectForbiddenResources), and no entry here changes that. Permitting
+// (backend.rejectForbiddenResources), and no entry here changes that. The one
+// application that may reach them is the one marked Self, and it reaches them by
+// being the controller's own release rather than by being permitted anything —
+// there is deliberately no way to write that permission down here. Permitting
 // one would not be an operator granting an application something of the
 // operator's; it would be handing the chart author the controller's own
 // credentials and, with them, the app set — the boundary above, approached from

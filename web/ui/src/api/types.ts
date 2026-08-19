@@ -63,6 +63,12 @@ export interface Spec {
   name: string
   source: Source
   registryAuth?: string
+  /**
+   * The one application that deploys the stack the controller itself runs as,
+   * which is how the controller upgrades itself. Absent on every other
+   * application, and on any controller older than the release that added it.
+   */
+  self?: boolean
   /** Always present: `json:"allow"` carries no omitempty, though the yaml tag does. */
   allow: Allow
   destination: Destination
