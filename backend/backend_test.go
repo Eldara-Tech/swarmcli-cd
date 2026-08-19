@@ -1263,6 +1263,273 @@ func TestWithSelfReleaseDoesNotMarkTheSharedBackend(t *testing.T) {
 	}
 }
 
+// ---------------------------------------- what the controller's own release may reach (#235)
+
+// selfStack is the shape the swarmcli-cd chart renders: the controller's own
+// admin token and app-set config referenced as external, its data volume
+// declared, and the socket bound. Deployed under the namespace this controller
+// runs as, which is what makes every one of those the release's own.
+const selfStack = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    secrets: [swarmcli-cd-token]
+    configs:
+      - source: swarmcli-cd-applications
+        target: /etc/swarmcli-cd/applications.yaml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - swarmcli-cd-data:/var/lib/swarmcli-cd
+secrets:
+  swarmcli-cd-token:
+    external: true
+configs:
+  swarmcli-cd-applications:
+    external: true
+volumes:
+  swarmcli-cd-data: {}
+`
+
+// selfAPI is a swarm holding the controller's own credentials, as an operator's
+// `docker secret create` left them: cluster-global names with no stack of their
+// own, which is exactly why a reference to one carries no namespace.
+func selfAPI() *fakeAPI {
+	return asController(&fakeAPI{
+		secrets: []swarm.Secret{{ID: "tok", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-token"}}}},
+		configs: []swarm.Config{{ID: "apps", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"}}}},
+	})
+}
+
+// The whole of #234, from the other side. This manifest is refused for every
+// application on the swarm — it mounts the admin token, which is root-equivalent
+// — and for the one release that *is* this controller it is not reaching outside
+// itself at all.
+func TestASelfReleaseMountsTheControllersOwnSecretsAndConfigs(t *testing.T) {
+	api := selfAPI()
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: selfStack, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want the controller's own release deployed", err)
+	}
+	if len(api.created) != 1 || api.created[0].Name != "swarmcli-cd_controller" {
+		t.Errorf("created %d services, want just the controller's own", len(api.created))
+	}
+}
+
+// The same manifest, one application over, and permitted the socket outright so
+// that the bind guard is not what refuses it. Nothing about the exemption is
+// carried by the chart, the secret names or the swarm — only by the backend copy
+// the reconciler marked. So an operator generous enough to hand an application
+// the docker socket still has not handed it the admin token, which is the line
+// #46 drew and the one this must not move.
+func TestTheSameManifestIsRefusedForEveryOtherApplication(t *testing.T) {
+	api := selfAPI()
+	err := allowing(t, api, application.Allow{HostPaths: []string{"/var/run/docker.sock"}}).DeployStack(t.Context(),
+		charts.DeployRequest{Name: "cd", Manifest: selfStack, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want an ordinary release still refused the controller's own secret")
+	}
+	if !strings.Contains(err.Error(), "swarmcli-cd-token") || !strings.Contains(err.Error(), whatControllerSecret) {
+		t.Errorf("error %q does not refuse the controller's secret", err)
+	}
+	if len(api.created)+len(api.updated) > 0 {
+		t.Error("wrote services for a refused release")
+	}
+}
+
+// A release record is the one thing on that list no release owns, this
+// controller's own included: each holds the rendered manifest of a release on
+// this swarm. Checked before anything is recognised as ours, so the recognition
+// cannot reach it.
+func TestASelfReleaseStillCannotMountAReleaseRecord(t *testing.T) {
+	api := installed(selfAPI(), "other")
+	const manifest = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    configs: [history]
+configs:
+  history:
+    external: true
+    name: swarmcli.release.other.v1
+`
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: manifest, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a release record refused to the controller's own release too")
+	}
+	if !strings.Contains(err.Error(), whatReleaseRecord) {
+		t.Errorf("error %q does not name what was refused", err)
+	}
+}
+
+// The asymmetry with the referenced half, and it is deliberate. Mounting a
+// secret the controller already has changes nothing about it; declaring one runs
+// it through applySecrets, which relabels the existing secret into the stack's
+// namespace — an adoption of a credential nobody needed to adopt. `external:
+// true` is how the swarmcli-cd chart references its own, so nothing legitimate
+// is refused here.
+func TestASelfReleaseStillCannotDeclareTheControllersSecretAsItsOwn(t *testing.T) {
+	api := selfAPI()
+	const manifest = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    secrets: [tok]
+secrets:
+  tok:
+    name: swarmcli-cd-token
+    driver: vault
+`
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: manifest, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want #86's declaration refused for the self release too")
+	}
+	if !strings.Contains(err.Error(), "declares secret") {
+		t.Errorf("error %q is not the declaration refusal", err)
+	}
+}
+
+// The set the recognition reads is the controller's own *service spec*, not the
+// listing of /run/secrets — which names mount targets. This controller's admin
+// token arrives at /run/secrets/token, so "token" is in the filesystem-derived
+// set and is not the name any reference resolves by; a secret that really is
+// called "token" belongs to somebody else, and the self release may not have it.
+func TestASelfReleaseDoesNotGetASecretItOnlyKnowsByMountTarget(t *testing.T) {
+	api := selfAPI()
+	api.secrets = append(api.secrets, swarm.Secret{ID: "t", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "token"}}})
+	const manifest = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    secrets: [t]
+secrets:
+  t:
+    external: true
+    name: token
+`
+	b := testBackend(t, api, nil).
+		WithForbiddenSecrets(map[string]struct{}{"token": {}}).(*Backend).
+		WithSelfRelease(noDeferral)
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: manifest, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a mount target's name refused even to the self release")
+	}
+	if !strings.Contains(err.Error(), whatControllerSecret) {
+		t.Errorf("error %q does not refuse it as the controller's own", err)
+	}
+}
+
+// A volume the controller mounts that is not scoped under its stack is the case
+// the recognition is actually needed for: appset.mode dir mounts an external
+// volume something else writes, so its name carries no namespace at all.
+func TestASelfReleaseMountsTheControllersUnscopedVolume(t *testing.T) {
+	api := selfAPI()
+	spec := controllerService()
+	spec.TaskTemplate.ContainerSpec.Mounts = append(spec.TaskTemplate.ContainerSpec.Mounts,
+		mount.Mount{Type: mount.TypeVolume, Source: "swarmcli-cd-appset", Target: "/etc/swarmcli-cd/appset"})
+	api.selfSpec = spec
+	const manifest = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    volumes:
+      - swarmcli-cd-appset:/etc/swarmcli-cd/appset:ro
+volumes:
+  swarmcli-cd-appset:
+    external: true
+`
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: manifest, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want the controller's own app-set volume mounted", err)
+	}
+}
+
+// The socket is the fourth guard, and the only one that is not a name
+// comparison: compose.checkBindSources refuses a bind the application's
+// allow.hostPaths does not cover, during conversion, before any of the others is
+// reached. The chart that deploys this controller binds the socket because that
+// is what the controller talks to the swarm through, so the self release has to
+// be able to re-declare the mount it is already running with. Covered above by
+// TestASelfReleaseMountsTheControllersOwnSecretsAndConfigs, whose manifest binds
+// it; this is the other half of the bound.
+func TestASelfReleaseMayNotBindAPathTheControllerDoesNot(t *testing.T) {
+	const reachesFurther = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    volumes:
+      - /var/lib/docker:/host/docker
+`
+	api := selfAPI()
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: reachesFurther, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a bind the controller does not hold refused to the self release too")
+	}
+	if !strings.Contains(err.Error(), "/var/lib/docker") || !strings.Contains(err.Error(), "allow.hostPaths") {
+		t.Errorf("error %q does not refuse it as an unpermitted bind", err)
+	}
+}
+
+// The controller's stack was put there by `docker stack deploy` and has no
+// release record, exactly like any other foreign stack — and the remedy the
+// refusal offers, remove it and let the controller install it, leaves nothing
+// running to install it again. So the first self sync adopts.
+func TestASelfReleaseAdoptsTheControllersRunningServices(t *testing.T) {
+	api := selfAPI()
+	api.existing = []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{
+		Name:   "swarmcli-cd_controller",
+		Labels: map[string]string{convert.LabelNamespace: "swarmcli-cd"},
+	}}}}
+
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: selfStack, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want the controller's own services adopted", err)
+	}
+	if len(api.updated) != 1 || api.updated[0].spec.Name != "swarmcli-cd_controller" {
+		t.Errorf("updated %d services, want the running controller written over", len(api.updated))
+	}
+}
+
+// Adoption is the self release's alone. Anything else finding services under a
+// namespace it has no record for is still writing over somebody else's stack.
+func TestAnOrdinaryReleaseStillCannotAdoptAStackItDidNotInstall(t *testing.T) {
+	api := &fakeAPI{existing: []swarm.Service{{ID: "svc", Spec: swarm.ServiceSpec{Annotations: swarm.Annotations{
+		Name:   "legacy_web",
+		Labels: map[string]string{convert.LabelNamespace: "legacy"},
+	}}}}}
+	err := testBackend(t, api, nil).DeployStack(t.Context(),
+		charts.DeployRequest{Name: "legacy", Manifest: trivialStack, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a foreign namespace still refused")
+	}
+	if len(api.updated) > 0 {
+		t.Errorf("updated %d services, want nothing written", len(api.updated))
+	}
+}
+
+// Deploying onto the controller's own services is what upgrading it is;
+// deleting them is not, and no declaration in the app set makes it so. Both
+// verbs stay refused — the removal, and the volume listing a purge deletes from,
+// which is the one part no reconcile can put back.
+func TestTheSelfReleaseStillCannotRemoveOrPurgeTheController(t *testing.T) {
+	api := selfAPI()
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+
+	if err := b.RemoveStack(t.Context(), "swarmcli-cd"); err == nil {
+		t.Error("RemoveStack = nil, want the controller's own stack still refused")
+	}
+	self, ok := b.(*Backend)
+	if !ok {
+		t.Fatal("WithSelfRelease did not return a *Backend")
+	}
+	if _, err := self.StackVolumes(t.Context(), "swarmcli-cd"); err == nil {
+		t.Error("StackVolumes = nil, want the controller's own volumes still refused")
+	}
+}
+
 const mountsControllerConfig = `
 services:
   evil:

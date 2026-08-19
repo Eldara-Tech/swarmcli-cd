@@ -213,8 +213,25 @@ func (b *Backend) stackServices(ctx context.Context, namespace string) (map[stri
 // An operator who really means to bring an existing stack under GitOps removes
 // it first and lets the controller install it — which is a decision they make,
 // visible in what the deploy does, rather than a spec silently overwritten.
+//
+// # The one stack that cannot be removed first
+//
+// Except the controller's own, which is why the self release is exempt. It was
+// put there by `docker stack deploy -c stack.yml swarmcli-cd` and so has no
+// release record, exactly like any other foreign stack — but the remedy this
+// refusal offers is not available to it: removing the controller first leaves
+// nothing running to install it again. So for the release the app set marked
+// `self: true`, the answer to "whose are these services" is known without a
+// record, and the first sync adopts them as an install (#235).
+//
+// That is the one place this design accepts what the rest of this file refuses,
+// and it is worth being plain about: the operator asked for it, in the file that
+// already names every deployment on this swarm and already grants the docker
+// socket. The name is not their word for it either — rejectSelfMismatch has
+// established that this release is the stack this controller runs as, off the
+// controller's own service, before anything reaches here.
 func (b *Backend) rejectForeignNamespace(ctx context.Context, namespace string, existing map[string]swarm.Service) error {
-	if len(existing) == 0 {
+	if len(existing) == 0 || b.selfRelease {
 		return nil
 	}
 	ours, err := b.releaseRecorded(ctx, namespace)

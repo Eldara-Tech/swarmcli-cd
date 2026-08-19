@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -201,12 +202,24 @@ const (
 //
 // Two rules in one pass, in an order that is the whole of what they mean.
 //
-// The controller's own is refused first and unconditionally: no allowlist reaches
-// it, because permitting one is not an operator lending an application something
-// of the operator's, it is handing whoever writes the chart the controller's
-// credentials and with them the app set (see application.Allow). Everything else
-// outside the release is refused unless the application's allowlist names it,
-// which is the per-application half — #64. A name scoped to the release being
+// The controller's own is refused first, and no allowlist reaches it: permitting
+// one is not an operator lending an application something of the operator's, it
+// is handing whoever writes the chart the controller's credentials and with them
+// the app set (see application.Allow). Everything else outside the release is
+// refused unless the application's allowlist names it, which is the
+// per-application half — #64.
+//
+// One release is not refused, and it is not an allowlist that spares it. A
+// release the app set marked `self: true` is the stack this controller runs as,
+// so what it mounts of the controller's it does not reach outside itself for at
+// all — the release namespace is the controller's namespace, and the only reason
+// scopedUnder cannot see it is that a Swarm secret, config or volume carries no
+// namespace prefix on a cluster-global name. ownMount is that recognition, and
+// its three limits are what keep it from being a hole: it is the referenced half
+// only, it reads the set off the controller's own service spec rather than
+// /run/secrets, and the release records are refused before it is consulted. The
+// name of that release is not the app set's word either — rejectSelfMismatch has
+// already established it is this controller's stack (#235). A name scoped to the release being
 // deployed is the release's own and asks nobody: conversion produces
 // "<release>_<name>" for everything a stack owns.
 //
@@ -275,6 +288,9 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	for _, svc := range stack.Services {
 		secrets, configs := externalRefs(stack, svc)
 		for _, name := range secrets {
+			if b.ownMount(mine.secrets, name) {
+				continue
+			}
 			_, wired := b.forbiddenSecrets[name]
 			_, mounted := mine.secrets[name]
 			if wired || mounted {
@@ -285,9 +301,11 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			}
 		}
 		for _, name := range configs {
-			if _, forbidden := mine.configs[name]; forbidden {
-				return mountsForbidden(svc.Name, "config", name, whatControllerConfig)
-			}
+			// The release records are checked before anything is recognised as
+			// ours, because they are the one thing on this list that no release
+			// owns — this controller's own included. Nothing in the chart that
+			// deploys this controller mounts one, and a manifest that wants to is
+			// not a self-update.
 			known, err := records()
 			if err != nil {
 				return err
@@ -295,11 +313,20 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			if _, forbidden := known[name]; forbidden {
 				return mountsForbidden(svc.Name, "config", name, whatReleaseRecord)
 			}
+			if b.ownMount(mine.configs, name) {
+				continue
+			}
+			if _, forbidden := mine.configs[name]; forbidden {
+				return mountsForbidden(svc.Name, "config", name, whatControllerConfig)
+			}
 			if !scopedUnder(ns, name) && !permits(b.allow.Configs, name) {
 				return mountsUnpermitted(svc.Name, "config", name, "allow.configs")
 			}
 		}
 		for _, name := range volumeSources(svc) {
+			if b.ownMount(mine.volumes, name) {
+				continue
+			}
 			if _, forbidden := mine.volumes[name]; forbidden {
 				return mountsForbidden(svc.Name, "volume", name, whatControllerVolume)
 			}
@@ -313,6 +340,16 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	// it: the adoption happens in applySecrets and applyConfigs, which run over
 	// everything the manifest declares, so an unmounted declaration relabels the
 	// controller's resource just the same.
+	//
+	// The self release gets no recognition here, deliberately, and the asymmetry
+	// with the referenced half above is the point. Mounting a secret the
+	// controller already has changes nothing about it; *declaring* one runs it
+	// through applySecrets, which relabels the existing secret into the stack's
+	// namespace and hands it to the services — an adoption, of a credential
+	// nobody needed to adopt. `external: true` is how a chart references a
+	// pre-created credential and is what the swarmcli-cd chart writes, so nothing
+	// legitimate is refused; what is refused is the one release with the most to
+	// gain from #86's trick, which is where that guard is worth keeping whole.
 	for _, spec := range stack.Secrets {
 		_, wired := b.forbiddenSecrets[spec.Name]
 		_, mounted := mine.secrets[spec.Name]
@@ -346,7 +383,10 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	// stack's services to.
 	for _, name := range stack.ExternalNetworks {
 		if inControllersStack(mine.namespace, name) {
-			return joinsForbidden(name, mine.namespace)
+			if !b.selfRelease {
+				return joinsForbidden(name, mine.namespace)
+			}
+			continue
 		}
 		if !scopedUnder(ns, name) && !permits(b.allow.Networks, name) {
 			return joinsUnpermitted(name)
@@ -354,13 +394,76 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	}
 	for _, nw := range stack.Networks {
 		if inControllersStack(mine.namespace, nw.Name) {
-			return joinsForbidden(nw.Name, mine.namespace)
+			if !b.selfRelease {
+				return joinsForbidden(nw.Name, mine.namespace)
+			}
+			continue
 		}
 		if !scopedUnder(ns, nw.Name) && !permits(b.allow.Networks, nw.Name) {
 			return joinsUnpermitted(nw.Name)
 		}
 	}
 	return nil
+}
+
+// allowFor is the allowlist this deploy converts under: the application's own,
+// and for the self release the host paths the controller is already bound to.
+//
+// The socket is why. compose.checkBindSources refuses a bind of anything the
+// application's allow.hostPaths does not name, and it refuses it during
+// conversion — before any of the guards below are reached. The chart that
+// deploys this controller binds /var/run/docker.sock, because that is what the
+// controller talks to the swarm through, so without this the self release is
+// refused for re-declaring the mount it is already running with.
+//
+// It is the same recognition ownMount makes, in the one place a name is not what
+// is being compared: this release is the controller, so the paths the controller
+// holds are not paths it is reaching for. And it is bounded the same way — the
+// set comes off the controller's own service spec, so a self chart can re-declare
+// the socket and cannot reach / or /var/lib/docker. An operator who wants it to
+// have more says so in allow.hostPaths, exactly as for any other application.
+//
+// Requiring allow.hostPaths for the socket instead was the alternative, and it
+// is worse in the direction that matters: `self: true` already grants strictly
+// more than the socket does, so the entry would carry no decision, and an
+// operator who left it out would get a refusal about bind mounts for a mistake
+// about self-management.
+func (b *Backend) allowFor(ctx context.Context) (application.Allow, error) {
+	if !b.selfRelease {
+		return b.allow, nil
+	}
+	mine, err := b.mounts(ctx)
+	if err != nil {
+		return application.Allow{}, err
+	}
+	allow := b.allow
+	allow.HostPaths = append(slices.Clone(allow.HostPaths), slices.Sorted(maps.Keys(mine.binds))...)
+	return allow, nil
+}
+
+// ownMount reports whether this deploy may mount name because the controller
+// already has it.
+//
+// True only for the self release, and only for a name in the set read off this
+// controller's own service spec — which for that release is not a name reaching
+// outside the stack at all. A self release *is* the controller's stack: the
+// release namespace is the controller's namespace, and the only reason
+// scopedUnder cannot see that is that a Swarm secret, config or volume is
+// cluster-global and carries no namespace prefix on the reference.
+//
+// So this is not a permission granted to an application. It is the recognition
+// that for one release the question the guard asks — "is this somebody else's" —
+// has the answer no. Which is also why it takes the set read from the service
+// spec rather than forbiddenSecrets: that one is derived from /run/secrets and
+// names mount *targets*, so a target-renamed entry there is not the name any
+// reference resolves by, and treating it as the controller's own would permit a
+// different secret that happens to share the target's name.
+func (b *Backend) ownMount(mine map[string]struct{}, name string) bool {
+	if !b.selfRelease {
+		return false
+	}
+	_, ok := mine[name]
+	return ok
 }
 
 // permits reports whether an allowlist names name.
@@ -664,11 +767,23 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 	if err := b.rejectSelfMismatch(ctx, req.Name); err != nil {
 		return err
 	}
-	if err := b.rejectOwnNamespace(ctx, req.Name); err != nil {
-		return err
+	// And for every release that is not this controller's own, the collision
+	// that name would cause. The self release is exempt here and nowhere else:
+	// deploying onto the controller's own services is what upgrading it *is*,
+	// and the check above has already established the name is the controller's
+	// rather than the app set's claim that it is. Removal is not exempt and must
+	// not be — see RemoveStack and StackVolumes.
+	if !b.selfRelease {
+		if err := b.rejectOwnNamespace(ctx, req.Name); err != nil {
+			return err
+		}
 	}
 
-	unresolved, err := cdcompose.ConvertUnresolved(ctx, req.Manifest, req.Name, b.api, b.allow)
+	allow, err := b.allowFor(ctx)
+	if err != nil {
+		return err
+	}
+	unresolved, err := cdcompose.ConvertUnresolved(ctx, req.Manifest, req.Name, b.api, allow)
 	if err != nil {
 		return err
 	}
@@ -696,7 +811,7 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 		return err
 	}
 
-	stack, err := cdcompose.Convert(ctx, req.Manifest, req.Name, b.api, b.allow)
+	stack, err := cdcompose.Convert(ctx, req.Manifest, req.Name, b.api, allow)
 	if err != nil {
 		return err
 	}
