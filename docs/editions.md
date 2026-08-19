@@ -103,6 +103,36 @@ redeploy the stack). The startup log's `routes` lines are where to check that it
 took: an unlicensed build declares **no** licensed routes at all, so `/auth/*`
 appearing there is the licence having been read.
 
+### A managed licence has to be kept activated
+
+Most licences are a key and nothing else: install it and it works until it
+expires. A **managed** licence adds a second artifact — an *activation lease*
+for one swarm, with its own dates, typically 30 days to renewal and a further
+30 days of grace during which everything keeps working while the renewal is
+overdue.
+
+**The controller never renews it, on purpose.** A reconciler holding write
+access to a swarm does not ask anyone for entitlements; the licence it reads is
+whatever the swarm's Raft store already holds. So on a swarm running swarmcli-cd
+under a managed licence, something else has to keep the activation current:
+
+```cron
+# on a swarm manager, daily
+0 4 * * *  swarmcli license sync
+```
+
+`swarmcli license sync` renews this swarm's activation and exits non-zero if it
+could not; `swarmcli license status` reports what the swarm holds and exits
+non-zero when the licence is not granting. Both are in
+[swarmcli's licence documentation](https://github.com/Eldara-Tech/swarmcli/blob/main/docs/license.md).
+A lease can also be installed from a file, which is the air-gapped path.
+
+This matters more here than anywhere else, because the renewal a person
+performs by opening the swarmcli TUI is a person nobody has: a controller runs
+unattended for weeks, which is exactly the deployment where an activation
+quietly runs out. A renewed lease reaches a running controller the same way an
+installed licence does — on the next restart.
+
 What a licence grants today is [single sign-on](sso.md), which is where that
 `/auth/*` comes from. Multi-swarm, projects and RBAC, notifications and managed
 secret rotation are the rest of the plan; the seams they will arrive through are
