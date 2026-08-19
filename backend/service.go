@@ -23,6 +23,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 )
@@ -79,6 +80,13 @@ type Backend struct {
 	// which is what a backend nobody scoped to an application enforces, and the
 	// safe direction for one. Set per application by WithAllowedReferences.
 	allow application.Allow
+	// selfRelease marks this copy as deploying the stack the controller itself
+	// runs as, and holdSelf is where the write that replaces it is handed back.
+	// Set together by WithSelfRelease, which refuses to set either alone — the
+	// exemptions a self release gets are only safe because that write is issued
+	// last, so a copy that could not hand it back must not have them.
+	selfRelease bool
+	holdSelf    capability.DeferSelf
 	// self is what Swarm reports it has mounted into this controller, read from
 	// its own service spec on the first deploy that needs it. It covers the
 	// controller's configs, which have no /run/secrets equivalent to list, and

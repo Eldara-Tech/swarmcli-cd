@@ -1166,6 +1166,103 @@ func asController(api *fakeAPI) *fakeAPI {
 	return api
 }
 
+// ---------------------------------------- the controller's own release (#235)
+
+// noDeferral is a sink that throws the write away. Every test here is refused
+// before a service is written, so nothing reaches it; it exists because
+// WithSelfRelease refuses a nil one, which is the next test.
+func noDeferral(func(context.Context) error) {}
+
+const trivialStack = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+`
+
+// `self: true` says "this application deploys me", and the only thing that makes
+// that true is the release name — a release name is the stack namespace. Named
+// anything else, a self release deploys a *second* controller beside this one,
+// each reconciling the same app set on the same swarm. That is swarmcli-cd#234
+// as it was actually reported, and it got as far as it did because the name
+// looked like a detail. The refusal names the stack this controller runs as,
+// because that string is the fix.
+func TestASelfReleaseMustBeNamedAfterTheControllersOwnStack(t *testing.T) {
+	api := asController(&fakeAPI{})
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "cd", Manifest: trivialStack, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a self release named other than the controller's stack refused")
+	}
+	for _, want := range []string{"'cd'", "'swarmcli-cd'"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %s", err, want)
+		}
+	}
+	if len(api.created)+len(api.updated) > 0 {
+		t.Errorf("wrote %d services; a refused self release must reach nothing", len(api.created)+len(api.updated))
+	}
+}
+
+// A process that is not a swarm service has no stack of its own to upgrade, so
+// the answer to "is this release me" is no — the opposite of what the guards
+// built on the same read do with an empty answer, and deliberately. They ask
+// whether there is anything of ours to protect and go quiet when there is not;
+// this asks whether this release *is* us. An application whose destination
+// resolves to another swarm arrives here identically, because that swarm's
+// daemon has never heard of this container.
+func TestASelfReleaseIsRefusedWhereTheControllerIsNotAService(t *testing.T) {
+	api := &fakeAPI{}
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: trivialStack, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a self release refused where this controller is not a swarm service")
+	}
+	if !strings.Contains(err.Error(), "not deployed as a stack on this swarm") {
+		t.Errorf("error %q does not say why", err)
+	}
+}
+
+// The exemptions a self release will get are only defensible because the write
+// replacing this controller is issued last, after the pass has been recorded. A
+// copy with nowhere to hand that write back would deploy everything except the
+// controller, report a successful sync, and have upgraded nothing — so a nil
+// sink does not produce a self backend at all.
+func TestWithSelfReleaseNeedsSomewhereToHandTheWrite(t *testing.T) {
+	b := testBackend(t, asController(&fakeAPI{}), nil)
+	if got := b.WithSelfRelease(nil); got != charts.Backend(b) {
+		t.Error("WithSelfRelease(nil) returned a different backend, want the original unchanged")
+	}
+	if b.selfRelease {
+		t.Error("selfRelease = true after a nil sink, want the backend left alone")
+	}
+}
+
+// A backend is built once per swarm and reused by every application, so the
+// answer to "is this release the controller's own" has to live on the copy. The
+// shared one still deploys an ordinary release under any name it likes.
+func TestWithSelfReleaseDoesNotMarkTheSharedBackend(t *testing.T) {
+	api := asController(&fakeAPI{})
+	shared := testBackend(t, api, nil)
+
+	self, ok := shared.WithSelfRelease(noDeferral).(*Backend)
+	if !ok {
+		t.Fatal("WithSelfRelease did not return a *Backend")
+	}
+	if !self.selfRelease || self.holdSelf == nil {
+		t.Errorf("the copy has selfRelease=%v holdSelf==nil:%v, want both set", self.selfRelease, self.holdSelf == nil)
+	}
+	if shared.selfRelease || shared.holdSelf != nil {
+		t.Fatal("WithSelfRelease marked the shared backend, so the next application would deploy as the controller's own")
+	}
+	// And the shared one is unaffected in the only way that matters: a release
+	// named anything at all still deploys, with no self comparison made.
+	if err := shared.DeployStack(t.Context(), charts.DeployRequest{Name: "cd", Manifest: trivialStack, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack through the shared backend = %v, want nil", err)
+	}
+}
+
 const mountsControllerConfig = `
 services:
   evil:
