@@ -49,6 +49,7 @@ var (
 	_ capability.RegistryAuth        = (*Backend)(nil)
 	_ capability.ForbidSecrets       = (*Backend)(nil)
 	_ capability.AllowedReferences   = (*Backend)(nil)
+	_ capability.SelfRelease         = (*Backend)(nil)
 	_ capability.OutOfBand           = (*Backend)(nil)
 	_ capability.StackServicesReader = (*Backend)(nil)
 	_ capability.StacksReader        = (*Backend)(nil)
@@ -109,6 +110,29 @@ func (b *Backend) WithForbiddenSecrets(names map[string]struct{}) charts.Backend
 func (b *Backend) WithAllowedReferences(allow application.Allow) charts.Backend {
 	c := *b
 	c.allow = allow
+	return &c
+}
+
+// WithSelfRelease returns a copy of the backend that deploys the stack this
+// controller itself runs as, handing hold the one write that would replace it.
+//
+// The copy is what carries the answer to "is this release ours", and it is a
+// copy for the same reason WithAllowedReferences is: a backend is built once per
+// swarm and reused by every application, so a flag set on the shared one would
+// make the next application's deploy the controller's own.
+//
+// A nil hold returns the backend unchanged rather than a self copy with nowhere
+// to put the write. The exemptions a self release gets are only defensible
+// because the write replacing this controller is issued last, after the pass has
+// been recorded; a copy that could not hand it back would deploy everything
+// except the controller, report a successful sync, and have upgraded nothing.
+// Refusing to be self is the failure that says so.
+func (b *Backend) WithSelfRelease(hold capability.DeferSelf) charts.Backend {
+	if hold == nil {
+		return b
+	}
+	c := *b
+	c.selfRelease, c.holdSelf = true, hold
 	return &c
 }
 
@@ -487,6 +511,52 @@ func volumeSources(svc cdcompose.Service) []string {
 	return out
 }
 
+// rejectSelfMismatch refuses a release declared as this controller's own that is
+// not the stack this controller runs as.
+//
+// It is the half of the self declaration a file cannot be held to. `self: true`
+// says "this application deploys me", and the only thing that makes that true is
+// the release name: a release name *is* the stack namespace, so a self release
+// named anything else deploys a second controller beside this one rather than
+// upgrading it — with its own copy of the app set, reconciling the same
+// applications on the same swarm, which is why the chart pins replicas to one.
+// That is swarmcli-cd#234 as reported, and it got as far as it did because the
+// name looked like a detail.
+//
+// The name to compare against is a label on this controller's own service, so it
+// takes the daemon to read and cannot be checked by the config loader. Both
+// failures name what the controller is actually deployed as, because that string
+// is the fix.
+//
+// A controller with no namespace at all is refused rather than waved through,
+// which is the opposite of what the guards built on the same read do. They ask
+// "is this ours to protect", and nothing is: a development run has no stack of
+// its own for a release to claim. This asks "is this release us", and for a
+// process that is not a swarm service the answer is no — there is nothing here
+// to upgrade, and deploying the controller's chart as an ordinary release is not
+// what the app set asked for. A destination resolving to another swarm arrives
+// the same way, because that swarm's daemon has never heard of this container.
+func (b *Backend) rejectSelfMismatch(ctx context.Context, release string) error {
+	if !b.selfRelease {
+		return nil
+	}
+	mine, err := b.mounts(ctx)
+	if err != nil {
+		return err
+	}
+	switch {
+	case mine.namespace == "":
+		return fmt.Errorf("refusing release '%s': it is declared as this controller's own, but this controller is not "+
+			"deployed as a stack on this swarm — a development run and an application destined for another swarm both "+
+			"read this way, and neither has a stack of its own to upgrade", release)
+	case mine.namespace != release:
+		return fmt.Errorf("refusing release '%s': it is declared as this controller's own, but this controller runs as "+
+			"the stack '%s'. A release name is the stack namespace, so this one would deploy a second controller beside "+
+			"this one rather than upgrading it; name the release '%s'", release, mine.namespace, mine.namespace)
+	}
+	return nil
+}
+
 // rejectOwnNamespace refuses a release whose name is the stack namespace this
 // controller itself was deployed under.
 //
@@ -588,7 +658,12 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) error {
 	// Before the manifest is even converted: a release claiming the controller's
 	// own stack is refused whatever it declares, because the collision is the
-	// name and not anything in the chart.
+	// name and not anything in the chart — and a release declaring itself the
+	// controller's own and named anything else is refused first, because that
+	// one deploys a second controller instead of colliding with this one.
+	if err := b.rejectSelfMismatch(ctx, req.Name); err != nil {
+		return err
+	}
 	if err := b.rejectOwnNamespace(ctx, req.Name); err != nil {
 		return err
 	}

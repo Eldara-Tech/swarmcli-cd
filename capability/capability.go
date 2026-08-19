@@ -76,6 +76,33 @@ type AllowedReferences interface {
 	WithAllowedReferences(application.Allow) charts.Backend
 }
 
+// SelfRelease is the optional interface a backend implements to deploy the
+// stack this controller itself runs as — the one release whose upgrade replaces
+// the process performing it.
+//
+// It takes the deferral rather than a bare flag because the two are one
+// decision. What makes a self release safe to deploy at all is that the write
+// replacing this controller is issued last, after everything the pass did has
+// been recorded; a backend that cannot hand that write back cannot be asked for
+// the exemptions either, and a nil hold therefore leaves the backend unchanged.
+// That is the safe direction: a self release that deployed everything except
+// the controller and never came back for it would report a successful sync and
+// have changed nothing.
+type SelfRelease interface {
+	WithSelfRelease(hold DeferSelf) charts.Backend
+}
+
+// DeferSelf is handed the one write that replaces this controller, for the
+// caller to issue once the pass it belongs to is over.
+//
+// A sink rather than a return value because a deploy reaches a backend by two
+// routes — the chart engine's apply, whose signature is charts.Backend's, and
+// the reconciler's own drift correction, which calls DeployStack directly — and
+// widening the one this repository does not own is not available. A sink is the
+// same shape for both, and holding one for the whole pass rather than one per
+// deploy is what stops a deferral taken during a correction from being dropped.
+type DeferSelf func(apply func(context.Context) error)
+
 // OutOfBand is the optional interface a backend implements to report a mutation
 // that lost its compare-and-swap.
 //
