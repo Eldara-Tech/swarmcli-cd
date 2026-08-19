@@ -36,6 +36,15 @@ type selfMounts struct {
 	namespace string
 	secrets   map[string]struct{}
 	configs   map[string]struct{}
+	// binds names the host paths Swarm has bind-mounted into this controller —
+	// for the shipped stack.yml, the docker socket.
+	//
+	// Not a guard. Nothing a tenant manifest writes resolves *to* a bind: naming
+	// the same path is the host-path question, which compose.checkBindSources
+	// answers from the application's own allow.hostPaths, and that is where it
+	// belongs. This is here for the self release alone, which has to be able to
+	// re-declare the socket the controller is already holding — see allowFor.
+	binds map[string]struct{}
 	// volumes names the volumes Swarm has mounted into this controller — for the
 	// shipped stack.yml, the one holding every application's git clone and chart
 	// cache.
@@ -193,14 +202,21 @@ func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 	for _, ref := range cs.Configs {
 		out.configs[ref.ConfigName] = struct{}{}
 	}
-	// Only the named volumes. A bind's source is a path on the node rather than a
-	// cluster-wide name, so nothing a tenant manifest writes resolves *to* it —
-	// naming the same path is the host-path question compose.checkBindSources
-	// answers from the application's own allowlist, not this one. An anonymous
-	// volume has no source at all.
+	// The two are kept apart because they answer different questions. A named
+	// volume is a cluster-wide name a tenant manifest can resolve to, which is
+	// what makes the volume set a guard. A bind's source is a path on the node,
+	// which nothing resolves to — naming the same path is the host-path question
+	// compose.checkBindSources answers from the application's own allowlist — so
+	// the bind set guards nothing and exists only so the self release can
+	// re-declare what the controller already holds. An anonymous volume has no
+	// source at all and is neither.
+	out.binds = make(map[string]struct{}, len(cs.Mounts))
 	for _, m := range cs.Mounts {
-		if m.Type == mount.TypeVolume && m.Source != "" {
+		switch {
+		case m.Type == mount.TypeVolume && m.Source != "":
 			out.volumes[m.Source] = struct{}{}
+		case m.Type == mount.TypeBind && m.Source != "":
+			out.binds[m.Source] = struct{}{}
 		}
 	}
 	return out, nil
