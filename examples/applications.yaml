@@ -118,3 +118,37 @@ applications:
     # behind the controller's back is ever noticed. With automated: true it
     # redeploys the release to correct it; with a manual policy it reports and
     # waits for `app sync`. See docs/configuration.md for what is compared.
+
+  # The controller itself. `self: true` marks the one application that deploys
+  # the stack this controller runs as, so upgrading it is a commit like any
+  # other. Commented out because it is the highest privilege in this file: every
+  # other application is refused the controller's own secrets, configs, volume
+  # and networks whatever `allow` says, and this one is not — point it at a chart
+  # that is not this controller's and you have handed that chart the admin token.
+  #
+  # The release name must be the stack namespace the controller was deployed
+  # under — the `swarmcli-cd` in `docker stack deploy -c stack.yml swarmcli-cd`.
+  # It defaults to the application's name, so calling the application
+  # `swarmcli-cd` needs no `release:` at all. Named anything else it deploys a
+  # SECOND controller beside this one rather than upgrading it.
+  #
+  # Upgrade the controller to a release that knows this key BEFORE committing it:
+  # an older one refuses the whole file and stops following git. And read
+  # docs/configuration.md#self-optional first — the chart becomes the definition
+  # of your deployment, and anything it cannot express is dropped on the first
+  # apply.
+  #
+  # - name: swarmcli-cd
+  #   self: true
+  #   source:
+  #     repoURL: https://github.com/your-org/infra.git
+  #     revision: main
+  #     chart:
+  #       ref: swarmcli-charts/swarmcli-cd
+  #       version: "0.2.4"
+  #       values: [values/swarmcli-cd.yaml]
+  #       repositories:
+  #         - name: swarmcli-charts
+  #           url: https://eldara-tech.github.io/swarmcli-charts
+  #   syncPolicy:
+  #     automated: true

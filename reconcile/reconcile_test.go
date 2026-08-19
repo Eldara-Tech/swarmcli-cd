@@ -155,6 +155,7 @@ func (b recordingBackend) WithAllowedReferences(allow application.Allow) charts.
 // sync, then synced after the apply".
 type fakeEngine struct {
 	mu        sync.Mutex
+	onApply   func()
 	plans     []*charts.Plan
 	planErr   error
 	planErrAt int // 1-based call number at which PlanApply starts failing
@@ -232,6 +233,12 @@ func (e *fakeEngine) Apply(_ context.Context, plan *charts.Plan, opts charts.Ins
 	defer e.mu.Unlock()
 	e.applied++
 	e.opts = append(e.opts, opts)
+	// What the backend does inside Apply. The real one deploys, which is where a
+	// self release hands its last write back; this is the seam a test uses to say
+	// so without a swarm.
+	if e.onApply != nil {
+		e.onApply()
+	}
 	if e.applyErr != nil {
 		return nil, e.applyErr
 	}
@@ -4558,5 +4565,95 @@ func TestASiblingTheCorrectionDidNotWriteDoesNotHoldTheRelease(t *testing.T) {
 	view, _ := r.View("edge")
 	if view.Status.Health.State != application.HealthDegraded {
 		t.Errorf("health = %q, want degraded — the wedged sidecar is still there", view.Status.Health.State)
+	}
+}
+
+// ---------------------------------------- the controller's own application (#235)
+
+// selfBackend is a backend that can be told the release is the controller's own,
+// and records the sink it was handed. The real one hands a write back from inside
+// DeployStack; here the engine stands in for that, because what these tests are
+// about is when the reconciler issues it, not how the applier produces it.
+type selfBackend struct {
+	charts.Backend
+	held *capability.DeferSelf
+}
+
+func (b selfBackend) StackServices(context.Context, string) []charts.ServiceState { return nil }
+
+func (b selfBackend) WithSelfRelease(hold capability.DeferSelf) charts.Backend {
+	*b.held = hold
+	return b
+}
+
+// The ordering the whole design rests on. The write that replaces this
+// controller is handed back during the apply and issued only after it returns,
+// so the release record the chart engine writes is already durable when the task
+// performing the pass is stopped.
+func TestTheControllerIsReplacedAfterTheApplyItBelongsTo(t *testing.T) {
+	var held capability.DeferSelf
+	var order []string
+
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}}
+	engine.onApply = func() {
+		order = append(order, "apply")
+		held(func(context.Context) error { order = append(order, "replace"); return nil })
+	}
+
+	self := spec("swarmcli-cd", true)
+	self.Self = true
+	r := newTestWith(t, []application.Spec{self}, engine, &fakeFetcher{revision: strings.Repeat("a", 40)},
+		fakeRegistry{backend: selfBackend{held: &held}})
+
+	if err := r.Sync(context.Background(), "swarmcli-cd"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if want := []string{"apply", "replace"}; !slices.Equal(order, want) {
+		t.Errorf("order = %v, want %v — the controller must not be replaced before the pass is recorded", order, want)
+	}
+}
+
+// A pass that failed after handing the write back has already written the
+// release record, so the desired state is durable and the running spec is not —
+// which live drift sees next reconcile and converges. Replacing the controller in
+// the middle of that trades a self-healing state for one whose next diagnostic
+// step is against a controller that has just been restarted.
+func TestAFailedPassDoesNotReplaceTheController(t *testing.T) {
+	var held capability.DeferSelf
+	replaced := false
+
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}, applyErr: errors.New("a later release would not deploy")}
+	engine.onApply = func() {
+		held(func(context.Context) error { replaced = true; return nil })
+	}
+
+	self := spec("swarmcli-cd", true)
+	self.Self = true
+	r := newTestWith(t, []application.Spec{self}, engine, &fakeFetcher{revision: strings.Repeat("a", 40)},
+		fakeRegistry{backend: selfBackend{held: &held}})
+
+	if err := r.Sync(context.Background(), "swarmcli-cd"); err == nil {
+		t.Fatal("Sync = nil, want the failed apply reported")
+	}
+	if replaced {
+		t.Error("the controller was replaced by a pass that failed")
+	}
+}
+
+// And every other application's backend is the one it has always been. The
+// upgrade is asked for only for the application the app set marked, so nothing
+// else can be handed the write that replaces this process.
+func TestOnlyTheMarkedApplicationGetsASelfBackend(t *testing.T) {
+	var held capability.DeferSelf
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}}
+
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine,
+		&fakeFetcher{revision: strings.Repeat("a", 40)}, fakeRegistry{backend: selfBackend{held: &held}})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if held != nil {
+		t.Error("an ordinary application's backend was asked to deploy the controller's own release")
 	}
 }

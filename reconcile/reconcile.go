@@ -563,6 +563,68 @@ func withAllowedReferences(b charts.Backend, allow application.Allow) charts.Bac
 	return b
 }
 
+// withSelfRelease scopes a backend to deploying the stack this controller itself
+// runs as, and gives it somewhere to hand back the write that replaces this
+// process.
+//
+// Only for the application the app set marked, and unconditionally not for any
+// other: an ordinary application's backend must be the one it has always been.
+//
+// A backend that does not support the upgrade is left alone, like its
+// neighbours — but the consequence is different and worth stating. The other
+// three lose a feature; this one loses the whole application, because the self
+// release is then deployed as an ordinary one and refused by the guards that
+// exist to refuse it. That is the right failure: a backend that cannot hand back
+// the last write cannot deploy this release safely, so being unable to deploy it
+// at all is the honest outcome rather than a half-applied controller.
+func withSelfRelease(b charts.Backend, spec application.Spec, hold capability.DeferSelf) charts.Backend {
+	if !spec.Self {
+		return b
+	}
+	if sb, ok := b.(capability.SelfRelease); ok {
+		return sb.WithSelfRelease(hold)
+	}
+	return b
+}
+
+// replaceSelf issues the write that replaces this controller, and is the last
+// thing this process does.
+//
+// Held back through the whole pass by design — see backend.deferSelf for why the
+// deploy cannot make it — and issued here, after the apply, the drift
+// correction, both sweeps and the confirming re-plan have all happened and been
+// recorded. Swarm's update order is stop-first, so this task is stopped as the
+// rollout starts: everything above this line is what the replacement will find,
+// and anything below it would not have run.
+//
+// Not issued for a pass that failed, which is the whole of the decision here. A
+// pass that got as far as deploying the controller's own release and then failed
+// on something after it has already written the release record, so the desired
+// state is durable and the running spec is not — which live drift sees on the
+// next reconcile and converges. Replacing the controller in the middle of a
+// failure trades a self-healing state for one where the operator's next
+// diagnostic step is against a controller that has just been restarted.
+//
+// The event goes out before the write and not after: there is no after.
+func (r *Reconciler) replaceSelf(ctx context.Context, spec application.Spec, revision string, apply func(context.Context) error) error {
+	if apply == nil {
+		return nil
+	}
+	dispatch(ctx, spec, notify.Event{
+		Type:     notify.SelfUpdateIssued,
+		Revision: revision,
+		At:       r.now(),
+		Message:  "replacing this controller with the revision just applied",
+	})
+	r.log.Warn("replacing this controller with the revision just applied; this task is stopped as the "+
+		"rollout starts, so this is the last line of this controller's log",
+		"application", spec.Name, "revision", revision)
+	if err := apply(ctx); err != nil {
+		return fmt.Errorf("replacing this controller: %w", err)
+	}
+	return nil
+}
+
 // dispatch sends one event, stamped with the application it is about, the
 // destination it concerns and whoever asked for the work that raised it.
 //
@@ -1748,6 +1810,12 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	backend = withForbiddenSecrets(backend, r.forbidden)
 	backend = withAllowedReferences(backend, spec.Allow)
 	backend = r.withOutOfBandNotifier(ctx, backend, spec)
+	// One sink for the whole pass, not one per deploy. The write that replaces
+	// this controller can be handed back by the apply or by a drift correction —
+	// converge writes through DeployStack directly — and a deferral taken by
+	// whichever ran second would otherwise be the only one issued.
+	var replaceSelf func(context.Context) error
+	backend = withSelfRelease(backend, spec, func(apply func(context.Context) error) { replaceSelf = apply })
 	engine := r.newEngine(backend)
 
 	plan, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{
@@ -1832,7 +1900,10 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	if err := checkCompat(plan); err != nil {
 		return err
 	}
-	return r.apply(ctx, e, spec, backend, engine, plan, built, checkout, live, doomed)
+	if err := r.apply(ctx, e, spec, backend, engine, plan, built, checkout, live, doomed); err != nil {
+		return err
+	}
+	return r.replaceSelf(ctx, spec, checkout.Revision, replaceSelf)
 }
 
 // checkCompat refuses a plan containing a release this build's chart engine is

@@ -183,6 +183,14 @@ clone and chart cache. The controller reads that name off its own service, so a
 development run that is not a swarm service has no name to protect and nothing to
 refuse.
 
+Unless that is the point. An application marked
+[`self: true`](configuration.md#self-optional) deploys the controller's own
+stack, and for it the collision is what an upgrade *is* — so the deploy is
+permitted and its release name is required to be that name rather than refused
+for being it. Only the deploy: removing the controller's stack stays refused
+whatever the app set says, because there is no correct way for a controller to
+delete itself.
+
 And a release may not deploy into a namespace whose services this controller has
 no release record for. Those services were put there by something else — a
 `docker stack deploy`, another tool, a shell — and the namespace label they carry

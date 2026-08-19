@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
@@ -19,6 +20,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
 )
 
@@ -327,6 +329,28 @@ func TestAFailedStackRemovalKeepsTheReleaseRecords(t *testing.T) {
 	}
 	if len(e.calls) != 0 {
 		t.Error("the release records were deleted even though the stack is still deployed")
+	}
+}
+
+// The one departure that is not a cleanup. Dropping the self application from
+// the app set leaves the stack this controller runs as stamped for an
+// application nobody declares — and no sweep can remove it, because the
+// controller would be deleting itself. Reported as a failure it would be the
+// same failure every interval, for ever, about a controller that is working.
+func TestTheControllersOwnStackIsLeftAloneWhenItLeavesTheSet(t *testing.T) {
+	e := &fakeEngine{releases: []charts.Release{owned("swarmcli-cd", "gone")}}
+	b := &fakeBackend{removeErr: map[string]error{"swarmcli-cd": fmt.Errorf(
+		"refusing to act on release 'swarmcli-cd': %w, so removing it would delete the controller", capability.ErrOwnStack)}}
+
+	got, err := prunerWith(t, e, b, false).Departed(t.Context(), []string{"kept"}, nil)
+	if err != nil {
+		t.Fatalf("Departed = %v, want the controller's own stack skipped rather than reported", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("pruned = %v, want none — nothing was removed", got)
+	}
+	if len(e.calls) != 0 {
+		t.Error("the release records were deleted for a stack that is still deployed")
 	}
 }
 
