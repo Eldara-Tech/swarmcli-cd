@@ -97,6 +97,98 @@ func TestDriftDetectionLiveAccepted(t *testing.T) {
 	}
 }
 
+// An operator marking the controller's own application should not also have to
+// know that live drift is what makes a rolled-back self-update visible. Under
+// manifest the release record already names the revision that failed, so the
+// plan reads unchanged and the controller reports itself synced while running
+// the previous image.
+func TestSelfDefaultsToLiveDrift(t *testing.T) {
+	src := "applications:\n  - name: swarmcli-cd\n    self: true\n    source:\n      repoURL: https://x/y.git\n" +
+		"      revision: main\n      chart: {path: ./charts/swarmcli-cd}\n"
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	app := f.Applications[0]
+	if !app.Self {
+		t.Error("self = false, want it kept")
+	}
+	if got := app.DriftDetection; got != application.DriftLive {
+		t.Errorf("driftDetection = %q, want it defaulted to live for a self application", got)
+	}
+	// The default is the application's own name, and for this one that is also
+	// the stack namespace the controller is deployed under — which is what makes
+	// the shipped stack.yml's name the one that needs no `release:` at all.
+	if got := app.Source.Chart.Release; got != "swarmcli-cd" {
+		t.Errorf("release = %q, want swarmcli-cd", got)
+	}
+}
+
+// Only the empty value is defaulted. An operator who writes `live` down gets it
+// for the same reason anyone else does, and this is here so that the branch
+// above cannot be rewritten into one that overwrites what the file said.
+func TestSelfAcceptsAnExplicitLiveDrift(t *testing.T) {
+	src := "applications:\n  - name: swarmcli-cd\n    self: true\n    driftDetection: live\n    source:\n" +
+		"      repoURL: https://x/y.git\n      revision: main\n      chart: {path: ./charts/swarmcli-cd}\n"
+	f, err := Parse([]byte(src), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	if got := f.Applications[0].DriftDetection; got != application.DriftLive {
+		t.Errorf("driftDetection = %q, want live", got)
+	}
+}
+
+// This controller runs as one stack, so two applications claiming to be it is a
+// file that cannot be obeyed either way round. The error names both, because
+// resolving it by order would leave the loser deploying the controller's chart
+// as an ordinary release — refused for mounting the controller's own secrets,
+// which reads like a different bug entirely.
+func TestTwoApplicationsMayNotBothBeSelf(t *testing.T) {
+	const src = `
+applications:
+  - name: swarmcli-cd
+    self: true
+    source:
+      repoURL: https://x/y.git
+      revision: main
+      chart: {path: ./charts/swarmcli-cd}
+  - name: cd-again
+    self: true
+    source:
+      repoURL: https://x/y.git
+      revision: main
+      chart: {release: other, path: ./charts/swarmcli-cd}
+`
+	_, err := Parse([]byte(src), "applications.yaml")
+	if err == nil {
+		t.Fatal("Parse = nil, want an error")
+	}
+	for _, want := range []string{"swarmcli-cd", "cd-again", "self"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+// An application that says nothing is not the controller's own, and nothing
+// about it moves. The whole file has one privileged entry at most and it is
+// opt-in by a field nobody has to write.
+func TestSelfIsOffByDefault(t *testing.T) {
+	f, err := Parse([]byte(valid), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	for _, app := range f.Applications {
+		if app.Self {
+			t.Errorf("'%s': self = true, want false", app.Name)
+		}
+		if app.DriftDetection != application.DriftManifest {
+			t.Errorf("'%s': driftDetection = %q, want manifest", app.Name, app.DriftDetection)
+		}
+	}
+}
+
 // A release name is the Swarm stack namespace, so an application that names no
 // release must reach the swarm under the name the operator wrote down — the
 // application's (#139). Anything else is a stack an operator cannot find.
@@ -235,6 +327,8 @@ func TestValidationErrors(t *testing.T) {
 		"slash regauth":      {base("      releaseFile: r.yaml\n    registryAuth: \"has/slash\"\n"), "invalid registryAuth"},
 		"traversal regauth":  {base("      releaseFile: r.yaml\n    registryAuth: \"..\"\n"), "invalid registryAuth"},
 		"volumes no prune":   {base("      releaseFile: r.yaml\n    syncPolicy: {pruneVolumes: true}\n"), "pruneVolumes means nothing without prune"},
+		"self releaseFile":   {base("      releaseFile: r.yaml\n    self: true\n"), "self needs a chart source"},
+		"self manifest":      {base("      chart: {release: h, path: ./c}\n    self: true\n    driftDetection: manifest\n"), "self needs driftDetection 'live'"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Parse([]byte(tc.src), "applications.yaml")

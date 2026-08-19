@@ -121,6 +121,15 @@ func (f *File) applyDefaults() {
 		app := &f.Applications[i]
 		if app.DriftDetection == "" {
 			app.DriftDetection = application.DriftManifest
+			// Except for the controller's own application, which is defaulted to
+			// live and refused anything else below. Without the running-spec
+			// comparison a self-update Swarm rolled back is invisible: the plan
+			// reads unchanged, because the release record already names the
+			// revision that failed, and nothing else looks at what is actually
+			// running.
+			if app.Self {
+				app.DriftDetection = application.DriftLive
+			}
 		}
 		// A chart source that names no release installs one named after the
 		// application. See ChartSource.Release for why that is the default; what
@@ -151,6 +160,7 @@ func (f *File) validate() error {
 
 	seen := make(map[string]bool, len(f.Applications))
 	claimed := make(map[string]string, len(f.Applications))
+	selfApp := ""
 	for i, app := range f.Applications {
 		if err := validateApplication(app); err != nil {
 			return fmt.Errorf("applications[%d]: %w", i, err)
@@ -159,6 +169,18 @@ func (f *File) validate() error {
 			return fmt.Errorf("applications[%d]: duplicate application name '%s'", i, app.Name)
 		}
 		seen[app.Name] = true
+
+		// One controller runs as one stack, so two applications claiming to be
+		// it is a file that cannot be obeyed either way round. Named rather than
+		// resolved by order: whichever this took, the other would deploy the
+		// controller's chart as an ordinary release and be refused for mounting
+		// the controller's secrets, which reads like a different bug.
+		if app.Self {
+			if selfApp != "" {
+				return fmt.Errorf("applications[%d]: '%s' and '%s' both declare self, and this controller runs as one stack", i, selfApp, app.Name)
+			}
+			selfApp = app.Name
+		}
 
 		// Two applications may not claim one release. A release name is the
 		// Swarm stack namespace, so a shared one is a shared stack: each
@@ -202,6 +224,9 @@ func validateApplication(app application.Spec) error {
 	if err := validateSource(app.Source); err != nil {
 		return fmt.Errorf("'%s': %w", app.Name, err)
 	}
+	if err := validateSelf(app); err != nil {
+		return fmt.Errorf("'%s': %w", app.Name, err)
+	}
 	if app.SyncPolicy.Interval < 0 || app.SyncPolicy.Timeout < 0 {
 		return fmt.Errorf("'%s': syncPolicy interval and timeout cannot be negative", app.Name)
 	}
@@ -222,6 +247,41 @@ func validateApplication(app application.Spec) error {
 	// its own: it is a sibling of prune rather than an extension of it.
 	if app.SyncPolicy.PruneFirst && !app.SyncPolicy.Prune && !app.SyncPolicy.PruneResources {
 		return fmt.Errorf("'%s': syncPolicy pruneFirst means nothing without prune or pruneResources", app.Name)
+	}
+	return nil
+}
+
+// validateSelf holds the controller's own application to what a file can be held
+// to.
+//
+// Two rules, and neither is the important one. The important rule is that the
+// release name must be the stack namespace this controller was deployed under,
+// and nothing here can check it: that name is a label on the controller's own
+// service, so it takes a daemon to read, and the backend refuses a mismatch at
+// deploy time naming both values (swarmcli-cd#235). What is left is the pair
+// that would otherwise produce a confusing refusal much later.
+//
+// A release file is several releases and cannot be the one the controller runs
+// as. It would be planned, rendered and deployed as an ordinary set of releases,
+// and whichever of them mounted the admin token would be refused for mounting
+// the controller's secrets — an error about a chart, for a mistake in the source
+// type.
+//
+// And live drift is required rather than merely defaulted, because an operator
+// who writes `manifest` down means it. Under manifest a self-update that Swarm
+// rolled back leaves the release record naming the revision that failed and the
+// plan therefore reading unchanged, so the controller reports itself synced
+// while running the previous image, for ever.
+func validateSelf(app application.Spec) error {
+	if !app.Self {
+		return nil
+	}
+	if app.Source.Chart == nil {
+		return errors.New("self needs a chart source: a releaseFile application is several releases and cannot be the single stack this controller runs as")
+	}
+	if app.DriftDetection != application.DriftLive {
+		return fmt.Errorf("self needs driftDetection '%s', not '%s': without it a self-update the swarm rolled back is invisible, because the release record already names the revision that failed and the plan reads unchanged",
+			application.DriftLive, app.DriftDetection)
 	}
 	return nil
 }
