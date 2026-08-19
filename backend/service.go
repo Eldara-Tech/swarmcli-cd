@@ -188,6 +188,11 @@ func (b *Backend) ApplyServices(ctx context.Context, stack *cdcompose.Stack, res
 // this task container's own label, so it is this process's service and not one
 // that happens to be called the same thing.
 //
+// Nothing is logged here. The caller announces this — it knows the application
+// and the revision, and it is where the notify event goes — and two lines a
+// microsecond apart saying the same thing would leave a reader looking for the
+// difference between them.
+//
 // The spec is captured and the service re-read when the write is finally made,
 // because time passes in between: the pass carries on, and a compare-and-swap
 // against a version read before all of it would lose to any other write in the
@@ -201,7 +206,6 @@ func (b *Backend) deferSelf(mine selfMounts, name string, cur swarm.Service, spe
 		if err != nil {
 			return fmt.Errorf("re-reading this controller's own service before replacing it: %w", err)
 		}
-		b.log.Info("replacing this controller with the revision just applied", "service", name)
 		return b.updateService(ctx, name, live, spec, resolve)
 	})
 	return true

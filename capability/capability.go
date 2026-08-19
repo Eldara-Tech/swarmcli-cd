@@ -34,6 +34,11 @@
 // unchanged backend, no live drift, no sweep, no purge — so it stays with the
 // caller that has to choose.
 //
+// One value is not an interface: ErrOwnStack. It is here on the same test
+// everything else is — it is part of what a backend is written against, and a
+// caller matching the OSS applier's own sentinel instead would make every
+// companion import that applier.
+//
 // Adding one is the same commitment as adding a seam method: the day the
 // companion ships, every signature in this file is frozen, and a capability that
 // needs to grow grows by taking a struct rather than by widening a parameter
@@ -42,6 +47,7 @@ package capability
 
 import (
 	"context"
+	"errors"
 
 	"github.com/docker/docker/api/types/swarm"
 
@@ -51,6 +57,28 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/compose"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 )
+
+// ErrOwnStack is what a backend's refusal to act on the stack this controller
+// runs as wraps, so that a caller sweeping rather than deploying can tell it
+// from the other reasons a removal fails.
+//
+// The only error value in a package of interfaces, and here for the same reason
+// they are: it is part of what a backend is written against. A sweep that
+// matched on the OSS applier's own sentinel would make every companion backend
+// import that applier to be skipped correctly, which is the coupling this
+// package exists to remove.
+//
+// One caller needs it. An operator who drops the self application from the app
+// set leaves the controller's own stack stamped for an application nobody
+// declares, and no sweep can remove it — deleting it would delete the
+// controller, which every backend must refuse. Without a way to recognise that
+// refusal the sweep reports the same failure every interval, for ever, about a
+// controller that is working perfectly.
+//
+// A backend that does not wrap it is not broken. The sweep then does what it
+// did before and reports the failure, which is degraded rather than wrong —
+// the same silent-fallback bargain every interface here makes.
+var ErrOwnStack = errors.New("it is the stack namespace this controller itself is deployed under")
 
 // RegistryAuth is the optional interface a backend implements to authenticate
 // image pulls with an application's credential. A backend reached through the

@@ -253,6 +253,15 @@ shared network only if you would grant every application on it the same.
 The release records cannot come from a set read once at startup, because a new
 one is written on every deploy. They are matched by their label at deploy time.
 
+One release is not held to the first four, and no allowlist is what spares it:
+the application marked [`self: true`](#self-optional) deploys the stack this
+controller runs as, so what its chart mounts of the controller's it is not
+reaching outside itself for at all — the release namespace *is* the controller's
+namespace. The recognition is limited to what the controller already has,
+mounted rather than declared, and the release records are refused to it like
+everything else. The controller's *network* needs no exception: its own stack's
+networks are already the release's own.
+
 None of these five needs configuring, and there is no flag to forget. A
 controller that is **not** running as a Swarm service — a development run — has
 nothing mounted
@@ -274,6 +283,113 @@ helpers, so a `config.json` using `credsStore` or `credHelpers` is refused at
 startup. Registries with static credentials (Docker Hub, GHCR, Harbor, GitLab,
 self-hosted) work; short-lived cloud-registry tokens (ECR, GCR) are not
 refreshed and must be rotated out of band for now.
+
+### `self` (optional)
+
+```yaml
+- name: swarmcli-cd
+  self: true
+  source:
+    repoURL: https://github.com/your-org/apps.git
+    revision: main
+    chart:
+      ref: swarmcli-charts/swarmcli-cd
+      version: "0.2.4"
+      values: [values/swarmcli-cd.yaml]
+      repositories:
+        - name: swarmcli-charts
+          url: https://eldara-tech.github.io/swarmcli-charts
+```
+
+Marks the one application that deploys **the stack this controller itself runs
+as**, so that upgrading the controller is a commit like every other
+deployment's.
+
+Read [the trust boundary](#the-trust-boundary) first if you have not. `self` is
+the highest privilege this file grants: every other application is refused the
+controller's own secrets, configs, volume and networks whatever `allow` says,
+and this one is not — because for it those are the release's own. Point it at a
+chart that is not this controller's and you have handed that chart the admin
+token.
+
+Three rules the file is held to, and one it is not:
+
+- **At most one application**, because this controller runs as one stack.
+- **A chart source**, not a `releaseFile`: a release file is several releases
+  and cannot be the single stack the controller runs as.
+- **`driftDetection: live`**, defaulted for you and refused if you write
+  `manifest`. Without the running-spec comparison a self-update the swarm rolled
+  back is invisible — the release record already names the revision that failed,
+  so the plan reads *unchanged* and the controller reports itself synced while
+  running the previous image.
+- And the rule the file cannot be held to: **the release name must be the stack
+  namespace the controller was deployed under** — `swarmcli-cd`, from
+  `docker stack deploy -c stack.yml swarmcli-cd`. That name is a label on the
+  controller's own service, so it takes the daemon to read and the refusal comes
+  at deploy time, naming both values. The release name defaults to the
+  application's name, so calling the application `swarmcli-cd` needs no
+  `release:` at all.
+
+Named anything else, the release does not upgrade this controller — it deploys a
+**second** one beside it, and two controllers reconciling one app set apply over
+each other every interval. That is [swarmcli-cd#234][i234].
+
+[i234]: https://github.com/Eldara-Tech/swarmcli-cd/issues/234
+
+#### Upgrade the controller before you add the entry
+
+The app set is read with unknown keys refused, so a controller older than the
+release that added `self:` refuses the **whole file** the moment the key appears
+— it keeps its last-good set and stops following git. That is a frozen
+deployment and a loud error rather than an outage, but it is not what adding one
+line should do. So: upgrade the controller by hand first, then commit the entry.
+
+#### What the first sync does
+
+The controller's stack was deployed by `docker stack deploy` and has no release
+record, so the first sync **adopts** it — the one place this controller writes
+over services it has no record of installing, and it does so because the remedy
+it offers everywhere else, remove the stack and let the controller install it,
+would leave nothing running to install it again.
+
+From then on the chart is the definition. Anything the chart cannot express is
+dropped on the first apply, so compare the rendered values against your
+`stack.yml` before you commit. Four losses are refused outright, because each
+takes away the thing that would perform the next reconcile:
+
+| refused | why |
+|---|---|
+| a bind the controller is running with | the docker socket is how it reaches the swarm at all |
+| the secret `SWARMCLI_CD_ADMIN_TOKEN_FILE` names | the API and the healthcheck stop answering, and swarm restarts a controller whose only fault is that it cannot say who is calling |
+| the app-set source — the flag, or what it points at | there is nothing left to reconcile, and nothing that would notice a correction |
+| the controller's own service | applying deletes nothing, so a renamed service leaves this controller running and starts a second one beside it |
+
+Everything else is applied and logged at `warn`, naming what stopped being
+mounted. TLS and single sign-on are the two to watch: a deployment using either
+is still running afterwards and one commit from having them back, but it will
+not have them in the meantime.
+
+#### What it does not do
+
+**It does not wait.** `syncPolicy.wait` cannot cover the controller's own
+rollout — the process doing the waiting is the one being replaced. The write is
+issued last, after the apply, any drift correction and both sweeps have all
+happened and been recorded, and then this task is stopped. The
+`self-update-issued` event is the last thing the controller says.
+
+**It does not roll back.** Swarm's own `failure_action` is the mechanism, and
+the chart sets `rollback` for exactly this: a controller image that fails its
+healthcheck is reverted, and the recovered controller reports the difference as
+live drift rather than re-pushing the spec the swarm just rejected. The remedy is
+a commit.
+
+**It cannot remove itself.** Deploying onto the controller's own services is
+what upgrading it is; deleting them is not, and no entry in this file makes it
+so — `--prune` included. Drop the `self` application from the set and the
+controller's stack is left standing, with a warning every sweep saying so.
+
+**It does not bootstrap.** The controller still has to be deployed once by
+`docker stack deploy`. `self` maintains it; it does not install it.
 
 ### `allow` (optional)
 

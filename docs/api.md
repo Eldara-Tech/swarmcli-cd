@@ -405,12 +405,20 @@ meet it for the first time pointed at a controller that fills it, which is
 exactly the client that must not be surprised.
 
 The event name is the `type` verbatim, because that is what an `EventSource`
-listener binds to. There are eight of them and no others: `sync-started`,
+listener binds to. There are nine of them and no others: `sync-started`,
 `sync-succeeded`, `sync-failed`, `drift-detected`, `live-drift-detected`,
-`drift-converged`, `resources-pruned` and `prune-failed`. Live drift is its own
-type rather than a `drift-detected` with a different message — one is a commit
-to review and the other a change nobody recorded, and a client routing on the
-name must be able to tell them apart without reading prose.
+`drift-converged`, `resources-pruned`, `prune-failed` and `self-update-issued`.
+Live drift is its own type rather than a `drift-detected` with a different
+message — one is a commit to review and the other a change nobody recorded, and
+a client routing on the name must be able to tell them apart without reading
+prose.
+
+`self-update-issued` is the last event a controller sends. It reports that the
+write replacing it has been accepted by the daemon, which is not the same as a
+controller that came back: the task is stopped as the rollout starts, and if the
+new one fails its healthcheck the swarm reverts the service and the recovered
+controller reports that as live drift. A client must not read it as a
+completion, and should expect the stream to end immediately after it.
 
 The stream is fed by the same notifier seam that writes the controller's log,
 which is why a companion adding Slack *appends* a notifier rather than replacing

@@ -1000,9 +1000,9 @@ func (b *Backend) rejectOwnNamespace(ctx context.Context, release string) error 
 	if mine.namespace == "" || mine.namespace != release {
 		return nil
 	}
-	return fmt.Errorf("refusing to act on release '%s': it is the stack namespace this controller itself "+
-		"is deployed under, so deploying it would write this release's services over the controller's own "+
-		"and removing it would delete the controller. Give the release a name of its own", release)
+	return fmt.Errorf("refusing to act on release '%s': %w, so deploying it would write this release's "+
+		"services over the controller's own and removing it would delete the controller. Give the release "+
+		"a name of its own", release, capability.ErrOwnStack)
 }
 
 // releaseConfigNames names the chart engine's release records.

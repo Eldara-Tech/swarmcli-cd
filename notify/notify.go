@@ -57,6 +57,22 @@ const (
 	// PruneFailed reports that the deletion did not complete. What it names is
 	// still deployed and still unmanaged; the next reconcile tries again.
 	PruneFailed EventType = "prune-failed"
+	// SelfUpdateIssued reports that the controller has asked the swarm to
+	// replace it with the revision it just applied. Message names the release.
+	//
+	// It is the last thing this controller says. Swarm's update order is
+	// stop-first, so the task that dispatched this is stopped as the rollout
+	// starts, and the sync it belongs to therefore has no recorded outcome —
+	// the process that would have recorded one is gone. This event is what
+	// stands in its place, and the release record written a moment earlier is
+	// what the replacement reads.
+	//
+	// Which is also why a notifier must not treat it as a completion. What it
+	// reports is a write accepted by the daemon, not a controller that came
+	// back: if the new task fails its healthcheck the swarm rolls the service
+	// back, and the recovered controller reports that as live drift rather than
+	// as anything here.
+	SelfUpdateIssued EventType = "self-update-issued"
 )
 
 // Event is one thing that happened to one application.
@@ -224,6 +240,11 @@ func (logNotifier) Notify(ctx context.Context, e Event) {
 	// running service outside git, and the controller either has or has not put
 	// it back. Both are lines an operator needs to find afterwards.
 	case LiveDriftDetected, DriftConverged:
+		level = slog.LevelWarn
+	// Warn, for the reason ResourcesPruned is: the controller is about to stop.
+	// It is the line an operator goes looking for to explain why the log ends
+	// here and the API stopped answering for a minute.
+	case SelfUpdateIssued:
 		level = slog.LevelWarn
 	}
 	slog.Default().Log(ctx, level, "reconcile", attrs...)

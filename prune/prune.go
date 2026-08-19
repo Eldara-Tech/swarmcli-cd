@@ -549,13 +549,41 @@ func (p *Pruner) Departed(ctx context.Context, desired, declared []string) ([]st
 	var errs []error
 	for _, app := range departed(releases, desired, declared, p.controller) {
 		var failed []failure
+		// Counted, and it keeps the application out of the pruned list below. A
+		// stack that was deliberately left standing is not a cleanup that
+		// happened, and saying it was would tell an operator their controller
+		// had been torn down.
+		var left int
 		for _, release := range app.releases {
-			if err := p.uninstall(ctx, backend, engine, app.name, release); err != nil {
+			err := p.uninstall(ctx, backend, engine, app.name, release)
+			// The one departure that is not a cleanup. Dropping the self
+			// application from the app set leaves the stack this controller runs
+			// as stamped for an application nobody declares, and no sweep can
+			// remove it — the controller would be deleting itself, which the
+			// backend refuses and must. Reported as a failure it would be the
+			// same failure every interval, for ever, about a controller that is
+			// working perfectly.
+			//
+			// Said every sweep rather than once. The condition is unresolved
+			// until somebody edits the app set, and a warning an operator can
+			// only find by scrolling back to the first sweep after the commit is
+			// not one they will find.
+			if errors.Is(err, capability.ErrOwnStack) {
+				left++
+				p.log.Warn("the stack this controller runs as is no longer declared in the app set; leaving it "+
+					"alone, because a controller cannot delete itself. Deploy it by hand if it is meant to stop "+
+					"being managed from here",
+					"application", app.name, "release", release)
+				continue
+			}
+			if err != nil {
 				failed = append(failed, failure{release: release, err: err})
 			}
 		}
 		if len(failed) == 0 {
-			pruned = append(pruned, app.name)
+			if left == 0 {
+				pruned = append(pruned, app.name)
+			}
 			continue
 		}
 
