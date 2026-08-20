@@ -429,6 +429,7 @@ func (l *Loop) apply(desired []application.Spec) error {
 			continue
 		}
 		l.log.Info("application changed in the app set", "application", spec.Name)
+		l.noteSelf(spec)
 	}
 
 	for _, spec := range add {
@@ -442,9 +443,32 @@ func (l *Loop) apply(desired []application.Spec) error {
 		}
 		l.adopt(spec.Name)
 		l.log.Info("application joined the app set", "application", spec.Name)
+		l.noteSelf(spec)
 	}
 
 	return errors.Join(errs...)
+}
+
+// noteSelf says out loud that an application marks the controller's own stack.
+//
+// At warn, and beside the two lines that already report the change, because
+// `self` is the highest privilege this file grants and it arrives looking like
+// any other edit: the release namespace *is* the controller's namespace, so the
+// chart it names is handed the docker socket and the admin token, which is
+// root-equivalent on the swarm. An operator reading the log after somebody
+// else's commit has no other way to learn that the file now says the controller
+// upgrades itself.
+//
+// Once per change rather than once per reconcile. What it reports is the app set
+// having said so, which happens here and nowhere else; repeating it every
+// interval would train an operator to scroll past it (#245).
+func (l *Loop) noteSelf(spec application.Spec) {
+	if !spec.Self {
+		return
+	}
+	l.log.Warn("this application is this controller's own stack; from its next sync the app set upgrades "+
+		"this controller, and its chart is deployed with the socket and the admin token this controller holds",
+		"application", spec.Name)
 }
 
 // credential resolves an application's image-pull credential and hands it to the

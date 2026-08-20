@@ -570,21 +570,35 @@ func withAllowedReferences(b charts.Backend, allow application.Allow) charts.Bac
 // Only for the application the app set marked, and unconditionally not for any
 // other: an ordinary application's backend must be the one it has always been.
 //
-// A backend that does not support the upgrade is left alone, like its
-// neighbours — but the consequence is different and worth stating. The other
-// three lose a feature; this one loses the whole application, because the self
-// release is then deployed as an ordinary one and refused by the guards that
-// exist to refuse it. That is the right failure: a backend that cannot hand back
-// the last write cannot deploy this release safely, so being unable to deploy it
-// at all is the honest outcome rather than a half-applied controller.
-func withSelfRelease(b charts.Backend, spec application.Spec, hold capability.DeferSelf) charts.Backend {
+// A backend that does not support the upgrade fails the application here rather
+// than being left alone like its neighbours. The other three lose a feature;
+// this one cannot deploy at all — the self release would go to the swarm as an
+// ordinary one and be refused by the guards that exist to refuse it. Failing
+// early is the same outcome and says why: refused further down, what the
+// operator reads is a message about the release name colliding with the
+// controller's stack, which is true and is not the reason, and which sends them
+// to rename the release — the one change that guarantees it never works (#245).
+func withSelfRelease(b charts.Backend, spec application.Spec, hold capability.DeferSelf) (charts.Backend, error) {
 	if !spec.Self {
-		return b
+		return b, nil
 	}
-	if sb, ok := b.(capability.SelfRelease); ok {
-		return sb.WithSelfRelease(hold)
+	sb, ok := b.(capability.SelfRelease)
+	if !ok {
+		return nil, fmt.Errorf("this application is marked `self: true`, which needs a backend that can "+
+			"deploy the stack this controller runs as, and the backend for destination '%s' cannot",
+			destinationName(spec))
 	}
-	return b
+	return sb.WithSelfRelease(hold), nil
+}
+
+// destinationName names the swarm an application deploys to for a message, and
+// says "this one" for the destination nothing was written about — which in an
+// Apache-2.0 build is every application.
+func destinationName(spec application.Spec) string {
+	if spec.Destination.Swarm == "" {
+		return "the swarm this controller runs in"
+	}
+	return spec.Destination.Swarm
 }
 
 // replaceSelf issues the write that replaces this controller, and is the last
@@ -1815,7 +1829,10 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	// converge writes through DeployStack directly — and a deferral taken by
 	// whichever ran second would otherwise be the only one issued.
 	var replaceSelf func(context.Context) error
-	backend = withSelfRelease(backend, spec, func(apply func(context.Context) error) { replaceSelf = apply })
+	backend, err = withSelfRelease(backend, spec, func(apply func(context.Context) error) { replaceSelf = apply })
+	if err != nil {
+		return err
+	}
 	engine := r.newEngine(backend)
 
 	plan, err := engine.PlanApply(ctx, built.ReleaseFile, built.Charts, charts.PlanOptions{

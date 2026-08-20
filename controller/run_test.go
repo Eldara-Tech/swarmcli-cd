@@ -1063,3 +1063,36 @@ func waitForGet(c *http.Client, url string) (*http.Response, error) {
 	}
 	return nil, err
 }
+
+// The line an operator greps when a controller does not behave has to name the
+// build. Whether this one knows a key the app set uses was the whole of #234,
+// and answering it meant a shell inside the container.
+func TestTheStartupLineNamesTheBuild(t *testing.T) {
+	swapAuthorizer(t, readyAuthorizer{})
+	data := t.TempDir()
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := serve(ctx, options{
+		listen: testListen, dataDir: data, appSetInterval: appset.DefaultInterval,
+		appSetDir: filepath.Join(data, "not-synced-yet"),
+	}, log)
+	if err != nil {
+		t.Fatalf("serve = %v, want nil", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "version="+version) {
+		t.Errorf("the startup line does not name this build's version:\n%s", out)
+	}
+	// The engine is the other half: a chart's swarmcliVersion resolves against
+	// it and not against the line above, so one without the other names the
+	// wrong number for half the questions asked of it.
+	if !strings.Contains(out, "engine=") {
+		t.Errorf("the startup line does not name the chart engine:\n%s", out)
+	}
+}

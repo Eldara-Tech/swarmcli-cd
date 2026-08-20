@@ -4,6 +4,7 @@
 package appset
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -1241,5 +1242,86 @@ func TestReclaimFailureIsReported(t *testing.T) {
 	}
 	if got := loop.Status().AppSet.Error; !strings.Contains(got, "permission denied") {
 		t.Errorf("status error = %q, want the sweep failure reported", got)
+	}
+}
+
+// selfApp is a set whose second application marks the stack this controller
+// itself runs as — a chart source and a pinned version, which is what the
+// loader requires of one.
+const selfApp = `applications:
+  - name: edge
+    source:
+      repoURL: https://example.com/infra.git
+      revision: main
+      releaseFile: releases/edge.yaml
+  - name: swarmcli-cd
+    self: true
+    source:
+      repoURL: https://example.com/infra.git
+      revision: main
+      chart:
+        ref: swarmcli-charts/swarmcli-cd
+        version: "0.3.0"
+        repositories:
+          - name: swarmcli-charts
+            url: https://eldara-tech.github.io/swarmcli-charts
+`
+
+// captured builds a logger writing into a buffer the caller reads back.
+func captured() (*slog.Logger, *bytes.Buffer) {
+	var buf bytes.Buffer
+	return slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), &buf
+}
+
+// newLoggedLoop is newLoop with a logger the test can read. Separate rather than
+// a parameter on newLoop because every other test in this file is indifferent to
+// what was logged and says so by not asking.
+func newLoggedLoop(t *testing.T, initial string, apps ...application.Spec) (*Loop, *bytes.Buffer, func(string)) {
+	t.Helper()
+	m := pathMode(t, initial)
+	log, buf := captured()
+	loop := NewLoop(m.loader, newFakeReconciler(apps...), LoopOptions{
+		Mode: "path", Source: testSource, Log: log, Credentials: noCredentials,
+	})
+	return loop, buf, m.publish
+}
+
+// An application arriving as self is the highest privilege the file grants, and
+// it arrives looking like any other edit. Both routes in have to say so.
+func TestSelfApplicationIsAnnouncedWhenItJoins(t *testing.T) {
+	loop, log, _ := newLoggedLoop(t, selfApp)
+
+	if err := loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if !strings.Contains(log.String(), "this controller's own stack") {
+		t.Errorf("an application joining as self logged nothing about it:\n%s", log.String())
+	}
+	if !strings.Contains(log.String(), "level=WARN") {
+		t.Errorf("the self announcement is not at warn:\n%s", log.String())
+	}
+}
+
+func TestSelfApplicationIsAnnouncedWhenItChanges(t *testing.T) {
+	loop, log, publish := newLoggedLoop(t, oneApp, spec("edge", "releases/edge.yaml"))
+
+	publish(selfApp)
+	if err := loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if !strings.Contains(log.String(), "this controller's own stack") {
+		t.Errorf("an application becoming self logged nothing about it:\n%s", log.String())
+	}
+}
+
+// And an ordinary set says nothing, or the line means nothing.
+func TestAnOrdinaryApplicationIsNotAnnouncedAsSelf(t *testing.T) {
+	loop, log, _ := newLoggedLoop(t, oneApp)
+
+	if err := loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if strings.Contains(log.String(), "this controller's own stack") {
+		t.Errorf("an ordinary application was announced as self:\n%s", log.String())
 	}
 }

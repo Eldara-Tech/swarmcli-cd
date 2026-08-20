@@ -1072,3 +1072,32 @@ func TestAppGetShowsTheWaveWhenThereIsMoreThanOne(t *testing.T) {
 		t.Errorf("stdout = %q, want api reported in wave 2", stdout)
 	}
 }
+
+// The application the controller upgrades itself from reads exactly like every
+// other one in this view, and it is the one whose privilege is different.
+func TestAppGetNamesASelfApplication(t *testing.T) {
+	view := syncedView()
+	view.Spec.Self = true
+	server := start(t, &stubReconciler{view: view})
+
+	code, stdout, stderr := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "Self") {
+		t.Errorf("stdout = %q, want it to say the application is this controller's own stack", stdout)
+	}
+}
+
+// And says nothing about it otherwise, or the row means nothing.
+func TestAppGetIsSilentAboutSelfOnAnOrdinaryApplication(t *testing.T) {
+	server := start(t, &stubReconciler{view: syncedView()})
+
+	code, stdout, stderr := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if strings.Contains(stdout, "Self") {
+		t.Errorf("stdout = %q, want no self row on an ordinary application", stdout)
+	}
+}

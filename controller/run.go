@@ -542,10 +542,18 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// licensed module.
 	go feature.WatchLicence(ctx, log, time.Now)
 
+	// version leads, because whether this build knows a key the app set uses is
+	// the first thing every field report turns on and the only place it was
+	// answerable from was a shell inside the container (#245). The engine goes
+	// with it: a chart's swarmcliVersion resolves against that and not against
+	// this, so reporting one without the other names the wrong number half the
+	// time.
+	//
 	// tls is on this line because it is the line an operator greps when the task
 	// will not stay up: a healthcheck still probing http against a TLS listener
 	// restarts the task forever with everything else working perfectly.
 	log.Info("starting",
+		"version", version, "engine", engineVersion(),
 		"applications", len(cfg.Applications), "listen", o.listen, "tls", o.tlsCert != "",
 		"mode", mode, "appSet", sourceDesc,
 		"prune", o.prune, "pruneVolumes", o.pruneVolumes, "controllerID", o.controllerID)

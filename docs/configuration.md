@@ -344,6 +344,21 @@ release that added `self:` refuses the **whole file** the moment the key appears
 deployment and a loud error rather than an outage, but it is not what adding one
 line should do. So: upgrade the controller by hand first, then commit the entry.
 
+#### Checking it took
+
+The controller reports what it is holding, which is not always what the file
+says — a static Docker config is immutable, and a published set arrives a
+sidecar interval behind the commit:
+
+```bash
+swarmcli-cd app get swarmcli-cd            # a `Self` row, or the marking has not arrived
+swarmcli-cd app get swarmcli-cd -o json | jq .spec.self
+```
+
+An application that has just become `self` also says so once in the log, at
+`warn`, beside the line reporting the change. And the `starting` line names the
+build, which is what decides whether this controller knows the key at all.
+
 #### What the first sync does
 
 The controller's stack was deployed by `docker stack deploy` and has no release
