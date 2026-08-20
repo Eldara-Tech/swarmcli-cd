@@ -80,5 +80,10 @@ jobs:
       # budget on the last of those PRs. The headroom is deliberate: a timeout
       # here reads as a defect in whatever was being tested when the alarm fired,
       # which costs an investigation before anyone notices it was only the clock.
+      # Two packages. Self-management is exercised in package backend rather than
+      # here: the identity read starts at the hostname, so a test can only be
+      # this controller's own stack if it can redirect that — and the seam must
+      # stay unexported, because what it answers decides which release is exempt
+      # from every guard the others are held to (#246).
       - name: Run the integration tests
-        run: go test -tags=integration -count=1 -v -timeout=25m ./integration-tests/...
+        run: go test -tags=integration -count=1 -v -timeout=25m ./integration-tests/... ./backend/...

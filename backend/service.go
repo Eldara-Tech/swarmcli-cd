@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -95,6 +96,17 @@ type Backend struct {
 	self *selfMountCache
 	// now stamps the swarmcli.created label; overridable in tests.
 	now func() time.Time
+	// hostname is where readSelfMounts starts: in a container the hostname is
+	// the container id unless somebody overrode it, and that is what ties this
+	// process to a task, a service and a stack namespace.
+	//
+	// os.Hostname in production, and deliberately not in Options. What this
+	// answers decides which release is exempt from every guard the others are
+	// held to, so it must not be settable by anything outside this package —
+	// while the guards themselves cannot be exercised against a real daemon at
+	// all unless a test can be a swarm task, which is what this makes possible
+	// (#246).
+	hostname func() (string, error)
 }
 
 // Options tune a Backend. Every field has a working default.
@@ -116,7 +128,7 @@ func New(api client.APIClient, o Options) *Backend {
 		o.Now = time.Now
 	}
 	return &Backend{api: api, log: o.Log, onOutOfBandChange: o.OnOutOfBandChange, now: o.Now,
-		self: &selfMountCache{}}
+		hostname: os.Hostname, self: &selfMountCache{}}
 }
 
 // ApplyServices creates the stack's services that do not exist and updates
