@@ -687,7 +687,9 @@ const (
 // the chart cannot express is dropped on the first apply. Most of that is
 // survivable: a deployment that loses TLS or SSO is still running, still
 // reconciling, and one commit away from having them back — so those are said out
-// loud and applied. Four losses are not survivable, and they are the ones here.
+// loud and applied. Five are not survivable, and they are the ones here — four
+// the manifest takes away, and one it adds, which is a controller older than the
+// one applying it (checkSelfVersion).
 //
 // The asymmetry is the whole rule. This is not a check that the manifest matches
 // the running spec — it is meant not to, that is what an upgrade is. It is a
@@ -746,6 +748,10 @@ func (b *Backend) rejectSelfLoss(ctx context.Context, stack *cdcompose.Stack) er
 	}
 
 	if err := checkAppSetSource(live.Spec.Name, from, to); err != nil {
+		return err
+	}
+
+	if err := b.checkSelfVersion(live.Spec.Name, from.Image, to.Image); err != nil {
 		return err
 	}
 

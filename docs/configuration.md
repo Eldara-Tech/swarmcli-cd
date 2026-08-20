@@ -369,7 +369,7 @@ would leave nothing running to install it again.
 
 From then on the chart is the definition. Anything the chart cannot express is
 dropped on the first apply, so compare the rendered values against your
-`stack.yml` before you commit. Four losses are refused outright, because each
+`stack.yml` before you commit. Five changes are refused outright, because each
 takes away the thing that would perform the next reconcile:
 
 | refused | why |
@@ -378,6 +378,13 @@ takes away the thing that would perform the next reconcile:
 | the secret `SWARMCLI_CD_ADMIN_TOKEN_FILE` names | the API and the healthcheck stop answering, and swarm restarts a controller whose only fault is that it cannot say who is calling |
 | the app-set source — the flag, or what it points at | there is nothing left to reconcile, and nothing that would notice a correction |
 | the controller's own service | applying deletes nothing, so a renamed service leaves this controller running and starts a second one beside it |
+| a controller image older than the one applying it | an older build may not understand the app set it inherits — every build before the one that added `self:` refuses a file naming it — and then nothing is left reading the file that would correct it |
+
+The version comparison is deliberately narrow: only a strict downgrade of the
+same repository, both tags parsing as semantic versions. A different repository,
+a digest, `latest` or a build id cannot be ordered, so it is logged and applied —
+which is why the values file this application deploys from should name the
+version you mean rather than leaving `image.tag` to the chart's default.
 
 Everything else is applied and logged at `warn`, naming what stopped being
 mounted. TLS and single sign-on are the two to watch: a deployment using either

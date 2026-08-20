@@ -3138,3 +3138,142 @@ func TestAnUndecoratedBackendPermitsNothing(t *testing.T) {
 		t.Fatalf("DeployStack = %v, want a chart that owns everything it names deployed", err)
 	}
 }
+
+// ---------------------------------------- a self release that goes backwards (#244)
+
+// controllerOnImage is the swarm with a controller on it that names the image it
+// is running. controllerService leaves Image empty, which is the honest shape
+// for every guard that does not look at it — this one does.
+func controllerOnImage(image string) *fakeAPI {
+	api := asController(&fakeAPI{})
+	api.selfSpec.TaskTemplate.ContainerSpec.Image = image
+	return api
+}
+
+// selfManifest is bootstrappedStack's shape reduced to what controllerService is
+// running with — the socket, which is the one earlier loss this fixture would
+// otherwise trip — parameterised on the image, which is what these tests move.
+func selfManifest(image string) string {
+	return `
+services:
+  controller:
+    image: ` + image + `
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+`
+}
+
+// The trap #243 describes, refused. A values file that does not pin `image.tag`
+// renders the chart's appVersion, which is a controller that predates the key
+// the app set it would inherit is written with — and once it is running, nothing
+// left is reading that file to apply the correction.
+func TestASelfReleaseIsRefusedAnOlderController(t *testing.T) {
+	api := controllerOnImage("eldaratech/swarmcli-cd:1.3.0-rc1-oss")
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+
+	err := b.DeployStack(t.Context(), charts.DeployRequest{
+		Name: "swarmcli-cd", Manifest: selfManifest("eldaratech/swarmcli-cd:1.2.0"), Resolve: ResolveNever,
+	})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a self release that downgrades this controller refused")
+	}
+	for _, want := range []string{"1.2.0", "1.3.0-rc1-oss"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %s", err, want)
+		}
+	}
+	if len(api.created)+len(api.updated) > 0 {
+		t.Error("wrote services for a refused self release")
+	}
+}
+
+// The daemon appends the digest it resolved the running tag to, so the live side
+// is never the string the manifest would be compared against as written.
+func TestTheRunningControllersDigestDoesNotDefeatTheComparison(t *testing.T) {
+	api := controllerOnImage("eldaratech/swarmcli-cd:1.3.0-rc1-oss@sha256:" + strings.Repeat("a", 64))
+	b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+
+	err := b.DeployStack(t.Context(), charts.DeployRequest{
+		Name: "swarmcli-cd", Manifest: selfManifest("eldaratech/swarmcli-cd:1.2.0"), Resolve: ResolveNever,
+	})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want the downgrade refused through the digest the daemon resolved")
+	}
+}
+
+// Upgrading is the whole feature, and it must not be what this guard catches.
+func TestASelfReleaseMayMoveThisControllerForward(t *testing.T) {
+	for name, to := range map[string]string{
+		"a newer version":             "eldaratech/swarmcli-cd:1.3.0",
+		"the same version":            "eldaratech/swarmcli-cd:1.2.0",
+		"a prerelease of it":          "eldaratech/swarmcli-cd:1.3.0-rc1-oss",
+		"another repository":          "my-registry.example.com/swarmcli-cd:0.1.0",
+		"a tag that is not a version": "eldaratech/swarmcli-cd:nightly",
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := controllerOnImage("eldaratech/swarmcli-cd:1.2.0")
+			b := testBackend(t, api, nil).WithSelfRelease(noDeferral)
+
+			err := b.DeployStack(t.Context(), charts.DeployRequest{
+				Name: "swarmcli-cd", Manifest: selfManifest(to), Resolve: ResolveNever,
+			})
+			if err != nil {
+				t.Fatalf("DeployStack = %v, want %s applied", err, name)
+			}
+		})
+	}
+}
+
+// And the guard is the self release's alone. Every other application deploys
+// whatever image it likes, including this controller's own repository at a
+// version older than the one running — it is not being deployed over this
+// controller, so there is nothing to be unable to fix.
+func TestAnOrdinaryReleaseMayDeployAnOlderImage(t *testing.T) {
+	api := controllerOnImage("eldaratech/swarmcli-cd:1.3.0-rc1-oss")
+
+	err := allowing(t, api, application.Allow{HostPaths: []string{"/var/run/docker.sock"}}).DeployStack(t.Context(),
+		charts.DeployRequest{Name: "elsewhere", Manifest: selfManifest("eldaratech/swarmcli-cd:1.2.0"), Resolve: ResolveNever})
+	if err != nil {
+		t.Fatalf("DeployStack = %v, want an ordinary release left alone", err)
+	}
+}
+
+// What cannot be ordered is said out loud instead, next to the other drops. An
+// operator tagging their own builds gets no refusal from this guard, and no
+// silence either — the one deploy whose mistake removes the thing that would
+// correct it is not a place to be quiet about not having checked.
+func TestAnUnorderableSelfImageIsWarnedAboutRatherThanRefused(t *testing.T) {
+	api := controllerOnImage("eldaratech/swarmcli-cd:1.2.0")
+	var log bytes.Buffer
+	b := New(api, Options{Log: slog.New(slog.NewTextHandler(&log, nil))}).WithSelfRelease(noDeferral)
+
+	err := b.DeployStack(t.Context(), charts.DeployRequest{
+		Name: "swarmcli-cd", Manifest: selfManifest("eldaratech/swarmcli-cd:nightly"), Resolve: ResolveNever,
+	})
+	if err != nil {
+		t.Fatalf("DeployStack = %v, want an image that cannot be ordered applied", err)
+	}
+	if !strings.Contains(log.String(), "cannot be ordered") {
+		t.Errorf("nothing was logged about an image the guard could not read:\n%s", log.String())
+	}
+}
+
+// And an unchanged reference says nothing. A self release redeploys on every
+// drift correction, so a controller pinned by digest would otherwise be told the
+// same thing about the same image for ever.
+func TestAnUnchangedSelfImageIsNotWarnedAbout(t *testing.T) {
+	const pinned = "eldaratech/swarmcli-cd@sha256:" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	api := controllerOnImage(pinned)
+	var log bytes.Buffer
+	b := New(api, Options{Log: slog.New(slog.NewTextHandler(&log, nil))}).WithSelfRelease(noDeferral)
+
+	err := b.DeployStack(t.Context(), charts.DeployRequest{
+		Name: "swarmcli-cd", Manifest: selfManifest(pinned), Resolve: ResolveNever,
+	})
+	if err != nil {
+		t.Fatalf("DeployStack = %v, want the unchanged image applied", err)
+	}
+	if strings.Contains(log.String(), "cannot be ordered") {
+		t.Errorf("an unchanged image was warned about:\n%s", log.String())
+	}
+}
