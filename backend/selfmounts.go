@@ -6,7 +6,6 @@ package backend
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
 
 	"github.com/containerd/errdefs"
@@ -147,7 +146,7 @@ func (b *Backend) mounts(ctx context.Context) (selfMounts, error) {
 func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 	// In a container the hostname is the container id unless somebody overrode
 	// it, which is what makes the rest of this resolvable from the inside.
-	host, err := os.Hostname()
+	host, err := b.hostname()
 	if err != nil {
 		return selfMounts{}, fmt.Errorf("reading this container's hostname: %w", err)
 	}
