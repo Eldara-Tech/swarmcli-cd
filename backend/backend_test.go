@@ -2501,6 +2501,13 @@ func TestDeployStackRefusesTheControllersOwnStackName(t *testing.T) {
 		t.Errorf("the controller was written to: created=%d updated=%d order=%v",
 			len(api.created), len(api.updated), api.order)
 	}
+	// And the other way out. This guard fires only for a release the app set did
+	// not mark, so an operator following the self documentation who lands here
+	// has one thing to change and it is not the release name — which is what
+	// #234 cost twice over.
+	if !strings.Contains(err.Error(), "self: true") {
+		t.Errorf("error %q does not name `self: true` as the other way out", err)
+	}
 }
 
 // The destruction direction, which needs no chart at all. RemoveStack deletes

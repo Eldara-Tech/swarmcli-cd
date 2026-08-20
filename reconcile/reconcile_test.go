@@ -4657,3 +4657,34 @@ func TestOnlyTheMarkedApplicationGetsASelfBackend(t *testing.T) {
 		t.Error("an ordinary application's backend was asked to deploy the controller's own release")
 	}
 }
+
+// A backend that cannot take the self scoping fails the application here, saying
+// so. Left alone, it would deploy the self release as an ordinary one and be
+// refused further down by the guard that exists to refuse exactly that — with a
+// message about the release name colliding with the controller's stack, which is
+// true, is not the reason, and sends the operator to rename the release (#245).
+func TestABackendThatCannotDeployTheControllerSaysSo(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}}
+
+	self := spec("swarmcli-cd", true)
+	self.Self = true
+	r := newTestWith(t, []application.Spec{self}, engine, &fakeFetcher{revision: strings.Repeat("a", 40)},
+		fakeRegistry{backend: plainBackend{}})
+
+	err := r.Sync(context.Background(), "swarmcli-cd")
+	if err == nil {
+		t.Fatal("Sync = nil, want the self release refused by a backend that cannot deploy it")
+	}
+	if !strings.Contains(err.Error(), "self: true") {
+		t.Errorf("error %q does not say which part of the app set could not be honoured", err)
+	}
+	if engine.applied != 0 {
+		t.Errorf("applied = %d, want the pass refused before anything reached the swarm", engine.applied)
+	}
+}
+
+// plainBackend is the smallest contract the reconciler holds and nothing more —
+// a Phase 3 remote backend that has not implemented the self upgrade.
+type plainBackend struct{ charts.Backend }
+
+func (plainBackend) StackServices(context.Context, string) []charts.ServiceState { return nil }

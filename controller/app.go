@@ -355,6 +355,13 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 	} else {
 		_, _ = fmt.Fprintf(out, "  Release file %s\n", view.Spec.Source.ReleaseFile)
 	}
+	// Only when it is set, like the JSON's omitempty and for the same reason:
+	// this is the one application the controller upgrades itself from, and a row
+	// reading "no" on every other one would say nothing while making the case
+	// that matters harder to see.
+	if view.Spec.Self {
+		_, _ = fmt.Fprintf(out, "  Self         yes — this controller's own stack\n")
+	}
 	_, _ = fmt.Fprintf(out, "  Destination  %s\n", destination(view.Spec.Destination))
 	_, _ = fmt.Fprintf(out, "  Sync         %s%s\n", state(view.Status.Sync.State), revisionSuffix(view.Status.Sync.Revision))
 	_, _ = fmt.Fprintf(out, "  Health       %s (%s services)\n", state(view.Status.Health.State), services(view.Status.Health.Services))

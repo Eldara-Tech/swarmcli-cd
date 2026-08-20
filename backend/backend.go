@@ -980,6 +980,14 @@ func bindSources(cs *swarm.ContainerSpec) []string {
 // every application's clone and chart cache. Nothing reconverges after that,
 // because the thing that would have is gone (#102).
 //
+// One release is not that collision, and it is why the message names two ways
+// out rather than one. An application marked `self: true` deploys this exact
+// namespace on purpose — overwriting the controller's own services is what
+// upgrading it *is* — and DeployStack exempts it before reaching here. So an
+// operator who arrives at this message has an application the controller is not
+// holding as self, and telling them only to rename the release sends them away
+// from the fix. That is what #234 cost, twice.
+//
 // So both verbs are guarded, and the guard is here rather than at the reconciler
 // because these two methods are what every path acting on a release name goes
 // through — the engine's install, upgrade and uninstall, the drift correction,
@@ -1002,7 +1010,8 @@ func (b *Backend) rejectOwnNamespace(ctx context.Context, release string) error 
 	}
 	return fmt.Errorf("refusing to act on release '%s': %w, so deploying it would write this release's "+
 		"services over the controller's own and removing it would delete the controller. Give the release "+
-		"a name of its own", release, capability.ErrOwnStack)
+		"a name of its own, or — if this release really is this controller's own stack — mark its "+
+		"application `self: true` in the app set", release, capability.ErrOwnStack)
 }
 
 // releaseConfigNames names the chart engine's release records.
