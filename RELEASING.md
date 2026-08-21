@@ -64,10 +64,13 @@ image push fails.
 
 **Check what the chart engine will be stamped as.** The image and the binaries
 both stamp `charts.engineVersion` with whatever swarmcli release `go.mod` pins,
-read at build time so it cannot drift from what is compiled in:
+read at build time so it cannot drift from what is compiled in. Read the module
+path out of `go.mod` too, the same way the build does — Go puts the major in the
+path from v2 on, so a literal one is wrong the day CE crosses a major:
 
 ```bash
-go list -m -f '{{.Version}}' github.com/Eldara-Tech/swarmcli
+CE=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^github\.com\/Eldara-Tech\/swarmcli(\/v[0-9]+)?$/) {print $i; exit}}' go.mod)
+go list -m -f '{{.Path}} {{.Version}}' "$CE"
 ```
 
 A pseudo-version (`v1.13.0-rc4.0.20260722094010-8b65cf951c7e`) works — chart
@@ -127,10 +130,16 @@ renderings, not a sign that the wrong thing was built.
 ## Locally, without publishing
 
 Needs Node as well as Go: the `before.hooks` run `npm --prefix web/ui ci` and
-`npm --prefix web/ui run build`, and `ENGINE_VERSION` is what the ldflag reads.
+`npm --prefix web/ui run build`, and the two `ENGINE_*` exports below are what
+the ldflag reads.
 
 ```bash
-export ENGINE_VERSION=$(go list -m -f '{{.Version}}' github.com/Eldara-Tech/swarmcli)
+export ENGINE_PKG=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^github\.com\/Eldara-Tech\/swarmcli(\/v[0-9]+)?$/) {print $i; exit}}' go.mod)
+export ENGINE_VERSION=$(go list -m -f '{{.Version}}' "$ENGINE_PKG")
 goreleaser release --snapshot --clean
 docker build -t swarmcli-cd:dev .
 ```
+
+Both, not just the version: `.goreleaser.yml` stamps
+`-X {{.Env.ENGINE_PKG}}/charts.engineVersion`, and goreleaser fails on a
+template key the environment does not carry.

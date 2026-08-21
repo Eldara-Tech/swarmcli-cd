@@ -23,7 +23,7 @@ import (
 
 	"github.com/docker/docker/client"
 
-	"github.com/Eldara-Tech/swarmcli/charts"
+	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/backend"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"

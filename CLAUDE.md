@@ -34,10 +34,12 @@ npm --prefix web/ui run build
   normal versioned module — **no `replace`, no sibling checkout**. That is
   deliberate: swarmcli-be pays the sibling-checkout tax, and renaming CE's
   module (Eldara-Tech/swarmcli#476) existed precisely so this repo would not
-  have to. Ask `go.mod` what the pin is rather than trusting a version written
-  down anywhere, including here:
+  have to. Ask `go.mod` what the pin is rather than trusting a path or a version
+  written down anywhere, including here — Go puts the major in the module path
+  from v2 on, so both halves move:
   ```bash
-  go list -m -f '{{.Version}}' github.com/Eldara-Tech/swarmcli
+  CE=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^github\.com\/Eldara-Tech\/swarmcli(\/v[0-9]+)?$/) {print $i; exit}}' go.mod)
+  go list -m -f '{{.Path}} {{.Version}}' "$CE"
   ```
   A pseudo-version is the normal state between CE releases and builds fine;
   what it costs at release time is in [RELEASING.md](RELEASING.md).

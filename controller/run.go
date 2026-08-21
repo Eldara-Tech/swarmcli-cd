@@ -38,7 +38,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
 	"github.com/Eldara-Tech/swarmcli-cd/web"
 
-	swarmlog "github.com/Eldara-Tech/swarmcli/utils/log"
+	swarmlog "github.com/Eldara-Tech/swarmcli/v2/utils/log"
 )
 
 // Defaults for the in-swarm deployment: applications.yaml arrives as a Docker
