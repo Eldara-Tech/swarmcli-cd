@@ -56,8 +56,30 @@ jobs:
       # The chart engine's version is the swarmcli release go.mod pins, which is
       # not this binary's tag. Reading it here rather than hard-coding it is what
       # keeps the stamp from drifting away from what is actually compiled in.
-      - name: Read the pinned chart-engine version
-        run: echo "ENGINE_VERSION=$(go list -m -f '{{.Version}}' github.com/Eldara-Tech/swarmcli)" >> "$GITHUB_ENV"
+      # Both the version and the package it is stamped into, because the package
+      # path carries the major from v2 on. Hard-coding it makes a CE major bump
+      # a silently unstamped release: the linker drops a -X whose symbol does
+      # not resolve without a word, and charts.EngineVersion() then returns
+      # empty, which reads as "unknown" at every swarmcliVersion floor.
+      - name: Read the pinned chart-engine module and version
+        run: |
+          ce=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^github\.com\/Eldara-Tech\/swarmcli(\/v[0-9]+)?$/) {print $i; exit}}' go.mod)
+          if [ -z "$ce" ]; then
+            echo "::error::no github.com/Eldara-Tech/swarmcli[/vN] require in go.mod"
+            exit 1
+          fi
+          # Prove the package the -X names actually exists before goreleaser
+          # builds. This is the only gate on the published binaries: the image
+          # has "The binary reports both versions" in ci.yml, but goreleaser
+          # builds and publishes in one invocation, so a check after it is not
+          # a gate, and cross-compiled artefacts cannot be run on this runner
+          # to be asked.
+          if ! go list "$ce/charts" >/dev/null 2>&1; then
+            echo "::error::$ce/charts is not in the build graph; the engine-version -X would be dropped silently"
+            exit 1
+          fi
+          echo "ENGINE_PKG=$ce" >> "$GITHUB_ENV"
+          echo "ENGINE_VERSION=$(go list -m -f '{{.Version}}' "$ce")" >> "$GITHUB_ENV"
 
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:

@@ -31,10 +31,19 @@ ARG VERSION=dev
 # module pins, read from go.mod rather than passed in so it cannot drift from
 # what is actually compiled in — without it charts.EngineVersion() is empty and
 # every chart declaring a swarmcliVersion floor is deployed unchecked.
-RUN ENGINE=$(go list -m -f '{{.Version}}' github.com/Eldara-Tech/swarmcli) && \
+#
+# The module path is read out of go.mod rather than written here. Go requires a
+# /vN suffix on every major from v2 on, so a literal path is wrong the day
+# swarmcli crosses one — and the two references fail differently. `go list -m`
+# on a path that is not in the graph errors, which is loud; the linker ignores
+# a -X naming a symbol it cannot resolve, which is silent, and silent here
+# means EngineVersion() is empty and the floors above go unchecked.
+RUN CE=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^github\.com\/Eldara-Tech\/swarmcli(\/v[0-9]+)?$/) {print $i; exit}}' go.mod) && \
+    test -n "$CE" && \
+    ENGINE=$(go list -m -f '{{.Version}}' "$CE") && \
     go build -trimpath -ldflags="-s -w \
       -X github.com/Eldara-Tech/swarmcli-cd/controller.version=${VERSION} \
-      -X github.com/Eldara-Tech/swarmcli/charts.engineVersion=${ENGINE}" \
+      -X ${CE}/charts.engineVersion=${ENGINE}" \
       -o /swarmcli-cd ./cmd/swarmcli-cd
 
 FROM alpine:3.24

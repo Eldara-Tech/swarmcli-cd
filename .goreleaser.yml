@@ -50,10 +50,14 @@ builds:
       - -s -w
       - -X github.com/Eldara-Tech/swarmcli-cd/controller.version={{.Version}}
       # The chart engine is the swarmcli release this module pins, not this
-      # binary's tag. ENGINE_VERSION is computed from go.mod by the workflow;
-      # without it charts.EngineVersion() is empty and every chart's declared
-      # floor goes unchecked.
-      - -X github.com/Eldara-Tech/swarmcli/charts.engineVersion={{.Env.ENGINE_VERSION}}
+      # binary's tag. ENGINE_PKG and ENGINE_VERSION are both computed from
+      # go.mod by the workflow, the package as well as the version because Go
+      # puts the major in the path from v2 on. Neither may be written literally
+      # here: the linker discards a -X whose symbol it cannot resolve without
+      # saying so, charts.EngineVersion() is then empty, and every chart's
+      # declared floor goes unchecked. The workflow proves the package resolves
+      # before this runs.
+      - -X {{.Env.ENGINE_PKG}}/charts.engineVersion={{.Env.ENGINE_VERSION}}
     hooks:
       # On each of the four binaries actually being published, rather than on a
       # stand-in built somewhere else. What it asserts is what the -oss name
