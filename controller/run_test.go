@@ -34,7 +34,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 
-	swarmlog "github.com/Eldara-Tech/swarmcli/utils/log"
+	swarmlog "github.com/Eldara-Tech/swarmcli/v2/utils/log"
 )
 
 func TestControllerHelp(t *testing.T) {

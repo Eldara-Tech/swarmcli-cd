@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Eldara-Tech/swarmcli/charts"
+	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 )

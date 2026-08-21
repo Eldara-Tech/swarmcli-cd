@@ -29,7 +29,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/Eldara-Tech/swarmcli/charts"
+	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/seam"
 )

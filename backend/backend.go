@@ -18,8 +18,8 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 
-	"github.com/Eldara-Tech/swarmcli/charts"
-	"github.com/Eldara-Tech/swarmcli/docker"
+	"github.com/Eldara-Tech/swarmcli/v2/charts"
+	"github.com/Eldara-Tech/swarmcli/v2/docker"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/capability"
