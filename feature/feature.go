@@ -129,8 +129,17 @@ const (
 	// remedy genuinely differs, but a sixth value that the Apache-2.0 build can
 	// never produce is a worse cost than the ambiguity.
 	StatusInvalid Status = "invalid"
-	// StatusAbsent is a build with a licensed module linked and no licence
-	// installed at all. Install one; nothing is wrong.
+	// StatusAbsent is a build with a licensed module linked and nothing
+	// granting, where the operator's own action is what turns it on and
+	// nothing is broken.
+	//
+	// Two states share it, and a message written for this value has to fit
+	// both: no licence installed at all, and — since managed licensing — a
+	// licence that is installed, verifies, and has not been activated for this
+	// swarm. They share a value for the reason given against StatusInvalid: a
+	// sixth that an Apache-2.0 build could never produce is a worse cost than
+	// the ambiguity. What it costs here is the word "install", which is only
+	// half the remedy.
 	StatusAbsent Status = "absent"
 )
 

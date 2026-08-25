@@ -36,6 +36,11 @@ func TestLicenceWarning_WhatIsWorthSaying(t *testing.T) {
 		report   Report
 		wantSaid bool
 		contains []string
+		// remedy is checked against the `remedy` log argument rather than the
+		// message. It was unchecked entirely: TestLicenceWarning_NamesTheRemedy
+		// asserts the key is present and never what it says, so a remedy that
+		// named the wrong action passed both tests.
+		remedy []string
 	}{
 		{
 			name:     "a build with no licensed module says nothing",
@@ -63,6 +68,9 @@ func TestLicenceWarning_WhatIsWorthSaying(t *testing.T) {
 			report:   licenceReport(StatusGrace, &past),
 			wantSaid: true,
 			contains: []string{"grace period", "still granted"},
+			// The managed half of the remedy, which grace has carried since
+			// #242 and nothing checked. It is the shape absent's now follows.
+			remedy: []string{"renew the licence", "license sync"},
 		},
 		{
 			name:     "expired says the features are off",
@@ -77,10 +85,15 @@ func TestLicenceWarning_WhatIsWorthSaying(t *testing.T) {
 			contains: []string{"did not verify"},
 		},
 		{
-			name:     "absent is said too — a licensed build with no licence is a state",
+			name:     "absent is said too — a licensed build with nothing granting is a state",
 			report:   licenceReport(StatusAbsent, nil),
 			wantSaid: true,
-			contains: []string{"no licence is installed"},
+			// Both halves of the remedy, because absent is two states: no
+			// licence at all, and a managed one this swarm never activated.
+			// Saying only "install" sends the second one's operator after a
+			// key already in their hand.
+			contains: []string{"no licence is active"},
+			remedy:   []string{"install a licence", "activate a managed one"},
 		},
 		{
 			name:     "a status from a newer reporter is surfaced rather than swallowed",
@@ -107,6 +120,11 @@ func TestLicenceWarning_WhatIsWorthSaying(t *testing.T) {
 			if len(args)%2 != 0 {
 				t.Errorf("odd number of log arguments: %v", args)
 			}
+			for _, want := range tc.remedy {
+				if got := remedyOf(args); !strings.Contains(got, want) {
+					t.Errorf("remedy %q does not contain %q", got, want)
+				}
+			}
 		})
 	}
 }
@@ -122,16 +140,23 @@ func TestLicenceWarning_NamesTheRemedy(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s: nothing said", status)
 		}
-		var found bool
-		for i := 0; i+1 < len(args); i += 2 {
-			if args[i] == "remedy" {
-				found = true
-			}
-		}
-		if !found {
+		// The value, not just the key: an empty remedy is not a remedy, and
+		// asserting only that the key is there is what let one go unread.
+		if got := remedyOf(args); got == "" {
 			t.Errorf("%s carries no remedy", status)
 		}
 	}
+}
+
+// remedyOf is the `remedy` log argument's value, or "" when there is none.
+func remedyOf(args []any) string {
+	for i := 0; i+1 < len(args); i += 2 {
+		if args[i] == "remedy" {
+			s, _ := args[i+1].(string)
+			return s
+		}
+	}
+	return ""
 }
 
 // The reporter revalidates per request, so between requests the clock can be

@@ -210,9 +210,9 @@ test('logs in, watches an application converge without reloading, and reads ever
   // #178's acceptance criterion — a chip that could only ever read one word is a
   // dead control the free product must not grow. The merged binary can never
   // report null, because under D20 the module is always linked; with no licence
-  // installed it reports `absent`, and the badge says "no licence, install one
-  // to turn the licensed features on". Both are community builds. Both are
-  // right.
+  // installed it reports `absent`, and the badge says "no active licence,
+  // install one, or activate a managed one, to turn the licensed features on".
+  // Both are community builds. Both are right.
   //
   // So it is derived from the document rather than from the edition, which also
   // makes it the stronger assertion: the badge renders exactly when the

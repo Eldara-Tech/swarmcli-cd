@@ -176,12 +176,29 @@ describe("the licence badge", () => {
     expect(await badgeText()).toContain("ask for a replacement");
   });
 
-  it("reads absent as something to install, not as something broken", async () => {
+  // Two states arrive here — no licence at all, and a managed one this swarm
+  // has never been activated for — because the seam is frozen at five values.
+  // The copy has to fit both, so it names both halves of the remedy.
+  it("reads absent as something to turn on, not as something broken", async () => {
     await show(licensed("absent", null));
 
     const text = await badgeText();
-    expect(text).toContain("no licence");
+    expect(text).toContain("no active licence");
     expect(text).toContain("install one");
+    expect(text).toContain("activate a managed one");
+  });
+
+  // A companion that sends the wrong one of two clocks — a managed licence's
+  // token expiry instead of its lease's — reports "expired" beside a date that
+  // has not happened. Flooring the age made that read "expired today", which is
+  // the one wrong answer that looks right.
+  it("does not invent a day for an expiry that has not happened", async () => {
+    await show(licensed("grace", daysAfterNow(30)));
+
+    const text = await badgeText();
+    expect(text).toContain("grace period");
+    expect(text).toContain("expired");
+    expect(text).not.toContain("expired today");
   });
 
   // A controller ahead of this build reports a sixth status. It has to render

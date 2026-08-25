@@ -137,11 +137,16 @@ func licenceWarning(rep Report, now time.Time) (msg string, args []any, ok bool)
 			[]any{"status", lic.Status, "remedy", "ask for a replacement licence; this is not a controller misconfiguration"}, true
 
 	case StatusAbsent:
-		// Not a lapse: this build simply has no licence. Said once at
-		// startup (the first pass) and then only every licenceRenotify, by
-		// the caller's own repetition rule.
-		return "no licence is installed — licensed features are off",
-			[]any{"status", lic.Status, "remedy", "install a licence to turn them on"}, true
+		// Not a lapse: nothing is broken and the operator's own action fixes
+		// it. Said once at startup (the first pass) and then only every
+		// licenceRenotify, by the caller's own repetition rule.
+		//
+		// "installed" is the word this cannot use, and the remedy is two:
+		// StatusAbsent also carries a managed licence that is installed and
+		// not activated for this swarm, whose operator is holding the key
+		// already and would spend the afternoon installing it again.
+		return "no licence is active — licensed features are off",
+			[]any{"status", lic.Status, "remedy", "install a licence, or run 'swarmcli license sync' on a manager to activate a managed one"}, true
 
 	case StatusValid:
 		if lic.ExpiresAt == nil {
