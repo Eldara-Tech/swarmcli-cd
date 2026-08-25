@@ -138,11 +138,16 @@ function describe(
         detail: "it did not verify — ask for a replacement",
       };
     case "absent":
-      // Nothing is wrong: the module is linked and no licence is installed.
+      // Nothing is broken, and the reader's own action turns it on. Two states
+      // share this status and the copy has to fit both: no licence installed at
+      // all, and a managed one that is installed, verifies, and has not been
+      // activated for this swarm. "install one" alone was written for the first
+      // and sends the second's reader after a key already in their hand.
       return {
         tone: "warn",
-        label: "no licence",
-        detail: "install one to turn the licensed features on",
+        label: "no active licence",
+        detail:
+          "install one, or activate a managed one, to turn the licensed features on",
       };
     default:
       return {
@@ -184,11 +189,19 @@ function daysUntil(at: string): number | null {
  * click away in the capability document. A licence with no expiry that reports
  * one of the expired statuses is a contradiction the controller sent, so it
  * says only that it expired rather than inventing a day for it.
+ *
+ * A date in the *future* under one of those statuses is the same contradiction
+ * and used to be the one that read plausibly: flooring a negative age gave
+ * "expired today", so a licence that lapsed a month ago and one still inside
+ * its window rendered identically, and both read as though it had just
+ * happened. That is what a companion sending the wrong one of two clocks looks
+ * like from here, and hedging is the honest answer to it — this build cannot
+ * know which of them the controller meant.
  */
 function expiredWhen(expiresAt: string | null): string {
   if (expiresAt === null) return "expired";
   const parsed = Date.parse(expiresAt);
-  if (Number.isNaN(parsed)) return "expired";
+  if (Number.isNaN(parsed) || parsed > Date.now()) return "expired";
   const days = Math.floor((Date.now() - parsed) / 86_400_000);
   return days <= 0 ? "expired today" : `expired ${plural(days, "day")} ago`;
 }
