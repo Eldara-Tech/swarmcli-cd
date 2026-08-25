@@ -14,7 +14,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/Eldara-Tech/swarmcli/charts"
+	"github.com/Eldara-Tech/swarmcli/v2/charts"
 )
 
 // version is the binary's own version, stamped at build time with

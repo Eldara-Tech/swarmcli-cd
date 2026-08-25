@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
-	"github.com/Eldara-Tech/swarmcli/charts"
+	"github.com/Eldara-Tech/swarmcli/v2/charts"
 )
 
 // removeDrain bounds how long Remove waits for work it has just cancelled.
