@@ -38,6 +38,13 @@ const shipped = new Set([
   "ISC",
   "MIT",
   "MIT-0",
+  // The self-hosted UI fonts (@fontsource/inter, /plus-jakarta-sans,
+  // /jetbrains-mono) are OFL-1.1: the SIL Open Font License, which permits
+  // embedding and redistributing the font files — as `//go:embed all:dist`
+  // does, inside every released binary — provided the licence travels with
+  // them, which each package ships as its own OFL.txt. The bytes are in the
+  // bundle, so this is a shipped permission, not a build-time one.
+  "OFL-1.1",
   "Python-2.0",
   "Unlicense",
 ]);

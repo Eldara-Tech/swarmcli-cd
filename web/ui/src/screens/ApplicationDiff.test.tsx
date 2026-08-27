@@ -166,5 +166,6 @@ it('reaches the tab from the detail screen, and leaves the header in place', asy
 
   expect(await screen.findByRole('heading', { name: 'edge', level: 1 })).toBeDefined()
   expect(screen.getByRole('link', { name: 'Diff' }).className).toContain('tab-current')
-  expect(screen.getByRole('link', { name: 'Overview' }).className).not.toContain('tab-current')
+  const tabs = document.querySelector('.tabs') as HTMLElement
+  expect(within(tabs).getByRole('link', { name: 'Overview' }).className).not.toContain('tab-current')
 })

@@ -9,6 +9,7 @@ import { controllerKey } from '../api/queries'
 import type { AppSetStatus, ControllerStatus as Status } from '../api/types'
 import { Instant } from '../components/Instant'
 import { shortRevision } from '../format'
+import { Loading } from '../components/StateBlock'
 
 /**
  * The controller itself, as distinct from the applications it reconciles.
@@ -30,7 +31,7 @@ export function ControllerStatusScreen() {
     queryFn: () => apiGet<Status>('/api/v1/status'),
   })
 
-  if (status.isPending) return <p>Loading…</p>
+  if (status.isPending) return <Loading />
   if (status.isError) {
     return (
       <p className="error" role="alert">
@@ -50,33 +51,56 @@ export function ControllerStatusScreen() {
 
       <AppSetNotice shape={shape} appSet={set} />
 
-      <dl className="detail-fields">
-        <dt>Mode</dt>
-        {/* An empty mode is not an unknown one: it is the status handler's
-            no-controller arm, and "unknown" would suggest something to diagnose
-            where there is nothing wired to diagnose. */}
-        <dd>{set.mode === '' ? <span className="muted">none</span> : set.mode}</dd>
-        {set.source !== undefined && set.source !== '' && (
-          <>
-            <dt>Source</dt>
-            <dd className="wrap">{set.source}</dd>
-          </>
-        )}
-        {set.revision !== undefined && set.revision !== '' && (
-          <>
-            <dt>Revision</dt>
-            <dd>
-              <code title={set.revision}>{shortRevision(set.revision)}</code>
-            </dd>
-          </>
-        )}
-        <dt>Loaded</dt>
-        <dd data-testid="app-set-loaded">
-          <Instant at={set.loadedAt} />
-        </dd>
-        <dt>Applications</dt>
-        <dd data-testid="app-set-applications">{status.data.applications}</dd>
-      </dl>
+      <div className="bento-grid">
+        <div className="bento-col-12">
+          <div className="card-frame">
+            <div className="card-frame-head">
+              <h2>
+                <span className="dot dot-ok dot-pulse" />
+                GitOps Reconcile Engine
+              </h2>
+              <span className="chip chip-good">Engine Online</span>
+            </div>
+            <div className="card-frame-body">
+              <dl className="spec-grid">
+                <div className="spec-item">
+                  <dt className="spec-label">Mode</dt>
+                  {/* An empty mode is not an unknown one: it is the status handler's
+                      no-controller arm, and "unknown" would suggest something to diagnose
+                      where there is nothing wired to diagnose. */}
+                  <dd className="spec-value">{set.mode === '' ? <span className="muted">none</span> : set.mode}</dd>
+                </div>
+                {set.source !== undefined && set.source !== '' && (
+                  <div className="spec-item">
+                    <dt className="spec-label">Source Path / Repo</dt>
+                    <dd className="spec-value wrap">{set.source}</dd>
+                  </div>
+                )}
+                {set.revision !== undefined && set.revision !== '' && (
+                  <div className="spec-item">
+                    <dt className="spec-label">Target Revision</dt>
+                    <dd className="spec-value">
+                      <code title={set.revision}>{shortRevision(set.revision)}</code>
+                    </dd>
+                  </div>
+                )}
+                <div className="spec-item">
+                  <dt className="spec-label">Last Loaded</dt>
+                  <dd className="spec-value" data-testid="app-set-loaded">
+                    <Instant at={set.loadedAt} />
+                  </dd>
+                </div>
+                <div className="spec-item">
+                  <dt className="spec-label">Managed Applications</dt>
+                  <dd className="spec-value" data-testid="app-set-applications">
+                    {status.data.applications}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          </div>
+        </div>
+      </div>
 
       {/* The three lists that only exist when something happened. A "Pruned:
           none" row on every healthy controller would train an operator to stop

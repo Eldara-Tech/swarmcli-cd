@@ -42,7 +42,10 @@ describe('the login screen', () => {
 
     expect(await screen.findByLabelText('Admin token')).toBeDefined()
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeDefined()
-    expect(screen.queryByRole('link')).toBeNull()
+    // No sign-in method drawn as a link: a typed credential is a box, not a
+    // button-to-somewhere. The card's swarmcli.io footer is a link, so this
+    // names the one that must not be here rather than forbidding links at all.
+    expect(screen.queryByRole('link', { name: 'Sign in with SSO' })).toBeNull()
   })
 
   it('draws a link for a method that carries a start path', async () => {

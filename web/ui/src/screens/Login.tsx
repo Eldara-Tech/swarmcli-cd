@@ -6,6 +6,7 @@ import { useState, type FormEvent } from 'react'
 import { verify } from '../api/client'
 import { useBootstrap, type LoginOption } from '../api/discovery'
 import { setToken } from '../auth/session'
+import { BrandMark } from '../components/Icon'
 
 /**
  * The login screen: whatever /ui/bootstrap.json says a browser may sign in with.
@@ -73,7 +74,13 @@ export function Login() {
 
   const card = (
     <>
-      <h1>swarmcli-cd</h1>
+      <div className="login-brand">
+        <BrandMark />
+        <div className="login-title">
+          <h1>SwarmCLI CD</h1>
+          <p className="login-tagline">Continuous delivery for Docker Swarm</p>
+        </div>
+      </div>
       {methods.length === 0 && (
         <p className="login-error" role="alert">
           This controller advertises no way to sign in from a browser.
@@ -102,6 +109,14 @@ export function Login() {
           {checking ? 'Checking…' : 'Sign in'}
         </button>
       )}
+      {/* The one link out of the credential page. rel="noreferrer" so the tab it
+          opens cannot read back through window.opener, and the referrer — this
+          URL — never leaves with it. */}
+      <p className="login-foot">
+        <a href="https://swarmcli.io" target="_blank" rel="noreferrer">
+          swarmcli.io
+        </a>
+      </p>
     </>
   )
 

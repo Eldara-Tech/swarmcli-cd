@@ -9,6 +9,7 @@ import { historyKey } from '../api/queries'
 import type { History, ReleaseHistory } from '../api/types'
 import { Forbidden } from '../components/Forbidden'
 import { Instant } from '../components/Instant'
+import { Loading } from '../components/StateBlock'
 
 /**
  * Every declared release, with the revisions the chart engine recorded for it.
@@ -40,7 +41,7 @@ export function ApplicationHistory() {
     queryFn: () => apiGet<History>(`/api/v1/applications/${encodeURIComponent(app)}/history`),
   })
 
-  if (history.isPending) return <p>Loading…</p>
+  if (history.isPending) return <Loading />
   if (history.isError) {
     if (hasStatus(history.error, 403)) return <Forbidden action="history" />
     // The only endpoint in the API that answers 502, and it means something
@@ -112,55 +113,64 @@ function ReleaseHistoryPanel({ release }: { release: ReleaseHistory }) {
   // a `.map()` two lines below.
   const revisions = release.revisions ?? []
   return (
-    <section className="history-release" data-testid="release-history">
-      <h2>{release.name}</h2>
-      {revisions.length === 0 ? (
-        <p className="empty">
-          Declared, never deployed — the plan would install this release, so the chart engine has no revisions
-          recorded for it yet.
-        </p>
-      ) : (
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Revision</th>
-              <th scope="col">Chart</th>
-              <th scope="col">Version</th>
-              <th scope="col">Status</th>
-              <th scope="col">Created</th>
-              <th scope="col">Owner</th>
-            </tr>
-          </thead>
-          <tbody>
-            {/* Newest first, exactly as served. */}
-            {revisions.map((revision) => (
-              <tr key={revision.revision}>
-                <th scope="row">{revision.revision}</th>
-                <td>{revision.chart}</td>
-                <td>{revision.version}</td>
-                <td>{revision.status}</td>
-                {/* A dash rather than Instant's "never": the field is optional
-                    because the engine may not have recorded one, and a revision
-                    that exists was plainly created at some point. */}
-                <td>
-                  {revision.created === undefined || revision.created === '' ? (
-                    <span className="muted">–</span>
-                  ) : (
-                    <Instant at={revision.created} />
-                  )}
-                </td>
-                <td className="wrap">
-                  {revision.owner === undefined || revision.owner === '' ? (
-                    <span className="muted">unclaimed</span>
-                  ) : (
-                    <code>{revision.owner}</code>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+    <section className="history-release card-frame" data-testid="release-history">
+      <div className="card-frame-head">
+        <h2>{release.name}</h2>
+        <span className="chip chip-muted">{revisions.length} recorded</span>
+      </div>
+      <div className="card-frame-body">
+        {revisions.length === 0 ? (
+          <p className="empty">
+            Declared, never deployed — the plan would install this release, so the chart engine has no revisions
+            recorded for it yet.
+          </p>
+        ) : (
+          <div className="app-table-wrap">
+            <table className="app-table">
+              <thead>
+                <tr>
+                  <th scope="col">Revision</th>
+                  <th scope="col">Chart</th>
+                  <th scope="col">Version</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Created</th>
+                  <th scope="col">Owner</th>
+                </tr>
+              </thead>
+              <tbody>
+                {/* Newest first, exactly as served. */}
+                {revisions.map((revision) => (
+                  <tr key={revision.revision}>
+                    <th scope="row">{revision.revision}</th>
+                    <td>{revision.chart}</td>
+                    <td>{revision.version}</td>
+                    <td>
+                      <span className="chip chip-good">{revision.status}</span>
+                    </td>
+                    {/* A dash rather than Instant's "never": the field is optional
+                        because the engine may not have recorded one, and a revision
+                        that exists was plainly created at some point. */}
+                    <td>
+                      {revision.created === undefined || revision.created === '' ? (
+                        <span className="muted">–</span>
+                      ) : (
+                        <Instant at={revision.created} />
+                      )}
+                    </td>
+                    <td className="wrap">
+                      {revision.owner === undefined || revision.owner === '' ? (
+                        <span className="muted">unclaimed</span>
+                      ) : (
+                        <code>{revision.owner}</code>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </section>
   )
 }

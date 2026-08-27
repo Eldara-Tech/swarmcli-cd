@@ -10,7 +10,9 @@ import { useFeature } from '../api/discovery'
 import { decodeEnum, driftStates, healthStates, syncStates } from '../api/enums'
 import { controllerKey, listKey } from '../api/queries'
 import type { ApplicationList, ControllerStatus, View } from '../api/types'
+import { Dot, type DotTone } from '../components/Dot'
 import { DriftCell, HealthChip, SyncChip } from '../components/StateChip'
+import { Empty, Loading } from '../components/StateBlock'
 import { Instant } from '../components/Instant'
 import { destination, plural, serviceCounts, shortRevision } from '../format'
 
@@ -70,7 +72,7 @@ export function Applications() {
     setParams(next, { replace: true })
   }
 
-  if (applications.isPending) return <p>Loading…</p>
+  if (applications.isPending) return <Loading rows={5} />
   if (applications.isError) {
     return (
       <p className="error" role="alert">
@@ -192,8 +194,10 @@ export function Applications() {
         </button>
       </form>
 
-      {all.length === 0 && <p className="empty">No applications.</p>}
-      {all.length > 0 && shown.length === 0 && <p className="empty">No application matches these filters.</p>}
+      {all.length === 0 && <Empty icon="app">No applications.</Empty>}
+      {all.length > 0 && shown.length === 0 && (
+        <Empty icon="filter">No application matches these filters.</Empty>
+      )}
       {shown.length > 0 && (cards ? <Cards views={shown} /> : <Table views={shown} showSwarm={showSwarm} />)}
 
       <ReconcileErrors views={shown} />
@@ -251,6 +255,18 @@ function stale(view: View): boolean {
   return view.status.error !== undefined && view.status.error !== ''
 }
 
+function appTone(view: View): DotTone {
+  if (stale(view)) return 'bad'
+  const { status } = view
+  const health = decodeEnum(status.health.state, healthStates)
+  if (health === 'degraded' || health === 'missing') return 'bad'
+  const sync = decodeEnum(status.sync.state, syncStates)
+  if (sync === 'out-of-sync') return 'warn'
+  if (health === 'progressing') return 'warn'
+  if (status.drift !== undefined && decodeEnum(status.drift.state, driftStates) === 'detected') return 'warn'
+  return 'ok'
+}
+
 /**
  * The table, with the CLI's two conditional columns and its reasoning.
  *
@@ -272,80 +288,92 @@ function Table({ views, showSwarm }: { views: View[]; showSwarm: boolean }) {
   const showError = views.some(stale)
 
   return (
-    <table className="app-table">
-      <thead>
-        <tr>
-          <th scope="col">Name</th>
-          {showSwarm && <th scope="col">Swarm</th>}
-          <th scope="col">Sync</th>
-          {showDrift && <th scope="col">Drift</th>}
-          <th scope="col">Health</th>
-          <th scope="col">Services</th>
-          <th scope="col">Revision</th>
-          {showError && <th scope="col">Reconcile</th>}
-        </tr>
-      </thead>
-      <tbody>
-        {views.map((view) => (
-          <tr key={view.spec.name} className={stale(view) ? 'row-stale' : undefined}>
-            <th scope="row">
-              <Link to={detailPath(view.spec.name)}>{view.spec.name}</Link>
+    <div className="app-table-wrap">
+      <table className="app-table">
+        <thead>
+          <tr>
+            <th scope="col">Name</th>
+            {showSwarm && <th scope="col">Swarm</th>}
+            <th scope="col">Sync</th>
+            {showDrift && <th scope="col">Drift</th>}
+            <th scope="col">Health</th>
+            <th scope="col" className="cell-num">
+              Services
             </th>
-            {showSwarm && <td>{destination(view.spec.destination)}</td>}
-            <td>
-              <SyncChip state={view.status.sync.state} />
-            </td>
-            {showDrift && (
-              <td>
-                <DriftCell drift={view.status.drift} />
-              </td>
-            )}
-            <td>
-              <HealthChip state={view.status.health.state} />
-            </td>
-            <td>{serviceCounts(view.status.health.services)}</td>
-            <td>
-              <Revision revision={view.status.sync.revision} />
-            </td>
-            {showError && <td>{stale(view) ? <span className="chip chip-bad">failed</span> : 'ok'}</td>}
+            <th scope="col">Revision</th>
+            {showError && <th scope="col">Reconcile</th>}
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {views.map((view) => (
+            <tr key={view.spec.name} className={stale(view) ? 'row-stale' : undefined}>
+              <th scope="row">
+                <div className="table-app-cell">
+                  <Dot tone={appTone(view)} />
+                  <Link to={detailPath(view.spec.name)} className="app-row-link">
+                    {view.spec.name}
+                  </Link>
+                </div>
+              </th>
+              {showSwarm && <td>{destination(view.spec.destination)}</td>}
+              <td>
+                <SyncChip state={view.status.sync.state} />
+              </td>
+              {showDrift && (
+                <td>
+                  <DriftCell drift={view.status.drift} />
+                </td>
+              )}
+              <td>
+                <HealthChip state={view.status.health.state} />
+              </td>
+              <td className="cell-num">{serviceCounts(view.status.health.services)}</td>
+              <td>
+                <Revision revision={view.status.sync.revision} />
+              </td>
+              {showError && <td>{stale(view) ? <span className="chip chip-bad">failed</span> : 'ok'}</td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
 
 function Cards({ views }: { views: View[] }) {
   return (
     <ul className="app-cards">
-      {views.map((view) => (
-        <li key={view.spec.name}>
-          <article className={stale(view) ? 'card card-stale' : 'card'}>
-            <h2>
-              <Link to={detailPath(view.spec.name)}>{view.spec.name}</Link>
-            </h2>
-            <p className="card-chips">
-              <SyncChip state={view.status.sync.state} />
-              <HealthChip state={view.status.health.state} />
-              <DriftCell drift={view.status.drift} />
-            </p>
-            <dl className="card-fields">
-              <dt>Services</dt>
-              <dd>{serviceCounts(view.status.health.services)}</dd>
-              <dt>Revision</dt>
-              <dd>
-                <Revision revision={view.status.sync.revision} />
-              </dd>
-              <dt>Repository</dt>
-              <dd className="wrap">{view.spec.source.repoURL}</dd>
-              <dt>Observed</dt>
-              <dd>
-                <Instant at={view.status.observedAt} />
-              </dd>
-            </dl>
-          </article>
-        </li>
-      ))}
+      {views.map((view) => {
+        const tone = appTone(view)
+        return (
+          <li key={view.spec.name}>
+            <article className={`card${stale(view) ? ' card-stale' : ''}`}>
+              <h2>
+                <Dot tone={tone} /> <Link to={detailPath(view.spec.name)}>{view.spec.name}</Link>
+              </h2>
+              <p className="card-chips">
+                <SyncChip state={view.status.sync.state} />
+                <HealthChip state={view.status.health.state} />
+                <DriftCell drift={view.status.drift} />
+              </p>
+              <dl className="card-fields">
+                <dt>Services</dt>
+                <dd>{serviceCounts(view.status.health.services)}</dd>
+                <dt>Revision</dt>
+                <dd>
+                  <Revision revision={view.status.sync.revision} />
+                </dd>
+                <dt>Repository</dt>
+                <dd className="wrap">{view.spec.source.repoURL}</dd>
+                <dt>Observed</dt>
+                <dd>
+                  <Instant at={view.status.observedAt} />
+                </dd>
+              </dl>
+            </article>
+          </li>
+        )
+      })}
     </ul>
   )
 }

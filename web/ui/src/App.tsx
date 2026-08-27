@@ -6,12 +6,15 @@ import { BrowserRouter, Route, Routes } from 'react-router'
 
 import { useBootstrap, useFeature, useSignedIn } from './api/discovery'
 import { Shell } from './Shell'
-import { ApplicationDetail, ApplicationOverview } from './screens/ApplicationDetail'
+import { ApplicationDetail, ApplicationOverview, ApplicationTopology } from './screens/ApplicationDetail'
 import { ApplicationDiff } from './screens/ApplicationDiff'
 import { ApplicationHistory } from './screens/ApplicationHistory'
 import { Applications } from './screens/Applications'
 import { ControllerStatusScreen } from './screens/ControllerStatus'
+import { Diagnostics } from './screens/Diagnostics'
+import { FleetOverview } from './screens/FleetOverview'
 import { Login } from './screens/Login'
+import { Monitor } from './screens/Monitor'
 import { Projects } from './screens/Projects'
 
 /**
@@ -112,7 +115,13 @@ function SignedIn() {
     <BrowserRouter>
       <Routes>
         <Route element={<Shell />}>
+          {/* The list stays index — the console opens where an operator most
+              often lands and where the tests reach for it. Overview, Monitor and
+              Diagnostics are siblings reached from the rail, not the landing. */}
           <Route index element={<Applications />} />
+          <Route path="overview" element={<FleetOverview />} />
+          <Route path="monitor" element={<Monitor />} />
+          <Route path="diagnostics" element={<Diagnostics />} />
           {/* Encoded by the screens that link here, and decoded by
               useParams, so an application whose name needs escaping is
               still one route rather than a special case.
@@ -124,6 +133,7 @@ function SignedIn() {
               why they are separate endpoints in the first place. */}
           <Route path="applications/:app" element={<ApplicationDetail />}>
             <Route index element={<ApplicationOverview />} />
+            <Route path="topology" element={<ApplicationTopology />} />
             <Route path="diff" element={<ApplicationDiff />} />
             <Route path="history" element={<ApplicationHistory />} />
           </Route>
