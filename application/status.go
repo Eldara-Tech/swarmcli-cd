@@ -98,3 +98,62 @@ type AppSetStatus struct {
 	// measure is indistinguishable from a broken feature.
 	PruneHeldBy []string `json:"pruneHeldBy,omitempty"`
 }
+
+// SwarmNode is one Docker Swarm engine node observed in the cluster.
+type SwarmNode struct {
+	ID            string `json:"id"`
+	Hostname      string `json:"hostname"`
+	Role          string `json:"role"`         // "manager" or "worker"
+	Availability  string `json:"availability"` // "active", "pause", "drain"
+	Status        string `json:"status"`       // "ready", "down", "unknown"
+	EngineVersion string `json:"engineVersion"`
+	Addr          string `json:"addr"`
+	Leader        bool   `json:"leader,omitempty"`
+	TasksRunning  int    `json:"tasksRunning"`
+	TasksDesired  int    `json:"tasksDesired"`
+}
+
+// NodesResponse is the payload served by GET /api/v1/nodes.
+type NodesResponse struct {
+	Swarm string      `json:"swarm"`
+	Nodes []SwarmNode `json:"nodes"`
+}
+
+// ServiceLogEvent is one framed log line emitted over SSE.
+type ServiceLogEvent struct {
+	Service   string    `json:"service"`
+	TaskID    string    `json:"taskID,omitempty"`
+	NodeID    string    `json:"nodeID,omitempty"`
+	Stream    string    `json:"stream"` // "stdout" or "stderr"
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// RiskItem is one identified risk in cluster health diagnostics.
+type RiskItem struct {
+	ID          string `json:"id"`
+	Severity    string `json:"severity"` // "bad", "warn", "info"
+	Application string `json:"application,omitempty"`
+	Title       string `json:"title"`
+	Summary     string `json:"summary"`
+	Remedy      string `json:"remedy,omitempty"`
+}
+
+// CheckItem is one operational check item in cluster diagnostics.
+type CheckItem struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Passed bool   `json:"passed"`
+	Detail string `json:"detail"`
+}
+
+// DiagnosticsResponse is the payload served by GET /api/v1/diagnostics.
+type DiagnosticsResponse struct {
+	Score      int         `json:"score"`
+	Tone       string      `json:"tone"` // "ok", "warn", "bad"
+	ClearCount int         `json:"clearCount"`
+	TotalCount int         `json:"totalCount"`
+	Risks      []RiskItem  `json:"risks"`
+	Checks     []CheckItem `json:"checks"`
+}
+

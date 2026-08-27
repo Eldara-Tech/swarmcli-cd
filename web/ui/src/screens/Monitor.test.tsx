@@ -81,6 +81,11 @@ describe('the monitor', () => {
 
     expect(await screen.findByText('sync-succeeded')).toBeDefined()
     expect(screen.getByText('converged')).toBeDefined()
+
+    // Switches to service container logs console
+    fireEvent.click(screen.getByRole('button', { name: 'Service Container Logs' }))
+    expect(screen.getByText('APP')).toBeDefined()
+    expect(screen.getByText('SVC')).toBeDefined()
   })
 })
 

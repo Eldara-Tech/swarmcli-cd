@@ -366,3 +366,60 @@ export interface DiffResponse {
   releases: ReleaseDiff[] | null
   planned: boolean
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2.0 — Swarm Telemetry & Cluster Diagnostics
+// ---------------------------------------------------------------------------
+
+export interface SwarmNode {
+  id: string
+  hostname: string
+  role: 'manager' | 'worker'
+  availability: 'active' | 'pause' | 'drain'
+  status: 'ready' | 'down' | 'unknown'
+  engineVersion: string
+  addr: string
+  leader?: boolean
+  tasksRunning: number
+  tasksDesired: number
+}
+
+export interface NodesResponse {
+  swarm: string
+  nodes: SwarmNode[]
+}
+
+export interface ServiceLogEvent {
+  service: string
+  taskID?: string
+  nodeID?: string
+  stream: 'stdout' | 'stderr'
+  message: string
+  timestamp: Timestamp
+}
+
+export interface RiskItem {
+  id: string
+  severity: 'bad' | 'warn' | 'info'
+  application?: string
+  title: string
+  summary: string
+  remedy?: string
+}
+
+export interface CheckItem {
+  id: string
+  name: string
+  passed: boolean
+  detail: string
+}
+
+export interface DiagnosticsResponse {
+  score: number
+  tone: 'ok' | 'warn' | 'bad'
+  clearCount: number
+  totalCount: number
+  risks: RiskItem[]
+  checks: CheckItem[]
+}
+

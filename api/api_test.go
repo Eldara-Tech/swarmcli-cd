@@ -2073,3 +2073,35 @@ func TestTheSeamIsWhatHandlerReads(t *testing.T) {
 		t.Errorf("Routes = %+v, want the seam's own registration named", s.Routes())
 	}
 }
+
+func TestNodesEndpoint(t *testing.T) {
+	_, h := testServer(t, &fakeReconciler{}, nil)
+	rr := do(t, h, "GET", "/api/v1/nodes")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/nodes = %d, want 200", rr.Code)
+	}
+	resp := decode[application.NodesResponse](t, rr)
+	if len(resp.Nodes) == 0 {
+		t.Fatalf("expected at least one node in response, got %v", resp)
+	}
+	if resp.Nodes[0].Role != "manager" {
+		t.Errorf("expected manager node, got %s", resp.Nodes[0].Role)
+	}
+}
+
+func TestDiagnosticsEndpoint(t *testing.T) {
+	views := []application.View{view("edge")}
+	_, h := testServer(t, &fakeReconciler{views: views}, nil)
+	rr := do(t, h, "GET", "/api/v1/diagnostics")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/diagnostics = %d, want 200", rr.Code)
+	}
+	resp := decode[application.DiagnosticsResponse](t, rr)
+	if resp.Score == 0 && resp.Tone == "" {
+		t.Fatalf("expected non-zero diagnostic response, got %v", resp)
+	}
+	if len(resp.Checks) == 0 {
+		t.Fatalf("expected diagnostic checks in response, got %v", resp)
+	}
+}
+
