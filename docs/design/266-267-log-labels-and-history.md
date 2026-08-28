@@ -192,6 +192,12 @@ Confirmed 2026-08-28 before code.
   exported v1 interface with no implementer outside this repository. Rejected:
   adding `since` as a sixth parameter, which is the growth #267 names as the way
   the decision gets taken by accident.
+  The struct is declared in `application`, not in `api`. `api` declares the
+  Reconciler interface so that something other than the OSS applier can serve
+  these endpoints, and `TestTheApiDoesNotImportTheReconciler` pins that — a
+  request type declared in `api` would make the reconciler import the HTTP layer
+  to satisfy it, which is why both sentinel errors already live in
+  `application`.
 - **D2 — the backend resolves the node hostname** and adds `nodeHostname` to
   `application.ServiceLogEvent`. Additive wire field, non-breaking. Rejected: a
   browser fetch of `/api/v1/nodes`, for §2.4; and showing the raw node id, which
@@ -209,23 +215,39 @@ Confirmed 2026-08-28 before code.
   wrong for a completed range.
 
 - **D6 — the slot map is refreshed when an unseen task id arrives**, throttled to
-  one refresh per 30 seconds. A rollout starts tasks the map does not know, and a
+  one refresh per 30 seconds — but the *initial* build does not count against the
+  throttle. The throttle bounds repeated asking, and the first id the map cannot
+  name is the signal that it is already stale; making that first refresh wait out
+  the interval would leave a rollout's new replica unnamed for up to half a
+  minute, which is the window an operator is most likely to be watching. A rollout starts tasks the map does not know, and a
   rollout is when an operator is watching. Rejected: no refresh, which leaves a
   task started after the console opened unnamed for the life of the stream. The
   node map is not refreshed: nodes do not join a swarm on a rollout's timescale.
-- **D7 — the console buffer rises to the largest preset's tail and the list is
-  windowed** (§5.6). Rejected: capping the presets near 2,000 lines so the
-  unwindowed list stays renderable, which would ship a 6-hour button that returns
-  twenty minutes of a busy service. The window is hand-rolled over a fixed row
-  height rather than taken from a library, because it is about sixty lines and the
-  alternative is a new runtime dependency in an Apache-2.0 UI.
+- **D7 — the console buffer rises to the largest preset's tail, and the render is
+  capped at 2,000 rows** (§5.6). Rejected: capping the *presets* near 2,000 lines,
+  which would ship a 6-hour button returning twenty minutes of a busy service.
+  Also rejected, and it was the first choice: true windowing. It needs a fixed row
+  height, so `.line-content` would stop wrapping long lines, and the spacer
+  heights cannot be expressed as a class — `style-src 'self'` carries no
+  `unsafe-inline`, which this repository's own lint rule states on the `style`
+  prop. Capping the render keeps the row as it is, needs no scroll arithmetic,
+  and costs only scrolling by hand past 2,000 rows; the search, the task filter,
+  Copy and Export still work on all 50,000, which is how an operator finds
+  something in six hours of output. The gap is stated above the rows rather than
+  hidden.
 - **D8 — `maxLogStreams` stays at 16.** A history read holds a slot for its
   backlog and then for as long as the tab is open, which is heavier than a tail,
   but a separate bound for history reads needs a second counter and a fairness
   rule for a problem no deployment has reported. Recorded rather than changed.
-- **D9 — `maxLogTail` is 50,000**, matching the largest preset, so the console
-  cannot ask for something the API refuses and a scripted client cannot ask the
-  swarm for an unbounded read.
+- **D9 — `maxLogTail` is 50,000 and `maxLogSince` is 24 hours, and both are
+  refused rather than clamped.** The tail matches the largest preset, so the
+  console cannot ask for something the API refuses. Refusing rather than clamping
+  because a client handed the last fifty thousand lines when it asked for a
+  million has been answered with something other than what it asked for, with
+  nothing in the reply to say so. `maxLogSince` is the companion bound the first
+  draft of this document did not have: the tail caps how many lines cross the
+  wire, and this caps how much of each node's rotated log set has to be walked to
+  find them.
 - **D10 — the task colour palette is its own categorical set**, not the existing
   stream and severity colours. Reusing those would make the second task look like
   an error.
@@ -275,10 +297,11 @@ The handler reads the window from the query string:
 - `?since=15m` — a duration, parsed with `time.ParseDuration`, resolved against
   the server's clock. Not an absolute instant: the browser's clock is not the
   daemon's, and a skewed laptop would silently ask for the wrong window.
-- `?tail=N` — an integer, clamped to `[1, maxLogTail]`.
+- `?tail=N` — an integer, refused outside `[1, maxLogTail]`.
 - Absent means today's behaviour: `tail=100`, no `since`.
 
-`maxLogTail` is the one number that bounds what a caller can ask the swarm for.
+`maxLogTail`, with `maxLogSince` beside it, bounds what a caller can ask the
+swarm for.
 It is enforced in the handler rather than behind the seam, for the reason
 `maxLogStreams` is: the bound then covers every implementer, including a
 companion's.
@@ -471,19 +494,37 @@ hang on the preset it was added for.
 
 `logBufferLimit` must rise to at least the largest preset's `tail` — otherwise a
 20,000-line read is discarded down to 1,000 the moment it arrives, which is the
-same failure as not asking for it. So the buffer grows and the render must window.
+same failure as not asking for it. So the buffer grows and the *render* has to
+stop growing with it.
 
-There is no virtualization dependency in `web/ui/package.json` and adding one is a
-new runtime dependency in an Apache-2.0 UI. The rows are a fixed height and
-uniform, which is the easy case, so a hand-rolled window is about 60 lines: a
-spacer div above, the visible slice, a spacer below, sized from `scrollTop`,
-`clientHeight` and the row height. It composes with the existing autoscroll and
-the jump-to-bottom button, both of which already read `scrollTop` and
-`scrollHeight` directly.
+**True windowing was the first answer and is not the one taken.** Placing every
+row by multiplying a fixed row height needs the row to be a fixed height, which
+means `.line-content` stops wrapping and a long line scrolls sideways instead —
+a visible change to every line the console has ever drawn, made for the benefit
+of a preset. And the spacer heights above and below the window are arbitrary
+pixel values, which cannot be a class; this UI is served under `style-src 'self'`
+with no `unsafe-inline`, and the repository's own lint rule states exactly that
+on the `style` prop.
 
-The alternative, recorded because it was close: cap the presets so the largest
-buffer stays renderable — roughly 2,000 rows — and file the windowing separately.
-That halves the feature's reach, and is why D7 went the other way.
+**So the render is capped instead.** The newest `logRenderLimit` (2,000) of the
+matching lines are drawn, and the console says so above them:
+
+> Showing the newest 2,000 of 18,432 matching lines. Narrow with the search or
+> the task filter to reach the rest; Copy and Export write all of them.
+
+That is a bound on the rendering and on nothing else. The search, the task
+filter, Copy and Export all work on the whole buffer, which is the property that
+makes the cap acceptable: an operator reading six hours of a service is looking
+for something, and the way to find it in twenty thousand lines was never to
+scroll. What it costs is scrolling by hand past 2,000 rows, and the banner is
+what keeps that a stated limit rather than a silent one.
+
+**One more thing the larger buffer broke.** The reader appended one line per
+state update, and each append copies the buffer — O(n) per line, which is
+quadratic across a 50,000-line history read and would hang the browser on the
+one request this feature exists to make. It was survivable at 1,000 lines. Lines
+are now batched per `reader.read()` chunk, which is one update per chunk rather
+than one per line.
 
 ## 6. Verification
 
@@ -502,10 +543,12 @@ blocking on live output; and the live phase still drops with its notice.
 
 **Unit, `api`** — extending `api/logs_test.go` (11 tests today), ported to the
 request struct. New: `?since=15m&tail=5000` reaches the seam as a resolved
-instant and a clamped integer; `?tail=999999` is clamped to `maxLogTail`; a
-malformed `since` is a 400 before any header is written, which the handler's
-existing headers-last discipline already allows; no query parameters reproduces
-today's request exactly.
+instant and a bounded integer; `?tail=999999` is refused rather than served
+quietly reduced; `?since=` without a `?tail=` is refused, because the daemon
+would have bounded the window to the default tail; a malformed `since` is a 400
+before any header is written, which the handler's existing headers-last
+discipline already allows; no query parameters reproduces today's request
+exactly.
 
 **Unit, `reconcile`** — the struct is passed through unchanged and
 `declaredService` still refuses a service the view does not declare.
@@ -516,8 +559,9 @@ task id and hostname; a line with no slot and no hostname renders the truncated
 task id; two tasks get two colours and the same task keeps its colour after the
 buffer scrolls; the task filter narrows to one task and back; Copy writes the slot;
 selecting a preset reopens the stream with the right query and empties the buffer.
-And, for the window (D7): a buffer of 20,000 renders a bounded number of rows and
-the last line is reachable by scrolling.
+And, for the render cap (D7): a buffer of 20,000 draws a bounded number of rows,
+says how many it is holding, draws the *newest* of them, and still finds an
+undrawn line through the search and writes it to the clipboard.
 
 **Integration**, `integration-tests/logs_test.go` (build tag `integration`, first
 run in CI by definition — there is no daemon here). Extend the existing case: a
@@ -547,12 +591,14 @@ until the decisions above are signed off.
 | `backend/logs.go` | the slot and host maps, the throttled refresh, the block-then-drop sink |
 | `backend/logs_test.go` | the fake answers `TaskList` and `NodeList`; labels, degraded lookups, the backlog phase |
 | `web/ui/src/api/types.ts` | `nodeHostname`, `slot` |
-| `web/ui/src/components/ServiceLogViewer.tsx` | the slot cell, the task filter, the scrollback presets, the window, the `indexOf` removal |
-| `web/ui/src/index.css` | the slot cell and the task palette |
-| `web/ui/src/screens/Monitor.test.tsx` | the labels, the filter, the presets, the windowed render |
+| `web/ui/src/components/ServiceLogViewer.tsx` | the slot cell, the task filter, the scrollback presets, the render cap, the `indexOf` and per-line-append removals |
+| `web/ui/src/index.css` | the slot cell, the task palette, the truncation banner |
+| `web/ui/src/screens/Monitor.test.tsx` | the labels, the filter, the presets, the capped render |
 | `docs/api.md` | the two query parameters and the two event fields |
 | `docs/web-ui.md` | the scrollback control and the task filter |
 | `docs/extensibility.md` | the seam's new shape, for an implementer outside this module |
+| `docs/PHASE-2.0.md` | the window, the two new event fields, the backlog phase |
+| `api/capability_test.go`, `web/ui/src/test/fakeApi.ts` | the fakes the two above need |
 | `integration-tests/logs_test.go` | two replicas carry two slots and their hostnames; a narrow `since` reads less |
 
 Labels: `A1-feature`, `B0-low-priority`, `C1-breaking-change`. Both issues close
