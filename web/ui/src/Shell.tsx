@@ -38,7 +38,9 @@ export function Shell() {
           <div className="rail-brand">
             <Link className="brand" to="/">
               <BrandMark />
-              <span className="brand-text">swarmcli-cd</span>
+              <span className="brand-text">
+                SwarmCLI <span className="brand-badge font-mono">CD</span>
+              </span>
             </Link>
           </div>
           {/* Controller is reachable from here as well as from the list's

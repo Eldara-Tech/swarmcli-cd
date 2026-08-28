@@ -128,6 +128,46 @@ export function pushStream(): { open: () => Response; push: (event: ControllerEv
 }
 
 /**
+ * The same driven stream, carrying service log frames rather than controller
+ * events.
+ *
+ * api/logs.go writes one JSON object per `data:` line and no `event:` name, so
+ * this is a different wire shape from pushStream's and gets its own fake rather
+ * than a flag — a fake that produced a frame the server never writes would let
+ * a parser bug pass.
+ */
+export function pushLogStream(): {
+  open: () => Response
+  push: (event: Record<string, unknown>) => void
+} {
+  const encoder = new TextEncoder()
+  const queued: Uint8Array[] = []
+  let waiting: ((chunk: { done: boolean; value: Uint8Array }) => void) | null = null
+
+  function read(): Promise<{ done: boolean; value?: Uint8Array }> {
+    const next = queued.shift()
+    if (next !== undefined) return Promise.resolve({ done: false, value: next })
+    return new Promise((resolve) => {
+      waiting = resolve
+    })
+  }
+
+  return {
+    open: () => ({ ok: true, status: 200, body: { getReader: () => ({ read }) } }) as unknown as Response,
+    push: (event) => {
+      const frame = encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
+      if (waiting === null) {
+        queued.push(frame)
+        return
+      }
+      const deliver = waiting
+      waiting = null
+      deliver({ done: false, value: frame })
+    },
+  }
+}
+
+/**
  * clone detaches a generated fixture so a test can vary it.
  *
  * The fixtures are marshalled from the Go types by application/fixtures_test.go

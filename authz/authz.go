@@ -108,6 +108,11 @@ const (
 	// that predates it refuses it, as this type's contract requires, and gets
 	// less disclosed rather than a screen that stopped working.
 	ActionController Action = "controller"
+	// ActionLogs is the live streaming log tail from container tasks backing a
+	// service.
+	ActionLogs Action = "logs"
+	// ActionNodes is the Swarm node topology and daemon health roster.
+	ActionNodes Action = "nodes"
 )
 
 // Authorizer gates every API request.

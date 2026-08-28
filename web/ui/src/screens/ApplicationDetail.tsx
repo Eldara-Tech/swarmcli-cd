@@ -252,7 +252,7 @@ export function ApplicationOverview() {
 
       <div className="bento-grid">
         <div className="bento-col-6">
-          <div className="card-frame">
+          <div className="card-frame spec-card-frame">
             <div className="card-frame-head">
               <h2>
                 <Icon name="app" size={16} />
@@ -270,7 +270,7 @@ export function ApplicationOverview() {
                 {spec.source.chart === undefined ? (
                   <div className="spec-item">
                     <dt className="spec-label">Release file</dt>
-                    <dd className="spec-value">{spec.source.releaseFile}</dd>
+                    <dd className="spec-value font-mono">{spec.source.releaseFile}</dd>
                   </div>
                 ) : (
                   <div className="spec-item">
@@ -300,11 +300,11 @@ export function ApplicationOverview() {
         </div>
 
         <div className="bento-col-6">
-          <div className="card-frame">
+          <div className="card-frame spec-card-frame">
             <div className="card-frame-head">
               <h2>
                 <Icon name="service" size={16} />
-                Swarm Runtime & Reconcile
+                Swarm Runtime &amp; Reconcile
               </h2>
             </div>
             <div className="card-frame-body">
@@ -313,12 +313,16 @@ export function ApplicationOverview() {
                   <dt className="spec-label">Services</dt>
                   <dd className="spec-value">{serviceCounts(status.health.services)}</dd>
                 </div>
-                {status.health.message !== undefined && status.health.message !== '' && (
-                  <div className="spec-item">
-                    <dt className="spec-label">Health message</dt>
-                    <dd className="spec-value wrap">{status.health.message}</dd>
-                  </div>
-                )}
+                <div className="spec-item">
+                  <dt className="spec-label">Drift State</dt>
+                  <dd className="spec-value">
+                    {status.drift === undefined || status.drift.state === 'none' ? (
+                      <span className="text-ok font-medium">Invariance Maintained</span>
+                    ) : (
+                      <span className="chip chip-bad">{status.drift.state}</span>
+                    )}
+                  </dd>
+                </div>
                 <div className="spec-item">
                   <dt className="spec-label">Last sync</dt>
                   <dd className="spec-value">
@@ -342,6 +346,12 @@ export function ApplicationOverview() {
                     <Instant at={status.observedAt} />
                   </dd>
                 </div>
+                {status.health.message !== undefined && status.health.message !== '' && (
+                  <div className="spec-item full-spec-item">
+                    <dt className="spec-label">Health Message</dt>
+                    <dd className="spec-value wrap">{status.health.message}</dd>
+                  </div>
+                )}
               </dl>
             </div>
           </div>
@@ -407,16 +417,21 @@ function ReleaseNode({ release }: { release: ReleaseStatus }) {
   const services = release.services ?? []
   return (
     <li className="tree-release">
-      <div className="tree-head">
-        <h3>{release.name}</h3>
-        <code>
-          {release.chart} {release.version}
-        </code>
-        <span className="muted">revision {release.revision}</span>
-        <span className="chip chip-muted">{decodeEnum(release.action, syncActions)}</span>
-        <SyncChip state={release.sync} />
-        <HealthChip state={release.health.state} />
-        {release.compat !== undefined && <CompatChip status={release.compat.status} />}
+      <div className="release-card-header">
+        <div className="release-title-group">
+          <Icon name="layers" size={16} />
+          <h3 className="release-name">{release.name}</h3>
+          <span className="release-chart-badge font-mono">
+            {release.chart} {release.version}
+          </span>
+          <span className="release-rev-chip font-mono">rev {release.revision}</span>
+        </div>
+        <div className="release-chips-group">
+          <span className="chip chip-muted">{decodeEnum(release.action, syncActions)}</span>
+          <SyncChip state={release.sync} />
+          <HealthChip state={release.health.state} />
+          {release.compat !== undefined && <CompatChip status={release.compat.status} />}
+        </div>
       </div>
       {services.length === 0 ? (
         // A release with no services, which is a release with no services — a
@@ -439,10 +454,16 @@ function ReleaseNode({ release }: { release: ReleaseStatus }) {
           <tbody>
             {services.map((service) => (
               <tr key={service.name}>
-                <th scope="row">{service.name}</th>
-                <td>{service.mode}</td>
+                <th scope="row" className="service-name-cell font-mono">
+                  {service.name}
+                </th>
                 <td>
-                  {service.running}/{service.desired}
+                  <span className="chip chip-muted font-mono">{service.mode}</span>
+                </td>
+                <td>
+                  <span className="replicas-badge font-mono">
+                    {service.running}/{service.desired}
+                  </span>
                 </td>
                 <td>
                   <HealthChip state={service.health} />
@@ -453,10 +474,10 @@ function ReleaseNode({ release }: { release: ReleaseStatus }) {
                   {service.updateState === undefined || service.updateState === '' ? (
                     <span className="muted">–</span>
                   ) : (
-                    service.updateState
+                    <span className="font-mono">{service.updateState}</span>
                   )}
                 </td>
-                <td className="wrap">{service.message}</td>
+                <td className="wrap muted">{service.message || '–'}</td>
               </tr>
             ))}
           </tbody>
