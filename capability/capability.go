@@ -48,6 +48,7 @@ package capability
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/docker/docker/api/types/swarm"
 
@@ -287,12 +288,11 @@ type NodeRoster interface {
 	SwarmNodeRoster(ctx context.Context) ([]application.SwarmNode, error)
 }
 
-// ServiceLogRequest names one tail of one service's container output.
+// ServiceLogRequest names one read of one service's container output.
 //
-// A struct rather than three parameters, for the reason this package's doc
+// A struct rather than four parameters, for the reason this package's doc
 // comment gives: a capability that needs to grow grows by taking a struct. The
-// growth this one can already see coming is `since`, which the daemon supports
-// and no caller asks for yet.
+// growth it saw coming was `since`, and `since` has since arrived.
 type ServiceLogRequest struct {
 	// Service is the swarm service name, as the application's own status
 	// reported it. It is not a name the reader may resolve for itself: the
@@ -302,6 +302,15 @@ type ServiceLogRequest struct {
 	Service string
 	// Tail is how much scrollback a newly attached client is given.
 	Tail int
+	// Since bounds how far back that scrollback may reach. The zero time means
+	// no bound, which is what every caller asked for before there was a bound.
+	//
+	// It does not stand alone, and an implementer must not treat it as the only
+	// thing that decides the window. The daemon selects the last Tail lines
+	// first and only then drops the ones older than Since, so a Since with a
+	// small Tail returns that small Tail — the two are one intent, and a caller
+	// that sets one without the other has asked for nothing.
+	Since time.Time
 	// Follow keeps the stream open for new lines. False reads the tail and
 	// ends, which nothing asks for yet and which costs nothing to pass through.
 	Follow bool

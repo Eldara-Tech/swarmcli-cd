@@ -165,6 +165,14 @@ export function pushStream(): { open: () => Response; push: (event: ControllerEv
 export function pushLogStream(): {
   open: () => Response
   push: (event: Record<string, unknown>) => void
+  /**
+   * Every event in one chunk, which is what a backlog looks like on the wire.
+   *
+   * The parser already handles several frames per read — a stream does not
+   * arrive one line per packet — and a test about how many lines the console
+   * draws needs thousands of them without thousands of microtask turns.
+   */
+  pushAll: (events: Record<string, unknown>[]) => void
 } {
   const encoder = new TextEncoder()
   const queued: Uint8Array[] = []
@@ -178,18 +186,21 @@ export function pushLogStream(): {
     })
   }
 
+  function send(frame: Uint8Array): void {
+    if (waiting === null) {
+      queued.push(frame)
+      return
+    }
+    const deliver = waiting
+    waiting = null
+    deliver({ done: false, value: frame })
+  }
+
   return {
     open: () => ({ ok: true, status: 200, body: { getReader: () => ({ read }) } }) as unknown as Response,
-    push: (event) => {
-      const frame = encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
-      if (waiting === null) {
-        queued.push(frame)
-        return
-      }
-      const deliver = waiting
-      waiting = null
-      deliver({ done: false, value: frame })
-    },
+    push: (event) => send(encoder.encode(`data: ${JSON.stringify(event)}\n\n`)),
+    pushAll: (events) =>
+      send(encoder.encode(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join(''))),
   }
 }
 

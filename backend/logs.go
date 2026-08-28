@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
@@ -60,6 +61,30 @@ const logChunk = 32 * 1024
 // worse line but not a lost stream.
 const maxLogLine = 1 << 20
 
+// logSlotRefresh is the shortest interval between two task lookups on one
+// stream.
+//
+// The map is built once at open and a rollout starts tasks it does not know —
+// which is exactly when an operator is watching — so an unseen task id asks the
+// daemon again. Throttled because a service crash-looping through tasks would
+// otherwise turn one log stream into a TaskList loop against the manager, and
+// the lookup runs on the goroutine draining the daemon connection.
+const logSlotRefresh = 30 * time.Second
+
+// logBacklogGrace is how long a read from the daemon must stall before the
+// backlog is judged to be over.
+//
+// See logSink.send for why the phase matters at all. The signal is the *read*
+// and not the gap between two events: a slow consumer makes the sink block, and
+// the time spent blocked would show up in an event-to-event gap and end the
+// backlog phase in the middle of it. A read that stalls means the daemon has
+// nothing more to hand over, which is the thing being asked.
+//
+// Backlog lines arrive back to back because they are a file being read. Two
+// seconds is far longer than that and far shorter than the quiet a live service
+// falls into. A var so a test does not have to spend it.
+var logBacklogGrace = 2 * time.Second
+
 // logBuffer is how many events a client may fall behind by before lines start
 // being dropped.
 //
@@ -97,8 +122,9 @@ func (b *Backend) ServiceLogs(ctx context.Context, req capability.ServiceLogRequ
 	// Before the stream, because it decides how to read it. A service whose
 	// tasks have a TTY is served unframed — the daemon multiplexes only when no
 	// selected task has one — and reading that as frames yields nothing but
-	// header errors.
-	tty, err := b.serviceHasTTY(ctx, req.Service)
+	// header errors. The id comes back from the same call, so naming the tasks
+	// below costs no second inspect.
+	id, tty, err := b.inspectForLogs(ctx, req.Service)
 	if err != nil {
 		return nil, err
 	}
@@ -110,24 +136,39 @@ func (b *Backend) ServiceLogs(ctx context.Context, req capability.ServiceLogRequ
 		Details:    true,
 		Follow:     req.Follow,
 		Tail:       strconv.Itoa(req.Tail),
+		// The daemon's own spelling of an instant on this path — the format
+		// daemon/cluster/executor/container/adapter.go writes when it passes a
+		// swarm log subscription down to a node's container reader. RFC3339
+		// would also parse, and matching the daemon costs nothing.
+		Since: sinceParam(req.Since),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("opening the log stream for service '%s': %w", req.Service, err)
 	}
 
 	out := make(chan application.ServiceLogEvent, logBuffer)
-	go b.pumpLogs(ctx, rc, req.Service, tty, out)
+	go b.pumpLogs(ctx, rc, req.Service, id, tty, req.Tail, out)
 	return out, nil
 }
 
-// serviceHasTTY reports whether the service's tasks are given a terminal.
-func (b *Backend) serviceHasTTY(ctx context.Context, service string) (bool, error) {
+// sinceParam renders an instant the way the daemon renders it, and the zero
+// time as no bound at all.
+func sinceParam(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+	return fmt.Sprintf("%d.%09d", at.Unix(), at.Nanosecond())
+}
+
+// inspectForLogs reports the service's id and whether its tasks are given a
+// terminal.
+func (b *Backend) inspectForLogs(ctx context.Context, service string) (id string, tty bool, err error) {
 	svc, _, err := b.api.ServiceInspectWithRaw(ctx, service, swarm.ServiceInspectOptions{})
 	if err != nil {
-		return false, fmt.Errorf("inspecting service '%s': %w", service, err)
+		return "", false, fmt.Errorf("inspecting service '%s': %w", service, err)
 	}
 	spec := svc.Spec.TaskTemplate.ContainerSpec
-	return spec != nil && spec.TTY, nil
+	return svc.ID, spec != nil && spec.TTY, nil
 }
 
 // pumpLogs owns the response body and the channel for the life of the stream.
@@ -136,17 +177,33 @@ func (b *Backend) serviceHasTTY(ctx context.Context, service string) (bool, erro
 // makes cancelling the caller's context sufficient to end the stream: the
 // daemon request is made with that context, so a cancel fails the read, which
 // ends the loop, which closes both.
-func (b *Backend) pumpLogs(ctx context.Context, rc io.ReadCloser, service string, tty bool, out chan<- application.ServiceLogEvent) {
+func (b *Backend) pumpLogs(ctx context.Context, rc io.ReadCloser, service, serviceID string, tty bool, tail int, out chan<- application.ServiceLogEvent) {
 	defer close(out)
 	defer func() { _ = rc.Close() }()
 
-	sink := &logSink{ctx: ctx, out: out, service: service, now: b.now}
+	sink := &logSink{
+		ctx:     ctx,
+		out:     out,
+		service: service,
+		now:     b.now,
+		labels:  b.logLabels(ctx, serviceID),
+		// The backlog is what the daemon had before it started following, and
+		// it is at most `tail` lines. Delivering it is the whole point of a
+		// history read, so the sink blocks rather than drops until it is
+		// through — see send.
+		backlog: tail,
+	}
+
+	// The reader reports a stalled read so the sink can stop blocking. Passed
+	// as a function rather than read from the reader afterwards because the
+	// judgement has to be made while the stream is still running.
+	timed := &timedReader{r: rc, now: b.now, stalled: sink.caughtUp, after: logBacklogGrace}
 
 	var err error
 	if tty {
-		err = readRawLog(rc, sink)
+		err = readRawLog(timed, sink)
 	} else {
-		err = readFramedLog(rc, sink)
+		err = readFramedLog(timed, sink)
 	}
 	sink.flush()
 
@@ -163,6 +220,175 @@ func (b *Backend) pumpLogs(ctx context.Context, rc io.ReadCloser, service string
 		// the error from a failed open.
 		b.log.Error("the service log stream ended with an error", "service", service, "error", err)
 	}
+}
+
+// timedReader watches how long each read takes and reports a stall.
+//
+// The stall is how the backlog phase ends. It is measured on the read rather
+// than on the interval between two events because the sink blocks while the
+// backlog is draining, and blocked time sits between two events but not inside
+// a read: the bytes are already on the connection, so a read that returns
+// slowly is the daemon having nothing left to hand over.
+//
+// It reports once and then stops timing, so a live service that goes quiet does
+// not pay for a clock read per frame for the rest of the stream.
+type timedReader struct {
+	r       io.Reader
+	now     func() time.Time
+	stalled func()
+	after   time.Duration
+	done    bool
+}
+
+func (t *timedReader) Read(p []byte) (int, error) {
+	if t.done {
+		return t.r.Read(p)
+	}
+	start := t.now()
+	n, err := t.r.Read(p)
+	if t.now().Sub(start) >= t.after {
+		t.done = true
+		t.stalled()
+	}
+	return n, err
+}
+
+// logLabels is what an operator calls the task and the node behind a line.
+//
+// Two maps and not one, because the two ids arrive independently: the daemon's
+// details prefix carries both the task id and the node id per line, so the
+// hostname needs only a node lookup and the task is not on the path to it. Only
+// the slot needs the task.
+//
+// That split is what makes the degraded cases partial rather than total. A task
+// listing that fails costs the slot and leaves the hostname; a node listing that
+// fails costs the hostname and leaves the slot. Neither costs the line, which is
+// the product — a label is a convenience, and a stream that refused to open
+// because the manager was busy would be a worse answer than an unnamed replica.
+type logLabels struct {
+	// slots maps a task id to the replica number swarm gave it. Absent means
+	// unknown; zero is not stored, because a global service's tasks have no
+	// slot and replica zero does not exist.
+	slots map[string]int
+	// hosts maps a node id to its hostname.
+	hosts map[string]string
+
+	// refresh re-reads slots. Nil once the lookup has failed in a way that
+	// asking again will not fix.
+	refresh func(context.Context) map[string]int
+	// asked is when refresh last ran, so an unseen task id cannot ask more
+	// often than logSlotRefresh.
+	asked time.Time
+	now   func() time.Time
+}
+
+// logLabels builds the maps for one stream.
+//
+// Both lookups are targeted rather than a whole-swarm snapshot: CE's
+// docker.SnapshotWith is four unfiltered reads — nodes, services, tasks and
+// info — and this needs two, one of which the daemon can filter for us.
+func (b *Backend) logLabels(ctx context.Context, serviceID string) *logLabels {
+	l := &logLabels{now: b.now, hosts: map[string]string{}}
+
+	if serviceID != "" {
+		l.refresh = func(ctx context.Context) map[string]int { return b.taskSlots(ctx, serviceID) }
+		l.slots = l.refresh(ctx)
+	}
+	if l.slots == nil {
+		l.slots = map[string]int{}
+	}
+	// asked is deliberately left at the zero time rather than set to now. The
+	// throttle exists to bound *repeated* asking, and the first task id this
+	// map cannot name is the signal that it is already stale — making the very
+	// first refresh wait out the interval would leave a rollout's new replica
+	// unnamed for up to half a minute, which is the window an operator is most
+	// likely to be watching.
+
+	nodes, err := b.api.NodeList(ctx, swarm.NodeListOptions{})
+	if err != nil {
+		// Logged and survived. Every line then carries the node id it already
+		// carried, which is what the console showed before hostnames existed.
+		b.log.Warn("could not name the nodes behind a log stream; lines will carry node ids", "error", err)
+		return l
+	}
+	for _, n := range nodes {
+		if n.Description.Hostname != "" {
+			l.hosts[n.ID] = n.Description.Hostname
+		}
+	}
+	return l
+}
+
+// taskSlots maps each of the service's task ids to its replica number.
+//
+// A nil map means the lookup failed, which is deliberately distinct from an
+// empty one: empty is a service whose tasks are all global, and nil is a
+// question that was not answered.
+func (b *Backend) taskSlots(ctx context.Context, serviceID string) map[string]int {
+	tasks, err := b.api.TaskList(ctx, swarm.TaskListOptions{
+		Filters: filters.NewArgs(filters.Arg("service", serviceID)),
+	})
+	if err != nil {
+		b.log.Warn("could not name the tasks behind a log stream; lines will carry task ids", "service", serviceID, "error", err)
+		return nil
+	}
+	out := make(map[string]int, len(tasks))
+	for _, t := range tasks {
+		// Slot 0 is not stored. It is what a global-mode service reports —
+		// the daemon treats a zero slot as the global case itself — and storing
+		// it would let the console draw a replica that does not exist.
+		if t.Slot > 0 {
+			out[t.ID] = t.Slot
+		}
+	}
+	return out
+}
+
+// slot reports the replica number for a task id, and whether it is known.
+//
+// An id the map has never seen asks the daemon again, at most once per
+// logSlotRefresh: a rollout starts tasks after the stream opened, and a rollout
+// is when an operator is reading. The first such id is answered at once and the
+// rest of its burst is not, which is the whole of the throttle's job — a service
+// crash-looping through tasks would otherwise turn one log stream into a
+// TaskList loop against the manager, on the goroutine draining the connection.
+//
+// A global service's tasks are never in this map by design, so it pays one
+// lookup per interval for as long as the stream is open. That is the cost of
+// not having a second map to record that a task is known to have no slot, and
+// it is bounded where a per-line lookup would not be.
+func (l *logLabels) slot(ctx context.Context, taskID string) int {
+	// A nil receiver is "nothing is known", not a wiring mistake. Every label
+	// is optional by design — the line is the product and the name is the
+	// convenience — so a sink assembled without them labels nothing and still
+	// delivers everything, which is also what the two failed lookups produce.
+	if l == nil || taskID == "" {
+		return 0
+	}
+	if n, ok := l.slots[taskID]; ok {
+		return n
+	}
+	if l.refresh == nil || l.now().Sub(l.asked) < logSlotRefresh {
+		return 0
+	}
+	l.asked = l.now()
+	if fresh := l.refresh(ctx); fresh != nil {
+		l.slots = fresh
+	}
+	return l.slots[taskID]
+}
+
+// host reports the hostname for a node id, or the empty string.
+//
+// Not refreshed, unlike slots. Nodes do not join a swarm on a rollout's
+// timescale, and one that does during a single console session is rare enough
+// to be worth the reopen.
+// A nil receiver answers nothing, for the reason slot gives.
+func (l *logLabels) host(nodeID string) string {
+	if l == nil {
+		return ""
+	}
+	return l.hosts[nodeID]
 }
 
 // readFramedLog reads the daemon's multiplexed stream.
@@ -255,6 +481,11 @@ type logSink struct {
 	out     chan<- application.ServiceLogEvent
 	service string
 	now     func() time.Time
+	labels  *logLabels
+
+	// backlog counts down the lines the sink will block to deliver rather than
+	// drop. See send.
+	backlog int
 
 	// partial is what has arrived of a line that has not ended yet, per stream.
 	partial map[string][]byte
@@ -317,18 +548,27 @@ func (s *logSink) flush() {
 	}
 }
 
-// emit parses one line and delivers it.
+// emit parses one line, names what wrote it, and delivers it.
 func (s *logSink) emit(stream, line string) {
 	at, taskID, nodeID, message := parseLogLine(line, s.now)
 	s.send(application.ServiceLogEvent{
-		Service:   s.service,
-		TaskID:    taskID,
-		NodeID:    nodeID,
-		Stream:    stream,
-		Message:   message,
-		Timestamp: at,
+		Service:      s.service,
+		TaskID:       taskID,
+		NodeID:       nodeID,
+		NodeHostname: s.labels.host(nodeID),
+		Slot:         s.labels.slot(s.ctx, taskID),
+		Stream:       stream,
+		Message:      message,
+		Timestamp:    at,
 	})
 }
+
+// caughtUp ends the backlog phase.
+//
+// Called by the reader when a read from the daemon stalls, which is what the
+// end of a backlog looks like from here. Also reached by the count in send, for
+// the case where the daemon keeps producing and the stall never comes.
+func (s *logSink) caughtUp() { s.backlog = 0 }
 
 // notice delivers a line the controller wrote rather than the container.
 func (s *logSink) notice(message string) {
@@ -343,12 +583,29 @@ func (s *logSink) notice(message string) {
 	})
 }
 
-// send delivers an event without ever blocking on the consumer.
+// send delivers an event, blocking through the backlog and dropping once live.
 //
-// A browser that has stopped reading must not be able to stall the goroutine
-// draining the daemon connection, so a full channel drops the line and counts
-// it. The count is reported as its own notice as soon as there is room, which
-// is what keeps a gap in a console visible as a gap.
+// # Why there are two rules and not one
+//
+// The live rule came first and is unchanged: a browser that has stopped reading
+// must not be able to stall the goroutine draining the daemon connection, so a
+// full channel drops the line and counts it, and the count is reported as its
+// own notice as soon as there is room. That is what keeps a gap in a console
+// visible as a gap.
+//
+// Applied to a backlog it is wrong, and wrong at exactly the thing a history
+// read is for. Twenty thousand lines arrive from the daemon far faster than
+// they can be written to a browser, so most of a history read would be dropped
+// and the operator would be handed a notice saying so. The justification for
+// dropping is that a live stream is unbounded; a backlog is `tail` lines and no
+// more, so blocking on it delays a bounded amount of work, and cancelling the
+// context still ends it.
+//
+// The phase ends on whichever comes first: `tail` events delivered, or a read
+// from the daemon that stalled (logBacklogGrace). Both are needed. The count
+// alone blocks on live output whenever the service has less history than `tail`
+// — twenty thousand asked for, fifty in the file, and events fifty-one onward
+// are live. The stall alone never fires against a service producing steadily.
 func (s *logSink) send(e application.ServiceLogEvent) {
 	if s.dropped > 0 && !e.Notice {
 		select {
@@ -366,6 +623,14 @@ func (s *logSink) send(e application.ServiceLogEvent) {
 		}
 	}
 	if s.ctx.Err() != nil {
+		return
+	}
+	if s.backlog > 0 {
+		select {
+		case s.out <- e:
+			s.backlog--
+		case <-s.ctx.Done():
+		}
 		return
 	}
 	select {

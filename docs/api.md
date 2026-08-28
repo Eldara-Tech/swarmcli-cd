@@ -456,6 +456,100 @@ The stream is fed by the same notifier seam that writes the controller's log,
 which is why a companion adding Slack *appends* a notifier rather than replacing
 one — replacing would silently kill the UI's live updates.
 
+## Service log stream — `GET /api/v1/applications/{app}/services/{svc}/logs`
+
+Server-Sent Events, one JSON object per `data:` line, one line of container
+output per object:
+
+```
+data: {"service":"edge_web","taskID":"k9r2m1x8p4qz…","nodeID":"n3f8…","nodeHostname":"swarm-w1","slot":3,"stream":"stdout","message":"listening on :8080","timestamp":"2026-08-28T06:00:00.412Z"}
+
+```
+
+`service`, `stream`, `message` and `timestamp` are always present. `stream` is
+`stdout` or `stderr`; a line whose origin the daemon does not state is `stdout`,
+which is the honest default and is what every line of a TTY service is, because
+the daemon does not multiplex a stream it gave a terminal. `timestamp` is when
+the *container* wrote the line, not when the controller read it.
+
+`taskID` and `nodeID` are the daemon's own ids for the replica and the machine.
+`nodeHostname` and `slot` are what an operator calls them, resolved by the
+controller against the live swarm:
+
+- **`slot`** is the replica number, as `docker service ps` shows it. It is
+  **absent for a global-mode service**, whose tasks have no slot — the daemon
+  reports 0 and means it, and there is no replica zero — and absent for a task
+  that started after the stream opened and has not yet been re-read.
+- **`nodeHostname`** is absent if the roster could not be read. The two are
+  separate lookups on purpose, so one failing costs one label rather than both.
+
+Neither is ever the only thing identifying a line: the ids are always there.
+A client that needs a label should fall back `slot` → `nodeHostname` → `taskID`,
+which is the order the console uses.
+
+`notice` marks the one class of line the container did not write — the
+controller reporting that it dropped output, or truncated a line that would not
+end. It carries `stream: "stderr"`, so an operator filtered to stderr sees the
+reason a gap appeared, and it carries no `taskID`.
+
+### Choosing a window
+
+| Parameter | Meaning | Default |
+| --- | --- | --- |
+| `tail` | how many lines of scrollback to deliver before following | `100` |
+| `since` | how far back those lines may reach, as a Go duration (`15m`, `6h`) | none |
+
+**`since` may not be given without `tail`, and a request that does is a 400.**
+That is not fussiness. The daemon selects the last `tail` lines *first* and only
+then drops the ones older than `since`, so `?since=6h` on its own asks for six
+hours and is answered with a hundred lines — a window that silently does
+nothing. The two are one intent and the API requires both.
+
+`tail` must be between 1 and 50,000, and `since` at most 24 hours. Both are
+**refused** rather than clamped: a client handed the last fifty thousand lines
+when it asked for a million has been answered with something other than what it
+asked for, with nothing in the reply to say so.
+
+`since` is a duration and not an instant deliberately. It is resolved against
+the controller's clock, which is far closer to the daemon's than a browser's is,
+so a client whose clock is a few minutes fast cannot ask for a window that has
+not happened yet.
+
+There is no `until`. The daemon's swarm log route does not read one — only the
+container endpoint does — so this endpoint cannot offer an end bound and does
+not pretend to.
+
+### What it costs
+
+A `since` reaching far back is read on **each node holding a task**, by that
+node's own log driver; the manager relays. So the disk cost is spread across the
+swarm rather than landing on the raft store, and `tail` is what bounds how much
+crosses the wire.
+
+The controller serves **16 log streams at once** across all clients and
+applications, and answers **503** when they are all taken. A history read holds
+one for as long as its tab stays open.
+
+### Statuses
+
+| Status | Meaning |
+| --- | --- |
+| `400` | the window could not be read — see above |
+| `404` | no such application, or no such service *for this application* |
+| `501` | this build's reconciler cannot stream logs, or the destination's backend cannot |
+| `503` | all 16 log streams are in use |
+| `502` | the stream could not be opened; the daemon's own words go to the controller log only |
+
+Every one of them is decided before the response headers are written, so a
+failure is never the first frame of a `200`.
+
+An idle stream writes a `: keepalive` comment frame every 20 seconds, which
+conforming SSE clients ignore. The event stream above deliberately has no such
+timer; this one does because its client is `fetch` rather than `EventSource` and
+does not reconnect, so a proxy closing an idle connection would be permanent.
+The controller re-checks the caller's authorisation on the same tick, so a
+withdrawn grant ends an attached console rather than outliving it.
+
 ## See also
 
 - [Getting started](getting-started.md) · [Configuration](configuration.md) · [Concepts](concepts.md)
