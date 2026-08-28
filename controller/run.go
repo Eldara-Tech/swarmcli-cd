@@ -460,6 +460,14 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 		Reclaimer: reclaim.New(reclaim.Options{Roots: []string{repos, chartCache}, Log: log}),
 	})
 
+	// The reconciler this build wires answers the node roster, so the endpoint's
+	// 501 branch is unreachable here. Asserted rather than left to the type
+	// assertion inside api, which falls back silently: a renamed or re-signed
+	// Nodes would not fail the build, it would turn the node matrix off and the
+	// first evidence would be an operator being told this controller does not
+	// report swarm node telemetry.
+	var _ api.NodeLister = rec
+
 	// The UI is built here and passed in, so that api stays data-only and
 	// nothing importing it links an embedded asset tree. With --ui=false the
 	// handler is absent rather than the routes: api.New answers them with a 404.

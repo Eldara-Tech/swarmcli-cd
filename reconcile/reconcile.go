@@ -3157,3 +3157,44 @@ func revisions(revs []charts.Release) []application.Revision {
 	}
 	return out
 }
+
+// Nodes describes the swarm this controller applies to.
+//
+// It is what makes *Reconciler an api.NodeLister, so the endpoint's 501 branch
+// is unreachable on this build. The branch stays because the interface is the
+// seam a Phase 3 reconciler is written against, and one that cannot answer must
+// still be able to say so.
+//
+// The empty target rather than any application's destination. The roster is the
+// controller's own swarm — the one its docker.sock reaches and the one every
+// unqualified destination resolves to — and asking per application would make
+// the answer depend on which applications happen to be in the set.
+//
+// Reported unqualified for the same reason: swarms.Target names the local swarm
+// with an empty string, so that is what NodesResponse.Swarm carries here. A
+// multi-swarm registry naming its destinations fills it; this one has no name
+// to give, and inventing the cluster ID would put an identifier in a field that
+// means a destination everywhere else.
+func (r *Reconciler) Nodes(ctx context.Context) (application.NodesResponse, error) {
+	target := swarms.Target{}
+	backend, err := r.swarms.Backend(ctx, target)
+	if err != nil {
+		return application.NodesResponse{}, fmt.Errorf("resolving the local swarm: %w", err)
+	}
+
+	roster, ok := backend.(capability.NodeRoster)
+	if !ok {
+		// Not a failure, and not silently degraded either. Every other optional
+		// capability here falls back to doing less of something the caller was
+		// already doing; this one is the whole of what the caller asked for, so
+		// the fallback is to say the destination cannot answer and let the API
+		// report that as the same 501 a reconciler with no roster at all gives.
+		return application.NodesResponse{}, application.ErrUnsupported
+	}
+
+	nodes, err := roster.SwarmNodeRoster(ctx)
+	if err != nil {
+		return application.NodesResponse{}, fmt.Errorf("reading the swarm's node roster: %w", err)
+	}
+	return application.NodesResponse{Swarm: target.Swarm, Nodes: nodes}, nil
+}

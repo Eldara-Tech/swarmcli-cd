@@ -73,17 +73,33 @@ Added two new fine-grained permission verbs:
 - **Route:** `GET /api/v1/nodes`
 - **Guarded Action:** `ActionNodes`
 - **Interface:** `NodeLister` seam (`Nodes(ctx) (application.NodesResponse, error)`)
-- **Unimplemented in this repository.** No reconciler here satisfies `NodeLister`, so an
-  open-source build answers **501** and the Diagnostics matrix says so. The example below is
-  the *shape* a response takes, not something this build produces — the first version returned
-  exactly that object as a literal, and the console drew a manager called `swarm-manager-01`
-  at `127.0.0.1` running engine `27.5.1` on every deployment that had never been asked about.
-  501 rather than an empty list, because a swarm with no nodes is not a thing and a UI cannot
-  tell an empty roster from one it failed to read.
+- **Implemented (#260).** `*reconcile.Reconciler` satisfies `NodeLister`, resolving the local
+  swarm through the `swarms` seam and reading the roster behind `capability.NodeRoster` — the
+  same whole-swarm snapshot the reconcile loop already takes, so nodes and their task counts
+  arrive in one round trip. `controller` asserts the wiring at compile time, because the seam's
+  type assertion falls back silently and a renamed method would turn the matrix off rather than
+  fail the build.
+- **The 501 branch stays, and is still reachable.** A reconciler reached through the same
+  interface may not implement the method, and one that does may still meet a backend with no
+  roster behind it — resolved per request, not at construction. That second case is reported
+  with `application.ErrUnsupported` and answered identically: same status, same sentence, since
+  from the caller's side both are "this build does not report that".
+- **An empty roster is an error, not an answer.** 501 rather than an empty list because a swarm
+  with no nodes is not a thing and a UI cannot tell an empty roster from one it failed to read.
+  A locked swarm is the case that makes this load-bearing: `docker.SnapshotWith` answers one
+  with an empty snapshot and a *nil* error, so passing it through would draw a locked cluster
+  as an empty one.
+- **The counts are per node, and are not record counts.** The swarm keeps stopped task records
+  — that is how `docker service ps` shows a crash history — so `tasksDesired` counts the tasks
+  the orchestrator still wants on that node and `tasksRunning` those that are up. Counting
+  every record on a node instead gives a number that only ever grows.
+- The first version of this endpoint returned the example below as a literal, and the console
+  drew a manager called `swarm-manager-01` at `127.0.0.1` running engine `27.5.1` on every
+  deployment that had never been asked about. It is now the shape of a real response.
 - **Payload Wire Format:**
   ```json
   {
-    "swarm": "local",
+    "swarm": "",
     "nodes": [
       {
         "id": "node-mgr-01",
@@ -132,7 +148,7 @@ Added two new fine-grained permission verbs:
 - **Integrity Gauge:** Dynamic SVG score ring with status tone.
 - **Audit Checklist:** Operational verification matrix with pass/warn chips.
 - **Swarm Node Matrix:** Pro node cards displaying server icons, live status dots (`● READY`), 4-column metric grids (Engine version, IP address, Availability, and Tasks Allocated with visual progress tracks). The task gauge is an `<svg>` rect rather than a styled `<div>`: a data-driven width is an inline `style` attribute, which `style-src 'self'` refuses — the same constraint the integrity ring beside it is drawn under.
-- **Three states, not one.** A build with no `NodeLister` (501), a roster that could not be read, and a swarm reporting no nodes are drawn differently; none of them is an empty grid.
+- **Three states, not one.** A build that cannot report a roster (501), a roster that could not be read, and a swarm reporting no nodes are drawn differently; none of them is an empty grid. The third is now unreachable from this build's own backend, which refuses an empty roster rather than serving one, but the state stays: it is what a reconciler reached through the same interface may still produce.
 
 ### 3.3 Application Detail & Release Polish (`web/ui/src/screens/ApplicationDetail.tsx`)
 - **Balanced Spec Bento Grid:** Equal-height layout for `GitOps Specification` and `Swarm Runtime & Reconcile` with drift state indicator.

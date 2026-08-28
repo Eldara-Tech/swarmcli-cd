@@ -2119,6 +2119,43 @@ func (n *nodeLister) Nodes(context.Context) (application.NodesResponse, error) {
 	return n.resp, n.err
 }
 
+// A reconciler that has the method and still cannot answer — the backend behind
+// this destination implements no roster — must be indistinguishable from one
+// that never had the method. Both are "this build does not report that", and a
+// client branching on the status has only the status to branch on.
+func TestNodesReportsAnUnsupportedDestinationAsUnimplemented(t *testing.T) {
+	rec := &nodeLister{fakeReconciler: fakeReconciler{}, err: application.ErrUnsupported}
+	_, h := testServer(t, rec, nil)
+	rr := do(t, h, "GET", "/api/v1/nodes")
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("GET /api/v1/nodes = %d, want 501", rr.Code)
+	}
+
+	// The same sentence, not merely the same code: the console renders the body
+	// and two wordings would leak the distinction the status deliberately hides.
+	_, bare := testServer(t, &fakeReconciler{}, nil)
+	if got, want := rr.Body.String(), do(t, bare, "GET", "/api/v1/nodes").Body.String(); got != want {
+		t.Errorf("unsupported destination said %q, a reconciler with no lister said %q; they must match", got, want)
+	}
+}
+
+// A read that failed is not a build that cannot read. Reporting either as the
+// other tells an operator to stop asking when the daemon merely blinked, or
+// tells them to retry something no build was ever going to answer.
+func TestNodesReportsAFailedReadAsAFailure(t *testing.T) {
+	rec := &nodeLister{fakeReconciler: fakeReconciler{}, err: errors.New("the daemon is unreachable")}
+	_, h := testServer(t, rec, nil)
+	rr := do(t, h, "GET", "/api/v1/nodes")
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("GET /api/v1/nodes = %d, want 500", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "the daemon is unreachable") {
+		t.Error("the daemon's own error text reached the caller")
+	}
+}
+
 func TestDiagnosticsEndpoint(t *testing.T) {
 	views := []application.View{view("edge")}
 	_, h := testServer(t, &fakeReconciler{views: views}, nil)

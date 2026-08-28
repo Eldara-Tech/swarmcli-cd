@@ -5,7 +5,7 @@ package application
 
 import "errors"
 
-// The two sentinels a reconciler answers with that are not failures, and that
+// The sentinels a reconciler answers with that are not failures, and that
 // the API turns into a particular response rather than into an error.
 //
 // They live here, beside the types those responses are built from, rather than
@@ -35,4 +35,23 @@ var (
 	// so the API can say which of the two happened rather than claiming to have
 	// started something it did not.
 	ErrSyncPending = errors.New("a sync is already queued for this application")
+
+	// ErrUnsupported reports that the reconciler could reach the destination
+	// and the destination cannot answer the question — not that the request
+	// was wrong, and not that the read failed.
+	//
+	// It exists because an optional capability is resolved per request rather
+	// than at construction. api reaches the swarm node roster through a
+	// NodeLister the reconciler either is or is not, which is a compile-time
+	// fact; but which backend serves a destination is a run-time one, and a
+	// reconciler that implements the method still cannot answer for a backend
+	// that does not implement the capability behind it. Without a sentinel that
+	// case arrives as a failure, and an operator is told the roster could not
+	// be read when nothing was ever going to read it.
+	//
+	// The API answers it exactly as it answers a reconciler that is not a
+	// NodeLister at all: 501, and the same sentence. The two are the same fact
+	// from the caller's side — this build does not report that — and a client
+	// branching on the status must not have to tell them apart.
+	ErrUnsupported = errors.New("this destination cannot answer that")
 )

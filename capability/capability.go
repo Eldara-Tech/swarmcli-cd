@@ -262,3 +262,27 @@ type ResourceRemover interface {
 type SwarmSizer interface {
 	SwarmNodes(ctx context.Context) (int, error)
 }
+
+// NodeRoster is the optional interface a backend implements to describe the
+// swarm's nodes rather than only count them.
+//
+// Separate from SwarmSizer rather than a widening of it, for the reason the two
+// resource interfaces are separate: the count answers whether a node-local
+// listing was the whole swarm's, and is asked on the deletion path where a
+// backend that cannot answer has to mean "assume not". The roster answers what
+// the cluster looks like, is asked by the API on a read, and a backend that
+// cannot answer it says so rather than being taken for a swarm with no nodes.
+//
+// It returns the wire type rather than the daemon's, as AllowedReferences takes
+// one: a companion backend reached through the swarms seam must not have to
+// depend on the moby client's node and task types to describe its own swarm,
+// and mapping them is exactly the work this interface exists to have done
+// already.
+//
+// An empty roster is not a valid answer. A swarm with no nodes is not a thing,
+// so a backend that finds one — a locked swarm answers that way — returns an
+// error instead, which is what keeps "could not read" distinguishable from
+// "read, and there is nothing there".
+type NodeRoster interface {
+	SwarmNodeRoster(ctx context.Context) ([]application.SwarmNode, error)
+}
