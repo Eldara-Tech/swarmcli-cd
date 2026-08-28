@@ -106,7 +106,9 @@ func (s *Server) serviceLogs(w http.ResponseWriter, r *http.Request, _ authz.Sub
 		fail(w, http.StatusBadGateway, "could not open the service log stream; ask an administrator")
 		return
 	}
-	defer rc.Close()
+	// Closed the way every other reader in this repository is: errcheck is on,
+	// and a bare `defer rc.Close()` is the one call in the tree that ignored it.
+	defer func() { _ = rc.Close() }()
 
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
