@@ -2104,4 +2104,3 @@ func TestDiagnosticsEndpoint(t *testing.T) {
 		t.Fatalf("expected diagnostic checks in response, got %v", resp)
 	}
 }
-

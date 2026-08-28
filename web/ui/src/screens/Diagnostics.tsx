@@ -11,6 +11,18 @@ import { Loading } from '../components/StateBlock'
 /**
  * Diagnostics 2.0: Unified cluster health assessment and Swarm node topology matrix.
  */
+/** What a risk's severity is called on its badge. See application/status.go. */
+function riskLabel(severity: string): string {
+  switch (severity) {
+    case 'bad':
+      return 'critical'
+    case 'unknown':
+      return 'unknown'
+    default:
+      return 'warning'
+  }
+}
+
 export function Diagnostics() {
   const diag = useQuery({
     queryKey: ['diagnostics'],
@@ -149,8 +161,13 @@ export function Diagnostics() {
                       <Icon name={risk.severity === 'bad' ? 'error' : 'warn'} size={16} />
                       <h3>{risk.title}</h3>
                     </div>
+                    {/* The server's third severity is `unknown` — an application
+                        it has accepted and not yet reported on. Labelled
+                        "warning" it claims a finding nobody made; the badge is
+                        drawn in the warn tone because it is not an all-clear,
+                        but it says what it is. */}
                     <span className={`risk-badge risk-badge-${risk.severity === 'bad' ? 'crit' : 'warn'}`}>
-                      {risk.severity === 'bad' ? 'critical' : 'warning'}
+                      {riskLabel(risk.severity)}
                     </span>
                   </div>
                   <p>{risk.summary}</p>
@@ -221,9 +238,18 @@ export function Diagnostics() {
                         <span className="metric-cell-val font-mono">
                           {node.tasksRunning} / {node.tasksDesired}
                         </span>
-                        <div className="task-progress-track">
-                          <div className="task-progress-fill" style={{ width: `${taskPct}%` }} />
-                        </div>
+                        {/* viewBox is 100 wide and preserveAspectRatio is off,
+                            so the percentage is the rect's width directly. */}
+                        <svg
+                          className="task-progress"
+                          viewBox="0 0 100 4"
+                          preserveAspectRatio="none"
+                          role="img"
+                          aria-label={`${node.tasksRunning} of ${node.tasksDesired} tasks running`}
+                        >
+                          <rect className="task-progress-track" x="0" y="0" width="100" height="4" rx="2" />
+                          <rect className="task-progress-fill" x="0" y="0" width={taskPct} height="4" rx="2" />
+                        </svg>
                       </div>
                     </div>
                   </div>

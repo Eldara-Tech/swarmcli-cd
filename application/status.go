@@ -131,8 +131,15 @@ type ServiceLogEvent struct {
 
 // RiskItem is one identified risk in cluster health diagnostics.
 type RiskItem struct {
-	ID          string `json:"id"`
-	Severity    string `json:"severity"` // "bad", "warn", "info"
+	ID string `json:"id"`
+	// Severity is "bad", "warn" or "unknown".
+	//
+	// "unknown" is its own tier rather than a flavour of the other two: every
+	// enum in enum.go has the empty string as its Unknown member, so an
+	// application the controller has accepted and not yet reconciled reports
+	// exactly that. Called "bad" it says a healthy young fleet is degraded;
+	// called clear it says a fleet nobody has looked at is fine.
+	Severity    string `json:"severity"`
 	Application string `json:"application,omitempty"`
 	Title       string `json:"title"`
 	Summary     string `json:"summary"`
@@ -147,13 +154,61 @@ type CheckItem struct {
 	Detail string `json:"detail"`
 }
 
+// AppSetShape is which of the app set's five states a controller is in.
+//
+// Mirrored by appSetShape in web/ui/src/api/appset.ts, and the reason both
+// exist is that three of these are *different* failures — docs/api.md is
+// explicit about it — and a boolean cannot tell them apart. `Stale` alone was
+// what the controller-integrity check read, so a controller that had never
+// loaded a set, and one with no reconcile loop wired at all, both reported as
+// operational.
+type AppSetShape string
+
+const (
+	// AppSetUnwired is api.go's no-controller arm: a zero ControllerStatus, so
+	// Mode is empty and every field below it is a zero value rather than an
+	// observation. Checked first, which is the whole reason this is a function
+	// — LoadedAt is zero here too, and would otherwise read as never-loaded.
+	AppSetUnwired AppSetShape = "unwired"
+	// AppSetNeverLoaded is the loudest: no set has ever loaded, so the
+	// applications list is empty for a reason that has nothing to do with any
+	// application in it.
+	AppSetNeverLoaded AppSetShape = "never-loaded"
+	// AppSetStale is a newer set being refused while the last good one runs.
+	AppSetStale AppSetShape = "stale"
+	// AppSetPartial is a set that loaded and could not be applied in full.
+	AppSetPartial AppSetShape = "partial"
+	AppSetOK      AppSetShape = "ok"
+)
+
+// Shape classifies this controller status. See AppSetShape.
+func (s ControllerStatus) Shape() AppSetShape {
+	switch {
+	case s.AppSet.Mode == "":
+		return AppSetUnwired
+	// Both halves, as docs/api.md states it: a set that loaded and legitimately
+	// declares nothing has a LoadedAt, and a controller mid-first-load has
+	// neither — the difference between "nothing to do" and "nothing works".
+	case s.AppSet.LoadedAt.IsZero() && s.Applications == 0:
+		return AppSetNeverLoaded
+	case s.AppSet.Stale:
+		return AppSetStale
+	case s.AppSet.Error != "":
+		return AppSetPartial
+	default:
+		return AppSetOK
+	}
+}
+
 // DiagnosticsResponse is the payload served by GET /api/v1/diagnostics.
 type DiagnosticsResponse struct {
-	Score      int         `json:"score"`
-	Tone       string      `json:"tone"` // "ok", "warn", "bad"
+	Score int `json:"score"`
+	// Tone is "ok", "warn" or "bad", taken from the worst risk present rather
+	// than from a threshold on Score. A threshold said "Nominal" beside a red
+	// risk list as soon as the arithmetic landed on 90.
+	Tone       string      `json:"tone"`
 	ClearCount int         `json:"clearCount"`
 	TotalCount int         `json:"totalCount"`
 	Risks      []RiskItem  `json:"risks"`
 	Checks     []CheckItem `json:"checks"`
 }
-

@@ -116,4 +116,40 @@ describe('the diagnostics screen', () => {
     expect(screen.getByText('All Checks Passed')).toBeDefined()
     expect(screen.getByText('swarm-mgr-1')).toBeDefined()
   })
+
+  it('does not call an unreported application a warning, or the fleet nominal', async () => {
+    // The server's third severity. Rendered through the old two-way branch it
+    // was labelled "warning" — a finding nobody made — and the chip came off a
+    // tone that read ok at any score of 90 or more. Both now come from the risks.
+    controller({
+      ...communityDiscovery(),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [row('edge', 'synced', 'healthy')] }),
+      '/api/v1/diagnostics': () =>
+        json(200, {
+          score: 95,
+          tone: 'warn',
+          clearCount: 3,
+          totalCount: 4,
+          risks: [
+            {
+              id: 'health-edge',
+              severity: 'unknown',
+              application: 'edge',
+              title: 'Application \'edge\' has not been reported on',
+              summary: 'The controller has not reported a health state for this application yet.',
+            },
+          ],
+          checks: [{ id: 'c1', name: 'GitOps Manifest Convergence', passed: true, detail: '1 of 1 in sync' }],
+        }),
+      '/api/v1/nodes': () => json(200, { swarm: 'local', nodes: [] }),
+      '/api/v1/events': openStream,
+    })
+    await openDiagnostics()
+
+    expect(screen.getByText('unknown')).toBeDefined()
+    expect(screen.queryByText('warning')).toBeNull()
+    expect(screen.queryByText('Nominal')).toBeNull()
+    expect(screen.getByText('Attention Needed')).toBeDefined()
+  })
 })

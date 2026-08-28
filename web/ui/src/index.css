@@ -175,7 +175,7 @@ code {
 }
 
 .brand-badge {
-  background: var(--surface-raised);
+  background: var(--panel-high);
   border: 1px solid var(--edge);
   border-radius: var(--r-xs);
   color: var(--primary);
@@ -2388,7 +2388,7 @@ select:focus-visible,
 }
 
 .btn-seg.active {
-  background: var(--surface-raised);
+  background: var(--panel-high);
   box-shadow: var(--e-1);
   color: var(--primary);
 }
@@ -2429,7 +2429,7 @@ select:focus-visible,
 
 .toolbar-select-wrap {
   align-items: center;
-  background: var(--surface-raised);
+  background: var(--panel-high);
   border: 1px solid var(--edge);
   border-radius: var(--r-xs);
   display: flex;
@@ -2477,7 +2477,7 @@ select:focus-visible,
 
 .search-wrap {
   align-items: center;
-  background: var(--surface-raised);
+  background: var(--panel-high);
   border: 1px solid var(--edge);
   border-radius: var(--r-xs);
   display: flex;
@@ -2510,7 +2510,7 @@ select:focus-visible,
 }
 
 .toolbar-btn {
-  background: var(--surface-raised);
+  background: var(--panel-high);
   border: 1px solid var(--edge);
   border-radius: var(--r-xs);
   color: var(--ink-muted);
@@ -2523,7 +2523,7 @@ select:focus-visible,
 }
 
 .toolbar-btn:hover {
-  background: var(--edge-focus);
+  background: var(--edge-strong);
   color: var(--ink);
 }
 
@@ -2692,7 +2692,7 @@ select:focus-visible,
 }
 
 .node-card-pro:hover {
-  border-color: var(--edge-focus);
+  border-color: var(--edge-strong);
   box-shadow: var(--e-1);
 }
 
@@ -2712,7 +2712,7 @@ select:focus-visible,
 
 .node-icon-wrap {
   align-items: center;
-  background: var(--surface-raised);
+  background: var(--panel-high);
   border: 1px solid var(--edge);
   border-radius: var(--r-sm);
   display: flex;
@@ -2727,7 +2727,7 @@ select:focus-visible,
 }
 
 .node-status-dot {
-  border: 2px solid var(--surface-raised);
+  border: 2px solid var(--panel-high);
   border-radius: 50%;
   bottom: -2px;
   height: 8px;
@@ -2805,19 +2805,23 @@ select:focus-visible,
   gap: 0.3rem;
 }
 
-.task-progress-track {
-  background: var(--edge);
-  border-radius: var(--r-pill);
+/* Drawn as an <svg>, not two divs, for the reason the score ring above is:
+   the width is data and `style-src 'self'` refuses the style attribute a
+   data-driven width would need. A rect's `width` is a presentation attribute,
+   so the same number goes in without one. */
+.task-progress {
+  display: block;
   height: 4px;
-  overflow: hidden;
   width: 100%;
 }
 
+.task-progress-track {
+  fill: var(--edge);
+}
+
 .task-progress-fill {
-  background: var(--primary);
-  border-radius: var(--r-pill);
-  height: 100%;
-  transition: width var(--dur-mid) var(--ease);
+  fill: var(--primary);
+  transition: width var(--dur) var(--ease);
 }
 
 /* Specification & Release Polish */
@@ -2866,7 +2870,7 @@ select:focus-visible,
 }
 
 .release-chart-badge {
-  background: var(--surface-raised);
+  background: var(--panel-high);
   border: 1px solid var(--edge);
   border-radius: var(--r-xs);
   color: var(--ink);
@@ -2891,7 +2895,7 @@ select:focus-visible,
 }
 
 .replicas-badge {
-  background: var(--surface-raised);
+  background: var(--panel-high);
   border: 1px solid var(--edge);
   border-radius: var(--r-xs);
   color: var(--ink);
