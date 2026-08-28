@@ -257,11 +257,28 @@ Node installed — which is what the getting-started guide promises today.
 | new: `deps.yml` | an npm licence allowlist gate. A JS dependency tree is a new third-party licence obligation this repository has never had, and the existing `licence.yml` only checks our own headers. |
 
 Dependency budget, deliberately small: `react`, `react-dom`, `react-router`,
-`@tanstack/react-query`, and dev-only `vite`, `typescript`, `vitest`,
-`@testing-library/react`, `eslint`. **No component library and no diff library**
-— the components are ~15 small ones we own, and the diff is already a unified
-text diff that a 60-line colouriser renders. Every dependency here is one we
-would have to vet and keep vetting on a process holding the Docker socket.
+`@tanstack/react-query`, the three `@fontsource` font packages, and dev-only
+`vite`, `typescript`, `vitest`, `@testing-library/react`, `eslint`. **No
+component library, no icon package and no diff library** — the components are
+~15 small ones we own, the icons are fifteen vendored `<path>`s carrying
+Lucide's ISC notice in the file, and the diff is already a unified text diff
+that a 60-line colouriser renders. Every dependency here is one we would have to
+vet and keep vetting on a process holding the Docker socket.
+
+The fonts are the one entry that is *data* rather than code, and they came with
+an obligation the rest of the budget always had and had never met. MIT, ISC and
+OFL-1.1 all make retaining the copyright and permission notice a condition of
+redistribution, and `//go:embed all:dist` redistributes the whole bundle inside
+every released binary. `thirdPartyNotices()` in `web/ui/vite.config.ts` writes
+every runtime package's notice into `dist/THIRD-PARTY-NOTICES.txt` and **fails
+the build** on one it cannot find a licence file for; `web/web.go` serves it at
+the root, unauthenticated, because a licence notice behind a credential has not
+been provided to anybody. `check-npm-licences.sh` vets which licences may appear
+there; this is what makes its `OFL-1.1` entry true rather than merely allowed.
+
+`woff2Only()` in the same file drops the legacy `.woff` fallback from the built
+stylesheet and its files from the bundle: nothing that runs React 19 lacks
+woff2, so those 197KB were embedded in every binary and fetched by nobody.
 
 ### 4.3 Serving: routes, fallback, headers
 
@@ -270,6 +287,7 @@ Four routes are added to `api.coreRoutes`:
 | Route | Guard | |
 | --- | --- | --- |
 | `GET /` | public | the SPA index, and the fallback for client-side routes |
+| `GET /THIRD-PARTY-NOTICES.txt` | public | the bundle's retained third-party notices (§4.2), served from the root so the address does not move with a build hash |
 | `GET /assets/{path...}` | public | hashed, immutable build output |
 | `GET /ui/bootstrap.json` | public | login methods only — see §4.6 |
 | `GET /api/v1/capabilities` | `read` | seams, features, licence summary |
@@ -487,8 +505,12 @@ the new seam.
 | Screen | Endpoint | New work |
 | --- | --- | --- |
 | Login | `GET /ui/bootstrap.json` | new (§4.6) |
+| Overview — the fleet rollup across the three axes, the app-set card, and the live terminal | `GET /api/v1/applications`, `GET /api/v1/status` | none |
 | Applications list — cards and table, filters on sync / health / drift, text search | `GET /api/v1/applications` | none |
 | Application detail — header, and the tree: application → release → service | `GET /api/v1/applications/{app}` | none |
+| Application topology — the same three levels as node cards on connector rails | same document | none |
+| Monitor — the controller's own reconcile events, full height | `GET /api/v1/events` | none |
+| Diagnostics — an integrity score and the risks behind it | `GET /api/v1/applications` | none |
 | Drift panel, down to `field / desired / live` | same document (`status.releases[].drift`) | none |
 | Diff | `GET /api/v1/applications/{app}/diff` | none |
 | History — per release, per revision, with owner stamps | `GET /api/v1/applications/{app}/history` | none |
@@ -499,7 +521,25 @@ the new seam.
 
 The tree stops at services because that is where the API stops: `ServiceStatus`
 has mode, running, desired, completed, health, update state and message, and
-there is no task or container level (§7).
+there is no task or container level (§7). The topology tab stops there for the
+same reason, and Monitor is the *controller's* event stream and not container
+output — per-service logs would need an endpoint that does not exist.
+
+Overview and Diagnostics add no endpoint: both read documents the list and the
+controller screen already hold, under the same query keys, so reaching them from
+either costs no request. Nothing on either is asserted rather than derived —
+Diagnostics' all-clear lines are each rendered from their own predicate, and the
+engine card on the controller screen is drawn from the same `AppSetShape` its
+notice uses. A console that hard-codes a green chip has told an operator the one
+thing they cannot check.
+
+**One fold, not one per screen** (`api/severity.ts`). The list's dot, the
+topology node and the integrity score are the same question asked three times,
+and written three times they disagreed on `unknown` — the *zero* member of every
+enum in `application/enum.go`, and therefore what an application the controller
+has accepted and not yet reconciled actually reports. Two of the three read it
+as an all-clear. It is its own severity: excluded from the clear count, drawn
+neutral, never green.
 
 The `swarm` column exists in the table from day one, hidden while
 `features["multi-swarm"]` is false. Every event already carries `swarm`, and

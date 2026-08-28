@@ -77,7 +77,7 @@ export function Login() {
       <div className="login-brand">
         <BrandMark />
         <div className="login-title">
-          <h1>SwarmCLI CD</h1>
+          <h1>swarmcli-cd</h1>
           <p className="login-tagline">Continuous delivery for Docker Swarm</p>
         </div>
       </div>
@@ -109,12 +109,19 @@ export function Login() {
           {checking ? 'Checking…' : 'Sign in'}
         </button>
       )}
-      {/* The one link out of the credential page. rel="noreferrer" so the tab it
+      {/* Two links out of the credential page. rel="noreferrer" so the tab each
           opens cannot read back through window.opener, and the referrer — this
-          URL — never leaves with it. */}
+          URL — never leaves with it.
+
+          The notices are same-origin and served by web.go out of the bundle, so
+          they are reachable on a controller with no route to the internet;
+          swarmcli.io is not, which is why only one of them is the obligation. */}
       <p className="login-foot">
         <a href="https://swarmcli.io" target="_blank" rel="noreferrer">
           swarmcli.io
+        </a>
+        <a href="/THIRD-PARTY-NOTICES.txt" target="_blank" rel="noreferrer">
+          Third-party notices
         </a>
       </p>
     </>

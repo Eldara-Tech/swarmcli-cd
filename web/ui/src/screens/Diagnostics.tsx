@@ -4,21 +4,25 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { apiGet } from '../api/client'
-import { decodeEnum, driftStates, healthStates, syncStates } from '../api/enums'
+import { decodeEnum, healthStates, syncStates } from '../api/enums'
 import { listKey } from '../api/queries'
+import { assess, type Severity } from '../api/severity'
 import type { ApplicationList, View } from '../api/types'
 import { Icon } from '../components/Icon'
-import { Loading } from '../components/StateBlock'
+import { ErrorState, Loading } from '../components/StateBlock'
 
 /**
  * Diagnostics: an integrity score and the risks behind it, derived from the
  * status the controller already reports.
  *
  * Everything here is computed from /api/v1/applications — the sync, health and
- * drift axes — and nothing is fabricated. The deeper scans the mockup sketches
- * (a per-node health matrix, an auto-resolver) need controller endpoints that
- * are a later phase, and the note at the foot says so rather than filling the
- * space with numbers this build cannot stand behind.
+ * drift axes, folded by api/severity.ts — and nothing is fabricated. That is a
+ * constraint on the checks below and not a boast: the three all-clear lines are
+ * each rendered from the predicate beside them, so a line can only appear when
+ * the documents say it is true. The deeper scans the mockup sketches (a
+ * per-node health matrix, an auto-resolver) need controller endpoints that are
+ * a later phase, and the note at the foot says so rather than filling the space
+ * with claims this build cannot stand behind.
  */
 export function Diagnostics() {
   const apps = useQuery({
@@ -28,19 +32,24 @@ export function Diagnostics() {
 
   if (apps.isPending) return <Loading />
   if (apps.isError) {
-    return (
-      <p className="error" role="alert">
-        {apps.error.message}
-      </p>
-    )
+    return <ErrorState message={apps.error.message} />
   }
 
   const views = apps.data.applications
   const assessed = views.map((view) => ({ name: view.spec.name, ...assess(view) }))
+  // Clear is `ok` and only `ok`. An application whose axes read unknown has not
+  // been reported on, which is not the same as having been reported clear, and
+  // counting it as clear is what let a controller that had reconciled nothing
+  // score 100.
   const clear = assessed.filter((a) => a.severity === 'ok').length
   const risks = assessed.filter((a) => a.severity !== 'ok')
   const score = views.length === 0 ? 100 : Math.round((100 * clear) / views.length)
-  const tone = score >= 90 ? 'ok' : score >= 60 ? 'warn' : 'bad'
+
+  // The tone is taken from the risks and not from the score, so the ring, the
+  // chip and the list cannot disagree. A threshold on the score said "Nominal"
+  // beside a critical risk as soon as nine applications in ten were clear, and
+  // Math.round said 100/100 beside one from two hundred.
+  const tone = worst(risks.map((r) => r.severity))
 
   // The arc, drawn as SVG geometry attributes — stroke-dasharray and -dashoffset
   // are presentation attributes, not the inline style the CSP forbids. The
@@ -64,9 +73,7 @@ export function Diagnostics() {
               <Icon name="gauge" size={16} />
               System integrity
             </h2>
-            <span className={`chip chip-${tone === 'ok' ? 'good' : tone === 'warn' ? 'warn' : 'bad'}`}>
-              {tone === 'ok' ? 'Nominal' : 'Attention Needed'}
-            </span>
+            <span className={`chip ${chipClass(tone)}`}>{tone === 'ok' ? 'Nominal' : 'Attention Needed'}</span>
           </div>
           <div className="card-frame-body">
             <div className="score">
@@ -108,48 +115,10 @@ export function Diagnostics() {
               <Icon name="warn" size={16} />
               Risks &amp; Anomalies
             </h2>
-            <span className={`chip ${risks.length === 0 ? 'chip-good' : 'chip-bad'}`}>
-              {risks.length} Detected
-            </span>
+            <span className={`chip ${chipClass(tone)}`}>{risks.length} Detected</span>
           </div>
           <div className="card-frame-body">
-            {risks.length === 0 ? (
-              <div className="checklist">
-                <p className="muted">No risks detected.</p>
-                <div className="checklist-item checklist-item-ok">
-                  <Icon name="check" size={16} />
-                  <span className="checklist-text">All deployed stacks matching declared manifests</span>
-                  <span className="checklist-tag">SYNC OK</span>
-                </div>
-                <div className="checklist-item checklist-item-ok">
-                  <Icon name="check" size={16} />
-                  <span className="checklist-text">Zero container task restart loops or missing services</span>
-                  <span className="checklist-tag">HEALTH OK</span>
-                </div>
-                <div className="checklist-item checklist-item-ok">
-                  <Icon name="check" size={16} />
-                  <span className="checklist-text">Reconcile loop converged with zero daemon errors</span>
-                  <span className="checklist-tag">ENGINE OK</span>
-                </div>
-              </div>
-            ) : (
-              <div className="risk-list">
-                {risks.map((risk) => (
-                  <div key={risk.name} className={`risk-card risk-${risk.severity === 'crit' ? 'crit' : 'warn'}`}>
-                    <div className="risk-card-top">
-                      <div className="risk-card-header">
-                        <Icon name={risk.severity === 'crit' ? 'error' : 'warn'} size={16} />
-                        <h3>{risk.name}</h3>
-                      </div>
-                      <span className={`risk-badge risk-badge-${risk.severity === 'crit' ? 'crit' : 'warn'}`}>
-                        {risk.severity === 'crit' ? 'critical' : 'warning'}
-                      </span>
-                    </div>
-                    <p>{risk.reason}</p>
-                  </div>
-                ))}
-              </div>
-            )}
+            {risks.length === 0 ? <Checks views={views} /> : <RiskList risks={risks} />}
           </div>
         </div>
       </div>
@@ -162,34 +131,94 @@ export function Diagnostics() {
   )
 }
 
-type Severity = 'crit' | 'warn' | 'ok'
+/** The chip class for a tone. `unknown` reads amber: it is not an all-clear. */
+function chipClass(tone: Severity): string {
+  if (tone === 'ok') return 'chip-good'
+  if (tone === 'crit') return 'chip-bad'
+  return 'chip-warn'
+}
+
+/** worst is the loudest severity in a set, or `ok` for an empty one. */
+function worst(severities: Severity[]): Severity {
+  if (severities.includes('crit')) return 'crit'
+  if (severities.includes('warn')) return 'warn'
+  if (severities.includes('unknown')) return 'unknown'
+  return 'ok'
+}
 
 /**
- * assess reduces one application's three axes to a single worst finding.
+ * The all-clear list, one line per predicate that actually held.
  *
- * A failed reconcile outranks everything, because every other field on that row
- * is then the last successful observation and not the current one (the list
- * marks the same row stale for the same reason). A dead health is next; drift
- * and being out of sync are warnings; progressing is the mildest. Each enum is
- * decoded so a state a newer controller added is read as itself.
+ * Each line is rendered from the check beside it rather than asserted, which is
+ * the difference between a checklist and a picture of one. The middle line says
+ * "missing services" and not "restart loops" because HealthState is what the
+ * API reports: there is no task-level document, so a restart loop is not a
+ * thing this build can claim to have looked for.
+ *
+ * With no applications at all there is nothing that held, so the list is empty
+ * and only the sentence above it remains — three ticks over an empty fleet were
+ * three claims about nothing.
  */
-function assess(view: View): { severity: Severity; reason: string } {
-  const { status } = view
-  if (status.error !== undefined && status.error !== '') {
-    return { severity: 'crit', reason: `Last reconcile failed: ${status.error}` }
-  }
-  const health = decodeEnum(status.health.state, healthStates)
-  if (health === 'degraded' || health === 'missing') {
-    return { severity: 'crit', reason: `Health is ${health}` }
-  }
-  if (status.drift !== undefined && decodeEnum(status.drift.state, driftStates) === 'detected') {
-    return { severity: 'warn', reason: 'Live drift detected against the running swarm' }
-  }
-  if (decodeEnum(status.sync.state, syncStates) === 'out-of-sync') {
-    return { severity: 'warn', reason: 'Out of sync with the repository' }
-  }
-  if (health === 'progressing') {
-    return { severity: 'warn', reason: 'A rollout is still progressing' }
-  }
-  return { severity: 'ok', reason: 'Synced and healthy' }
+function Checks({ views }: { views: View[] }) {
+  const every = (predicate: (view: View) => boolean) => views.length > 0 && views.every(predicate)
+  const checks = [
+    {
+      tag: 'SYNC OK',
+      text: 'All deployed stacks matching declared manifests',
+      held: every((v) => decodeEnum(v.status.sync.state, syncStates) === 'synced'),
+    },
+    {
+      tag: 'HEALTH OK',
+      text: 'No service reported degraded or missing',
+      held: every((v) => {
+        const health = decodeEnum(v.status.health.state, healthStates)
+        return health !== 'degraded' && health !== 'missing'
+      }),
+    },
+    {
+      tag: 'ENGINE OK',
+      text: 'Reconcile loop converged with zero daemon errors',
+      held: every((v) => v.status.error === undefined || v.status.error === ''),
+    },
+  ].filter((check) => check.held)
+
+  return (
+    <div className="checklist">
+      <p className="muted">No risks detected.</p>
+      {checks.map((check) => (
+        <div key={check.tag} className="checklist-item checklist-item-ok">
+          <Icon name="check" size={16} />
+          <span className="checklist-text">{check.text}</span>
+          <span className="checklist-tag">{check.tag}</span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function RiskList({ risks }: { risks: { name: string; severity: Severity; reason: string }[] }) {
+  return (
+    <div className="risk-list">
+      {risks.map((risk) => (
+        <div key={risk.name} className={`risk-card risk-${risk.severity}`}>
+          <div className="risk-card-top">
+            <div className="risk-card-header">
+              <Icon name={badge[risk.severity].icon} size={16} />
+              <h3>{risk.name}</h3>
+            </div>
+            <span className={`risk-badge risk-badge-${risk.severity}`}>{badge[risk.severity].label}</span>
+          </div>
+          <p>{risk.reason}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** How each severity is labelled and glyphed on its card. `ok` never renders one. */
+const badge: Record<Severity, { label: string; icon: 'error' | 'warn' | 'app' }> = {
+  crit: { label: 'critical', icon: 'error' },
+  warn: { label: 'warning', icon: 'warn' },
+  unknown: { label: 'unknown', icon: 'app' },
+  ok: { label: 'ok', icon: 'app' },
 }

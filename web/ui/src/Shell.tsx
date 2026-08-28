@@ -66,7 +66,7 @@ export function Shell() {
             <LiveIndicator {...live} />
             <SignOut />
           </header>
-          <main className="app-main" id="main-content">
+          <main className="app-main" id="main-content" tabIndex={-1}>
             <Outlet />
           </main>
         </div>
@@ -101,7 +101,9 @@ function OperatorBadge() {
         <Icon name="terminal" size={16} />
       </div>
       <div className="rail-user-meta">
-        <span className="rail-user-name">{session?.name ?? 'Administrator'}</span>
+        <span className="rail-user-name">
+          {session === undefined || session.name === '' ? 'Administrator' : session.name}
+        </span>
         <span className="rail-user-sub label-caps">{session === undefined ? 'Token auth' : 'SSO session'}</span>
       </div>
     </div>

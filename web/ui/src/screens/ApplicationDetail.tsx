@@ -15,7 +15,7 @@ import { Instant } from '../components/Instant'
 import { CompatChip, DriftCell, HealthChip, SyncChip } from '../components/StateChip'
 import { TopologyTree } from '../components/TopologyTree'
 import { chartRef, destination, serviceCounts, shortRevision } from '../format'
-import { Loading } from '../components/StateBlock'
+import { ErrorState, Loading } from '../components/StateBlock'
 
 /**
  * The application's identity, and the three tabs that read it.
@@ -39,11 +39,7 @@ export function ApplicationDetail() {
 
   if (detail.isPending) return <Loading />
   if (detail.isError) {
-    return (
-      <p className="error" role="alert">
-        {detail.error.message}
-      </p>
-    )
+    return <ErrorState message={detail.error.message} />
   }
 
   const { spec, status } = detail.data

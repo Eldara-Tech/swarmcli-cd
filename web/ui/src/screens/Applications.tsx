@@ -9,10 +9,11 @@ import { apiGet } from '../api/client'
 import { useFeature } from '../api/discovery'
 import { decodeEnum, driftStates, healthStates, syncStates } from '../api/enums'
 import { controllerKey, listKey } from '../api/queries'
+import { assess, toneOf } from '../api/severity'
 import type { ApplicationList, ControllerStatus, View } from '../api/types'
 import { Dot, type DotTone } from '../components/Dot'
 import { DriftCell, HealthChip, SyncChip } from '../components/StateChip'
-import { Empty, Loading } from '../components/StateBlock'
+import { Empty, ErrorState, Loading } from '../components/StateBlock'
 import { Instant } from '../components/Instant'
 import { destination, plural, serviceCounts, shortRevision } from '../format'
 
@@ -74,11 +75,7 @@ export function Applications() {
 
   if (applications.isPending) return <Loading rows={5} />
   if (applications.isError) {
-    return (
-      <p className="error" role="alert">
-        {applications.error.message}
-      </p>
-    )
+    return <ErrorState message={applications.error.message} />
   }
 
   const all = applications.data.applications
@@ -255,16 +252,16 @@ function stale(view: View): boolean {
   return view.status.error !== undefined && view.status.error !== ''
 }
 
+/**
+ * The row's dot, from the one fold every screen shares.
+ *
+ * This was a fourth copy of the same reasoning — diagnostics and the topology
+ * tree had the other three — and the copies disagreed on exactly the case none
+ * of them had thought about: an application reporting `unknown` was a green dot
+ * here and a neutral node there. See api/severity.ts.
+ */
 function appTone(view: View): DotTone {
-  if (stale(view)) return 'bad'
-  const { status } = view
-  const health = decodeEnum(status.health.state, healthStates)
-  if (health === 'degraded' || health === 'missing') return 'bad'
-  const sync = decodeEnum(status.sync.state, syncStates)
-  if (sync === 'out-of-sync') return 'warn'
-  if (health === 'progressing') return 'warn'
-  if (status.drift !== undefined && decodeEnum(status.drift.state, driftStates) === 'detected') return 'warn'
-  return 'ok'
+  return toneOf(assess(view).severity)
 }
 
 /**

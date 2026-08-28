@@ -3,12 +3,13 @@
 
 import { useQuery } from '@tanstack/react-query'
 
+import { appSetShape } from '../api/appset'
 import { apiGet } from '../api/client'
 import { decodeEnum, driftStates, healthStates, syncStates } from '../api/enums'
 import { controllerKey, listKey } from '../api/queries'
 import type { ApplicationList, ControllerStatus, View } from '../api/types'
 import { StatCard } from '../components/StatCard'
-import { Loading } from '../components/StateBlock'
+import { ErrorState, Loading } from '../components/StateBlock'
 import { TerminalStream } from '../components/TerminalStream'
 import { isUnset, formatInstant, serviceCounts } from '../format'
 import { useLive } from '../live'
@@ -36,16 +37,22 @@ export function FleetOverview() {
 
   if (apps.isPending) return <Loading rows={4} />
   if (apps.isError) {
-    return (
-      <p className="error" role="alert">
-        {apps.error.message}
-      </p>
-    )
+    return <ErrorState message={apps.error.message} />
   }
 
   const views = apps.data.applications
   const roll = rollup(views)
-  const nominal = views.length > 0 && roll.synced === views.length && roll.healthy === views.length && roll.drifted === 0 && roll.failed === 0
+  // The app set is half the answer and was not being asked. A controller
+  // refusing a newer set serves its last-good one, so every application below
+  // can be green while what they were loaded from is behind the repository —
+  // and AppSetStatus.Stale's own contract says it is the field a UI colours.
+  // Undefined counts against nominal too: a status document that has not
+  // arrived is not a status document that said yes.
+  const setShape = controller.data === undefined ? undefined : appSetShape(controller.data)
+  const setNominal = setShape === 'ok' || setShape === 'unwired'
+  const fleetNominal =
+    views.length > 0 && roll.synced === views.length && roll.healthy === views.length && roll.drifted === 0 && roll.failed === 0
+  const nominal = fleetNominal && setNominal
 
   return (
     <section className="screen">
@@ -59,6 +66,7 @@ export function FleetOverview() {
           ) : (
             <span className="chip chip-warn">needs attention</span>
           )}
+          {fleetNominal && !setNominal && <span className="chip chip-warn">application set: {setShape}</span>}
         </p>
       </header>
 
@@ -98,7 +106,9 @@ export function FleetOverview() {
           <div className="card-frame-head">
             <h2>Application set</h2>
             {controller.data !== undefined && (
-              <span className="chip chip-muted">{controller.data.appSet.mode || 'static'}</span>
+              <span className="chip chip-muted">
+                {controller.data.appSet.mode === '' ? 'none wired' : controller.data.appSet.mode}
+              </span>
             )}
           </div>
           <div className="card-frame-body">

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
+import { readFileSync, existsSync } from 'node:fs'
 import { writeFileSync } from 'node:fs'
 import react from '@vitejs/plugin-react'
 import type { Plugin } from 'vite'
@@ -28,6 +29,95 @@ if ('localStorage' in globalThis) {
   process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ?? ''} --no-experimental-webstorage`.trim()
 }
 
+// woff2Only strips the legacy .woff fallback out of the built stylesheet.
+//
+// Every @font-face @fontsource ships lists woff2 first and woff second. Nothing
+// that can run React 19 lacks woff2 — it has been baseline since 2015 — so the
+// fallback is never fetched by any browser that reaches this UI, and Vite emits
+// it anyway: 197KB of files then embedded in every released binary by
+// `//go:embed all:dist`. That is 56% of the font payload and 28% of the bundle.
+//
+// Done on the finished bundle rather than in a `transform` hook, because there
+// is no module to hook: Vite's own CSS plugin resolves and inlines the
+// `@import`s, so the @fontsource files never become modules of their own and a
+// transform never sees a woff url. Here the stylesheet is one asset with the
+// hashed names already in it, and the files it stops referencing are dropped in
+// the same pass — leaving one behind would embed an asset nothing can reach.
+const woff2Only = (): Plugin => ({
+  name: 'swarmcli-cd:woff2-only',
+  enforce: 'post',
+  generateBundle(_options, bundle) {
+    for (const [name, output] of Object.entries(bundle)) {
+      if (output.type !== 'asset' || !name.endsWith('.css')) continue
+      const css = output.source.toString()
+      output.source = css.replace(/,\s*url\([^)]*\.woff\)\s*format\(["']woff["']\)/g, '')
+    }
+    for (const name of Object.keys(bundle)) {
+      if (name.endsWith('.woff')) delete bundle[name]
+    }
+  },
+})
+
+/**
+ * thirdPartyNotices emits dist/THIRD-PARTY-NOTICES.txt.
+ *
+ * The bundle is third-party code and third-party font bytes, and both licence
+ * families it draws on — MIT/ISC for the JavaScript, OFL-1.1 for the fonts —
+ * make retaining the copyright and permission notice a *condition* of
+ * redistributing them. `//go:embed all:dist` redistributes them, inside every
+ * released binary and every published image, so the notice has to be in dist or
+ * it is nowhere.
+ *
+ * It throws rather than warning when a package has no readable licence file. A
+ * notices file that silently omits a dependency is worse than none: it reads as
+ * a statement that the dependency was checked. The lockfile is the source of
+ * the package list — transitive runtime packages ship exactly as the direct ones
+ * do, and `dev: true` is the only thing that means "not in the bundle".
+ */
+const thirdPartyNotices = (): Plugin => ({
+  name: 'swarmcli-cd:third-party-notices',
+  generateBundle() {
+    const lock = JSON.parse(readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8')) as {
+      packages: Record<string, { version?: string; dev?: boolean }>
+    }
+    const names = Object.entries(lock.packages)
+      .filter(([path, meta]) => path.startsWith('node_modules/') && meta.dev !== true)
+      .map(([path]) => path.slice('node_modules/'.length))
+      .sort()
+
+    const sections = names.map((name) => {
+      const root = new URL(`./node_modules/${name}/`, import.meta.url)
+      const manifest = JSON.parse(readFileSync(new URL('package.json', root), 'utf8')) as {
+        version: string
+        license?: string
+      }
+      // The spellings npm packages actually use, in the order they are looked for.
+      const file = ['LICENSE', 'LICENSE.md', 'LICENSE.txt', 'LICENCE', 'LICENCE.md', 'license']
+        .map((candidate) => new URL(candidate, root))
+        .find((url) => existsSync(url))
+      if (file === undefined) {
+        throw new Error(
+          `${name} ships in the bundle and has no licence file to retain. ` +
+            'Add its notice by hand here, or drop the dependency.',
+        )
+      }
+      const header = `${name}@${manifest.version}${manifest.license === undefined ? '' : ` (${manifest.license})`}`
+      return `${'='.repeat(78)}\n${header}\n${'='.repeat(78)}\n\n${readFileSync(file, 'utf8').trim()}\n`
+    })
+
+    this.emitFile({
+      type: 'asset',
+      fileName: 'THIRD-PARTY-NOTICES.txt',
+      source:
+        'swarmcli-cd bundles the third-party software below. Each package is\n' +
+        'reproduced here with the copyright and permission notice its licence\n' +
+        'requires to travel with it. swarmcli-cd itself is Apache-2.0; see LICENSE\n' +
+        'in the repository.\n\n' +
+        `${sections.join('\n')}`,
+    })
+  },
+})
+
 // keepSentinel puts web/dist/.gitkeep back after every build.
 //
 // emptyOutDir wipes the directory first, and that file is the whole reason
@@ -43,7 +133,7 @@ const keepSentinel = (): Plugin => ({
 })
 
 export default defineConfig({
-  plugins: [react(), keepSentinel()],
+  plugins: [woff2Only(), react(), thirdPartyNotices(), keepSentinel()],
   build: {
     // Outside this project's root, which is why emptyOutDir has to be said out
     // loud: Vite refuses to clear a directory above its root unless it is.

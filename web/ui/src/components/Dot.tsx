@@ -6,21 +6,13 @@ export type DotTone = 'ok' | 'warn' | 'bad' | 'info' | 'muted'
 /**
  * A pre-attentive status dot for tables, trees, and badges.
  *
- * Provides instant visual scanning before reading text. Renders as an aria-hidden
- * span by default, or with an aria-label if a label is supplied.
+ * Always decorative, and therefore always aria-hidden: every dot in this console
+ * sits beside the same state written as text, so naming it would make a screen
+ * reader say everything twice. It carried an optional `role="status"` label for
+ * the case where it did not — no caller ever had that case, and `status` is an
+ * aria-live region, so the unreached branch would have announced every dot in a
+ * table each time the list refetched.
  */
-export function Dot({
-  tone = 'info',
-  pulse = false,
-  label,
-}: {
-  tone?: DotTone
-  pulse?: boolean
-  label?: string
-}) {
-  const className = `dot dot-${tone}${pulse ? ' dot-pulse' : ''}`
-  if (label !== undefined && label !== '') {
-    return <span className={className} role="status" aria-label={label} />
-  }
-  return <span className={className} aria-hidden="true" />
+export function Dot({ tone = 'info', pulse = false }: { tone?: DotTone; pulse?: boolean }) {
+  return <span className={`dot dot-${tone}${pulse ? ' dot-pulse' : ''}`} aria-hidden="true" />
 }

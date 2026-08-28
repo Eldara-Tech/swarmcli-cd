@@ -11,7 +11,7 @@ import type { DiffResponse, ReleaseDiff } from '../api/types'
 import { DiffView } from '../components/DiffView'
 import { Forbidden } from '../components/Forbidden'
 import { Icon } from '../components/Icon'
-import { Loading } from '../components/StateBlock'
+import { ErrorState, Loading } from '../components/StateBlock'
 
 /**
  * What a sync would change, release by release.
@@ -53,11 +53,7 @@ export function ApplicationDiff() {
   if (diff.isPending) return <Loading />
   if (diff.isError) {
     if (hasStatus(diff.error, 403)) return <Forbidden action="diff" />
-    return (
-      <p className="error" role="alert">
-        {diff.error.message}
-      </p>
-    )
+    return <ErrorState message={diff.error.message} />
   }
 
   const { planned, releases } = diff.data

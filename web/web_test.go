@@ -23,6 +23,7 @@ func built() fstest.MapFS {
 		"index.html":                &fstest.MapFile{Data: []byte(`<!doctype html><script type="module" src="/assets/app-a1b2c3.js"></script>`)},
 		"assets/app-a1b2c3.js":      &fstest.MapFile{Data: []byte("console.log(1)\n")},
 		"assets/inter-d4e5f6.woff2": &fstest.MapFile{Data: []byte("not really a font")},
+		"THIRD-PARTY-NOTICES.txt":   &fstest.MapFile{Data: []byte("SIL OPEN FONT LICENSE Version 1.1")},
 	}
 }
 
@@ -258,5 +259,47 @@ func TestTheBuiltIndexHasNoInlineScriptOrStyle(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(markup), "<style") {
 		t.Error("the embedded index carries an inline <style>; the CSP has no 'unsafe-inline' and the page will render unstyled")
+	}
+}
+
+// The bundle carries third-party code and third-party font bytes, and MIT, ISC
+// and OFL-1.1 each make retaining the notice a condition of redistributing
+// them. //go:embed all:dist redistributes the lot inside every released binary,
+// so the notices have to be reachable — and reachable without a credential,
+// because a licence notice behind one has not been provided to anybody.
+func TestTheThirdPartyNoticesAreServedAsText(t *testing.T) {
+	rr := get(t, Handler(built(), Options{}), "/THIRD-PARTY-NOTICES.txt")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "SIL OPEN FONT LICENSE") {
+		t.Errorf("body = %q, want the notices rather than the index", rr.Body.String())
+	}
+	// Not the SPA fallback, which is what every other root path gets and which
+	// would answer 200 with an HTML document that says nothing about licences.
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("content-type = %q, want text/plain", ct)
+	}
+	// The name carries no build hash, so a cached copy would outlive the
+	// dependency set it describes.
+	if cc := rr.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("cache-control = %q, want no-store", cc)
+	}
+}
+
+// A tree built before the notices existed still has to serve a working UI: the
+// path falls through to the SPA rather than 404ing on the one file whose
+// absence is a build-age question and not a broken request.
+func TestABundleWithoutNoticesFallsThroughToTheIndex(t *testing.T) {
+	fsys := built()
+	delete(fsys, "THIRD-PARTY-NOTICES.txt")
+	rr := get(t, Handler(fsys, Options{}), "/THIRD-PARTY-NOTICES.txt")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "<!doctype html>") {
+		t.Errorf("body = %q, want the index", rr.Body.String())
 	}
 }

@@ -174,3 +174,60 @@ describe('the answers that are not a table', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 })
+
+describe('the status a recorded revision is drawn in', () => {
+  // charts/types.go declares five, and every one of them was drawn with
+  // chip-good — so the view an operator opens to find out which revision broke
+  // reported the broken one as a success.
+  const chipOf = (status: string): string => {
+    const cell = screen.getByText(status)
+    return cell.className
+  }
+
+  it('does not draw a failed revision as a success', async () => {
+    const body = deployed()
+    revisions(body)[0].status = 'failed'
+    serve(body)
+    render(<App />)
+
+    expect(await screen.findByText('failed')).toBeDefined()
+    expect(chipOf('failed')).toContain('chip-bad')
+    expect(chipOf('failed')).not.toContain('chip-good')
+  })
+
+  it('keeps chip-good for the one status that is good', async () => {
+    const body = deployed()
+    revisions(body)[0].status = 'deployed'
+    serve(body)
+    render(<App />)
+
+    expect(await screen.findByText('deployed')).toBeDefined()
+    expect(chipOf('deployed')).toContain('chip-good')
+  })
+
+  it('draws superseded and uninstalled as neither good nor bad', async () => {
+    for (const status of ['superseded', 'uninstalled']) {
+      const body = deployed()
+      revisions(body)[0].status = status
+      serve(body)
+      render(<App />)
+
+      expect(await screen.findByText(status)).toBeDefined()
+      expect(chipOf(status)).toContain('chip-muted')
+      cleanup()
+      queryClient.clear()
+    }
+  })
+
+  it('renders a status a newer engine added verbatim, and not as a success', async () => {
+    // application/history.go declares Status as a bare string with no
+    // marshaller, so a sixth value is a thing that can arrive.
+    const body = deployed()
+    revisions(body)[0].status = 'pending-rollback'
+    serve(body)
+    render(<App />)
+
+    expect(await screen.findByText('pending-rollback')).toBeDefined()
+    expect(chipOf('pending-rollback')).not.toContain('chip-good')
+  })
+})
