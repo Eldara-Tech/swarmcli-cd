@@ -199,11 +199,20 @@ Three layers, each the same shape as the node roster added in #262:
 
 - **`capability.ServiceLogReader`** — the optional interface a `charts.Backend`
   implements. It takes a *swarm service name*, because a backend knows nothing
-  about applications:
+  about applications, and it takes it in a struct because that is the rule the
+  package states for itself: a capability that needs to grow grows by taking a
+  struct rather than by widening a parameter list, and the growth this one can
+  already see coming is `since`.
 
   ```go
+  type ServiceLogRequest struct {
+      Service string
+      Tail    int
+      Follow  bool
+  }
+
   type ServiceLogReader interface {
-      ServiceLogs(ctx context.Context, service string, tail int, follow bool) (<-chan application.ServiceLogEvent, error)
+      ServiceLogs(ctx context.Context, req ServiceLogRequest) (<-chan application.ServiceLogEvent, error)
   }
   ```
 
@@ -302,8 +311,12 @@ such reason exists yet.
 
 ### 3.6 Keepalive, and why this stream diverges
 
-The handler emits `: keepalive\n\n` every 20 seconds when nothing else has been
-written, and flushes.
+The handler emits `: keepalive\n\n` every 20 seconds and flushes.
+
+Every 20 seconds, not 20 seconds after the last line: the tick is also when the
+authorisation is re-decided (§3.7), and that has to happen on a busy stream as
+well as a quiet one. A comment frame on a chatty console costs 13 bytes a
+minute.
 
 `api/stream.go` deliberately has no idle timer, and this stream deliberately
 does. The difference is not the traffic pattern — a quiet container and a quiet
@@ -544,7 +557,10 @@ is written until the decisions above are signed off.
 | `backend/logs.go`, `backend/logs_test.go` | the reader |
 | `reconcile/reconcile.go` | `ServiceLogs`, beside `Nodes` |
 | `controller/run.go` | `var _ api.LogStreamer = rec` |
-| `web/ui/src/api/types.ts`, `ServiceLogViewer.tsx` + test | `notice`, and its mark |
+| `backend/backend.go` | the compile-time capability assertion |
+| `reconcile/logs_test.go` | the destination and the second declared-service check |
+| `web/ui/src/api/types.ts`, `ServiceLogViewer.tsx`, `index.css` | `notice`, and its mark |
+| `web/ui/src/screens/Monitor.test.tsx` | the notice is labelled, and survives the stderr filter |
 | `docs/api.md`, `docs/PHASE-2.0.md` | `capabilities.logs`, and the seam's new shape |
 | `integration-tests/logs_test.go` | the live-swarm tail |
 
