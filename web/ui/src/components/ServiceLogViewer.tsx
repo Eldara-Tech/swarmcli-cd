@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import { authorized } from '../api/client'
 import type { ServiceLogEvent } from '../api/types'
@@ -21,23 +21,36 @@ type StreamStatus = 'connecting' | 'live' | 'ended' | 'failed' | 'unsupported'
 const logBufferLimit = 50_000
 
 /**
- * How many of the matching lines are put in the DOM at once.
+ * How many of the matching lines the console starts with, and how many more it
+ * adds each time the operator reaches the top of them.
  *
- * The newest of them, because a console is read from the bottom. Fifty thousand
- * rows of five spans each is a browser that stops responding, so the buffer and
- * the render are deliberately different sizes — everything else in this
- * component works on the whole buffer, and only this one thing does not.
+ * The newest of them first, because a console is read from the bottom. Fifty
+ * thousand rows of five spans each put in the DOM at once is a browser that
+ * stops responding, so the buffer and the render are deliberately different
+ * sizes — but the render is a starting size rather than a ceiling. Scrolling to
+ * the top of the drawn rows extends the window backwards by this many more,
+ * until the whole buffer is reachable.
  *
- * What that costs is scrolling by hand past this many rows; what it keeps is
- * the search, the task filter, Copy and Export, which all still see all 50,000.
- * On a wide window that is the exchange worth making: an operator reading six
- * hours of a service is looking for something, and the way to find it in
- * twenty thousand lines was never to scroll.
+ * The growth is bounded by the operator's attention rather than by a number:
+ * it happens only while they have left the bottom, and the window collapses
+ * back to this size the moment they return to it. So the live stream — the path
+ * that repaints on every arriving chunk — never draws more than this, however
+ * far back somebody read a minute ago.
  *
  * The footer says how many are held and how many are shown, because a console
  * silently drawing a fraction of what it has is a console that lies.
  */
 const logRenderLimit = 2_000
+
+/**
+ * How close to the top counts as reaching it.
+ *
+ * Pixels rather than rows: the row is not a fixed height, so there is no row
+ * count that means the same thing on a console of wrapped lines as on one of
+ * short ones. Wide enough that a fast scroll does not overshoot the trigger and
+ * stop dead at the top with more to read.
+ */
+const growAtTop = 400
 
 /**
  * How far back the console can read, and what it costs.
@@ -157,6 +170,32 @@ export function ServiceLogViewer({
   const [scrollback, setScrollback] = useState('tail')
   const [isPaused, setIsPaused] = useState(false)
   const [autoScroll, setAutoScroll] = useState(true)
+  /**
+   * The oldest line the console is currently drawing, by sequence number, or
+   * null while it is pinned to the newest `logRenderLimit`.
+   *
+   * A sequence number and not an index, because both things it has to survive
+   * move indices under it: the buffer drops its oldest line at 50,000, and a
+   * search narrows what is being indexed into. A number that means "the line
+   * the operator is looking at" keeps meaning that through both.
+   *
+   * Setting it is also what stops the drawn rows sliding. Pinned to the newest
+   * N, every arriving line drops the oldest drawn one — invisible at the bottom
+   * of the console, where the pin holds the view, and a drift upward of
+   * everything under the eye of somebody who has scrolled away from it. The pin
+   * is released the moment they do.
+   */
+  const [windowStart, setWindowStart] = useState<number | null>(null)
+  /**
+   * The scroll height from just before the window last grew, or null.
+   *
+   * Growing puts rows *above* the ones being read, so the browser's scrollTop —
+   * a distance from the top — now names different content. The layout effect
+   * adds back exactly what was inserted, before the paint, so the rows do not
+   * move. Doubles as the guard against a second growth being started while the
+   * first has not been paid for yet.
+   */
+  const grownFrom = useRef<number | null>(null)
   const [copied, setCopied] = useState(false)
   const [status, setStatus] = useState<StreamStatus>('connecting')
   const [error, setError] = useState('')
@@ -193,6 +232,7 @@ export function ServiceLogViewer({
    */
   useEffect(() => {
     setLogs([])
+    setWindowStart(null)
     setStatus('connecting')
     taskColour.current = new Map()
     if (!app || !service) return
@@ -316,12 +356,55 @@ export function ServiceLogViewer({
     }
   }, [logs, autoScroll])
 
+  /**
+   * The three things a scroll can mean here.
+   *
+   * Back at the bottom: the console is following again and the window collapses
+   * to the newest `logRenderLimit`, which is what keeps the live path cheap
+   * however far back this operator just read.
+   *
+   * Away from the bottom, for the first time: pin the window where it is, so
+   * that arriving lines are added below rather than trading the oldest drawn
+   * row for a new one under a reader who is not looking at the bottom.
+   *
+   * At the top of the drawn rows, with older ones held: draw more of them. This
+   * is the whole of #270 — the buffer was always reachable by search and by
+   * Export, and now it is reachable by the thing an operator reaches for first.
+   */
   const handleScroll = () => {
-    if (!terminalBodyRef.current) return
-    const { scrollTop, scrollHeight, clientHeight } = terminalBodyRef.current
+    const body = terminalBodyRef.current
+    if (!body) return
+    const { scrollTop, scrollHeight, clientHeight } = body
     const atBottom = scrollHeight - (scrollTop + clientHeight) < 30
     setAutoScroll(atBottom)
+
+    if (atBottom) {
+      setWindowStart(null)
+      return
+    }
+    if (windowStart === null) {
+      setWindowStart(visible[0]?.seq ?? null)
+      return
+    }
+    // One growth at a time: until the layout effect has corrected scrollTop it
+    // is still reporting the top, and every scroll event would start another.
+    if (scrollTop > growAtTop || grownFrom.current !== null) return
+    const at = filteredLogs.findIndex((log) => log.seq === visible[0]?.seq)
+    if (at <= 0) return
+    grownFrom.current = scrollHeight
+    setWindowStart(filteredLogs[Math.max(0, at - logRenderLimit)].seq)
   }
+
+  // Before the paint, never after: an effect that ran afterwards would let the
+  // browser show one frame of the rows in their new places, which is the jump
+  // this exists to prevent.
+  useLayoutEffect(() => {
+    const body = terminalBodyRef.current
+    const before = grownFrom.current
+    grownFrom.current = null
+    if (!body || before === null) return
+    body.scrollTop += body.scrollHeight - before
+  }, [windowStart])
 
   /**
    * The tasks seen so far, in the order they first wrote something.
@@ -352,12 +435,35 @@ export function ServiceLogViewer({
     })
   }, [logs, streamFilter, taskFilter, filter])
 
-  // The newest matches, which is what a console shows. Copy, Export and both
-  // filters above deliberately work on filteredLogs and not on this.
-  const visible =
-    filteredLogs.length > logRenderLimit
-      ? filteredLogs.slice(filteredLogs.length - logRenderLimit)
-      : filteredLogs
+  /**
+   * The matching lines that are actually drawn.
+   *
+   * The newest of them, which is what a console shows, until the operator
+   * scrolls back — then everything from where they have reached to the end,
+   * which grows as they keep going. Copy, Export and both filters above
+   * deliberately work on filteredLogs and not on this.
+   *
+   * `>=` rather than `===` because the anchor line need not still match: a
+   * search typed while scrolled back narrows what is here, and the honest
+   * answer is the first surviving line at or after where the operator was, not
+   * a jump to the bottom. When nothing survives at or after it — every match is
+   * older than where they stood — there is no position left to keep and the
+   * newest matches are the answer.
+   */
+  const visible = useMemo(() => {
+    if (windowStart === null) {
+      return filteredLogs.length > logRenderLimit
+        ? filteredLogs.slice(filteredLogs.length - logRenderLimit)
+        : filteredLogs
+    }
+    const at = filteredLogs.findIndex((log) => log.seq >= windowStart)
+    if (at < 0) {
+      return filteredLogs.length > logRenderLimit
+        ? filteredLogs.slice(filteredLogs.length - logRenderLimit)
+        : filteredLogs
+    }
+    return filteredLogs.slice(at)
+  }, [filteredLogs, windowStart])
 
   const copyLogs = () => {
     void navigator.clipboard.writeText(filteredLogs.map(asText).join('\n'))
@@ -506,7 +612,10 @@ export function ServiceLogViewer({
           <button
             type="button"
             className="toolbar-btn"
-            onClick={() => setLogs([])}
+            onClick={() => {
+              setLogs([])
+              setWindowStart(null)
+            }}
             title="Clear current log buffer"
           >
             Clear
@@ -551,9 +660,9 @@ export function ServiceLogViewer({
           <>
             {visible.length < filteredLogs.length && (
               <div className="console-truncated">
-                Showing the newest {visible.length.toLocaleString()} of{' '}
-                {filteredLogs.length.toLocaleString()} matching lines. Narrow with the search or
-                the task filter to reach the rest; Copy and Export write all of them.
+                {(filteredLogs.length - visible.length).toLocaleString()} older matching lines are
+                held above these. Keep scrolling to draw them; the search, the task filter, Copy
+                and Export already work on all {filteredLogs.length.toLocaleString()}.
               </div>
             )}
             {visible.map((log) => {
@@ -589,6 +698,7 @@ export function ServiceLogViewer({
           className="jump-bottom-btn"
           onClick={() => {
             setAutoScroll(true)
+            setWindowStart(null)
             if (terminalBodyRef.current) {
               terminalBodyRef.current.scrollTop = terminalBodyRef.current.scrollHeight
             }
