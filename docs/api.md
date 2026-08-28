@@ -28,10 +28,19 @@ so the quickest way to see any shape below is to run the matching command with
 | `GET` | `/api/v1/applications/{app}/diff` | what a sync would change |
 | `GET` | `/api/v1/applications/{app}/history` | each release's revisions |
 | `POST` | `/api/v1/applications/{app}/sync` | trigger a reconcile-and-apply |
+| `GET` | `/api/v1/applications/{app}/services/{svc}/logs` | a live container log stream for one of that application's services |
+| `GET` | `/api/v1/nodes` | the swarm's node roster, with each node's task counts |
+| `GET` | `/api/v1/diagnostics` | the cluster integrity score, its checks and its open risks |
 | `GET` | `/api/v1/events` | a live event stream, so a UI never polls |
 | `GET` | `/api/v1/capabilities` | what this build is, what it grants, and which seam implementations are live |
 | `GET` | `/` | the web UI, and the fallback for its client-side routes |
 | `GET` | `/assets/{path...}` | the UI's hashed build output |
+
+Two of those are served behind an optional interface a reconciler either
+implements or does not, and a build whose reconciler does not answers **501**
+rather than inventing a reply — which is what both of them used to do. The node
+roster is implemented here; the log stream is not yet, and its 501 is the normal
+state of every build today.
 
 The paths are nouns so that writable applications can be added later without any
 of them moving. Applications are read-only over the API in both directions of the
