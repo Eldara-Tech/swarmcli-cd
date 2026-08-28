@@ -127,6 +127,17 @@ type ServiceLogEvent struct {
 	Stream    string    `json:"stream"` // "stdout" or "stderr"
 	Message   string    `json:"message"`
 	Timestamp time.Time `json:"timestamp"`
+	// Notice marks the one class of line in the stream that the container did
+	// not write: the controller reporting that it dropped output, or truncated
+	// a line that would not end.
+	//
+	// It exists because such a line is indistinguishable from container output
+	// otherwise, and an operator reading an incident log has to be able to tell
+	// which of the two they are looking at. A notice carries Stream "stderr" —
+	// dropped output is trouble, and the operator filtering for trouble is the
+	// one who must see it — rather than a third stream value, which the
+	// console's three-way filter would hide from exactly that person.
+	Notice bool `json:"notice,omitempty"`
 }
 
 // RiskItem is one identified risk in cluster health diagnostics.

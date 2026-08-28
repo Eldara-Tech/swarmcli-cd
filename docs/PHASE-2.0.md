@@ -46,26 +46,58 @@ Added two new fine-grained permission verbs:
 - **Route:** `GET /api/v1/applications/{app}/services/{svc}/logs`
 - **Guarded Action:** `ActionLogs`
 - **Protocol:** Server-Sent Events (`text/event-stream; charset=utf-8`)
-- **Interface:** `LogStreamer` seam (`ServiceLogs(ctx, app, svc, tail, follow) (io.ReadCloser, error)`)
-- **Unimplemented in this repository.** No reconciler here satisfies `LogStreamer`, so an
-  open-source build reports `capabilities.logs: false` and the console leaves the control out
-  entirely (#259). The endpoint still answers **501** and the viewer still renders that state,
-  because the document says what a build is *wired* for and the endpoint is the authority on
-  any one request.
+- **Interface:** `LogStreamer` seam
+  (`ServiceLogs(ctx, app, svc, tail, follow) (<-chan application.ServiceLogEvent, error)`)
+- **Implemented (#261).** `*reconcile.Reconciler` satisfies `LogStreamer`, resolving the
+  *application's own* destination through the `swarms` seam — unlike the node roster, which
+  asks the swarm this controller runs in — and reading behind `capability.ServiceLogReader`.
+  `controller` asserts the wiring at compile time, because the seam's type assertion falls
+  back silently and a renamed method would turn the console off rather than fail the build.
   It must not answer anything else: the first version of this endpoint emitted a synthetic
   line every three seconds — `service X task healthy - 0 active errors` — as container output,
   which is a health claim about a service nothing had contacted.
+- **The 501 branch stays, and is still reachable.** A reconciler reached through the same
+  interface may not implement the method, and one that does may still meet a backend with no
+  reader behind this application's destination — resolved per request. That second case is
+  reported with `application.ErrUnsupported` and answered identically: same status, same
+  sentence.
+- **The seam carries events rather than bytes, and that is why.** It used to hand back an
+  `io.ReadCloser` of lines with an optional `stderr\t` prefix. `ServiceLogEvent` declares
+  `taskID` and `nodeID`, the daemon states both per line in its `details=1` prefix, and a byte
+  stream has nowhere to put them — so on a replicated service, one node crash-looping and the
+  whole service being broken looked identical. Demultiplexing Docker's 8-byte framing now
+  happens once, in the backend, instead of being re-encoded into lines for the handler to
+  parse back.
+- **Only two attributes survive the details prefix.** `details=1` prefixes every line with the
+  message's attributes, which includes whatever the operator configured through
+  `--log-opt labels=` and `--log-opt env=` — that is, selected environment variable *values*.
+  The reader keeps `com.docker.swarm.node.id` and `com.docker.swarm.task.id` and drops the
+  rest, so the console shows the text the container wrote.
+- **A TTY service loses the stream label and nothing else.** The daemon multiplexes only when
+  no selected task has a terminal, so with one there is nothing in the bytes to tell stdout
+  from stderr and every line is labelled `stdout`. The task and node labels survive.
 - **Authorisation is per application, and `{svc}` is not a second grant.** The guard authorises
   the subject for `{app}`; the handler then resolves `{svc}` against that application's own
   reported services and answers 404 otherwise, so a subject scoped to one application cannot
-  name a service belonging to another. An implementer must not look `svc` up swarm-wide.
-- **What an implementer owes:** one already-demultiplexed log line per line, no 8-byte Docker
-  frame header, an optional `stderr\t` prefix where the stream is known, and Docker's RFC3339
-  timestamp at the head of the line where `--timestamps` was requested.
+  name a service belonging to another. The reconciler repeats that check rather than trusting
+  it, so the rule belongs to the reconciler and not to one HTTP handler.
+- **It is bounded, it keeps itself open, and it re-checks.** Sixteen concurrent streams per
+  controller, enforced in the handler so the bound covers every implementer of the seam, and a
+  **503** past it. An SSE comment frame every twenty seconds, because the console reads this
+  with `fetch` and does not reconnect where `/events` uses `EventSource` and does — and each of
+  those ticks re-runs authentication and authorisation, so a withdrawn grant reaches a console
+  that is already attached. A 256-event buffer that drops rather than blocking, matching what
+  `api/stream.go`'s `publish` does for events.
+- **A line the controller wrote is marked.** Dropped output and a truncated line are reported
+  in the stream with `notice: true`, carrying `stream: "stderr"` so the console's filter does
+  not hide them from the operator looking for trouble, and rendered with their own label so
+  nobody reads them as container output.
 - **Event Wire Format:**
   ```json
   {
     "service": "whoami_web",
+    "taskID": "qz4k2h8x1n0p",
+    "nodeID": "8t3v1m9c7b2d",
     "stream": "stdout",
     "message": "Starting server on :80",
     "timestamp": "2026-08-27T14:35:08.922Z"

@@ -467,6 +467,10 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// first evidence would be an operator being told this controller does not
 	// report swarm node telemetry.
 	var _ api.NodeLister = rec
+	// And the log streamer, for the same reason: a drifted signature would turn
+	// the service log console into "this controller does not stream service
+	// logs" rather than failing the build.
+	var _ api.LogStreamer = rec
 
 	// The UI is built here and passed in, so that api stays data-only and
 	// nothing importing it links an embedded asset tree. With --ui=false the

@@ -2586,6 +2586,11 @@ select:focus-visible,
   color: #f87171;
 }
 
+.line-tag-notice {
+  background: rgba(250, 204, 21, 0.15);
+  color: #facc15;
+}
+
 .line-content {
   color: #e2e8f0;
   flex: 1;
@@ -2595,6 +2600,13 @@ select:focus-visible,
 
 .line-stderr .line-content {
   color: #fca5a5;
+}
+
+/* A notice is the controller talking, not the container. Distinct from stderr
+   even though it carries that label, so nobody reads it as output. */
+.line-notice .line-content {
+  color: #facc15;
+  font-style: italic;
 }
 
 .terminal-empty-state {

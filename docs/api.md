@@ -38,11 +38,19 @@ so the quickest way to see any shape below is to run the matching command with
 
 Two of those are served behind an optional interface a reconciler either
 implements or does not, and a build whose reconciler does not answers **501**
-rather than inventing a reply — which is what both of them used to do. The node
-roster is implemented here; the log stream is not yet, so its 501 is the normal
-state of every build today. Which of the two a build can serve is reported by
-`capabilities` in the document below, so the console leaves out a control it
-would only be able to apologise for.
+rather than inventing a reply — which is what both of them used to do. Both are
+implemented here, so both answer in this build; the 501 branch stays reachable
+for a reconciler reached through the same interface that has neither, and for a
+destination whose backend cannot serve one. Which of the two a build can serve
+is reported by `capabilities` in the document below, so the console leaves out a
+control it would only be able to apologise for.
+
+The log stream is the one endpoint with a bound on how many of it a controller
+serves at once: sixteen, after which it answers **503** rather than taking a
+seventeenth goroutine and daemon connection. It writes an SSE comment frame
+every twenty seconds so that a proxy does not close a stream watching a quiet
+container, and re-checks the caller's authorisation on each of those, so a
+withdrawn grant reaches a console that is already attached.
 
 The paths are nouns so that writable applications can be added later without any
 of them moving. Applications are read-only over the API in both directions of the
@@ -344,7 +352,7 @@ subject that is not granted it:
   "edition": "community",
   "features": { "multi-swarm": false, "sso": false, "projects": false,
                 "audit": false, "notifications": false },
-  "capabilities": { "logs": false, "nodes": true },
+  "capabilities": { "logs": true, "nodes": true },
   "licence": null,
   "seams": { "swarms": "local", "authz": "token", "notify": ["log", "api"],
              "secrets": "plaintext", "feature": "community", "extension": [] }

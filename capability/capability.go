@@ -286,3 +286,42 @@ type SwarmSizer interface {
 type NodeRoster interface {
 	SwarmNodeRoster(ctx context.Context) ([]application.SwarmNode, error)
 }
+
+// ServiceLogRequest names one tail of one service's container output.
+//
+// A struct rather than three parameters, for the reason this package's doc
+// comment gives: a capability that needs to grow grows by taking a struct. The
+// growth this one can already see coming is `since`, which the daemon supports
+// and no caller asks for yet.
+type ServiceLogRequest struct {
+	// Service is the swarm service name, as the application's own status
+	// reported it. It is not a name the reader may resolve for itself: the
+	// caller authorised a subject for one application and matched this string
+	// against that application's services, and a reader that looked it up
+	// swarm-wide would answer for a service nobody was granted.
+	Service string
+	// Tail is how much scrollback a newly attached client is given.
+	Tail int
+	// Follow keeps the stream open for new lines. False reads the tail and
+	// ends, which nothing asks for yet and which costs nothing to pass through.
+	Follow bool
+}
+
+// ServiceLogReader is the optional interface a backend implements to tail a
+// service's container output.
+//
+// It hands back a channel rather than an io.ReadCloser, and the events rather
+// than bytes, because the two labels the wire type carries — which task, which
+// node — exist per line and have nowhere to go in a byte stream. Demultiplexing
+// Docker's framing is the one part of this job with rules rather than plumbing,
+// and it needs the daemon in front of it, so it happens here rather than being
+// re-encoded into lines for a caller to parse back.
+//
+// The implementation owns the channel and closes it exactly once, when the
+// stream ends. Cancelling ctx is how a caller stops it; there is no Close to
+// forget. Sends must not block on a caller that has stopped reading — a
+// container in a crash loop outruns a browser — so an implementation drops and
+// says so, which is what application.ServiceLogEvent.Notice is for.
+type ServiceLogReader interface {
+	ServiceLogs(ctx context.Context, req ServiceLogRequest) (<-chan application.ServiceLogEvent, error)
+}

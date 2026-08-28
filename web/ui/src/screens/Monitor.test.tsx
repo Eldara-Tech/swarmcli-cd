@@ -323,6 +323,73 @@ describe('pausing the service log console', () => {
   })
 })
 
+describe('a controller notice is not container output', () => {
+  /** A Monitor already switched to the log console, tailing edge/edge-web. */
+  async function openLogs(stream: ReturnType<typeof pushLogStream>) {
+    controller({
+      ...discoveryWith({ logs: true }),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [edgeRow('edge-web')] }),
+      '/api/v1/events': openStream,
+      '/api/v1/applications/edge/services/edge-web/logs': stream.open,
+    })
+    render(<App />)
+    await screen.findByTestId('application-count')
+    fireEvent.click(screen.getByRole('link', { name: 'Monitor' }))
+    await screen.findByRole('heading', { name: 'Monitor' })
+    fireEvent.click(screen.getByRole('button', { name: 'Service Container Logs' }))
+    await screen.findByText('APP')
+  }
+
+  // The controller drops lines rather than buffering for a console that has
+  // stopped reading, and says so in the stream. Such a line carries
+  // stream: 'stderr' so the filter does not hide it from the operator looking
+  // for trouble — which is exactly what makes it indistinguishable from a line
+  // the container wrote unless it is labelled differently.
+  it('labels a dropped-output notice as the controller talking', async () => {
+    const stream = pushLogStream()
+    await openLogs(stream)
+
+    await deliver(() =>
+      stream.push({
+        service: 'edge-web',
+        stream: 'stderr',
+        message: '12 log lines were dropped because this client could not keep up',
+        timestamp: '2026-08-28T06:00:00Z',
+        notice: true,
+      }),
+    )
+
+    const text = await screen.findByText(/12 log lines were dropped/)
+    const row = text.closest('.console-line')
+    expect(row?.className).toContain('line-notice')
+    expect(row?.textContent).toContain('NOTICE')
+    // And not the label a container line gets, which is the whole point.
+    expect(row?.textContent).not.toContain('STDERR')
+  })
+
+  // It carries the stderr label so that an operator filtered to stderr — the
+  // one debugging the incident the drop happened during — still sees it.
+  it('keeps a notice visible under the stderr filter', async () => {
+    const stream = pushLogStream()
+    await openLogs(stream)
+
+    await deliver(() =>
+      stream.push({
+        service: 'edge-web',
+        stream: 'stderr',
+        message: 'a log line longer than 1MiB was truncated',
+        timestamp: '2026-08-28T06:00:00Z',
+        notice: true,
+      }),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Stderr' }))
+
+    expect(screen.getByText(/longer than 1MiB was truncated/)).toBeDefined()
+  })
+})
+
+
 describe('the log console is gated on the build reporting a streamer', () => {
   async function openMonitor(): Promise<void> {
     render(<App />)

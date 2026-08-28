@@ -5,7 +5,6 @@ package api
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"testing"
 
@@ -21,7 +20,7 @@ func (*bothSeams) Nodes(context.Context) (application.NodesResponse, error) {
 	return application.NodesResponse{}, nil
 }
 
-func (*bothSeams) ServiceLogs(context.Context, string, string, int, bool) (io.ReadCloser, error) {
+func (*bothSeams) ServiceLogs(context.Context, string, string, int, bool) (<-chan application.ServiceLogEvent, error) {
 	return nil, nil
 }
 

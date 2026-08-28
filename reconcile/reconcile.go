@@ -3198,3 +3198,56 @@ func (r *Reconciler) Nodes(ctx context.Context) (application.NodesResponse, erro
 	}
 	return application.NodesResponse{Swarm: target.Swarm, Nodes: nodes}, nil
 }
+
+// ServiceLogs tails the container output of one of an application's services.
+//
+// The destination is the application's own, unlike Nodes, which asks the swarm
+// this controller runs in: logs belong to a deployed service, and an
+// application can name a swarm.
+//
+// A backend with no reader behind it answers application.ErrUnsupported, which
+// the API reports as the same 501 a reconciler with no method at all gives.
+func (r *Reconciler) ServiceLogs(ctx context.Context, app, svc string, tail int, follow bool) (<-chan application.ServiceLogEvent, error) {
+	view, ok := r.View(app)
+	if !ok {
+		return nil, fmt.Errorf("no such application '%s'", app)
+	}
+
+	// The API resolves svc against this same set before it ever reaches here,
+	// and this is deliberately the second copy of that check rather than a
+	// trust in the first. The rule it enforces — a caller authorised for one
+	// application may name that application's services and no others — is a
+	// property of the reconciler, and stating it only in one HTTP handler would
+	// make it a property of that handler instead.
+	name, ok := declaredService(view, svc)
+	if !ok {
+		return nil, fmt.Errorf("application '%s' declares no service '%s'", app, svc)
+	}
+
+	backend, err := r.swarms.Backend(ctx, swarms.Target{Swarm: view.Spec.Destination.Swarm})
+	if err != nil {
+		return nil, fmt.Errorf("resolving destination: %w", err)
+	}
+	reader, ok := backend.(capability.ServiceLogReader)
+	if !ok {
+		return nil, application.ErrUnsupported
+	}
+	return reader.ServiceLogs(ctx, capability.ServiceLogRequest{Service: name, Tail: tail, Follow: follow})
+}
+
+// declaredService reports whether the application's own status names svc, and
+// returns the name as that status spelled it.
+//
+// The name it returns is what reaches the daemon, rather than the caller's
+// string: the two are equal here, and keeping the returned one is what makes
+// that a fact of the code rather than of this function staying a comparison.
+func declaredService(view application.View, svc string) (string, bool) {
+	for _, release := range view.Status.Releases {
+		for _, s := range release.Services {
+			if s.Name == svc {
+				return s.Name, true
+			}
+		}
+	}
+	return "", false
+}
