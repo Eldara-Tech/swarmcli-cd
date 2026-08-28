@@ -11,7 +11,19 @@ export interface LiveStream {
   state: StreamState
   /** The most recent frame, or null before one has arrived. */
   last: ControllerEvent | null
+  /**
+   * The frames this tab has seen, oldest first, capped at logLimit. It is a
+   * scrollback for the Monitor and Overview terminals, not a source of truth:
+   * the stream drops frames for a slow subscriber (api/stream.go) and a
+   * reconnect replays nothing, so a gap here is expected and the documents
+   * remain authoritative. Bounded because a tab left open for a week must not
+   * grow without limit.
+   */
+  log: ControllerEvent[]
 }
+
+/** How many past frames the scrollback keeps; older ones fall off the top. */
+export const logLimit = 250
 
 /**
  * useEventStream opens the tab's event stream and reports what it is doing.
@@ -31,6 +43,7 @@ export interface LiveStream {
 export function useEventStream(): LiveStream {
   const [state, setState] = useState<StreamState>('connecting')
   const [last, setLast] = useState<ControllerEvent | null>(null)
+  const [log, setLog] = useState<ControllerEvent[]>([])
   const client = useQueryClient()
   // Whether this tab has ever had a live stream. A ref, not state: it must not
   // reset when the effect re-runs, and nothing renders from it.
@@ -44,6 +57,12 @@ export function useEventStream(): LiveStream {
       signal: controller.signal,
       onEvent: (event) => {
         setLast(event)
+        // Appended for the terminals, capped so a long-lived tab does not grow
+        // without bound. slice keeps the newest logLimit frames.
+        setLog((prev) => {
+          const next = prev.length >= logLimit ? prev.slice(prev.length - logLimit + 1) : prev
+          return [...next, event]
+        })
         // invalidateQueries and never setQueryData: the frame is a hint that
         // something moved, not a copy of what it moved to. Its own fields are
         // not the document — an event carries a revision and a sentence, where
@@ -84,5 +103,5 @@ export function useEventStream(): LiveStream {
     }
   }, [client])
 
-  return { state, last }
+  return { state, last, log }
 }

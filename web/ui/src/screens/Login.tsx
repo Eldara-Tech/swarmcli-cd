@@ -6,6 +6,7 @@ import { useState, type FormEvent } from 'react'
 import { verify } from '../api/client'
 import { useBootstrap, type LoginOption } from '../api/discovery'
 import { setToken } from '../auth/session'
+import { BrandMark } from '../components/Icon'
 
 /**
  * The login screen: whatever /ui/bootstrap.json says a browser may sign in with.
@@ -73,7 +74,13 @@ export function Login() {
 
   const card = (
     <>
-      <h1>swarmcli-cd</h1>
+      <div className="login-brand">
+        <BrandMark />
+        <div className="login-title">
+          <h1>swarmcli-cd</h1>
+          <p className="login-tagline">Continuous delivery for Docker Swarm</p>
+        </div>
+      </div>
       {methods.length === 0 && (
         <p className="login-error" role="alert">
           This controller advertises no way to sign in from a browser.
@@ -102,6 +109,21 @@ export function Login() {
           {checking ? 'Checking…' : 'Sign in'}
         </button>
       )}
+      {/* Two links out of the credential page. rel="noreferrer" so the tab each
+          opens cannot read back through window.opener, and the referrer — this
+          URL — never leaves with it.
+
+          The notices are same-origin and served by web.go out of the bundle, so
+          they are reachable on a controller with no route to the internet;
+          swarmcli.io is not, which is why only one of them is the obligation. */}
+      <p className="login-foot">
+        <a href="https://swarmcli.io" target="_blank" rel="noreferrer">
+          swarmcli.io
+        </a>
+        <a href="/THIRD-PARTY-NOTICES.txt" target="_blank" rel="noreferrer">
+          Third-party notices
+        </a>
+      </p>
     </>
   )
 

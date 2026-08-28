@@ -6,8 +6,10 @@ import { Link, NavLink, Outlet } from 'react-router'
 import { signOutPath, useFeature, useSession } from './api/discovery'
 import { useEventStream } from './api/useEventStream'
 import { clearSession } from './auth/session'
+import { BrandMark, Icon, type IconName } from './components/Icon'
 import { LicenceBadge } from './components/LicenceBadge'
 import { LiveIndicator } from './components/LiveIndicator'
+import { LiveProvider } from './live'
 
 /**
  * The shell every screen hangs off: the header, the live indicator, and the
@@ -20,41 +22,90 @@ import { LiveIndicator } from './components/LiveIndicator'
  */
 export function Shell() {
   const live = useEventStream()
-  // False in a build with no capability endpoint, so this header is the one
+  // False in a build with no capability endpoint, so this shell is the one
   // Phase B shipped until a companion says otherwise; see api/discovery.ts.
   const projects = useFeature('projects')
 
   return (
-    <div className="shell">
-      <header className="shell-header">
-        <Link className="brand" to="/">
-          swarmcli-cd
-        </Link>
-        {/* The controller screen is reachable from here as well as from the
-            list's banner: an operator who suspects the app set has to be able
-            to look without a failing application to click through from. */}
-        <nav className="shell-nav">
-          <NavLink to="/" end className={({ isActive }) => (isActive ? 'nav-current' : undefined)}>
-            Applications
-          </NavLink>
-          {projects && (
-            <NavLink to="/projects" className={({ isActive }) => (isActive ? 'nav-current' : undefined)}>
-              Projects
-            </NavLink>
-          )}
-          <NavLink to="/status" className={({ isActive }) => (isActive ? 'nav-current' : undefined)}>
-            Controller
-          </NavLink>
-        </nav>
-        <LiveIndicator {...live} />
-        {/* Renders nothing at all in a build with no licence to report, which
-            is what keeps the free header identical to Phase B's. */}
-        <LicenceBadge />
-        <SignOut />
-      </header>
-      <main className="shell-main">
-        <Outlet />
-      </main>
+    // The tab's one event stream, published to the Overview and Monitor
+    // terminals below rather than re-opened by each; see live.tsx.
+    <LiveProvider value={live}>
+      <div className="app">
+        <a href="#main-content" className="skip-link">
+          Skip to content
+        </a>
+        <aside className="app-rail">
+          <div className="rail-brand">
+            <Link className="brand" to="/">
+              <BrandMark />
+              <span className="brand-text">swarmcli-cd</span>
+            </Link>
+          </div>
+          {/* Controller is reachable from here as well as from the list's
+              banner: an operator who suspects the app set has to be able to
+              look without a failing application to click through from. */}
+          <nav className="app-nav">
+            <RailLink to="/overview" icon="layers" label="Overview" />
+            <RailLink to="/" end icon="app" label="Applications" />
+            <RailLink to="/monitor" icon="activity" label="Monitor" />
+            <RailLink to="/diagnostics" icon="gauge" label="Diagnostics" />
+            <RailLink to="/status" icon="service" label="Controller" />
+            {/* Gated on its feature together with its route: a NavLink to a path
+                no route claims matches nothing, unmounting the shell with it. */}
+            {projects && <RailLink to="/projects" icon="app" label="Projects" />}
+          </nav>
+          {/* Renders nothing at all in a build with no licence to report, which
+              is what keeps the free shell identical to Phase B's. */}
+          <div className="rail-foot">
+            <OperatorBadge />
+            <LicenceBadge />
+          </div>
+        </aside>
+        <div className="app-col">
+          <header className="app-top">
+            <LiveIndicator {...live} />
+            <SignOut />
+          </header>
+          <main className="app-main" id="main-content" tabIndex={-1}>
+            <Outlet />
+          </main>
+        </div>
+      </div>
+    </LiveProvider>
+  )
+}
+
+/** One rail item: an icon and a label, current when its route is active. */
+function RailLink({ to, end, icon, label }: { to: string; end?: boolean; icon: IconName; label: string }) {
+  return (
+    <NavLink to={to} end={end} className={({ isActive }) => (isActive ? 'nav-current' : undefined)}>
+      <Icon name={icon} size={18} />
+      <span className="nav-label">{label}</span>
+    </NavLink>
+  )
+}
+
+/**
+ * Who is signed in, at the foot of the rail.
+ *
+ * A cookie session carries a name; the token build has none — it is the single
+ * admin the token is — so it is labelled as that rather than left blank. Both
+ * cases render the same element, which is what keeps the free shell's DOM
+ * identical whether or not a capability document was read.
+ */
+function OperatorBadge() {
+  const session = useSession()
+  return (
+    <div className="rail-user">
+      <div className="rail-avatar">
+        <Icon name="terminal" size={16} />
+      </div>
+      <div className="rail-user-meta">
+        <span className="rail-user-name">
+          {session === undefined || session.name === '' ? 'Administrator' : session.name}
+        </span>
+        <span className="rail-user-sub label-caps">{session === undefined ? 'Token auth' : 'SSO session'}</span>
+      </div>
     </div>
   )
 }
@@ -83,16 +134,13 @@ function SignOut() {
       </button>
     )
   }
+  // Who the identity provider said this is now lives in the rail's OperatorBadge,
+  // so it is not repeated here; this is only the control that ends the session.
+  // `session` is still read above because a cookie session is the case where
+  // signing out is a link to the controller rather than a button.
   return (
-    <>
-      {/* Who the identity provider said this is. The controller logs the same
-          name against every sync this session asks for, and an operator who
-          signed in through their company's provider and landed on a shell that
-          could not say who they were would have been signed in as nobody. */}
-      <span className="session-name">{session.name}</span>
-      <a className="sign-out" href={signOutPath} onClick={clearSession}>
-        Sign out
-      </a>
-    </>
+    <a className="sign-out" href={signOutPath} onClick={clearSession}>
+      Sign out
+    </a>
   )
 }

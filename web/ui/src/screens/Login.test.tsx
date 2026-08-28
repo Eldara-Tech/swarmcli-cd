@@ -8,7 +8,7 @@
 // read back off the mock rather than asserted about a mocked client.
 
 import { QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, queryClient } from '../App'
@@ -42,7 +42,20 @@ describe('the login screen', () => {
 
     expect(await screen.findByLabelText('Admin token')).toBeDefined()
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeDefined()
-    expect(screen.queryByRole('link')).toBeNull()
+    // No sign-in method drawn as a link: a typed credential is a box, not a
+    // button-to-somewhere.
+    //
+    // Scoped to the form rather than named, because naming it made the check
+    // vacuous: this test advertises only the token method, so a query for the
+    // *other* fixture's label could never match whatever the screen rendered.
+    // An unconditional <a>Sign in with Okta</a> passed it. The footer's links
+    // live outside the form, so the whole form can be forbidden links again —
+    // which is the assertion this replaced and the one that had teeth.
+    const form = document.querySelector('.login-form') as HTMLElement
+    expect(within(form).queryAllByRole('link').map((a) => a.getAttribute('href'))).toEqual([
+      'https://swarmcli.io',
+      '/THIRD-PARTY-NOTICES.txt',
+    ])
   })
 
   it('draws a link for a method that carries a start path', async () => {

@@ -38,6 +38,25 @@ const shipped = new Set([
   "ISC",
   "MIT",
   "MIT-0",
+  // The self-hosted UI fonts (@fontsource/inter, /plus-jakarta-sans,
+  // /jetbrains-mono) are OFL-1.1: the SIL Open Font License, which permits
+  // embedding and redistributing the font files — as `//go:embed all:dist`
+  // does, inside every released binary — provided the copyright and licence
+  // travel with them.
+  //
+  // They do not travel by themselves. Vite emits the .woff2 files into
+  // /assets and emits nothing else from the package, so the first version of
+  // this entry was allowing a permission whose one condition the build was
+  // not meeting: the font bytes shipped and the OFL text did not. What makes
+  // it true is thirdPartyNotices() in web/ui/vite.config.ts, which writes
+  // every runtime package's notice into dist/THIRD-PARTY-NOTICES.txt and
+  // fails the build on a package it cannot find one for — and web/web.go,
+  // which serves it. The same mechanism covers the MIT notices the
+  // JavaScript in the bundle has always required and never carried.
+  //
+  // The bytes are in the bundle, so this is a shipped permission, not a
+  // build-time one.
+  "OFL-1.1",
   "Python-2.0",
   "Unlicense",
 ]);

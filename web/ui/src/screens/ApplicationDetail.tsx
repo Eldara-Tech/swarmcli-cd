@@ -10,9 +10,12 @@ import { applicationKey } from '../api/queries'
 import type { ReleaseStatus, View } from '../api/types'
 import { DriftPanel } from '../components/DriftPanel'
 import { Forbidden } from '../components/Forbidden'
+import { Icon } from '../components/Icon'
 import { Instant } from '../components/Instant'
 import { CompatChip, DriftCell, HealthChip, SyncChip } from '../components/StateChip'
+import { TopologyTree } from '../components/TopologyTree'
 import { chartRef, destination, serviceCounts, shortRevision } from '../format'
+import { ErrorState, Loading } from '../components/StateBlock'
 
 /**
  * The application's identity, and the three tabs that read it.
@@ -34,13 +37,9 @@ export function ApplicationDetail() {
   // the button belongs to the header this component draws either way.
   const sync = useSync(app)
 
-  if (detail.isPending) return <p>Loading…</p>
+  if (detail.isPending) return <Loading />
   if (detail.isError) {
-    return (
-      <p className="error" role="alert">
-        {detail.error.message}
-      </p>
-    )
+    return <ErrorState message={detail.error.message} />
   }
 
   const { spec, status } = detail.data
@@ -82,6 +81,9 @@ export function ApplicationDetail() {
       <nav className="tabs">
         <NavLink to="." end className={tab}>
           Overview
+        </NavLink>
+        <NavLink to="topology" className={tab}>
+          Topology
         </NavLink>
         <NavLink to="diff" className={tab}>
           Diff
@@ -248,82 +250,157 @@ export function ApplicationOverview() {
         </div>
       )}
 
-      <dl className="detail-fields">
-        <dt>Source</dt>
-        <dd className="wrap">
-          {spec.source.repoURL} @ {spec.source.revision}
-        </dd>
-        {spec.source.chart === undefined ? (
-          <>
-            <dt>Release file</dt>
-            <dd>{spec.source.releaseFile}</dd>
-          </>
-        ) : (
-          <>
-            <dt>Chart</dt>
-            <dd>
-              {chartRef(spec.source.chart)} as {spec.source.chart.release}
-            </dd>
-          </>
-        )}
-        <dt>Destination</dt>
-        <dd>{destination(spec.destination)}</dd>
-        <dt>Revision</dt>
-        <dd>
-          {status.sync.revision === undefined || status.sync.revision === '' ? (
-            <span className="muted">–</span>
-          ) : (
-            <code title={status.sync.revision}>{shortRevision(status.sync.revision)}</code>
-          )}
-        </dd>
-        <dt>Services</dt>
-        <dd>{serviceCounts(status.health.services)}</dd>
-        {status.health.message !== undefined && status.health.message !== '' && (
-          <>
-            <dt>Health message</dt>
-            <dd className="wrap">{status.health.message}</dd>
-          </>
-        )}
-        <dt>Last sync</dt>
-        <dd>
-          {status.sync.lastSync === undefined ? (
-            <span className="muted">never</span>
-          ) : (
-            <>
-              {status.sync.lastSync.succeeded ? 'succeeded' : 'failed'} at{' '}
-              <Instant at={status.sync.lastSync.finishedAt} />{' '}
-              <code title={status.sync.lastSync.revision}>{shortRevision(status.sync.lastSync.revision)}</code>
-              {status.sync.lastSync.error !== undefined && status.sync.lastSync.error !== '' && (
-                <span className="error wrap"> {status.sync.lastSync.error}</span>
-              )}
-            </>
-          )}
-        </dd>
-        <dt>Observed</dt>
-        <dd>
-          <Instant at={status.observedAt} />
-        </dd>
-      </dl>
+      <div className="bento-grid">
+        <div className="bento-col-6">
+          <div className="card-frame">
+            <div className="card-frame-head">
+              <h2>
+                <Icon name="app" size={16} />
+                GitOps Specification
+              </h2>
+            </div>
+            <div className="card-frame-body">
+              <dl className="spec-grid">
+                <div className="spec-item">
+                  <dt className="spec-label">Source</dt>
+                  <dd className="spec-value wrap">
+                    {spec.source.repoURL} @ {spec.source.revision}
+                  </dd>
+                </div>
+                {spec.source.chart === undefined ? (
+                  <div className="spec-item">
+                    <dt className="spec-label">Release file</dt>
+                    <dd className="spec-value">{spec.source.releaseFile}</dd>
+                  </div>
+                ) : (
+                  <div className="spec-item">
+                    <dt className="spec-label">Chart</dt>
+                    <dd className="spec-value">
+                      {chartRef(spec.source.chart)} as {spec.source.chart.release}
+                    </dd>
+                  </div>
+                )}
+                <div className="spec-item">
+                  <dt className="spec-label">Destination</dt>
+                  <dd className="spec-value">{destination(spec.destination)}</dd>
+                </div>
+                <div className="spec-item">
+                  <dt className="spec-label">Revision</dt>
+                  <dd className="spec-value">
+                    {status.sync.revision === undefined || status.sync.revision === '' ? (
+                      <span className="muted">–</span>
+                    ) : (
+                      <code title={status.sync.revision}>{shortRevision(status.sync.revision)}</code>
+                    )}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          </div>
+        </div>
 
-      <h2>Releases</h2>
-      {releases === undefined ? (
-        // Absent is "not requested", never "none". The engine rejects a release
-        // file that declares no releases, so a reconciled application always has
-        // at least one — and the list endpoint strips the key on purpose. On
-        // this endpoint the only thing absence can mean is that the controller
-        // has not reconciled the application yet.
-        <p className="empty">Not reconciled yet — the controller has not reported this application&apos;s releases.</p>
-      ) : (
-        <ul className="tree">
-          {releases.map((release) => (
-            <ReleaseNode key={release.name} release={release} />
-          ))}
-        </ul>
-      )}
+        <div className="bento-col-6">
+          <div className="card-frame">
+            <div className="card-frame-head">
+              <h2>
+                <Icon name="service" size={16} />
+                Swarm Runtime & Reconcile
+              </h2>
+            </div>
+            <div className="card-frame-body">
+              <dl className="spec-grid">
+                <div className="spec-item">
+                  <dt className="spec-label">Services</dt>
+                  <dd className="spec-value">{serviceCounts(status.health.services)}</dd>
+                </div>
+                {status.health.message !== undefined && status.health.message !== '' && (
+                  <div className="spec-item">
+                    <dt className="spec-label">Health message</dt>
+                    <dd className="spec-value wrap">{status.health.message}</dd>
+                  </div>
+                )}
+                <div className="spec-item">
+                  <dt className="spec-label">Last sync</dt>
+                  <dd className="spec-value">
+                    {status.sync.lastSync === undefined ? (
+                      <span className="muted">never</span>
+                    ) : (
+                      <>
+                        {status.sync.lastSync.succeeded ? 'succeeded' : 'failed'} at{' '}
+                        <Instant at={status.sync.lastSync.finishedAt} />{' '}
+                        <code title={status.sync.lastSync.revision}>{shortRevision(status.sync.lastSync.revision)}</code>
+                        {status.sync.lastSync.error !== undefined && status.sync.lastSync.error !== '' && (
+                          <span className="error wrap"> {status.sync.lastSync.error}</span>
+                        )}
+                      </>
+                    )}
+                  </dd>
+                </div>
+                <div className="spec-item">
+                  <dt className="spec-label">Observed</dt>
+                  <dd className="spec-value">
+                    <Instant at={status.observedAt} />
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          </div>
+        </div>
+
+        <div className="bento-col-12">
+          <div className="card-frame">
+            <div className="card-frame-head">
+              <h2>
+                <Icon name="layers" size={16} />
+                Releases
+              </h2>
+            </div>
+            <div className="card-frame-body">
+              {releases === undefined ? (
+                // Absent is "not requested", never "none". The engine rejects a release
+                // file that declares no releases, so a reconciled application always has
+                // at least one — and the list endpoint strips the key on purpose. On
+                // this endpoint the only thing absence can mean is that the controller
+                // has not reconciled the application yet.
+                <p className="empty">Not reconciled yet — the controller has not reported this application&apos;s releases.</p>
+              ) : (
+                <ul className="tree">
+                  {releases.map((release) => (
+                    <ReleaseNode key={release.name} release={release} />
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
 
       <DriftPanel releases={releases ?? []} />
     </>
   )
+}
+
+/**
+ * The same application as a map rather than a table: application → releases →
+ * services, on connector rails.
+ *
+ * It reads the layout's already-resolved query — same key, so the cache answers
+ * and no request is made — and shares the overview's honesty about depth: the
+ * tree stops at services because ServiceStatus is where the API stops.
+ */
+export function ApplicationTopology() {
+  const { app = '' } = useParams()
+  const detail = useApplication(app)
+
+  if (detail.data === undefined) return null
+
+  const releases = detail.data.status.releases
+  if (releases === undefined) {
+    return (
+      <p className="empty">Not reconciled yet — the controller has not reported this application&apos;s resources.</p>
+    )
+  }
+  return <TopologyTree view={detail.data} />
 }
 
 function ReleaseNode({ release }: { release: ReleaseStatus }) {

@@ -7,8 +7,10 @@ import { appSetShape, type AppSetShape } from '../api/appset'
 import { apiGet } from '../api/client'
 import { controllerKey } from '../api/queries'
 import type { AppSetStatus, ControllerStatus as Status } from '../api/types'
+import { Dot, type DotTone } from '../components/Dot'
 import { Instant } from '../components/Instant'
 import { shortRevision } from '../format'
+import { ErrorState, Loading } from '../components/StateBlock'
 
 /**
  * The controller itself, as distinct from the applications it reconciles.
@@ -30,13 +32,9 @@ export function ControllerStatusScreen() {
     queryFn: () => apiGet<Status>('/api/v1/status'),
   })
 
-  if (status.isPending) return <p>Loading…</p>
+  if (status.isPending) return <Loading />
   if (status.isError) {
-    return (
-      <p className="error" role="alert">
-        {status.error.message}
-      </p>
-    )
+    return <ErrorState message={status.error.message} />
   }
 
   const set = status.data.appSet
@@ -50,33 +48,56 @@ export function ControllerStatusScreen() {
 
       <AppSetNotice shape={shape} appSet={set} />
 
-      <dl className="detail-fields">
-        <dt>Mode</dt>
-        {/* An empty mode is not an unknown one: it is the status handler's
-            no-controller arm, and "unknown" would suggest something to diagnose
-            where there is nothing wired to diagnose. */}
-        <dd>{set.mode === '' ? <span className="muted">none</span> : set.mode}</dd>
-        {set.source !== undefined && set.source !== '' && (
-          <>
-            <dt>Source</dt>
-            <dd className="wrap">{set.source}</dd>
-          </>
-        )}
-        {set.revision !== undefined && set.revision !== '' && (
-          <>
-            <dt>Revision</dt>
-            <dd>
-              <code title={set.revision}>{shortRevision(set.revision)}</code>
-            </dd>
-          </>
-        )}
-        <dt>Loaded</dt>
-        <dd data-testid="app-set-loaded">
-          <Instant at={set.loadedAt} />
-        </dd>
-        <dt>Applications</dt>
-        <dd data-testid="app-set-applications">{status.data.applications}</dd>
-      </dl>
+      <div className="bento-grid">
+        <div className="bento-col-12">
+          <div className="card-frame">
+            <div className="card-frame-head">
+              <h2>
+                <Dot tone={engine[shape].tone} pulse={shape === 'ok'} />
+                GitOps Reconcile Engine
+              </h2>
+              <span className={`chip chip-${engine[shape].chip}`}>{engine[shape].label}</span>
+            </div>
+            <div className="card-frame-body">
+              <dl className="spec-grid">
+                <div className="spec-item">
+                  <dt className="spec-label">Mode</dt>
+                  {/* An empty mode is not an unknown one: it is the status handler's
+                      no-controller arm, and "unknown" would suggest something to diagnose
+                      where there is nothing wired to diagnose. */}
+                  <dd className="spec-value">{set.mode === '' ? <span className="muted">none</span> : set.mode}</dd>
+                </div>
+                {set.source !== undefined && set.source !== '' && (
+                  <div className="spec-item">
+                    <dt className="spec-label">Source Path / Repo</dt>
+                    <dd className="spec-value wrap">{set.source}</dd>
+                  </div>
+                )}
+                {set.revision !== undefined && set.revision !== '' && (
+                  <div className="spec-item">
+                    <dt className="spec-label">Target Revision</dt>
+                    <dd className="spec-value">
+                      <code title={set.revision}>{shortRevision(set.revision)}</code>
+                    </dd>
+                  </div>
+                )}
+                <div className="spec-item">
+                  <dt className="spec-label">Last Loaded</dt>
+                  <dd className="spec-value" data-testid="app-set-loaded">
+                    <Instant at={set.loadedAt} />
+                  </dd>
+                </div>
+                <div className="spec-item">
+                  <dt className="spec-label">Managed Applications</dt>
+                  <dd className="spec-value" data-testid="app-set-applications">
+                    {status.data.applications}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          </div>
+        </div>
+      </div>
 
       {/* The three lists that only exist when something happened. A "Pruned:
           none" row on every healthy controller would train an operator to stop
@@ -95,6 +116,27 @@ export function ControllerStatusScreen() {
  * having nothing to say, so that the presence of a block here is itself the
  * signal.
  */
+/**
+ * What the engine card's dot and chip say, per app-set shape.
+ *
+ * Derived rather than written, because it was written: a hard-coded green
+ * "Engine Online" sat directly under the notices below, so a controller that
+ * had never loaded a set, or had no reconcile loop wired at all, announced
+ * itself as running. The shape is already computed for the notice — this is the
+ * same fact drawn a second way, and the two cannot now disagree.
+ *
+ * `unwired` is muted rather than red for the reason the notice gives: a
+ * controller serving the API without a loop is a deployment choice, not a
+ * fault, and colouring it as one trains an operator to ignore the colour.
+ */
+const engine: Record<AppSetShape, { tone: DotTone; chip: string; label: string }> = {
+  ok: { tone: 'ok', chip: 'good', label: 'Engine Online' },
+  partial: { tone: 'warn', chip: 'warn', label: 'Degraded Load' },
+  stale: { tone: 'warn', chip: 'warn', label: 'Serving Last-Good Set' },
+  'never-loaded': { tone: 'bad', chip: 'bad', label: 'Never Loaded' },
+  unwired: { tone: 'muted', chip: 'muted', label: 'No Reconcile Loop' },
+}
+
 function AppSetNotice({ shape, appSet }: { shape: AppSetShape; appSet: AppSetStatus }) {
   if (shape === 'ok') return null
 

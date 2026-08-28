@@ -10,6 +10,8 @@ import { diffKey } from '../api/queries'
 import type { DiffResponse, ReleaseDiff } from '../api/types'
 import { DiffView } from '../components/DiffView'
 import { Forbidden } from '../components/Forbidden'
+import { Icon } from '../components/Icon'
+import { ErrorState, Loading } from '../components/StateBlock'
 
 /**
  * What a sync would change, release by release.
@@ -48,14 +50,10 @@ export function ApplicationDiff() {
     queryFn: () => apiGet<DiffResponse>(`/api/v1/applications/${encodeURIComponent(app)}/diff`),
   })
 
-  if (diff.isPending) return <p>Loading…</p>
+  if (diff.isPending) return <Loading />
   if (diff.isError) {
     if (hasStatus(diff.error, 403)) return <Forbidden action="diff" />
-    return (
-      <p className="error" role="alert">
-        {diff.error.message}
-      </p>
-    )
+    return <ErrorState message={diff.error.message} />
   }
 
   const { planned, releases } = diff.data
@@ -73,9 +71,15 @@ export function ApplicationDiff() {
   const changed = releases ?? []
   if (changed.length === 0) {
     return (
-      <p className="empty" data-testid="diff-converged">
-        Nothing would change — the controller has a plan, and no release in it would be touched by a sync.
-      </p>
+      <div className="confirm-card">
+        <div className="confirm-icon">
+          <Icon name="check" size={24} />
+        </div>
+        <h2 className="confirm-title">Manifests in Sync</h2>
+        <p className="confirm-desc empty" data-testid="diff-converged">
+          Nothing would change — the controller has a plan, and no release in it would be touched by a sync.
+        </p>
+      </div>
     )
   }
 
