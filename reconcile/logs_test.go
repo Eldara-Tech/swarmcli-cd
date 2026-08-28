@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
@@ -55,7 +56,7 @@ func TestServiceLogsTailsWhatTheApplicationRuns(t *testing.T) {
 	r := newTestWith(t, []application.Spec{spec("edge", true)}, &fakeEngine{}, nil, fakeRegistry{backend: b})
 	running(t, r, "edge", "edge_web")
 
-	ch, err := r.ServiceLogs(t.Context(), "edge", "edge_web", 100, true)
+	ch, err := r.ServiceLogs(t.Context(), "edge", "edge_web", application.ServiceLogRequest{Tail: 100, Follow: true})
 	if err != nil {
 		t.Fatalf("ServiceLogs = %v, want nil", err)
 	}
@@ -64,6 +65,54 @@ func TestServiceLogsTailsWhatTheApplicationRuns(t *testing.T) {
 	}
 	if b.got.Service != "edge_web" || b.got.Tail != 100 || !b.got.Follow {
 		t.Errorf("backend asked for %+v", b.got)
+	}
+}
+
+// The two request types are owned by different layers and are copied field by
+// field rather than converted, so nothing but a test notices when one of them
+// grows a field the copy does not carry. Every field set here must arrive.
+func TestServiceLogsCarryTheWholeRequestToTheBackend(t *testing.T) {
+	b := &logBackend{}
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, &fakeEngine{}, nil, fakeRegistry{backend: b})
+	running(t, r, "edge", "edge_web")
+
+	since := time.Date(2026, 8, 28, 9, 30, 0, 0, time.UTC)
+	if _, err := r.ServiceLogs(t.Context(), "edge", "edge_web", application.ServiceLogRequest{
+		Tail:   5000,
+		Since:  since,
+		Follow: true,
+	}); err != nil {
+		t.Fatalf("ServiceLogs = %v, want nil", err)
+	}
+
+	want := capability.ServiceLogRequest{Service: "edge_web", Tail: 5000, Since: since, Follow: true}
+	if b.got != want {
+		t.Errorf("backend asked for %+v, want %+v", b.got, want)
+	}
+}
+
+// The window is one intent split across two fields, and the tail is the half
+// that bounds it: the daemon applies the tail first and only then drops what is
+// older than since. A reconciler that forwarded one without the other would
+// turn a six-hour request into a hundred lines with nothing to say so.
+func TestServiceLogsDoNotSeparateSinceFromItsTail(t *testing.T) {
+	b := &logBackend{}
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, &fakeEngine{}, nil, fakeRegistry{backend: b})
+	running(t, r, "edge", "edge_web")
+
+	since := time.Now().Add(-6 * time.Hour)
+	if _, err := r.ServiceLogs(t.Context(), "edge", "edge_web", application.ServiceLogRequest{
+		Tail:   50000,
+		Since:  since,
+		Follow: true,
+	}); err != nil {
+		t.Fatalf("ServiceLogs = %v, want nil", err)
+	}
+	if b.got.Since.IsZero() {
+		t.Error("the backend was asked for a window with no start")
+	}
+	if b.got.Tail != 50000 {
+		t.Errorf("the backend was asked for a tail of %d, which would bound the window to its own size", b.got.Tail)
 	}
 }
 
@@ -77,7 +126,7 @@ func TestServiceLogsRefuseAServiceTheApplicationDoesNotRun(t *testing.T) {
 	r := newTestWith(t, []application.Spec{spec("edge", true)}, &fakeEngine{}, nil, fakeRegistry{backend: b})
 	running(t, r, "edge", "edge_web")
 
-	if _, err := r.ServiceLogs(t.Context(), "edge", "other_db", 100, true); err == nil {
+	if _, err := r.ServiceLogs(t.Context(), "edge", "other_db", application.ServiceLogRequest{Tail: 100, Follow: true}); err == nil {
 		t.Fatal("a service the application does not run was tailed anyway")
 	}
 	if b.got.Service != "" {
@@ -88,7 +137,7 @@ func TestServiceLogsRefuseAServiceTheApplicationDoesNotRun(t *testing.T) {
 func TestServiceLogsForAnUnknownApplicationFail(t *testing.T) {
 	r := newTestWith(t, nil, &fakeEngine{}, nil, fakeRegistry{backend: &logBackend{}})
 
-	if _, err := r.ServiceLogs(t.Context(), "nope", "svc", 100, true); err == nil {
+	if _, err := r.ServiceLogs(t.Context(), "nope", "svc", application.ServiceLogRequest{Tail: 100, Follow: true}); err == nil {
 		t.Fatal("an application that does not exist produced a stream")
 	}
 }
@@ -101,7 +150,7 @@ func TestServiceLogsReportABackendWithoutAReaderAsUnsupported(t *testing.T) {
 	r := newTestWith(t, []application.Spec{spec("edge", true)}, &fakeEngine{}, nil, fakeRegistry{})
 	running(t, r, "edge", "edge_web")
 
-	_, err := r.ServiceLogs(t.Context(), "edge", "edge_web", 100, true)
+	_, err := r.ServiceLogs(t.Context(), "edge", "edge_web", application.ServiceLogRequest{Tail: 100, Follow: true})
 	if !errors.Is(err, application.ErrUnsupported) {
 		t.Fatalf("ServiceLogs = %v, want application.ErrUnsupported", err)
 	}
@@ -114,7 +163,7 @@ func TestServiceLogsKeepAFailedOpenDistinctFromAnUnsupportedOne(t *testing.T) {
 	r := newTestWith(t, []application.Spec{spec("edge", true)}, &fakeEngine{}, nil, fakeRegistry{backend: &logBackend{err: boom}})
 	running(t, r, "edge", "edge_web")
 
-	_, err := r.ServiceLogs(t.Context(), "edge", "edge_web", 100, true)
+	_, err := r.ServiceLogs(t.Context(), "edge", "edge_web", application.ServiceLogRequest{Tail: 100, Follow: true})
 	if !errors.Is(err, boom) {
 		t.Fatalf("ServiceLogs = %v, want the daemon's error", err)
 	}

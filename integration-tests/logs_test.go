@@ -11,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/client"
+
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 )
 
 // logChartFiles is a chart whose one service writes to both streams and then
@@ -80,7 +83,7 @@ func TestServiceLogsAgainstARealSwarm(t *testing.T) {
 	// against something and not against the assertion's own clock.
 	opened := time.Now().UTC()
 
-	events, err := rec.ServiceLogs(ctx, "logs", service, 100, true)
+	events, err := rec.ServiceLogs(ctx, "logs", service, application.ServiceLogRequest{Tail: 100, Follow: true})
 	if err != nil {
 		t.Fatalf("ServiceLogs = %v, want nil", err)
 	}
@@ -131,6 +134,24 @@ func TestServiceLogsAgainstARealSwarm(t *testing.T) {
 		t.Errorf("one replica produced two task ids: %q and %q", out.TaskID, err2.TaskID)
 	}
 
+	// #266. Both are resolved by the reader against the live swarm — the slot
+	// from the task listing and the hostname from the node roster — and neither
+	// can be checked against a fake, where both maps are whatever the fixture
+	// said. A single-replica service is slot 1: swarm numbers replicas from
+	// one, and 0 is what it reports for a global service that has no slot.
+	for _, e := range []application.ServiceLogEvent{out, err2} {
+		if e.Slot != 1 {
+			t.Errorf("%s line has slot %d, want 1 for the only replica of a replicated service", e.Stream, e.Slot)
+		}
+		if e.NodeHostname == "" {
+			t.Errorf("%s line names node %q and no hostname; the roster lookup did not happen", e.Stream, e.NodeID)
+		}
+	}
+	if hostname := nodeHostname(t, cli, out.NodeID); out.NodeHostname != hostname {
+		t.Errorf("the line says it came from %q and the daemon says that node is %q",
+			out.NodeHostname, hostname)
+	}
+
 	// The container's instant, not the read time. Asserted as *before* the tail
 	// was opened rather than merely non-zero: a reader that had gone back to
 	// stamping time.Now() would pass a non-zero check on every line.
@@ -153,6 +174,104 @@ func TestServiceLogsAgainstARealSwarm(t *testing.T) {
 			t.Fatal("the stream outlived the context it was opened with")
 		}
 	}
+}
+
+// A window narrower than the service is old returns less than an unbounded read
+// of the same service.
+//
+// This is the assertion #267 exists for, and it is the one that cannot be made
+// against a fake: `since` is applied by the log driver on the node holding the
+// task, after the daemon has already selected the last `tail` lines, and no
+// fixture can be wrong about that ordering the way a real daemon can. Asserted
+// as a comparison between two reads of one service rather than as a line count,
+// because how much a busybox writes is not this test's business.
+func TestALogWindowReadsLessThanAnUnboundedTail(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-logs-window"
+	repo := gitRepo(t, chattyChartFiles(release))
+	t.Cleanup(func() { removeStack(t, release) })
+
+	rec := reconciler(t, releaseApp("window", repo, true))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := rec.SyncNow(ctx, "window"); err != nil {
+		t.Fatalf("SyncNow = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 1)
+
+	view, ok := rec.View("window")
+	if !ok {
+		t.Fatal("no view for the application after a sync")
+	}
+	service := onlyService(t, view)
+
+	// The service writes its lines and then sleeps, so a few seconds is enough
+	// for all of them to be in the log and none of them to be recent.
+	time.Sleep(10 * time.Second)
+
+	whole := countTail(t, ctx, rec, service, application.ServiceLogRequest{Tail: 1000})
+	if whole < 2 {
+		t.Fatalf("the unbounded read returned %d lines; the fixture is not writing", whole)
+	}
+
+	// One second of history, of a service that wrote everything ten seconds ago.
+	narrow := countTail(t, ctx, rec, service, application.ServiceLogRequest{
+		Tail:  1000,
+		Since: time.Now().Add(-1 * time.Second),
+	})
+	if narrow >= whole {
+		t.Errorf("a one-second window returned %d of the %d lines; since is not reaching the daemon",
+			narrow, whole)
+	}
+}
+
+// chattyChartFiles is a chart whose service writes several lines and then stays
+// up, so that a window can exclude some of them.
+func chattyChartFiles(release string) map[string]string {
+	files := logChartFiles(release)
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sh\", \"-c\", \"for i in 1 2 3 4 5; do echo line-$i; done; sleep 3600\"]\n" +
+		"    deploy:\n" +
+		"      replicas: 1\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n"
+	return files
+}
+
+// countTail reads one non-following tail to its end and counts the container's
+// own lines, ignoring anything the controller said.
+func countTail(t *testing.T, ctx context.Context, rec *reconcile.Reconciler, service string, req application.ServiceLogRequest) int {
+	t.Helper()
+	read, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	events, err := rec.ServiceLogs(read, "window", service, req)
+	if err != nil {
+		t.Fatalf("ServiceLogs = %v, want nil", err)
+	}
+	n := 0
+	for e := range events {
+		if !e.Notice && strings.HasPrefix(strings.TrimSpace(e.Message), "line-") {
+			n++
+		}
+	}
+	return n
+}
+
+// nodeHostname asks the daemon what it calls a node, so the label on a line is
+// compared against the swarm rather than against itself.
+func nodeHostname(t *testing.T, cli client.APIClient, id string) string {
+	t.Helper()
+	node, _, err := cli.NodeInspectWithRaw(context.Background(), id)
+	if err != nil {
+		t.Fatalf("inspecting node %s: %v", id, err)
+	}
+	return node.Description.Hostname
 }
 
 // onlyService returns the single service the application reports, failing if

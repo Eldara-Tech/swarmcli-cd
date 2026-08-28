@@ -2598,6 +2598,50 @@ select:focus-visible,
   word-break: break-all;
 }
 
+/* Said rather than hidden: the buffer holds far more than the DOM does, and a
+   console silently drawing a fraction of what it has is a console that lies.
+   Sits above the rows it caps, where it is read before the gap is noticed. */
+.console-truncated {
+  background: rgba(250, 204, 21, 0.08);
+  border-bottom: 1px solid rgba(250, 204, 21, 0.2);
+  color: #facc15;
+  font-size: 0.7rem;
+  margin-bottom: 0.3rem;
+  padding: 0.35rem 0.85rem;
+}
+
+/* Which replica wrote the line: a slot for a replicated service, a hostname
+   for a global one, a truncated task id when the controller could not name it.
+   Fixed width so the message column starts in the same place on every row —
+   a message that moved left and right as replicas came and went would be
+   harder to read than no label at all. */
+.line-replica {
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 0.7rem;
+  max-width: 7rem;
+  min-width: 4rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: none;
+  white-space: nowrap;
+}
+
+/* One colour per task, in order of first appearance.
+
+   The second cue and never the only one: .line-replica carries the same fact
+   as text, which is what keeps the row readable for an operator who cannot
+   tell these apart, and what survives into Copy and Export. Its own set rather
+   than the stream and severity colours, which would make the second replica
+   look like an error. */
+.line-replica-0 { color: #7dd3fc; }
+.line-replica-1 { color: #86efac; }
+.line-replica-2 { color: #c4b5fd; }
+.line-replica-3 { color: #fdba74; }
+.line-replica-4 { color: #f0abfc; }
+.line-replica-5 { color: #5eead4; }
+.line-replica-6 { color: #fde047; }
+.line-replica-7 { color: #fda4af; }
+
 .line-stderr .line-content {
   color: #fca5a5;
 }

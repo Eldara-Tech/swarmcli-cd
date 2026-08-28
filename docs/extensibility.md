@@ -326,6 +326,15 @@ for, and all twelve of them are named in
 whichever it can answer; each one it leaves out costs that one feature and
 nothing else.
 
+`capability.ServiceLogReader` shows the shape this contract is meant to have.
+It takes a `ServiceLogRequest` struct rather than a parameter list, and when the
+log console needed to ask for a time window (`since`) as well as a line count,
+the field was added and nothing broke. The same capability's *API-side* seam,
+`api.LogStreamer`, was written with a parameter list and has had to change shape
+twice in two changes — once when a byte stream became a channel of events, and
+once when it took a request struct so that it never has to again. Take the
+struct first.
+
 They are exported, and in a package of their own, because a companion has to be
 able to name them. Go interfaces are structural, so a backend in another module
 *can* satisfy an interface it cannot name — but it cannot be compile-checked

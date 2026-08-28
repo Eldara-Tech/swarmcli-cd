@@ -434,3 +434,286 @@ describe('the log console is gated on the build reporting a streamer', () => {
     expect(screen.getByRole('button', { name: 'Service Container Logs' })).toBeDefined()
   })
 })
+
+// ---------------------------------------------------------------------------
+// #266 — the console names which replica wrote a line
+// ---------------------------------------------------------------------------
+
+/** A Monitor already switched to the log console, tailing edge/edge-web. */
+async function openConsole(stream: ReturnType<typeof pushLogStream>): Promise<void> {
+  controller({
+    ...discoveryWith({ logs: true }),
+    '/api/v1/status': () => json(200, okStatus),
+    '/api/v1/applications': () => json(200, { applications: [edgeRow('edge-web')] }),
+    '/api/v1/events': openStream,
+    '/api/v1/applications/edge/services/edge-web/logs': stream.open,
+  })
+  render(<App />)
+  await screen.findByTestId('application-count')
+  fireEvent.click(screen.getByRole('link', { name: 'Monitor' }))
+  await screen.findByRole('heading', { name: 'Monitor' })
+  fireEvent.click(screen.getByRole('button', { name: 'Service Container Logs' }))
+  await screen.findByText('APP')
+}
+
+/** One line as the controller sends it, with whatever labels the test is about. */
+function logLine(message: string, labels: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    service: 'edge-web',
+    stream: 'stdout',
+    message,
+    timestamp: '2026-08-28T06:00:00Z',
+    ...labels,
+  }
+}
+
+function rowFor(message: string): Element | null {
+  return screen.getByText(message).closest('.console-line')
+}
+
+describe('the console names which replica wrote a line', () => {
+  // The daemon says which task and which node in ids, and an operator reads
+  // `docker service ps`, which says `.1`. Showing the id would leave them
+  // correlating by eye against another window, which is the whole of #266.
+  it('draws the replica slot, with the long form on hover', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() =>
+      stream.push(
+        logLine('listening on :8080', {
+          taskID: 'k9r2m1x8p4qzabcd',
+          nodeID: 'node-a',
+          nodeHostname: 'swarm-w1',
+          slot: 3,
+        }),
+      ),
+    )
+
+    const cell = rowFor('listening on :8080')?.querySelector('.line-replica')
+    expect(cell?.textContent).toBe('.3')
+    // The column has no width for either, and a support conversation quotes
+    // both, so they live on the hover rather than being dropped.
+    expect(cell?.getAttribute('title')).toContain('k9r2m1x8p4qzabcd')
+    expect(cell?.getAttribute('title')).toContain('swarm-w1')
+  })
+
+  // A global service's tasks have no slot — the daemon reports 0 and means it —
+  // and neither does a task the controller could not name. Drawing `.0` would
+  // name a replica that does not exist, so the node is the label instead.
+  it('falls back to the hostname when there is no slot', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() =>
+      stream.push(logLine('global task up', { taskID: 'task-g', nodeID: 'node-a', nodeHostname: 'swarm-w1' })),
+    )
+
+    const cell = rowFor('global task up')?.querySelector('.line-replica')
+    expect(cell?.textContent).toBe('swarm-w1')
+    expect(cell?.textContent).not.toContain('.0')
+  })
+
+  // Both lookups can fail — they are separate calls on purpose — and the line
+  // still arrives. The id truncated the way the daemon's own tooling truncates
+  // it is the last honest thing left to say.
+  it('falls back to a truncated task id when the controller named neither', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() => stream.push(logLine('unnamed', { taskID: 'k9r2m1x8p4qzabcdefgh', nodeID: 'node-a' })))
+
+    expect(rowFor('unnamed')?.querySelector('.line-replica')?.textContent).toBe('k9r2m1x8p4qz')
+  })
+
+  // The colour is the second cue, never the only one, and it has to be stable:
+  // one task looking like itself is the entire point.
+  it('gives two tasks two colours and keeps each one', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() => {
+      stream.push(logLine('from one', { taskID: 'task-1', slot: 1 }))
+      stream.push(logLine('from two', { taskID: 'task-2', slot: 2 }))
+      stream.push(logLine('from one again', { taskID: 'task-1', slot: 1 }))
+    })
+
+    const first = rowFor('from one')?.querySelector('.line-replica')?.className
+    const second = rowFor('from two')?.querySelector('.line-replica')?.className
+    const again = rowFor('from one again')?.querySelector('.line-replica')?.className
+    expect(first).not.toBe(second)
+    expect(again).toBe(first)
+  })
+
+  // A notice is the controller talking about the stream, so no task wrote it
+  // and none is claimed for it.
+  it('claims no replica for a controller notice', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() =>
+      stream.push(logLine('12 log lines were dropped', { stream: 'stderr', notice: true })),
+    )
+
+    expect(rowFor('12 log lines were dropped')?.querySelector('.line-replica')?.textContent).toBe('')
+  })
+
+  it('narrows to one task and back', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() => {
+      stream.push(logLine('from one', { taskID: 'task-1', slot: 1 }))
+      stream.push(logLine('from two', { taskID: 'task-2', slot: 2 }))
+    })
+
+    fireEvent.change(screen.getByLabelText('Filter by task'), { target: { value: 'task-1' } })
+    expect(screen.getByText('from one')).toBeDefined()
+    expect(screen.queryByText('from two')).toBeNull()
+
+    fireEvent.change(screen.getByLabelText('Filter by task'), { target: { value: '' } })
+    expect(screen.getByText('from two')).toBeDefined()
+  })
+
+  // A notice reports on the stream itself — output dropped, a line truncated —
+  // so it is about every task, and narrowing to one must not hide the reason a
+  // gap appeared in it.
+  it('keeps a notice visible while narrowed to one task', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() => {
+      stream.push(logLine('from one', { taskID: 'task-1', slot: 1 }))
+      stream.push(logLine('12 log lines were dropped', { stream: 'stderr', notice: true }))
+    })
+
+    fireEvent.change(screen.getByLabelText('Filter by task'), { target: { value: 'task-1' } })
+
+    expect(screen.getByText('12 log lines were dropped')).toBeDefined()
+  })
+
+  // Copy and Export are what leaves the browser and gets pasted into an
+  // incident channel, so the label has to survive them.
+  it('writes the replica into what Copy puts on the clipboard', async () => {
+    const written: string[] = []
+    vi.stubGlobal('navigator', {
+      ...navigator,
+      clipboard: { writeText: (t: string) => { written.push(t); return Promise.resolve() } },
+    })
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() => stream.push(logLine('served /', { taskID: 'task-1', slot: 3 })))
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }))
+
+    expect(written[0]).toBe('[06:00:00] [.3] [STDOUT] served /')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// #267 — reading further back than the tail
+// ---------------------------------------------------------------------------
+
+describe('the console can read further back than its tail', () => {
+  // A string, because that is all src/api ever passes; the fake asserts the
+  // same thing in client.test.ts.
+  function requestedUrls(): string[] {
+    return vi.mocked(fetch).mock.calls.map((c) => c[0] as string)
+  }
+
+  // The default is what every build did before there was a window, and it
+  // stays a bare request rather than one spelling out the old default.
+  it('opens with no window at all until one is chosen', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    const opened = requestedUrls().filter((u) => u.includes('/logs'))
+    expect(opened).toHaveLength(1)
+    expect(opened[0]).toBe('/api/v1/applications/edge/services/edge-web/logs')
+  })
+
+  // The daemon applies the tail first and drops what is older than since
+  // afterwards, so a preset that sent only `since` would ask for six hours and
+  // be answered with a hundred lines. The pair is the control.
+  it('asks for a window as both a since and the tail that bounds it', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '1h' }))
+      await Promise.resolve()
+    })
+
+    const opened = requestedUrls().filter((u) => u.includes('/logs'))
+    expect(opened[opened.length - 1]).toContain('since=1h')
+    expect(opened[opened.length - 1]).toContain('tail=20000')
+  })
+
+  // A different window is a different read. The daemon cannot extend a stream
+  // backwards, so the buffer is replaced rather than prepended to, and a
+  // console still showing the old lines would be showing two windows at once.
+  it('replaces the buffer rather than adding to it', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() => stream.push(logLine('from the tail read', { taskID: 'task-1', slot: 1 })))
+    expect(screen.getByText('from the tail read')).toBeDefined()
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '6h' }))
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByText('from the tail read')).toBeNull()
+  })
+
+  // The buffer is far larger than the DOM can hold, and the gap is stated
+  // rather than hidden: a console silently drawing a fraction of what it has
+  // is a console that lies. Everything else — the filters, Copy, Export —
+  // still works on all of it.
+  it('draws a bounded number of rows and says how many it is holding', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    const many = Array.from({ length: 2500 }, (_, i) =>
+      logLine(`line ${i}`, { taskID: 'task-1', slot: 1 }),
+    )
+    await deliver(() => stream.pushAll(many))
+
+    const drawn = document.querySelectorAll('.console-line').length
+    // Bounded on both sides. "fewer than everything" is also true of a console
+    // that drew nothing, which is the failure this is between.
+    expect(drawn).toBeGreaterThan(100)
+    expect(drawn).toBeLessThan(2500)
+    expect(screen.getByText(/Showing the newest/)).toBeDefined()
+    // The newest, because a console is read from the bottom.
+    expect(screen.getByText('line 2499')).toBeDefined()
+    expect(screen.queryByText('line 0')).toBeNull()
+  })
+
+  // The cap is on the render and on nothing else. An operator who cannot scroll
+  // to a line must still be able to find it, or the buffer is decorative.
+  it('filters and exports the whole buffer and not only the drawn rows', async () => {
+    const written: string[] = []
+    vi.stubGlobal('navigator', {
+      ...navigator,
+      clipboard: { writeText: (t: string) => { written.push(t); return Promise.resolve() } },
+    })
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    const many = Array.from({ length: 2500 }, (_, i) =>
+      logLine(i === 0 ? 'the needle' : `line ${i}`, { taskID: 'task-1', slot: 1 }),
+    )
+    await deliver(() => stream.pushAll(many))
+
+    // Undrawn, and still on the clipboard.
+    expect(screen.queryByText('the needle')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }))
+    expect(written[0]).toContain('the needle')
+
+    // And reachable, which is what the banner tells the operator to do.
+    fireEvent.change(screen.getByPlaceholderText(/Grep logs/), { target: { value: 'needle' } })
+    expect(screen.getByText('the needle')).toBeDefined()
+  })
+})

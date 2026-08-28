@@ -3207,7 +3207,7 @@ func (r *Reconciler) Nodes(ctx context.Context) (application.NodesResponse, erro
 //
 // A backend with no reader behind it answers application.ErrUnsupported, which
 // the API reports as the same 501 a reconciler with no method at all gives.
-func (r *Reconciler) ServiceLogs(ctx context.Context, app, svc string, tail int, follow bool) (<-chan application.ServiceLogEvent, error) {
+func (r *Reconciler) ServiceLogs(ctx context.Context, app, svc string, req application.ServiceLogRequest) (<-chan application.ServiceLogEvent, error) {
 	view, ok := r.View(app)
 	if !ok {
 		return nil, fmt.Errorf("no such application '%s'", app)
@@ -3232,7 +3232,16 @@ func (r *Reconciler) ServiceLogs(ctx context.Context, app, svc string, tail int,
 	if !ok {
 		return nil, application.ErrUnsupported
 	}
-	return reader.ServiceLogs(ctx, capability.ServiceLogRequest{Service: name, Tail: tail, Follow: follow})
+	// Field by field rather than by conversion. The two structs happen to line
+	// up today and are owned by different layers, so a conversion would compile
+	// for exactly as long as that coincidence lasts and then start carrying a
+	// field neither side meant to share.
+	return reader.ServiceLogs(ctx, capability.ServiceLogRequest{
+		Service: name,
+		Tail:    req.Tail,
+		Since:   req.Since,
+		Follow:  req.Follow,
+	})
 }
 
 // declaredService reports whether the application's own status names svc, and

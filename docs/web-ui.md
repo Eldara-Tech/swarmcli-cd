@@ -96,6 +96,42 @@ script would arrive as a `200` that renders nothing — and `/assets/` itself is
 not browsable, since a directory listing would enumerate the whole build to a
 caller who has authenticated nothing.
 
+## The service log console
+
+On the Monitor screen, behind the **Service Container Logs** tab. It is offered
+only when `capabilities.logs` says the build can answer — a controller with no
+log streamer reports `false`, and a tab that reported `501` after being clicked
+would teach the operator that by wasting their time.
+
+Each row is a line number, the container's own timestamp, **which replica wrote
+it**, the stream tag and the message.
+
+The replica cell says the least it can honestly say. A replicated service's task
+shows as `.3`, the way `docker service ps` spells it. A **global** service's
+tasks have no slot at all, so they show the node's hostname instead; so does a
+task the controller could not name. Failing that there is the truncated task id.
+The full task id and the hostname are on the cell's hover, and each task keeps
+one colour for as long as the console is open — the colour is always a second
+cue, never the only one, so the row still reads in monochrome and in Export.
+
+**Scrollback** is four presets: the last 100 lines, or 15 minutes, an hour, or 6
+hours. Each sends a `since` *and* the tail that bounds it — see
+[api § choosing a window](api.md#choosing-a-window) for why one without the
+other is a control that does nothing. Changing the preset is a new read, not
+more of the current one: the daemon cannot extend a stream backwards, so the
+buffer is replaced rather than added to.
+
+The console holds up to 50,000 lines and **draws at most 2,000 of them**, the
+newest, saying so above the rows when it is holding more. That is a bound on the
+rendering and on nothing else — the search, the task filter, Copy and Export all
+work on everything held. An operator reading six hours of a service is looking
+for something, and the way to find it in twenty thousand lines was never to
+scroll.
+
+A line the controller wrote rather than the container — output dropped, a line
+truncated — is drawn as a `NOTICE` and is never hidden by the task filter, since
+it reports on the stream rather than on one replica.
+
 ## The security posture
 
 **The browser holds the admin token, and that token is root-equivalent on the

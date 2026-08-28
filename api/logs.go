@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
@@ -51,11 +52,29 @@ import (
 // up on its own, because the guard authorised the subject for `app` and for
 // nothing else.
 type LogStreamer interface {
-	ServiceLogs(ctx context.Context, app, svc string, tail int, follow bool) (<-chan application.ServiceLogEvent, error)
+	ServiceLogs(ctx context.Context, app, svc string, req application.ServiceLogRequest) (<-chan application.ServiceLogEvent, error)
 }
 
-// How much scrollback a newly attached client is given.
+// How much scrollback a newly attached client is given when it asks for none.
 const logTail = 100
+
+// maxLogTail bounds how much scrollback any client may ask for.
+//
+// Enforced here rather than behind the seam, for the reason maxLogStreams is:
+// the bound then covers every implementer of it, including a companion's. It is
+// the one number standing between a query string and an unbounded read of every
+// task's log file, and the console's widest preset is exactly this, so the UI
+// cannot ask for something the API refuses.
+const maxLogTail = 50_000
+
+// maxLogSince bounds how far back any client may ask to read.
+//
+// A companion to maxLogTail rather than a duplicate of it: the tail caps how
+// many lines cross the wire and this caps how much of each node's rotated log
+// set has to be walked to find them. Without it a `since` of a year asks every
+// node holding a task to read its whole retained history to answer with the
+// same capped number of lines.
+const maxLogSince = 24 * time.Hour
 
 // maxLogStreams bounds how many log streams this controller serves at once.
 //
@@ -102,6 +121,16 @@ func (s *Server) serviceLogs(w http.ResponseWriter, r *http.Request, _ authz.Sub
 		return
 	}
 
+	// Before the application is resolved, because a request this handler cannot
+	// read is a request, not an application — and because every answer below
+	// this point is written before the headers are, which is the discipline that
+	// lets a failure be a status code rather than the first frame of a 200.
+	req, err := parseLogRequest(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// The guard authorised this subject for `app`. It did not authorise them
 	// for `svc`, and nothing downstream re-derives the link — so without this,
 	// a subject an authorizer scoped to one application could read the logs of
@@ -143,7 +172,7 @@ func (s *Server) serviceLogs(w http.ResponseWriter, r *http.Request, _ authz.Sub
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	events, err := streamer.ServiceLogs(ctx, app, svc, logTail, true)
+	events, err := streamer.ServiceLogs(ctx, app, svc, req)
 	switch {
 	case errors.Is(err, application.ErrUnsupported):
 		// The same answer, and deliberately the same sentence, as a reconciler
@@ -222,6 +251,58 @@ func (s *Server) serviceLogs(w http.ResponseWriter, r *http.Request, _ authz.Sub
 			}
 		}
 	}
+}
+
+// parseLogRequest reads the window a client asked for out of the query string.
+//
+// # Why `since` is a duration and not an instant
+//
+// The obvious spelling is an RFC3339 timestamp, and it is the wrong one. The
+// browser would have to compute it, from a clock that is not the controller's
+// and certainly not the swarm's; a laptop a few minutes fast would silently ask
+// for a window that has not happened yet and be answered with nothing. A
+// duration is resolved here, against the clock the daemon call is about to be
+// made from, so the only clock involved is the one closest to the log.
+//
+// # Why `tail` is not optional once `since` is given
+//
+// The daemon selects the last `tail` lines *before* it drops the ones older than
+// `since` — see the reader in daemon/logger/loggerutils, and docs/design. So a
+// `since` of an hour with the default tail of 100 answers with the same 100
+// lines the console already had, and the operator sees a control that does
+// nothing rather than an error. Requiring the pair is the only way to make that
+// unrepresentable, so a `since` without a `tail` is refused here rather than
+// served as a disappointment.
+func parseLogRequest(r *http.Request) (application.ServiceLogRequest, error) {
+	q := r.URL.Query()
+	req := application.ServiceLogRequest{Tail: logTail, Follow: true}
+
+	if raw := q.Get("tail"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return application.ServiceLogRequest{}, errors.New("tail must be a positive whole number of lines")
+		}
+		if n > maxLogTail {
+			return application.ServiceLogRequest{}, fmt.Errorf("tail must be at most %d lines", maxLogTail)
+		}
+		req.Tail = n
+	}
+
+	if raw := q.Get("since"); raw != "" {
+		if q.Get("tail") == "" {
+			return application.ServiceLogRequest{}, errors.New("since must be given with a tail, because the tail is applied first and would bound the window to its own size")
+		}
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return application.ServiceLogRequest{}, errors.New("since must be a positive duration such as 15m or 6h")
+		}
+		if d > maxLogSince {
+			return application.ServiceLogRequest{}, fmt.Errorf("since must be at most %s", maxLogSince)
+		}
+		req.Since = time.Now().Add(-d)
+	}
+
+	return req, nil
 }
 
 // mayStillRead reports whether the credential on the request still authorises

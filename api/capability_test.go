@@ -20,7 +20,7 @@ func (*bothSeams) Nodes(context.Context) (application.NodesResponse, error) {
 	return application.NodesResponse{}, nil
 }
 
-func (*bothSeams) ServiceLogs(context.Context, string, string, int, bool) (<-chan application.ServiceLogEvent, error) {
+func (*bothSeams) ServiceLogs(context.Context, string, string, application.ServiceLogRequest) (<-chan application.ServiceLogEvent, error) {
 	return nil, nil
 }
 

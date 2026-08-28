@@ -119,11 +119,59 @@ type NodesResponse struct {
 	Nodes []SwarmNode `json:"nodes"`
 }
 
+// ServiceLogRequest names one read of one service's container output.
+//
+// It lives here rather than in api, for the reason the two sentinel errors do:
+// api declares the Reconciler interface precisely so that something other than
+// the OSS applier can serve these endpoints, and a request type declared there
+// would make the reconciler import the HTTP layer to satisfy it.
+//
+// A struct rather than a parameter list, and the change from one to the other
+// is deliberate rather than incidental to the feature that needed it. The seam
+// it crosses grew once already, when the byte stream became a channel of
+// events; growing a parameter list makes every subsequent field a breaking
+// change on an exported interface of a released v1 module. Nothing outside this
+// module implements that interface, here or in the private companion, which is
+// the only window in which the shape can be fixed at all.
+type ServiceLogRequest struct {
+	// Tail is how much scrollback a newly attached client is given.
+	Tail int
+	// Since bounds how far back that scrollback may reach. The zero time means
+	// no bound.
+	//
+	// It does not stand alone. The daemon selects the last Tail lines first and
+	// only then drops the ones older than Since, so a Since with a small Tail
+	// returns that small Tail and the window looks broken rather than narrow.
+	// The two are one intent, and the API refuses one without the other rather
+	// than serving a control that does nothing.
+	Since time.Time
+	// Follow keeps the stream open for new lines.
+	Follow bool
+}
+
 // ServiceLogEvent is one framed log line emitted over SSE.
 type ServiceLogEvent struct {
-	Service   string    `json:"service"`
-	TaskID    string    `json:"taskID,omitempty"`
-	NodeID    string    `json:"nodeID,omitempty"`
+	Service string `json:"service"`
+	TaskID  string `json:"taskID,omitempty"`
+	NodeID  string `json:"nodeID,omitempty"`
+	// NodeHostname is what an operator calls the node TaskID ran on.
+	//
+	// Resolved by the reader rather than by the client, because the roster it
+	// comes from is served under a different authorisation action than the log
+	// stream is — a subject granted logs may be refused nodes — and behind its
+	// own capability key. A console that fetched it would have to render a
+	// label for four states it cannot control; this way there are two, and the
+	// second is the id the line already carries.
+	NodeHostname string `json:"nodeHostname,omitempty"`
+	// Slot is the replica number the swarm gave TaskID, as `docker service ps`
+	// spells it.
+	//
+	// Zero means the reader could not name it, which covers two different
+	// things on purpose: a global-mode service, whose tasks have no slot at all
+	// — the daemon itself treats slot 0 as the global case — and a task started
+	// after the reader built its map. Both render as the node rather than as a
+	// slot, so neither is drawn as replica zero, which does not exist.
+	Slot      int       `json:"slot,omitempty"`
 	Stream    string    `json:"stream"` // "stdout" or "stderr"
 	Message   string    `json:"message"`
 	Timestamp time.Time `json:"timestamp"`

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,20 +42,19 @@ type logStreamer struct {
 	err    error
 	hold   bool
 
-	mu       sync.Mutex
-	gotApp   string
-	gotSvc   string
-	gotTail  int
-	gotFollw bool
-	opened   int
+	mu     sync.Mutex
+	gotApp string
+	gotSvc string
+	gotReq application.ServiceLogRequest
+	opened int
 	// ended is closed when the producer notices its context was cancelled, so
 	// a test can assert the seam was actually stopped rather than sleeping.
 	ended chan struct{}
 }
 
-func (l *logStreamer) ServiceLogs(ctx context.Context, app, svc string, tail int, follow bool) (<-chan application.ServiceLogEvent, error) {
+func (l *logStreamer) ServiceLogs(ctx context.Context, app, svc string, req application.ServiceLogRequest) (<-chan application.ServiceLogEvent, error) {
 	l.mu.Lock()
-	l.gotApp, l.gotSvc, l.gotTail, l.gotFollw = app, svc, tail, follow
+	l.gotApp, l.gotSvc, l.gotReq = app, svc, req
 	l.opened++
 	if l.ended == nil {
 		l.ended = make(chan struct{})
@@ -85,10 +85,10 @@ func (l *logStreamer) ServiceLogs(ctx context.Context, app, svc string, tail int
 	return ch, nil
 }
 
-func (l *logStreamer) asked() (app, svc string, tail int, follow bool) {
+func (l *logStreamer) asked() (app, svc string, req application.ServiceLogRequest) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.gotApp, l.gotSvc, l.gotTail, l.gotFollw
+	return l.gotApp, l.gotSvc, l.gotReq
 }
 
 // line is one log event as a test writes it, so the fixtures read as lines.
@@ -163,7 +163,7 @@ func TestLogsRefuseAServiceTheApplicationDoesNotDeclare(t *testing.T) {
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rr.Code)
 	}
-	if app, svc, _, _ := rec.asked(); app != "" || svc != "" {
+	if app, svc, _ := rec.asked(); app != "" || svc != "" {
 		t.Errorf("the streamer was asked for (%q, %q) for a service the application does not declare", app, svc)
 	}
 }
@@ -266,8 +266,8 @@ func TestLogsStreamOneFramePerEvent(t *testing.T) {
 	if buffering := rr.Header().Get("X-Accel-Buffering"); buffering != "no" {
 		t.Errorf("X-Accel-Buffering = %q, want no", buffering)
 	}
-	if app, svc, tail, follow := rec.asked(); app != "edge" || svc != "edge-web" || tail != logTail || !follow {
-		t.Errorf("streamer asked for (%q,%q,%d,%v)", app, svc, tail, follow)
+	if app, svc, req := rec.asked(); app != "edge" || svc != "edge-web" || req.Tail != logTail || !req.Follow || !req.Since.IsZero() {
+		t.Errorf("streamer asked for (%q,%q,%+v)", app, svc, req)
 	}
 
 	got := logEvents(t, rr.Body.String())
@@ -473,3 +473,142 @@ func (r *revocable) Visible(_ context.Context, _ authz.Subject, _ authz.Action, 
 }
 
 func (r *revocable) revoke() { r.gone.Store(true) }
+
+// ---------------------------------------------------------------------------
+// #267 — the window a client asks for
+// ---------------------------------------------------------------------------
+
+const logsPath = "/api/v1/applications/edge/services/edge-web/logs"
+
+// A window is two query parameters because it is two daemon options, and the
+// handler resolves the duration against its own clock rather than taking an
+// instant from the browser's.
+func TestAWindowIsResolvedAgainstTheControllersClock(t *testing.T) {
+	rec := &logStreamer{fakeReconciler: fakeReconciler{views: []application.View{viewWithService("edge", "edge-web")}}}
+	_, h := testServer(t, rec, nil)
+
+	before := time.Now()
+	rr := do(t, h, "GET", logsPath+"?since=15m&tail=5000")
+	after := time.Now()
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	_, _, req := rec.asked()
+	if req.Tail != 5000 {
+		t.Errorf("tail = %d, want 5000", req.Tail)
+	}
+	// Between the two readings taken around the call, less the duration asked
+	// for. Asserted as a range because the only alternative is to freeze the
+	// clock, and the property under test is precisely that the clock is this
+	// process's own.
+	if req.Since.Before(before.Add(-15*time.Minute)) || req.Since.After(after.Add(-15*time.Minute)) {
+		t.Errorf("since = %v, want 15 minutes before now", req.Since)
+	}
+}
+
+// The daemon applies the tail first and drops what is older than since
+// afterwards, so a since with the default tail of a hundred lines answers with
+// a hundred lines. Serving that would be a control that appears to do nothing,
+// which is worse than an error, so the pair is required rather than defaulted.
+func TestASinceWithoutATailIsRefusedRatherThanServed(t *testing.T) {
+	rec := &logStreamer{fakeReconciler: fakeReconciler{views: []application.View{viewWithService("edge", "edge-web")}}}
+	_, h := testServer(t, rec, nil)
+
+	rr := do(t, h, "GET", logsPath+"?since=6h")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	if rec.opened != 0 {
+		t.Error("the seam was opened for a window the daemon would have ignored")
+	}
+}
+
+// Refused rather than silently clamped. A client handed the last fifty thousand
+// lines when it asked for a million has been answered with something other than
+// what it asked for, with nothing in the response to say so — and on this
+// endpoint the difference is how much of every node's log file gets walked.
+func TestATailBeyondTheBoundIsRefusedRatherThanClamped(t *testing.T) {
+	rec := &logStreamer{fakeReconciler: fakeReconciler{views: []application.View{viewWithService("edge", "edge-web")}}}
+	_, h := testServer(t, rec, nil)
+
+	rr := do(t, h, "GET", logsPath+"?tail=1000000")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	if rec.opened != 0 {
+		t.Error("the seam was opened for a tail past the bound")
+	}
+	if _, _, req := rec.asked(); req.Tail != 0 {
+		t.Errorf("the streamer was asked for a tail of %d", req.Tail)
+	}
+}
+
+// The bound itself is servable. A test that only proves the refusal would pass
+// on a handler that refused everything.
+func TestATailAtTheBoundIsServed(t *testing.T) {
+	rec := &logStreamer{fakeReconciler: fakeReconciler{views: []application.View{viewWithService("edge", "edge-web")}}}
+	_, h := testServer(t, rec, nil)
+
+	rr := do(t, h, "GET", logsPath+"?tail="+strconv.Itoa(maxLogTail))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if _, _, req := rec.asked(); req.Tail != maxLogTail {
+		t.Errorf("tail = %d, want %d", req.Tail, maxLogTail)
+	}
+}
+
+// Every one of these is a 400 before a header is written, which is the whole
+// reason this handler resolves the request before it resolves the application:
+// a client already told "200, text/event-stream" cannot be told afterwards that
+// its query was unreadable.
+func TestAnUnreadableWindowIsAStatusAndNotAFrame(t *testing.T) {
+	for _, q := range []string{
+		"?tail=lots",
+		"?tail=0",
+		"?tail=-5",
+		"?since=yesterday&tail=100",
+		"?since=0s&tail=100",
+		"?since=-1h&tail=100",
+		"?since=8760h&tail=100",
+	} {
+		t.Run(q, func(t *testing.T) {
+			rec := &logStreamer{fakeReconciler: fakeReconciler{views: []application.View{viewWithService("edge", "edge-web")}}}
+			_, h := testServer(t, rec, nil)
+
+			rr := do(t, h, "GET", logsPath+q)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rr.Code)
+			}
+			if ct := rr.Header().Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
+				t.Errorf("a bad request was answered as a stream: content-type %q", ct)
+			}
+			if rec.opened != 0 {
+				t.Error("the seam was opened for a request the handler could not read")
+			}
+		})
+	}
+}
+
+// The window is optional and its absence is not a default that changed. Every
+// client written before there was one asks with no query at all and must get
+// exactly what it got before.
+func TestNoQueryAsksForExactlyWhatItAlwaysDid(t *testing.T) {
+	rec := &logStreamer{fakeReconciler: fakeReconciler{views: []application.View{viewWithService("edge", "edge-web")}}}
+	_, h := testServer(t, rec, nil)
+
+	if rr := do(t, h, "GET", logsPath); rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+
+	_, _, req := rec.asked()
+	want := application.ServiceLogRequest{Tail: logTail, Follow: true}
+	if req != want {
+		t.Errorf("streamer asked for %+v, want %+v", req, want)
+	}
+}

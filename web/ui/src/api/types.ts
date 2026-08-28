@@ -393,6 +393,26 @@ export interface ServiceLogEvent {
   service: string
   taskID?: string
   nodeID?: string
+  /**
+   * What an operator calls the node this line came from.
+   *
+   * Resolved by the controller rather than by this client. /api/v1/nodes has
+   * the same mapping, but it is served under a different authorisation action
+   * than the log stream and behind its own capability key — a subject granted
+   * logs can be refused it — so a console that fetched it would have to draw a
+   * label for four states it does not control. Absent means the controller
+   * could not name the node, and `nodeID` is what is left.
+   */
+  nodeHostname?: string
+  /**
+   * The replica number swarm gave this line's task, as `docker service ps`
+   * spells it.
+   *
+   * Absent means it has none to give, which covers a global-mode service and a
+   * task that started after the stream opened. Both are drawn as the node
+   * rather than as replica zero, which is not a replica.
+   */
+  slot?: number
   stream: 'stdout' | 'stderr'
   message: string
   timestamp: Timestamp

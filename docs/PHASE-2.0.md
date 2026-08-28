@@ -47,7 +47,7 @@ Added two new fine-grained permission verbs:
 - **Guarded Action:** `ActionLogs`
 - **Protocol:** Server-Sent Events (`text/event-stream; charset=utf-8`)
 - **Interface:** `LogStreamer` seam
-  (`ServiceLogs(ctx, app, svc, tail, follow) (<-chan application.ServiceLogEvent, error)`)
+  (`ServiceLogs(ctx, app, svc, application.ServiceLogRequest) (<-chan application.ServiceLogEvent, error)`)
 - **Implemented (#261).** `*reconcile.Reconciler` satisfies `LogStreamer`, resolving the
   *application's own* destination through the `swarms` seam — unlike the node roster, which
   asks the swarm this controller runs in — and reading behind `capability.ServiceLogReader`.
@@ -92,12 +92,28 @@ Added two new fine-grained permission verbs:
   in the stream with `notice: true`, carrying `stream: "stderr"` so the console's filter does
   not hide them from the operator looking for trouble, and rendered with their own label so
   nobody reads them as container output.
+- **The window is two parameters and they travel together (#267).** `?tail=` and `?since=`,
+  and `since` without `tail` is a **400**. The daemon selects the last `tail` lines *first*
+  and only then drops the ones older than `since`, so a lone `since` asks for six hours and is
+  answered with a hundred lines — a control that silently does nothing. `tail` is capped at
+  50,000 and `since` at 24 hours, both **refused** rather than clamped. There is no `until`:
+  the daemon's swarm log route does not read one, only the container route does.
+- **The replica and the node are named, not just identified (#266).** `ServiceLogEvent` also
+  carries `nodeHostname` and `slot`, resolved by the reader from a `TaskList` filtered to the
+  service and an unfiltered `NodeList` — two lookups filling two maps, so one failing costs
+  one label rather than both, and neither ever costs the line. `slot` is absent for a
+  global-mode service, whose tasks have no slot at all; the console falls back
+  `slot` → `nodeHostname` → truncated `taskID`. An unseen task id re-reads the task listing at
+  most once per 30 seconds, because a rollout starts tasks after the stream opened and that is
+  when an operator is watching.
 - **Event Wire Format:**
   ```json
   {
     "service": "whoami_web",
     "taskID": "qz4k2h8x1n0p",
     "nodeID": "8t3v1m9c7b2d",
+    "nodeHostname": "swarm-w1",
+    "slot": 3,
     "stream": "stdout",
     "message": "Starting server on :80",
     "timestamp": "2026-08-27T14:35:08.922Z"
