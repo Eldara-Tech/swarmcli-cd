@@ -2074,19 +2074,49 @@ func TestTheSeamIsWhatHandlerReads(t *testing.T) {
 	}
 }
 
-func TestNodesEndpoint(t *testing.T) {
+// This test used to require a node in the response from a reconciler that
+// implements no NodeLister — so what it actually asserted was that the handler
+// invented one, and it would have failed the moment the fabrication was
+// removed. A build that cannot see the swarm says so.
+func TestNodesWithoutAListerSaysSoRatherThanInventingOne(t *testing.T) {
 	_, h := testServer(t, &fakeReconciler{}, nil)
 	rr := do(t, h, "GET", "/api/v1/nodes")
+
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("GET /api/v1/nodes = %d, want 501", rr.Code)
+	}
+	for _, invented := range []string{"swarm-manager-01", "local-manager-01", "27.5.1", "127.0.0.1"} {
+		if strings.Contains(rr.Body.String(), invented) {
+			t.Errorf("the response still names %q, which no swarm reported", invented)
+		}
+	}
+}
+
+func TestNodesServesWhatTheListerReports(t *testing.T) {
+	want := application.NodesResponse{
+		Swarm: "prod",
+		Nodes: []application.SwarmNode{{ID: "abc", Hostname: "mgr-1", Role: "manager", Status: "ready"}},
+	}
+	_, h := testServer(t, &nodeLister{fakeReconciler: fakeReconciler{}, resp: want}, nil)
+	rr := do(t, h, "GET", "/api/v1/nodes")
+
 	if rr.Code != http.StatusOK {
 		t.Fatalf("GET /api/v1/nodes = %d, want 200", rr.Code)
 	}
-	resp := decode[application.NodesResponse](t, rr)
-	if len(resp.Nodes) == 0 {
-		t.Fatalf("expected at least one node in response, got %v", resp)
+	got := decode[application.NodesResponse](t, rr)
+	if got.Swarm != want.Swarm || len(got.Nodes) != 1 || got.Nodes[0].Hostname != "mgr-1" {
+		t.Errorf("nodes = %+v, want %+v", got, want)
 	}
-	if resp.Nodes[0].Role != "manager" {
-		t.Errorf("expected manager node, got %s", resp.Nodes[0].Role)
-	}
+}
+
+type nodeLister struct {
+	fakeReconciler
+	resp application.NodesResponse
+	err  error
+}
+
+func (n *nodeLister) Nodes(context.Context) (application.NodesResponse, error) {
+	return n.resp, n.err
 }
 
 func TestDiagnosticsEndpoint(t *testing.T) {

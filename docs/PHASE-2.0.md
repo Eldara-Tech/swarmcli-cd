@@ -47,6 +47,18 @@ Added two new fine-grained permission verbs:
 - **Guarded Action:** `ActionLogs`
 - **Protocol:** Server-Sent Events (`text/event-stream; charset=utf-8`)
 - **Interface:** `LogStreamer` seam (`ServiceLogs(ctx, app, svc, tail, follow) (io.ReadCloser, error)`)
+- **Unimplemented in this repository.** No reconciler here satisfies `LogStreamer`, so an
+  open-source build answers **501** and the console says the controller does not stream logs.
+  It must not answer anything else: the first version of this endpoint emitted a synthetic
+  line every three seconds — `service X task healthy - 0 active errors` — as container output,
+  which is a health claim about a service nothing had contacted.
+- **Authorisation is per application, and `{svc}` is not a second grant.** The guard authorises
+  the subject for `{app}`; the handler then resolves `{svc}` against that application's own
+  reported services and answers 404 otherwise, so a subject scoped to one application cannot
+  name a service belonging to another. An implementer must not look `svc` up swarm-wide.
+- **What an implementer owes:** one already-demultiplexed log line per line, no 8-byte Docker
+  frame header, an optional `stderr\t` prefix where the stream is known, and Docker's RFC3339
+  timestamp at the head of the line where `--timestamps` was requested.
 - **Event Wire Format:**
   ```json
   {
@@ -60,7 +72,14 @@ Added two new fine-grained permission verbs:
 #### 2. Swarm Node Health Roster (`api/nodes.go`)
 - **Route:** `GET /api/v1/nodes`
 - **Guarded Action:** `ActionNodes`
-- **Interface:** `NodeLister` seam (`Nodes(ctx) ([]SwarmNode, error)`)
+- **Interface:** `NodeLister` seam (`Nodes(ctx) (application.NodesResponse, error)`)
+- **Unimplemented in this repository.** No reconciler here satisfies `NodeLister`, so an
+  open-source build answers **501** and the Diagnostics matrix says so. The example below is
+  the *shape* a response takes, not something this build produces — the first version returned
+  exactly that object as a literal, and the console drew a manager called `swarm-manager-01`
+  at `127.0.0.1` running engine `27.5.1` on every deployment that had never been asked about.
+  501 rather than an empty list, because a swarm with no nodes is not a thing and a UI cannot
+  tell an empty roster from one it failed to read.
 - **Payload Wire Format:**
   ```json
   {
@@ -100,6 +119,8 @@ Added two new fine-grained permission verbs:
 - **Unified Header Toolbar:** Embedded Application & Service selectors with pulsing `LIVE` / `PAUSED` stream badge.
 - **High-Performance Log Viewer:**
   - Tabular column alignment: Line numbers (`001`, `002`) → Gutter timestamps → `STDOUT`/`STDERR` chips → Log messages.
+  - Line numbers count the buffer, not the filtered view, so grepping does not renumber the log.
+  - Pause holds the view; it does not drop the connection or empty the buffer.
   - Regex and text grep filter with live match count.
   - Stream level filters (`All`, `Stdout`, `Stderr`).
   - Pause / Resume toggle and Clear buffer action.
@@ -110,7 +131,8 @@ Added two new fine-grained permission verbs:
 ### 3.2 Diagnostics 2.0 (`web/ui/src/screens/Diagnostics.tsx`)
 - **Integrity Gauge:** Dynamic SVG score ring with status tone.
 - **Audit Checklist:** Operational verification matrix with pass/warn chips.
-- **Swarm Node Matrix:** Pro node cards displaying server icons, live status dots (`● READY`), 4-column metric grids (Engine version, IP address, Availability, and Tasks Allocated with visual progress tracks).
+- **Swarm Node Matrix:** Pro node cards displaying server icons, live status dots (`● READY`), 4-column metric grids (Engine version, IP address, Availability, and Tasks Allocated with visual progress tracks). The task gauge is an `<svg>` rect rather than a styled `<div>`: a data-driven width is an inline `style` attribute, which `style-src 'self'` refuses — the same constraint the integrity ring beside it is drawn under.
+- **Three states, not one.** A build with no `NodeLister` (501), a roster that could not be read, and a swarm reporting no nodes are drawn differently; none of them is an empty grid.
 
 ### 3.3 Application Detail & Release Polish (`web/ui/src/screens/ApplicationDetail.tsx`)
 - **Balanced Spec Bento Grid:** Equal-height layout for `GitOps Specification` and `Swarm Runtime & Reconcile` with drift state indicator.

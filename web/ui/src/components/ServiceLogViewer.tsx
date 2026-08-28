@@ -7,6 +7,22 @@ import { authorized } from '../api/client'
 import type { ServiceLogEvent } from '../api/types'
 import { Icon } from './Icon'
 
+/** What the stream is doing, which the footer reports rather than assuming. */
+type StreamStatus = 'connecting' | 'live' | 'ended' | 'failed' | 'unsupported'
+
+/** How many lines the buffer keeps. A console left open overnight is bounded. */
+const logBufferLimit = 1000
+
+/** What the stream badge and the footer say, per state. */
+const badge: Record<StreamStatus | 'paused', { dot: string; text: string }> = {
+  connecting: { dot: 'pulse-warn', text: 'CONNECTING' },
+  live: { dot: 'pulse-ok', text: 'LIVE' },
+  paused: { dot: 'pulse-warn', text: 'PAUSED' },
+  ended: { dot: 'pulse-warn', text: 'ENDED' },
+  failed: { dot: 'pulse-bad', text: 'FAILED' },
+  unsupported: { dot: 'pulse-warn', text: 'UNSUPPORTED' },
+}
+
 interface ServiceLogViewerProps {
   app: string
   service: string
@@ -28,11 +44,27 @@ export function ServiceLogViewer({
   const [isPaused, setIsPaused] = useState(false)
   const [autoScroll, setAutoScroll] = useState(true)
   const [copied, setCopied] = useState(false)
+  const [status, setStatus] = useState<StreamStatus>('connecting')
+  const [error, setError] = useState('')
   const terminalBodyRef = useRef<HTMLDivElement>(null)
+  // Read by the stream reader, which must not re-subscribe when it changes.
+  const pausedRef = useRef(false)
+  useEffect(() => {
+    pausedRef.current = isPaused
+  }, [isPaused])
 
-  // Live SSE stream fetch
+  /**
+   * The stream, opened once per app/service.
+   *
+   * `isPaused` is deliberately NOT a dependency. It was, and the effect body
+   * begins by emptying the buffer — so pressing Pause dropped the connection
+   * and wiped the scrollback, and pressing Resume wiped it again. Pause holds
+   * the view; it does not restart the stream. The ref is what lets the reader
+   * see the current value without the effect re-running.
+   */
   useEffect(() => {
     setLogs([])
+    setStatus('connecting')
     if (!app || !service) return
 
     const controller = new AbortController()
@@ -40,59 +72,68 @@ export function ServiceLogViewer({
 
     async function startStream() {
       try {
-        const response = await authorized(url, { signal: controller.signal })
+        const response = await authorized(url, {
+          signal: controller.signal,
+          headers: { Accept: 'text/event-stream' },
+        })
         if (!response.ok || !response.body) {
-          setLogs([
-            {
-              service,
-              stream: 'stderr',
-              message: `Failed to connect to service logs (${response.status})`,
-              timestamp: new Date().toISOString(),
-            },
-          ])
+          // 501 is the ordinary state of an open-source build: the controller
+          // has no log streamer wired. It is not an error to report in red, and
+          // it is certainly not something to fill with invented lines.
+          setStatus(response.status === 501 ? 'unsupported' : 'failed')
+          setError(
+            response.status === 501
+              ? 'This controller does not stream service logs.'
+              : response.status === 404
+                ? 'This application does not report a service by that name.'
+                : `The controller answered ${response.status}.`,
+          )
           return
         }
 
+        setStatus('live')
         const reader = response.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
 
-        while (true) {
+        for (;;) {
           const { done, value } = await reader.read()
           if (done) break
 
           buffer += decoder.decode(value, { stream: true })
-          const lines = buffer.split('\n\n')
-          buffer = lines.pop() ?? ''
+          const blocks = buffer.split('\n\n')
+          buffer = blocks.pop() ?? ''
 
-          for (const block of lines) {
-            for (const line of block.split('\n')) {
-              if (line.startsWith('data: ')) {
-                try {
-                  const event = JSON.parse(line.slice(6)) as ServiceLogEvent
-                  setLogs((prev) => {
-                    if (isPaused) return prev
-                    const next = [...prev, event]
-                    return next.length > 1000 ? next.slice(next.length - 1000) : next
-                  })
-                } catch {
-                  // Ignore corrupted frames
-                }
+          for (const block of blocks) {
+            for (const raw of block.split('\n')) {
+              // A proxy that rewrites line endings leaves a \r on every value,
+              // including inside the JSON. api/events.ts strips it for the same
+              // reason and this parser has the same problem.
+              const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+              if (!line.startsWith('data: ')) continue
+              try {
+                const event = JSON.parse(line.slice(6)) as ServiceLogEvent
+                if (pausedRef.current) continue
+                setLogs((prev) => {
+                  const next = [...prev, event]
+                  return next.length > logBufferLimit ? next.slice(next.length - logBufferLimit) : next
+                })
+              } catch {
+                // One frame this build cannot parse is one line lost.
               }
             }
           }
         }
+        // The server closed. Said rather than swallowed: the loop used to exit
+        // here and leave a console that looked live and received nothing.
+        if (!controller.signal.aborted) {
+          setStatus('ended')
+          setError('The controller closed the log stream.')
+        }
       } catch (err) {
         if (!controller.signal.aborted) {
-          setLogs((prev) => [
-            ...prev,
-            {
-              service,
-              stream: 'stderr',
-              message: `Stream disconnected: ${err instanceof Error ? err.message : String(err)}`,
-              timestamp: new Date().toISOString(),
-            },
-          ])
+          setStatus('failed')
+          setError(err instanceof Error ? err.message : String(err))
         }
       }
     }
@@ -101,7 +142,7 @@ export function ServiceLogViewer({
     return () => {
       controller.abort()
     }
-  }, [app, service, isPaused])
+  }, [app, service])
 
   // Autoscroll to bottom
   useEffect(() => {
@@ -117,11 +158,6 @@ export function ServiceLogViewer({
     setAutoScroll(atBottom)
   }
 
-  // Clean log message by stripping duplicated timestamp prefixes
-  const sanitizeMessage = (msg: string) => {
-    return msg.replace(/^\[\d{4}-\d{2}-\d{2}T[^\]]+\]\s*/, '').replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '')
-  }
-
   const filteredLogs = useMemo(() => {
     return logs.filter((log) => {
       if (streamFilter !== 'all' && log.stream !== streamFilter) return false
@@ -132,7 +168,7 @@ export function ServiceLogViewer({
 
   const copyLogs = () => {
     const text = filteredLogs
-      .map((l) => `[${l.timestamp.slice(11, 19)}] [${l.stream.toUpperCase()}] ${sanitizeMessage(l.message)}`)
+      .map((l) => `[${l.timestamp.slice(11, 19)}] [${l.stream.toUpperCase()}] ${l.message}`)
       .join('\n')
     void navigator.clipboard.writeText(text)
     setCopied(true)
@@ -141,7 +177,7 @@ export function ServiceLogViewer({
 
   const exportLogs = () => {
     const text = filteredLogs
-      .map((l) => `[${l.timestamp.slice(11, 19)}] [${l.stream.toUpperCase()}] ${sanitizeMessage(l.message)}`)
+      .map((l) => `[${l.timestamp.slice(11, 19)}] [${l.stream.toUpperCase()}] ${l.message}`)
       .join('\n')
     const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -149,11 +185,12 @@ export function ServiceLogViewer({
     a.href = url
     a.download = `${app}_${service}_logs.txt`
     a.click()
-    URL.revokeObjectURL(url)
+    // Not in this tick: some browsers have not started the download yet, and
+    // revoking underneath it cancels the file.
+    setTimeout(() => URL.revokeObjectURL(url), 0)
   }
 
-  const currentAppObj = apps.find((a) => a.name === app)
-  const availableServices = currentAppObj?.services ?? (app ? [`${app}_web`] : [])
+  const availableServices = apps.find((a) => a.name === app)?.services ?? []
 
   return (
     <div className="terminal-console">
@@ -191,8 +228,8 @@ export function ServiceLogViewer({
           </div>
 
           <div className="stream-badge-wrap">
-            <span className={`pulse-dot ${isPaused ? 'pulse-warn' : 'pulse-ok'}`} />
-            <span className="stream-badge-text">{isPaused ? 'PAUSED' : 'LIVE'}</span>
+            <span className={`pulse-dot ${badge[isPaused ? 'paused' : status].dot}`} />
+            <span className="stream-badge-text">{badge[isPaused ? 'paused' : status].text}</span>
           </div>
         </div>
 
@@ -281,21 +318,25 @@ export function ServiceLogViewer({
           <div className="terminal-empty-state">
             <Icon name="activity" size={24} />
             <p>
-              {logs.length === 0
-                ? `Connecting to container stream for ${app}/${service}...`
-                : 'No lines match active filter.'}
+              {logs.length > 0
+                ? 'No lines match active filter.'
+                : status === 'connecting'
+                  ? `Connecting to container stream for ${app}/${service}…`
+                  : status === 'live'
+                    ? `Attached to ${app}/${service}. No output yet.`
+                    : error}
             </p>
           </div>
         ) : (
-          filteredLogs.map((log, idx) => (
+          filteredLogs.map((log) => (
             <div
-              key={`${log.timestamp}-${idx}`}
+              key={`${log.timestamp}-${logs.indexOf(log)}`}
               className={`console-line ${log.stream === 'stderr' ? 'line-stderr' : 'line-stdout'}`}
             >
-              <span className="line-num">{String(idx + 1).padStart(3, '0')}</span>
+              <span className="line-num">{String(logs.indexOf(log) + 1).padStart(3, '0')}</span>
               <span className="line-time">{log.timestamp.slice(11, 19)}</span>
               <span className={`line-tag line-tag-${log.stream}`}>{log.stream.toUpperCase()}</span>
-              <span className="line-content">{sanitizeMessage(log.message)}</span>
+              <span className="line-content">{log.message}</span>
             </div>
           ))
         )}
@@ -333,7 +374,7 @@ export function ServiceLogViewer({
           </span>
         </div>
         <div className="footer-feed">
-          <span className="live-status-text">SSE 2.0 PROTOCOL</span>
+          <span className="live-status-text">{badge[isPaused ? 'paused' : status].text}</span>
         </div>
       </div>
     </div>

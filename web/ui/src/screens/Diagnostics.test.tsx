@@ -152,4 +152,26 @@ describe('the diagnostics screen', () => {
     expect(screen.queryByText('Nominal')).toBeNull()
     expect(screen.getByText('Attention Needed')).toBeDefined()
   })
+
+  it('says the build does not report nodes rather than drawing an empty matrix', async () => {
+    // /nodes answered 200 with one invented manager — swarm-manager-01 at
+    // 127.0.0.1 on engine 27.5.1 — whenever the reconciler had no node lister,
+    // which is every build. It now answers 501, and this is what that looks like.
+    controller({
+      ...communityDiscovery(),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [row('edge', 'synced', 'healthy')] }),
+      '/api/v1/diagnostics': () =>
+        json(200, { score: 100, tone: 'ok', clearCount: 4, totalCount: 4, risks: [], checks: [] }),
+      '/api/v1/nodes': () => json(501, { error: 'this controller does not report swarm node telemetry' }),
+      '/api/v1/events': openStream,
+    })
+    await openDiagnostics()
+
+    expect(screen.getByText(/does not report swarm node telemetry/)).toBeDefined()
+    expect(screen.getByText('unavailable')).toBeDefined()
+    for (const invented of ['swarm-manager-01', '27.5.1', '127.0.0.1']) {
+      expect(screen.queryByText(invented)).toBeNull()
+    }
+  })
 })

@@ -8,7 +8,7 @@ import { App, queryClient } from '../App'
 import { logLimit } from '../api/useEventStream'
 import type { View } from '../api/types'
 import { setToken } from '../auth/session'
-import { clone, communityDiscovery, controller, json, pushStream } from '../test/fakeApi'
+import { clone, communityDiscovery, controller, json, openStream, pushLogStream, pushStream } from '../test/fakeApi'
 import viewFull from '../test/fixtures/view-full.json'
 
 const okStatus = {
@@ -16,14 +16,29 @@ const okStatus = {
   applications: 1,
 }
 
-function edgeRow(): View {
+/** The list row, optionally declaring services the log console can offer. */
+function edgeRow(...services: string[]): View {
   const view = clone(viewFull) as unknown as View
   view.spec.name = 'edge'
   view.status.sync.state = 'synced'
   view.status.health.state = 'healthy'
-  delete view.status.releases
   delete view.status.drift
   delete view.status.error
+  if (services.length === 0) delete view.status.releases
+  else {
+    view.status.releases = [
+      {
+        name: 'rel',
+        chart: 'c',
+        version: '1',
+        revision: 1,
+        action: 'unchanged',
+        sync: 'synced',
+        health: { state: 'healthy', services: { healthy: 1, total: 1 } },
+        services: services.map((name) => ({ name, mode: 'replicated', running: 1, desired: 1, completed: 0, health: 'healthy' })),
+      },
+    ] as View['status']['releases']
+  }
   return view
 }
 
@@ -82,10 +97,53 @@ describe('the monitor', () => {
     expect(await screen.findByText('sync-succeeded')).toBeDefined()
     expect(screen.getByText('converged')).toBeDefined()
 
-    // Switches to service container logs console
+  })
+
+  it('offers the log console for the services an application actually reports', async () => {
+    const stream = pushStream()
+    controller({
+      ...communityDiscovery(),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [edgeRow('edge-web')] }),
+      '/api/v1/events': stream.open,
+      // 501 is what an open-source build answers; the viewer must say so
+      // rather than fill the console with lines.
+      '/api/v1/applications/edge/services/edge-web/logs': () =>
+        json(501, { error: 'this controller does not stream service logs' }),
+    })
+    render(<App />)
+    await screen.findByTestId('application-count')
+    fireEvent.click(screen.getByRole('link', { name: 'Monitor' }))
+    await screen.findByRole('heading', { name: 'Monitor' })
+
     fireEvent.click(screen.getByRole('button', { name: 'Service Container Logs' }))
     expect(screen.getByText('APP')).toBeDefined()
     expect(screen.getByText('SVC')).toBeDefined()
+    // The service the document reported, and no other.
+    const svc = screen.getAllByRole('combobox')[1]
+    expect([...svc.querySelectorAll('option')].map((o) => o.textContent)).toEqual(['edge-web'])
+    expect(await screen.findByText(/does not stream service logs/)).toBeDefined()
+  })
+
+  it('does not invent a service for an application that reports none', async () => {
+    // `${app}_web` was put in the picker and opened as a stream, so the console
+    // tailed a service name nothing had ever reported.
+    const stream = pushStream()
+    controller({
+      ...communityDiscovery(),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [edgeRow()] }),
+      '/api/v1/events': stream.open,
+    })
+    render(<App />)
+    await screen.findByTestId('application-count')
+    fireEvent.click(screen.getByRole('link', { name: 'Monitor' }))
+    await screen.findByRole('heading', { name: 'Monitor' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Service Container Logs' }))
+    expect(screen.getByText(/reports no services yet/)).toBeDefined()
+    expect(screen.queryByText('edge_web')).toBeNull()
+    expect(screen.queryByText('SVC')).toBeNull()
   })
 })
 
@@ -195,5 +253,60 @@ describe('the scrollback bound, and what it broke', () => {
     expect(body.scrollTop).toBe(200)
     // The line still arrived; it just did not drag the view with it.
     expect(screen.getByText('second')).toBeDefined()
+  })
+})
+
+describe('pausing the service log console', () => {
+  /** A Monitor already switched to the log console, tailing edge/edge-web. */
+  async function openLogs(stream: ReturnType<typeof pushLogStream>) {
+    controller({
+      ...communityDiscovery(),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [edgeRow('edge-web')] }),
+      '/api/v1/events': openStream,
+      '/api/v1/applications/edge/services/edge-web/logs': stream.open,
+    })
+    render(<App />)
+    await screen.findByTestId('application-count')
+    fireEvent.click(screen.getByRole('link', { name: 'Monitor' }))
+    await screen.findByRole('heading', { name: 'Monitor' })
+    fireEvent.click(screen.getByRole('button', { name: 'Service Container Logs' }))
+    await screen.findByText('APP')
+  }
+
+  const line = (message: string) => ({
+    service: 'edge-web',
+    stream: 'stdout',
+    message,
+    timestamp: '2026-08-28T06:00:00Z',
+  })
+
+  it('holds the view without dropping the connection or emptying the buffer', async () => {
+    // `isPaused` was an effect dependency, and the effect body begins with
+    // setLogs([]) — so Pause reopened the stream and wiped the scrollback, and
+    // Resume wiped it again. The opposite of what a pause button does.
+    const stream = pushLogStream()
+    await openLogs(stream)
+
+    await deliver(() => stream.push(line('before the pause')))
+    expect(await screen.findByText('before the pause')).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }))
+
+    // Still there: pausing must not clear what has already been read.
+    expect(screen.getByText('before the pause')).toBeDefined()
+
+    await deliver(() => stream.push(line('while paused')))
+    expect(screen.queryByText('while paused')).toBeNull()
+    expect(screen.getByText('before the pause')).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    expect(screen.getByText('before the pause')).toBeDefined()
+
+    await deliver(() => stream.push(line('after resuming')))
+    expect(await screen.findByText('after resuming')).toBeDefined()
+    // The buffer survived both transitions, which it cannot do if the effect
+    // re-ran.
+    expect(screen.getByText('before the pause')).toBeDefined()
   })
 })

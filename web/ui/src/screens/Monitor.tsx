@@ -8,6 +8,7 @@ import { apiGet } from '../api/client'
 import { listKey } from '../api/queries'
 import type { ApplicationList } from '../api/types'
 import { ServiceLogViewer } from '../components/ServiceLogViewer'
+import { Empty } from '../components/StateBlock'
 import { TerminalStream } from '../components/TerminalStream'
 import { useLive } from '../live'
 
@@ -29,16 +30,17 @@ export function Monitor() {
   const activeApp = views.find((v) => v.spec.name === selectedApp) ?? views[0]
   const currentApp = selectedApp || activeApp?.spec.name || ''
 
-  const appsList = views.map((v) => {
-    const svcs = v.status.releases?.flatMap((r) => r.services?.map((s) => s.name) ?? []) ?? []
-    return {
-      name: v.spec.name,
-      services: svcs.length > 0 ? svcs : [`${v.spec.name}_web`],
-    }
-  })
+  // The services each application actually reports. An application the
+  // controller has not reconciled yet reports none, and gets none — inventing
+  // `<name>_web` put a service that does not exist in the picker and opened a
+  // stream for it.
+  const appsList = views.map((v) => ({
+    name: v.spec.name,
+    services: v.status.releases?.flatMap((r) => r.services?.map((svc) => svc.name) ?? []) ?? [],
+  }))
 
   const currentAppObj = appsList.find((a) => a.name === currentApp)
-  const currentService = selectedService || currentAppObj?.services[0] || (currentApp ? `${currentApp}_web` : '')
+  const currentService = selectedService || currentAppObj?.services[0] || ''
 
   return (
     <section className="screen monitor-screen">
@@ -66,7 +68,13 @@ export function Monitor() {
         </div>
       </header>
 
-      {streamMode === 'service' ? (
+      {streamMode === 'service' && currentService === '' ? (
+        <Empty icon="service">
+          {views.length === 0
+            ? 'No applications to read logs from.'
+            : 'This application reports no services yet, so there is no container output to tail.'}
+        </Empty>
+      ) : streamMode === 'service' ? (
         <ServiceLogViewer
           app={currentApp}
           service={currentService}

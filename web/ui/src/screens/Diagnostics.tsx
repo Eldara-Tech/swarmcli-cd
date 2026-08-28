@@ -3,10 +3,10 @@
 
 import { useQuery } from '@tanstack/react-query'
 
-import { apiGet } from '../api/client'
+import { apiGet, hasStatus } from '../api/client'
 import type { DiagnosticsResponse, NodesResponse } from '../api/types'
 import { Icon } from '../components/Icon'
-import { Loading } from '../components/StateBlock'
+import { Empty, Loading } from '../components/StateBlock'
 
 /**
  * Diagnostics 2.0: Unified cluster health assessment and Swarm node topology matrix.
@@ -50,6 +50,9 @@ export function Diagnostics() {
   const risks = diag.data?.risks ?? []
   const checks = diag.data?.checks ?? []
   const swarmNodes = nodes.data?.nodes ?? []
+  // 501 is the ordinary state of a build whose reconciler has no node lister —
+  // not a failure to draw in red, and not an empty roster either.
+  const nodesUnsupported = hasStatus(nodes.error, 501)
 
   const radius = 42
   const circumference = 2 * Math.PI * radius
@@ -190,9 +193,22 @@ export function Diagnostics() {
             <Icon name="layers" size={16} />
             Swarm Node Topology &amp; Health Matrix
           </h2>
-          <span className="chip chip-muted">{swarmNodes.length} {swarmNodes.length === 1 ? 'Node Active' : 'Nodes Active'}</span>
+          <span className="chip chip-muted">
+            {nodes.isError
+              ? 'unavailable'
+              : `${swarmNodes.length} ${swarmNodes.length === 1 ? 'Node Active' : 'Nodes Active'}`}
+          </span>
         </div>
         <div className="card-frame-body">
+          {nodes.isError ? (
+            <Empty icon="service">
+              {nodesUnsupported
+                ? 'This controller does not report swarm node telemetry.'
+                : 'The swarm node roster could not be read.'}
+            </Empty>
+          ) : swarmNodes.length === 0 ? (
+            <Empty icon="service">The controller reported no swarm nodes.</Empty>
+          ) : (
           <div className="node-matrix-grid">
             {swarmNodes.map((node) => {
               const taskPct = node.tasksDesired > 0 ? Math.round((node.tasksRunning / node.tasksDesired) * 100) : 100
@@ -257,6 +273,7 @@ export function Diagnostics() {
               )
             })}
           </div>
+          )}
         </div>
       </div>
     </section>
