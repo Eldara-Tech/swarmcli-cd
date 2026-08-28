@@ -235,6 +235,17 @@ Confirmed 2026-08-28 before code.
   Copy and Export still work on all 50,000, which is how an operator finds
   something in six hours of output. The gap is stated above the rows rather than
   hidden.
+
+  **Superseded 2026-08-28 by #270.** The cap is now a starting size rather than a
+  ceiling: reaching the top of the drawn rows draws 2,000 more, and the window
+  collapses back when the operator returns to the bottom. The reasoning above
+  held except for one premise, and it was the load-bearing one — that the
+  alternative had to be *true windowing*, with its fixed row height and its
+  spacer heights. It does not. `content-visibility: auto` with
+  `contain-intrinsic-size: auto` is a class in `index.css`; the browser skips
+  layout and paint for an off-screen row and remembers each row's own measured
+  height once it has been seen, so wrapped lines keep wrapping and nothing has a
+  pixel value to express. See §5.6.
 - **D8 — `maxLogStreams` stays at 16.** A history read holds a slot for its
   backlog and then for as long as the tab is open, which is heavier than a tail,
   but a separate bound for history reads needs a second counter and a fairness
@@ -539,6 +550,54 @@ makes the cap acceptable: an operator reading six hours of a service is looking
 for something, and the way to find it in twenty thousand lines was never to
 scroll. What it costs is scrolling by hand past 2,000 rows, and the banner is
 what keeps that a stated limit rather than a silent one.
+
+**Amended 2026-08-28 by #270: the cap is a starting size, not a ceiling.**
+
+The paragraph above rejects windowing on a premise that does not hold. It is
+true that placing rows by arithmetic needs a fixed row height, and true that the
+spacer heights could not be a class under `style-src 'self'`. What is false is
+that those were the only way to stop drawing what nobody is looking at.
+
+`content-visibility: auto` on `.console-line`, with `contain-intrinsic-size:
+auto 1.4rem`, hands the whole problem to the browser: an off-screen row is
+skipped for layout and paint and stands in at the placeholder height, and once a
+row has been on screen its own measured height is remembered — so a line that
+wraps to three rows goes on costing three rows' worth of scrollbar. Variable
+heights, no arithmetic, no spacers, no pixel value anywhere but in a stylesheet
+this repository serves itself. It has been Baseline since September 2024.
+
+That leaves one real cost, and it is not the DOM. React reconciles the drawn
+rows on every render, and this console re-renders on every *controller* event as
+well as on every arriving chunk, because `useEventStream` holds its state in the
+Shell. Fifty thousand children diffed on each of those is a console that stutters
+while it streams. So the window is bounded by the operator instead of by a
+number:
+
+- at rest, and while following, it draws the newest 2,000 — unchanged;
+- leaving the bottom pins the window where it is, so arriving lines are added
+  below rather than traded for the oldest drawn row under somebody's eye;
+- reaching the top of the drawn rows draws 2,000 more, correcting `scrollTop` by
+  what was inserted above so the rows do not jump;
+- returning to the bottom collapses it back to 2,000.
+
+The live path — the one that repaints constantly — therefore never draws more
+than the original cap, however far back somebody read a minute ago. The growth
+happens only while the stream is not the thing being watched.
+
+The anchor is a sequence number rather than an index, because both things it has
+to survive move indices under it: the buffer drops its oldest line at 50,000, and
+a search narrows what is being indexed into.
+
+The banner stays, reworded. It sits inside the scrolling viewport above the
+oldest drawn row, which is exactly where an operator scrolling back arrives —
+and where its own sentence is about to stop being true, because reaching it is
+what draws more. The footer carries the same counts for anyone who never leaves
+the bottom, which is what the banner's placement had always meant it could not
+do.
+
+`.line-num` was `min-width: 2rem`, from the thousand-line buffer. Five digits do
+not fit, and it is the column every other column is positioned after, so one row
+whose number overflowed moved the message on that row alone.
 
 **One more thing the larger buffer broke.** The reader appended one line per
 state update, and each append copies the buffer — O(n) per line, which is

@@ -75,6 +75,17 @@ async function deliver(work: () => void): Promise<void> {
   })
 }
 
+/**
+ * How long a test that draws thousands of rows is given.
+ *
+ * jsdom lays out none of this and still builds every node, and both terminals
+ * here are bounded in the thousands — so these cost seconds where the rest of
+ * this file costs milliseconds. The default is five, set for tests that do not
+ * draw a buffer, and a test that fails on a slow runner rather than on a defect
+ * is worse than a slow one.
+ */
+const bufferTestMs = 30_000
+
 describe('the monitor', () => {
   it('tails the controller event stream, one line per frame', async () => {
     // A driven stream: it delivers a frame only when the test pushes one, so the
@@ -230,7 +241,7 @@ describe('the scrollback bound, and what it broke', () => {
     expect(body.scrollTop).toBe(10_000)
     const lines = document.querySelectorAll('.term-line')
     expect(lines[lines.length - 1].textContent).toContain('after the cap')
-  })
+  }, bufferTestMs)
 
   it('stops following once the reader has scrolled up', async () => {
     // An operator reading a failure was yanked to the bottom by the next frame,
@@ -667,9 +678,9 @@ describe('the console can read further back than its tail', () => {
     expect(screen.queryByText('from the tail read')).toBeNull()
   })
 
-  // The buffer is far larger than the DOM can hold, and the gap is stated
-  // rather than hidden: a console silently drawing a fraction of what it has
-  // is a console that lies. Everything else — the filters, Copy, Export —
+  // The buffer is far larger than the console draws at rest, and the gap is
+  // stated rather than hidden: a console silently drawing a fraction of what it
+  // has is a console that lies. Everything else — the filters, Copy, Export —
   // still works on all of it.
   it('draws a bounded number of rows and says how many it is holding', async () => {
     const stream = pushLogStream()
@@ -685,11 +696,148 @@ describe('the console can read further back than its tail', () => {
     // that drew nothing, which is the failure this is between.
     expect(drawn).toBeGreaterThan(100)
     expect(drawn).toBeLessThan(2500)
-    expect(screen.getByText(/Showing the newest/)).toBeDefined()
+    expect(screen.getByText(/older matching lines are held above these/)).toBeDefined()
     // The newest, because a console is read from the bottom.
     expect(screen.getByText('line 2499')).toBeDefined()
     expect(screen.queryByText('line 0')).toBeNull()
   })
+
+  /**
+   * The console's geometry, which jsdom does not have.
+   *
+   * scrollHeight is a function of the rows actually drawn rather than a
+   * constant, because the growth path is arithmetic on it: the component adds
+   * back what the new rows inserted above the old ones, and against a fixed
+   * number that correction is zero and the assertion passes without the code
+   * having worked.
+   */
+  function stubConsoleGeometry(rowHeight = 20, clientHeight = 500): HTMLElement {
+    const body = document.querySelector('.terminal-console-viewport') as HTMLElement
+    Object.defineProperty(body, 'scrollHeight', {
+      configurable: true,
+      get: () => document.querySelectorAll('.console-line').length * rowHeight,
+    })
+    Object.defineProperty(body, 'clientHeight', { configurable: true, value: clientHeight })
+    return body
+  }
+
+  /** Scroll the console to a position and let it react. */
+  async function scrollTo(body: HTMLElement, top: number): Promise<void> {
+    body.scrollTop = top
+    await deliver(() => fireEvent.scroll(body))
+  }
+
+  function drawnRows(): number {
+    return document.querySelectorAll('.console-line').length
+  }
+
+  /** The message on the oldest row currently drawn. */
+  function oldestDrawn(): string {
+    return document.querySelectorAll('.line-content')[0].textContent ?? ''
+  }
+
+  // #270. The buffer was reachable by search and by Export and not by the thing
+  // an operator reaches for first, which is the scrollbar.
+  it('draws more of the buffer each time the operator reaches the top of it', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    const many = Array.from({ length: 5000 }, (_, i) =>
+      logLine(`line ${i}`, { taskID: 'task-1', slot: 1 }),
+    )
+    await deliver(() => stream.pushAll(many))
+    const body = stubConsoleGeometry()
+
+    // At rest it draws the newest of them and no more.
+    const atRest = drawnRows()
+    expect(atRest).toBeLessThan(5000)
+    expect(screen.queryByText('line 0')).toBeNull()
+
+    // Leaving the bottom pins the window; reaching the top extends it.
+    await scrollTo(body, 5_000)
+    await scrollTo(body, 0)
+    expect(drawnRows()).toBeGreaterThan(atRest)
+
+    // And keeping at it reaches the first line the buffer holds, which is the
+    // whole of the issue.
+    for (let i = 0; i < 5 && screen.queryByText('line 0') === null; i++) {
+      await scrollTo(body, 0)
+    }
+    expect(screen.getByText('line 0')).toBeDefined()
+    expect(drawnRows()).toBe(5000)
+  }, bufferTestMs)
+
+  // Growing puts rows above the ones being read, so scrollTop — a distance from
+  // the top — now names different content. Without the correction the console
+  // jumps backwards by everything it just drew, every time.
+  it('keeps the rows under the reader still when it grows', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    const many = Array.from({ length: 3000 }, (_, i) =>
+      logLine(`line ${i}`, { taskID: 'task-1', slot: 1 }),
+    )
+    await deliver(() => stream.pushAll(many))
+    const body = stubConsoleGeometry()
+
+    await scrollTo(body, 5_000)
+    const before = drawnRows()
+    await scrollTo(body, 0)
+
+    // 20px a row, and it drew this many above where the reader was standing.
+    expect(body.scrollTop).toBe((drawnRows() - before) * 20)
+  }, bufferTestMs)
+
+  // Pinned to the newest N, every arriving line trades the oldest drawn row for
+  // a new one — invisible at the bottom, where the view is held, and a drift
+  // upward of everything under the eye of somebody who has scrolled away.
+  it('does not slide the drawn rows under a reader who has left the bottom', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() =>
+      stream.pushAll(
+        Array.from({ length: 3000 }, (_, i) => logLine(`line ${i}`, { taskID: 'task-1', slot: 1 })),
+      ),
+    )
+    const body = stubConsoleGeometry()
+
+    await scrollTo(body, 5_000)
+    const held = oldestDrawn()
+
+    await deliver(() =>
+      stream.pushAll(
+        Array.from({ length: 500 }, (_, i) => logLine(`later ${i}`, { taskID: 'task-1', slot: 1 })),
+      ),
+    )
+
+    expect(oldestDrawn()).toBe(held)
+    // Still arriving, and still at the bottom where they belong.
+    expect(screen.getByText('later 499')).toBeDefined()
+  }, bufferTestMs)
+
+  // The window grows while the operator is stopped and collapses when they are
+  // not, so the live path — the one that repaints on every arriving chunk —
+  // never draws more than the cap however far back somebody just read.
+  it('collapses the window when the operator returns to the bottom', async () => {
+    const stream = pushLogStream()
+    await openConsole(stream)
+
+    await deliver(() =>
+      stream.pushAll(
+        Array.from({ length: 3000 }, (_, i) => logLine(`line ${i}`, { taskID: 'task-1', slot: 1 })),
+      ),
+    )
+    const body = stubConsoleGeometry()
+
+    await scrollTo(body, 5_000)
+    const atRest = drawnRows()
+    await scrollTo(body, 0)
+    expect(drawnRows()).toBeGreaterThan(atRest)
+
+    await scrollTo(body, body.scrollHeight - 500)
+    expect(drawnRows()).toBe(atRest)
+  }, bufferTestMs)
 
   // The cap is on the render and on nothing else. An operator who cannot scroll
   // to a line must still be able to find it, or the buffer is decorative.
