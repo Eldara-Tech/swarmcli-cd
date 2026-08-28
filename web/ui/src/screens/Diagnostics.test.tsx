@@ -73,5 +73,49 @@ describe('the diagnostics screen', () => {
 
     expect(screen.getByLabelText('Integrity score 100 out of 100')).toBeDefined()
     expect(screen.getByText('No risks detected.')).toBeDefined()
+    expect(screen.getByText('Nominal')).toBeDefined()
+    // The three all-clear lines are rendered from their own predicates, so an
+    // all-clear fleet is the only thing that draws all three.
+    expect(screen.getAllByText(/OK$/).map((el) => el.textContent)).toEqual(['SYNC OK', 'HEALTH OK', 'ENGINE OK'])
+  })
+
+  it('does not read an unreconciled application as clear', async () => {
+    // Both axes at their zero member is what an application the controller has
+    // accepted and not yet reconciled looks like. Counted as clear it scored a
+    // controller that had reconciled nothing at 100/100, over a green ring, with
+    // three ticks claiming its stacks matched their manifests.
+    serve([row('edge', 'synced', 'healthy'), row('ingress', 'unknown', 'unknown')])
+    await openDiagnostics()
+
+    expect(screen.getByLabelText('Integrity score 50 out of 100')).toBeDefined()
+    expect(screen.queryByText('Nominal')).toBeNull()
+    expect(screen.getByText('Attention Needed')).toBeDefined()
+    expect(screen.getByRole('heading', { name: 'ingress', level: 3 })).toBeDefined()
+    expect(screen.getByText(/Not yet reconciled/)).toBeDefined()
+    expect(screen.getByText('unknown')).toBeDefined()
+    expect(screen.queryByText('No risks detected.')).toBeNull()
+  })
+
+  it('never says Nominal beside a critical risk', async () => {
+    // The chip came off a score threshold: nine clear applications in ten put it
+    // at 90, which read "Nominal" next to a red "1 Detected" for a degraded one.
+    const views = Array.from({ length: 9 }, (_, i) => row(`ok-${i}`, 'synced', 'healthy'))
+    views.push(row('broken', 'synced', 'degraded'))
+    serve(views)
+    await openDiagnostics()
+
+    expect(screen.getByLabelText('Integrity score 90 out of 100')).toBeDefined()
+    expect(screen.queryByText('Nominal')).toBeNull()
+    expect(screen.getByText('Attention Needed')).toBeDefined()
+    expect(screen.getByText('1 Detected')).toBeDefined()
+  })
+
+  it('claims nothing about a fleet with no applications in it', async () => {
+    // Three ticks over an empty fleet were three claims about nothing.
+    serve([])
+    await openDiagnostics()
+
+    expect(screen.getByText('No risks detected.')).toBeDefined()
+    expect(screen.queryByText(/OK$/)).toBeNull()
   })
 })

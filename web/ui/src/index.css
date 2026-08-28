@@ -9,10 +9,9 @@ Copyright © 2026 Eldara Tech
    in a real browser — never in jsdom, never in Vitest — so it is enforced by
    react/forbid-dom-props in eslint.config.js rather than by remembering.
 
-   The theme follows the operating system and has no toggle. Priming a stored
-   preference before first paint needs an inline <script>, which the same policy
-   forbids; a toggle that flashed the wrong theme on every load would be worse
-   than not having one. */
+   The console is dark-only and has no toggle; the palette block below says why,
+   and the CSP settles the toggle either way — priming a stored preference
+   before first paint needs an inline <script> the policy forbids. */
 
 /* Brand web fonts, self-hosted. The three families are @fontsource packages
    (OFL-1.1) whose .woff2 files Vite emits into /assets and serves same-origin,
@@ -97,12 +96,9 @@ Copyright © 2026 Eldara Tech
   /* Elevation — soft, low-alpha shadows that read on true black. */
   --e-1: 0 1px 2px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--edge);
   --e-2: 0 8px 24px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--edge);
-  --e-3: 0 24px 60px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--edge-strong);
 
   /* Type scale. */
-  --t-display: 2rem;
   --t-h1: 1.75rem;
-  --t-h2: 1.125rem;
 
   /* Motion. All of it collapses to near-zero under prefers-reduced-motion; see
      the media query at the foot of this file. */
@@ -110,10 +106,9 @@ Copyright © 2026 Eldara Tech
   --dur: 180ms;
   --ease: cubic-bezier(0.2, 0.6, 0.2, 1);
 
-  /* Layout constants. */
+  /* Layout constants. Referenced by the rules that lay the shell out; a token
+     nothing reads is a value that has already drifted from the rule beside it. */
   --rail-w: 15rem;
-  --topbar-h: 3.5rem;
-  --content-max: 86rem;
 }
 
 body {
@@ -409,9 +404,11 @@ code {
    a call to action competing with Sign in. */
 .login-foot {
   border-top: 1px solid var(--edge);
+  display: flex;
+  gap: var(--s-4);
+  justify-content: center;
   margin: 0.75rem 0 0;
   padding-top: 0.9rem;
-  text-align: center;
 }
 
 .login-foot a {
@@ -1039,7 +1036,7 @@ thead th {
   position: sticky;
   top: 0;
   height: 100vh;
-  width: 15rem;
+  width: var(--rail-w);
 }
 
 .rail-brand {
@@ -2332,6 +2329,21 @@ select:focus-visible,
   padding: 0.15rem 0.5rem;
 }
 
+/* Take an element out of the page without taking it out of the accessibility
+   tree. `display: none` does both, which is how the collapsed rail below ended
+   up with five links and a brand that no screen reader could name. */
+.visually-hidden {
+  border: 0;
+  clip-path: inset(50%);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+}
+
 /* Responsive layout under 960px */
 @media (max-width: 60rem) {
   .app-rail {
@@ -2340,18 +2352,24 @@ select:focus-visible,
   .rail-brand a {
     justify-content: center;
   }
-  .brand-text {
-    display: none;
-  }
-  .nav-label {
-    display: none;
+  /* Hidden from the eye, still read aloud and still the link's name — see
+     .visually-hidden above. */
+  .brand-text,
+  .nav-label,
+  .rail-user-meta {
+    border: 0;
+    clip-path: inset(50%);
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    padding: 0;
+    position: absolute;
+    white-space: nowrap;
+    width: 1px;
   }
   .app-nav a {
     justify-content: center;
     padding: 0.6rem;
-  }
-  .rail-user-meta {
-    display: none;
   }
   .rail-foot {
     display: flex;

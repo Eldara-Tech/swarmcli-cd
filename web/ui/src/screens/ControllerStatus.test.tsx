@@ -161,3 +161,54 @@ describe('the rest of the document', () => {
     expect(screen.getByRole('heading', { name: 'Prune held' })).toBeDefined()
   })
 })
+
+describe('the engine card, which reports the same fact a second way', () => {
+  // It was a hard-coded green dot and the words "Engine Online", written into
+  // the markup with nothing computing either, sitting immediately under the
+  // notices above. A controller that had never loaded a set announced itself as
+  // running; so did one with no reconcile loop wired at all. Deriving it from
+  // the shape the notice already uses is what stops the two disagreeing.
+  const cases = [
+    { name: 'a healthy set', build: () => loaded(), label: 'Engine Online' },
+    {
+      name: 'a stale set',
+      build: () => {
+        const s = loaded()
+        s.appSet.stale = true
+        return s
+      },
+      label: 'Serving Last-Good Set',
+    },
+    {
+      name: 'a partial load',
+      build: () => {
+        const s = loaded()
+        s.appSet.error = 'edge: chart render failed'
+        return s
+      },
+      label: 'Degraded Load',
+    },
+    {
+      name: 'a set that never loaded',
+      build: () => {
+        const s = loaded()
+        s.appSet.loadedAt = zeroTimestamp
+        s.applications = 0
+        return s
+      },
+      label: 'Never Loaded',
+    },
+    { name: 'no reconcile loop at all', build: () => status(controllerStatusZero), label: 'No Reconcile Loop' },
+  ]
+
+  for (const c of cases) {
+    it(`reports ${c.name} as "${c.label}"`, async () => {
+      serve(c.build())
+      render(<App />)
+
+      expect(await screen.findByText(c.label)).toBeDefined()
+      // The one that must never appear on any of the four failure shapes.
+      if (c.label !== 'Engine Online') expect(screen.queryByText('Engine Online')).toBeNull()
+    })
+  }
+})

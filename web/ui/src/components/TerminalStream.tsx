@@ -25,6 +25,9 @@ const toneFor: Record<string, string> = {
 
 type LevelFilter = 'all' | 'ok' | 'warn' | 'bad' | 'info'
 
+/** How far off the bottom still counts as following the tail. One line. */
+const bottomSlackPx = 24
+
 /** The wall clock an event arrived at, or a dash when its timestamp will not parse. */
 function clockOf(at: string): string {
   const parsed = Date.parse(at)
@@ -58,19 +61,35 @@ export function TerminalStream({
           return tone === `term-${filter}`
         })
 
-  // Follow the tail: a new frame scrolls the newest line into view. Keyed on the
-  // count so it fires per frame and not on every render.
+  // Follow the tail, unless the reader has scrolled away from it.
+  //
+  // Two bugs lived in the previous four lines. Keyed on the count, the effect
+  // stopped firing the moment the scrollback hit its cap: useEventStream holds
+  // the newest `logLimit` frames, so from frame 250 on the length is constant
+  // for ever and the terminal silently stopped following — while lines still
+  // fell off the top under a pinned scrollTop, dragging the view backwards. The
+  // key is the newest frame's identity instead, which keeps moving when the
+  // length cannot.
+  //
+  // And it followed unconditionally, so an operator scrolled up reading a
+  // failure was yanked to the bottom by the next frame.
+  const newest = filteredEvents.at(-1)
+  const pinned = useRef(true)
   useEffect(() => {
     const el = body.current
-    if (el !== null) el.scrollTop = el.scrollHeight
-  }, [filteredEvents.length])
+    if (el !== null && pinned.current) el.scrollTop = el.scrollHeight
+  }, [newest])
 
   return (
     <div className={className === undefined ? 'terminal' : `terminal ${className}`}>
       <div className="terminal-head">
         <span className="label-caps">
           <Icon name="terminal" size={14} /> {title}
-          <span className="term-count">{events.length} events</span>
+          <span className="term-count">
+            {filter === 'all'
+              ? `${events.length} events`
+              : `${filteredEvents.length} of ${events.length} events`}
+          </span>
         </span>
         <div className="terminal-controls">
           <button
@@ -103,7 +122,16 @@ export function TerminalStream({
           </button>
         </div>
       </div>
-      <div className="terminal-body" ref={body}>
+      <div
+        className="terminal-body"
+        ref={body}
+        onScroll={(event) => {
+          const el = event.currentTarget
+          // A slack of one line: a browser's fractional scrollHeight means an
+          // exact comparison reads a terminal sitting at the bottom as scrolled.
+          pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < bottomSlackPx
+        }}
+      >
         {filteredEvents.length === 0 && <p className="term-empty">Waiting for controller activity…</p>}
         {filteredEvents.map((event, index) => (
           <div

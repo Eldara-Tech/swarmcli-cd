@@ -42,8 +42,21 @@ const (
 
 	// assetsPrefix is the one directory served as files. Everything else is the
 	// index, because everything else is a route belonging to the router in the
-	// browser.
+	// browser — with the single exception below, which is a file at the root.
 	assetsPrefix = "assets/"
+
+	// noticesFile is the bundle's third-party copyright and permission notices,
+	// emitted by vite.config.ts and served at the root.
+	//
+	// It is a file and not a route because it is an obligation rather than a
+	// screen. Everything in the bundle that is not ours ships under a licence —
+	// MIT and ISC for the JavaScript, OFL-1.1 for the fonts — that makes
+	// retaining its notice a condition of redistributing it, and `//go:embed
+	// all:dist` redistributes all of it inside every released binary. Served
+	// from the root so that the address is quotable and does not move with a
+	// build hash, and public for the same reason /healthz is: a licence notice
+	// behind a credential has not been provided to anyone.
+	noticesFile = "THIRD-PARTY-NOTICES.txt"
 
 	// csp is the policy every UI response carries. `script-src 'self'` with no
 	// 'unsafe-inline' is a constraint on what Vite may emit rather than a wish:
@@ -132,6 +145,18 @@ func Handler(assets fs.FS, o Options) http.Handler {
 		// Cleaned first and then required to still be under assets/, an escape
 		// leaves the prefix behind and is answered with the index.
 		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+		if name == noticesFile {
+			// Not immutable: the name carries no build hash, so a cached copy
+			// would outlive the dependency set it describes.
+			if data, err := fs.ReadFile(assets, noticesFile); err == nil {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				http.ServeContent(w, r, noticesFile, time.Time{}, bytes.NewReader(data))
+				return
+			}
+			// A bundle without one falls through to the index rather than 404ing,
+			// so a tree built before this existed still serves a working UI.
+		}
 		if !strings.HasPrefix(name, assetsPrefix) {
 			// Every client-side route lands here — /applications/edge belongs to
 			// the router in the browser, not to the mux — which is what makes a

@@ -25,24 +25,12 @@ export function Loading({ rows = 3 }: { rows?: number }) {
   )
 }
 
-/** An empty result: a glyph, the message, and an optional action. */
-export function Empty({
-  icon = 'app',
-  title,
-  children,
-  action,
-}: {
-  icon?: IconName
-  title?: string
-  children?: ReactNode
-  action?: ReactNode
-}) {
+/** An empty result: a glyph and the message. */
+export function Empty({ icon = 'app', children }: { icon?: IconName; children?: ReactNode }) {
   return (
     <div className="state-empty">
       <Icon name={icon} size={28} />
-      {title !== undefined && <p className="state-title">{title}</p>}
       {children !== undefined && <p className="empty">{children}</p>}
-      {action}
     </div>
   )
 }

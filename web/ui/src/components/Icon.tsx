@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
+import type { ReactNode } from 'react'
+
 /**
  * The icon set, drawn inline.
  *
@@ -11,16 +13,40 @@
  * fill, round joins — matches the brand's terminal-prompt mark, so the set and
  * the logo beside it read as one hand.
  *
- * Paths are Lucide's (ISC), copied in rather than depended on: the set a
- * console needs is small and stable, and a package would be a tree to audit —
- * and a licence-gate entry — for the sake of fifteen `<path>`s. The ISC notice
- * they came under is retained by this line.
+ * Paths are Lucide's, copied in rather than depended on: the set a console
+ * needs is small and stable, and a package would be a tree to audit — and a
+ * licence-gate entry — for the sake of fifteen `<path>`s.
+ *
+ * ISC requires the copyright and permission notice to travel with the copy, so
+ * it is reproduced here in full rather than referred to. Naming a licence is
+ * not retaining its notice:
+ *
+ *   Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2022 as
+ *   part of Feather (MIT). All other copyright (c) for Lucide are held by
+ *   Lucide Contributors 2022.
+ *
+ *   Permission to use, copy, modify, and/or distribute this software for any
+ *   purpose with or without fee is hereby granted, provided that the above
+ *   copyright notice and this permission notice appear in all copies.
+ *
+ *   THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ *   WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ *   MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ *   ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ *   WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ *   ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+ *   IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *
  * No `style` prop anywhere — size is width/height attributes — because the CSP
  * this UI serves under forbids the inline style one would emit; see index.css.
  */
 
-const paths: Record<string, React.ReactNode> = {
+// `satisfies`, never an annotation. Written `Record<string, ReactNode>` the key
+// type widened to `string`, so `keyof typeof paths` was `string | number` and
+// IconName checked nothing at all: `<Icon name="typo" />` compiled and rendered
+// an empty <svg> with no error anywhere. Icon.test.tsx guards it with a pair of
+// expect-error directives, which stop being errors the moment it widens again.
+const paths = {
   terminal: (
     <>
       <path d="m4 17 6-6-6-6" />
@@ -123,24 +149,28 @@ const paths: Record<string, React.ReactNode> = {
       <path d="M3.34 19a10 10 0 1 1 17.32 0" />
     </>
   ),
-}
+} satisfies Record<string, ReactNode>
 
 export type IconName = keyof typeof paths
 
 /**
  * One glyph from the set. `size` is the box in px; the drawing scales to it.
- * `title` turns the icon from decoration into a named image for a screen
- * reader — pass it when the icon is the only label, omit it when text sits
- * beside it and the icon is decorative (the default: aria-hidden).
+ *
+ * Always decorative. Every icon in this console sits beside its own label — the
+ * rail's nav text, a card's heading, a chip's word — so none of them is the
+ * accessible name of anything, and an aria-hidden svg keeps a screen reader
+ * from reading the same thing twice. It carried an optional `title` for the
+ * case where an icon *is* the only label; no caller ever had that case, and the
+ * one place it looked like it might — the rail collapsed to icons under 960px —
+ * is solved by hiding the label visually rather than removing it.
  */
-export function Icon({ name, size = 20, title }: { name: IconName; size?: number; title?: string }) {
+export function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   return (
     <svg
-      aria-hidden={title === undefined || undefined}
+      aria-hidden="true"
       className="icon"
       fill="none"
       height={size}
-      role={title === undefined ? undefined : 'img'}
       stroke="currentColor"
       strokeLinecap="round"
       strokeLinejoin="round"
@@ -148,7 +178,6 @@ export function Icon({ name, size = 20, title }: { name: IconName; size?: number
       viewBox="0 0 24 24"
       width={size}
     >
-      {title === undefined ? null : <title>{title}</title>}
       {paths[name]}
     </svg>
   )

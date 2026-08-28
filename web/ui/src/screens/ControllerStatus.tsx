@@ -7,9 +7,10 @@ import { appSetShape, type AppSetShape } from '../api/appset'
 import { apiGet } from '../api/client'
 import { controllerKey } from '../api/queries'
 import type { AppSetStatus, ControllerStatus as Status } from '../api/types'
+import { Dot, type DotTone } from '../components/Dot'
 import { Instant } from '../components/Instant'
 import { shortRevision } from '../format'
-import { Loading } from '../components/StateBlock'
+import { ErrorState, Loading } from '../components/StateBlock'
 
 /**
  * The controller itself, as distinct from the applications it reconciles.
@@ -33,11 +34,7 @@ export function ControllerStatusScreen() {
 
   if (status.isPending) return <Loading />
   if (status.isError) {
-    return (
-      <p className="error" role="alert">
-        {status.error.message}
-      </p>
-    )
+    return <ErrorState message={status.error.message} />
   }
 
   const set = status.data.appSet
@@ -56,10 +53,10 @@ export function ControllerStatusScreen() {
           <div className="card-frame">
             <div className="card-frame-head">
               <h2>
-                <span className="dot dot-ok dot-pulse" />
+                <Dot tone={engine[shape].tone} pulse={shape === 'ok'} />
                 GitOps Reconcile Engine
               </h2>
-              <span className="chip chip-good">Engine Online</span>
+              <span className={`chip chip-${engine[shape].chip}`}>{engine[shape].label}</span>
             </div>
             <div className="card-frame-body">
               <dl className="spec-grid">
@@ -119,6 +116,27 @@ export function ControllerStatusScreen() {
  * having nothing to say, so that the presence of a block here is itself the
  * signal.
  */
+/**
+ * What the engine card's dot and chip say, per app-set shape.
+ *
+ * Derived rather than written, because it was written: a hard-coded green
+ * "Engine Online" sat directly under the notices below, so a controller that
+ * had never loaded a set, or had no reconcile loop wired at all, announced
+ * itself as running. The shape is already computed for the notice — this is the
+ * same fact drawn a second way, and the two cannot now disagree.
+ *
+ * `unwired` is muted rather than red for the reason the notice gives: a
+ * controller serving the API without a loop is a deployment choice, not a
+ * fault, and colouring it as one trains an operator to ignore the colour.
+ */
+const engine: Record<AppSetShape, { tone: DotTone; chip: string; label: string }> = {
+  ok: { tone: 'ok', chip: 'good', label: 'Engine Online' },
+  partial: { tone: 'warn', chip: 'warn', label: 'Degraded Load' },
+  stale: { tone: 'warn', chip: 'warn', label: 'Serving Last-Good Set' },
+  'never-loaded': { tone: 'bad', chip: 'bad', label: 'Never Loaded' },
+  unwired: { tone: 'muted', chip: 'muted', label: 'No Reconcile Loop' },
+}
+
 function AppSetNotice({ shape, appSet }: { shape: AppSetShape; appSet: AppSetStatus }) {
   if (shape === 'ok') return null
 

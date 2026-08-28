@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
-import { decodeEnum, driftStates, healthStates, syncStates } from '../api/enums'
-import type { HealthState, SyncState } from '../api/enums'
-import type { DriftState } from '../api/enums'
+import { assess, healthToneOf, toneOf } from '../api/severity'
 import type { ReleaseStatus, ServiceStatus, View } from '../api/types'
-import { Dot, type DotTone } from './Dot'
+import { Dot } from './Dot'
 import { Icon } from './Icon'
 
 /**
@@ -21,7 +19,7 @@ import { Icon } from './Icon'
  */
 export function TopologyTree({ view }: { view: View }) {
   const releases = view.status.releases ?? []
-  const appTone = worstTone(view) as DotTone
+  const appTone = toneOf(assess(view).severity)
 
   return (
     <div className="topo">
@@ -61,7 +59,7 @@ export function TopologyTree({ view }: { view: View }) {
 
 function ReleaseNode({ release }: { release: ReleaseStatus }) {
   const services = release.services ?? []
-  const tone = healthTone(release.health.state) as DotTone
+  const tone = healthToneOf(release.health.state)
   return (
     <div className="topo-item">
       <div className={`topo-node topo-${tone}`}>
@@ -87,7 +85,7 @@ function ServiceNode({ service }: { service: ServiceStatus }) {
   // Cap the pips so a wide service (a global mode across a large swarm) draws a
   // row rather than a paragraph; the exact count is beside them in any case.
   const pips = Math.min(Math.max(service.desired, 0), 12)
-  const tone = healthTone(service.health) as DotTone
+  const tone = healthToneOf(service.health)
   return (
     <div className="topo-item">
       <div className={`topo-node topo-${tone}`}>
@@ -107,51 +105,4 @@ function ServiceNode({ service }: { service: ServiceStatus }) {
       </div>
     </div>
   )
-}
-
-/** The tone one status axis reads as, in the console's three-way palette. */
-function healthTone(state: HealthState): string {
-  switch (decodeEnum(state, healthStates)) {
-    case 'healthy':
-      return 'ok'
-    case 'degraded':
-    case 'missing':
-      return 'bad'
-    case 'progressing':
-      return 'warn'
-    default:
-      return 'info'
-  }
-}
-
-function syncTone(state: SyncState): string {
-  switch (decodeEnum(state, syncStates)) {
-    case 'synced':
-      return 'ok'
-    case 'out-of-sync':
-      return 'warn'
-    default:
-      return 'info'
-  }
-}
-
-function driftTone(state: DriftState): string {
-  return decodeEnum(state, driftStates) === 'detected' ? 'warn' : 'ok'
-}
-
-/**
- * worstTone folds an application's three axes and its reconcile error into the
- * single tone its node wears — the same "show me the worst thing first" the
- * list's stale mark makes: a failed reconcile is red, then a dead health or
- * sync, then a warning, then unknown, and only an all-clear application is green.
- */
-function worstTone(view: View): string {
-  const { status } = view
-  if (status.error !== undefined && status.error !== '') return 'bad'
-  const tones = [healthTone(status.health.state), syncTone(status.sync.state)]
-  if (status.drift !== undefined) tones.push(driftTone(status.drift.state))
-  if (tones.includes('bad')) return 'bad'
-  if (tones.includes('warn')) return 'warn'
-  if (tones.includes('info')) return 'info'
-  return 'ok'
 }

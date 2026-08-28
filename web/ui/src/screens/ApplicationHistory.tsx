@@ -9,7 +9,7 @@ import { historyKey } from '../api/queries'
 import type { History, ReleaseHistory } from '../api/types'
 import { Forbidden } from '../components/Forbidden'
 import { Instant } from '../components/Instant'
-import { Loading } from '../components/StateBlock'
+import { ErrorState, Loading } from '../components/StateBlock'
 
 /**
  * Every declared release, with the revisions the chart engine recorded for it.
@@ -65,11 +65,7 @@ export function ApplicationHistory() {
         </div>
       )
     }
-    return (
-      <p className="error" role="alert">
-        {history.error.message}
-      </p>
-    )
+    return <ErrorState message={history.error.message} />
   }
 
   // Null as well as empty: api.go's ErrNotPlanned arm writes an empty list, and
@@ -106,6 +102,31 @@ export function ApplicationHistory() {
       ))}
     </section>
   )
+}
+
+/**
+ * The chip a recorded revision's status wears.
+ *
+ * charts/types.go declares five — pending-install, deployed, superseded,
+ * failed, uninstalled — and every one of them was drawn green, so the view an
+ * operator opens to find out which revision broke reported the broken one as a
+ * success. Only `deployed` is good; `failed` is the whole reason for looking.
+ *
+ * The status is a plain string on the wire (application/history.go declares it
+ * as one, with no marshaller), so an engine that grows a sixth falls to the
+ * muted chip and renders verbatim rather than being coerced or coloured.
+ */
+function revisionChip(status: string): string {
+  switch (status) {
+    case 'deployed':
+      return 'chip-good'
+    case 'failed':
+      return 'chip-bad'
+    case 'pending-install':
+      return 'chip-warn'
+    default:
+      return 'chip-muted'
+  }
 }
 
 function ReleaseHistoryPanel({ release }: { release: ReleaseHistory }) {
@@ -145,7 +166,7 @@ function ReleaseHistoryPanel({ release }: { release: ReleaseHistory }) {
                     <td>{revision.chart}</td>
                     <td>{revision.version}</td>
                     <td>
-                      <span className="chip chip-good">{revision.status}</span>
+                      <span className={`chip ${revisionChip(revision.status)}`}>{revision.status}</span>
                     </td>
                     {/* A dash rather than Instant's "never": the field is optional
                         because the engine may not have recorded one, and a revision
