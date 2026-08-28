@@ -4,7 +4,6 @@
 package api
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
@@ -22,17 +20,30 @@ import (
 // LogStreamer is the optional interface a Reconciler implements when it can
 // stream live Docker Swarm service container logs.
 //
-// Optional in the seam sense: nothing in this repository implements it, and a
-// build whose reconciler does not is expected rather than broken.
+// Optional in the seam sense: a build whose reconciler does not implement it is
+// expected rather than broken, and says so with a 501.
 //
 // # What an implementer owes the caller
 //
-// The reader yields **one log line per line**, already demultiplexed, with no
-// 8-byte Docker stream header left on it — the API's own framing is line-based
-// and cannot recover a length prefix. Where the implementer knows which of the
-// two streams a line came from it labels it; where it does not, stdout is the
-// honest default, and a line whose origin is not known must not be reported as
-// stderr.
+// Events, in order, on a channel the implementer owns and closes exactly once.
+// Cancelling ctx is how the caller stops it, so there is no Close to forget.
+// `Stream` is "stdout" or "stderr" — a line whose origin is not known is
+// stdout, which is the honest default, and must never be reported as stderr.
+// `Timestamp` is when the *container* emitted the line rather than when it was
+// read: a hundred lines of backlog stamped with the read time is a hundred
+// things happening at once, which in an incident is a lie about the sequence.
+// `Message` carries no trailing newline.
+//
+// It must not block on a caller that has stopped reading. A container in a
+// crash loop outruns a browser, and the answer is to drop and say so with
+// application.ServiceLogEvent.Notice, not to buffer the difference.
+//
+// This used to hand back an io.ReadCloser of lines with an optional "stderr\t"
+// prefix, which the handler split and parsed. It carries events instead because
+// the wire type has two fields that shape could not reach: the daemon states
+// which task and which node each line came from, and a byte stream has nowhere to
+// put them — so for a replicated service, one node crash-looping and the whole
+// service being broken looked identical.
 //
 // `app` and `svc` have already been authorised and, more importantly, `svc` has
 // already been checked to be one of `app`'s own services — see serviceLogs.
@@ -40,18 +51,38 @@ import (
 // up on its own, because the guard authorised the subject for `app` and for
 // nothing else.
 type LogStreamer interface {
-	ServiceLogs(ctx context.Context, app, svc string, tail int, follow bool) (io.ReadCloser, error)
+	ServiceLogs(ctx context.Context, app, svc string, tail int, follow bool) (<-chan application.ServiceLogEvent, error)
 }
 
 // How much scrollback a newly attached client is given.
 const logTail = 100
 
-// A container is entitled to emit a line longer than bufio's 64KB default — a
-// stack trace, a serialised request, one line of JSON — and the default makes
-// Scan return false on it, which ended the whole stream silently and left a
-// console that looked live. Capped rather than unbounded because the producer
-// is not ours.
-const maxLogLine = 1 << 20
+// maxLogStreams bounds how many log streams this controller serves at once.
+//
+// Each one holds a goroutine, a channel and a connection to the daemon, and
+// nothing else bounded them: a browser with several tabs open, or an authorised
+// client behaving badly, took as many as it asked for. Enforced here rather
+// than behind the seam so that the bound covers every implementer of it,
+// including a companion's.
+const maxLogStreams = 16
+
+// logKeepalive is how often an idle log stream writes a comment frame, and how
+// often it re-checks that the subject may still read it.
+//
+// # Why this stream has an idle timer when the event stream deliberately does not
+//
+// api/stream.go has none because a quiet controller is normal. A quiet
+// container is normal too, so the traffic is not the difference — the client
+// is. A browser opens /events with EventSource, which reconnects on its own, so
+// a proxy closing an idle event stream is invisible. The log console uses fetch
+// and a reader, does not reconnect, and renders the close as ENDED until the
+// operator changes tab and comes back. nginx's proxy_read_timeout is 60 seconds
+// by default, so without this every console watching a service that logs hourly
+// dies a minute after it was opened.
+//
+// A third of that default, so one lost frame still leaves 20 seconds of margin.
+// A var so a test does not have to spend it.
+var logKeepalive = 20 * time.Second
 
 // serviceLogs streams live stdout/stderr log lines for the given application
 // service over SSE.
@@ -96,8 +127,33 @@ func (s *Server) serviceLogs(w http.ResponseWriter, r *http.Request, _ authz.Sub
 		return
 	}
 
-	rc, err := streamer.ServiceLogs(r.Context(), app, svc, logTail, true)
-	if err != nil {
+	// After the 501, so a build with no streamer keeps saying so rather than
+	// reporting a full pool it does not have.
+	select {
+	case s.logSlots <- struct{}{}:
+		defer func() { <-s.logSlots }()
+	default:
+		fail(w, http.StatusServiceUnavailable, "too many log streams are open on this controller; try again shortly")
+		return
+	}
+
+	// Derived rather than the request's own, so that every path out of this
+	// handler ends the producer — including the ones the request context knows
+	// nothing about, such as the authorisation being withdrawn below.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	events, err := streamer.ServiceLogs(ctx, app, svc, logTail, true)
+	switch {
+	case errors.Is(err, application.ErrUnsupported):
+		// The same answer, and deliberately the same sentence, as a reconciler
+		// that is not a LogStreamer at all. Whether a build cannot stream
+		// because its reconciler has no method or because the backend behind
+		// this application's destination has no reader is a distinction inside
+		// the controller; from the caller's side it is one fact.
+		fail(w, http.StatusNotImplemented, "this controller does not stream service logs")
+		return
+	case err != nil:
 		// Logged in full, reported as a sentence. The error from a daemon call
 		// names socket paths and internal state, and this endpoint is reachable
 		// by every subject an authorizer grants ActionLogs — the same reasoning
@@ -106,13 +162,16 @@ func (s *Server) serviceLogs(w http.ResponseWriter, r *http.Request, _ authz.Sub
 		fail(w, http.StatusBadGateway, "could not open the service log stream; ask an administrator")
 		return
 	}
-	// Closed the way every other reader in this repository is: errcheck is on,
-	// and a bare `defer rc.Close()` is the one call in the tree that ignored it.
-	defer func() { _ = rc.Close() }()
 
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-transform")
-	w.Header().Set("Connection", "keep-alive")
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-cache, no-transform")
+	h.Set("Connection", "keep-alive")
+	// Proxies that buffer a response defeat the entire point of a stream; this
+	// is the header nginx and friends read to turn that off. api/stream.go has
+	// set it since it was written and this endpoint did not, so a proxied
+	// console could sit silent while the proxy accumulated.
+	h.Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
@@ -131,25 +190,48 @@ func (s *Server) serviceLogs(w http.ResponseWriter, r *http.Request, _ authz.Sub
 		return true
 	}
 
-	scanner := bufio.NewScanner(rc)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxLogLine)
-	for scanner.Scan() {
-		if r.Context().Err() != nil {
+	ticker := time.NewTicker(logKeepalive)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
 			return
-		}
-		stream, message, at := splitLine(scanner.Text(), func() time.Time { return time.Now().UTC() })
-		if !send(application.ServiceLogEvent{
-			Service:   svc,
-			Stream:    stream,
-			Message:   message,
-			Timestamp: at,
-		}) {
-			return
+		case <-ticker.C:
+			// Re-decided rather than settled at open, for the reason
+			// api/stream.go re-decides per event: this is the longest-lived
+			// authorised thing the API serves, and checked only once a
+			// withdrawn grant or a rotated token has no effect on a console
+			// that is already attached. Per tick rather than per line because
+			// a crash-looping container is thousands of lines a second.
+			if !s.mayStillRead(r, app) {
+				return
+			}
+			// A comment frame: ignored by every conforming SSE client, and by
+			// the console's own parser, which keeps only "data: " lines.
+			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case e, ok := <-events:
+			if !ok {
+				return
+			}
+			if !send(e) {
+				return
+			}
 		}
 	}
-	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
-		s.log.Error("error scanning service logs", "app", app, "service", svc, "error", err)
+}
+
+// mayStillRead reports whether the credential on the request still authorises
+// reading this application's logs.
+func (s *Server) mayStillRead(r *http.Request, app string) bool {
+	subject, err := s.authz.Authenticate(r)
+	if err != nil {
+		return false
 	}
+	return s.authz.Authorize(r.Context(), subject, authz.ActionLogs, app) == nil
 }
 
 // declaresService reports whether svc is one of the services this application's
@@ -162,45 +244,4 @@ func declaresService(view application.View, svc string) bool {
 		}
 	}
 	return false
-}
-
-// splitLine reads one line from the streamer into the three things the wire
-// type carries.
-//
-// # The stream label
-//
-// The wire type has carried a `stream` field since it was written and every
-// line was labelled "stdout" regardless, so the UI's STDERR filter matched
-// nothing and an error line was reported as ordinary output. A "stderr\t"
-// prefix is the cheapest thing a demultiplexing implementer can put on a line
-// that this side can read back; an unprefixed line is stdout, which is what an
-// implementer that cannot tell the two apart should produce.
-//
-// # The timestamp
-//
-// Docker puts an RFC3339 instant at the head of each line when asked for one,
-// and it is when the *container* emitted the line. Stamping time.Now() instead
-// — which is what this did — gives a hundred lines of backlog a single instant
-// and reads, in an incident, as a hundred things happening at once. A line
-// carrying no parseable instant falls back to now, because a log line with no
-// time at all is worse than one with an approximate one.
-func splitLine(line string, now func() time.Time) (stream, message string, at time.Time) {
-	stream = "stdout"
-	for _, p := range [...]struct{ prefix, name string }{{"stderr\t", "stderr"}, {"stdout\t", "stdout"}} {
-		if rest, ok := strings.CutPrefix(line, p.prefix); ok {
-			stream, line = p.name, rest
-			break
-		}
-	}
-
-	head, rest, found := strings.Cut(line, " ")
-	if !found {
-		return stream, line, now()
-	}
-	parsed, err := time.Parse(time.RFC3339Nano, head)
-	if err != nil {
-		// Not a timestamp, so it is the first word of the message.
-		return stream, line, now()
-	}
-	return stream, rest, parsed
 }

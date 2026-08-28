@@ -13,6 +13,19 @@ type StreamStatus = 'connecting' | 'live' | 'ended' | 'failed' | 'unsupported'
 /** How many lines the buffer keeps. A console left open overnight is bounded. */
 const logBufferLimit = 1000
 
+/**
+ * What a line is labelled with.
+ *
+ * A notice is the controller talking — output was dropped, a line was truncated
+ * — and it carries `stream: 'stderr'` so the stream filter does not hide it
+ * from the operator looking for trouble. That makes it indistinguishable from a
+ * line the container wrote unless it is labelled differently, which is what
+ * this is for, and it is also what Copy and Export write.
+ */
+function tagOf(log: ServiceLogEvent): string {
+  return log.notice ? 'NOTICE' : log.stream.toUpperCase()
+}
+
 /** What the stream badge and the footer say, per state. */
 const badge: Record<StreamStatus | 'paused', { dot: string; text: string }> = {
   connecting: { dot: 'pulse-warn', text: 'CONNECTING' },
@@ -168,7 +181,7 @@ export function ServiceLogViewer({
 
   const copyLogs = () => {
     const text = filteredLogs
-      .map((l) => `[${l.timestamp.slice(11, 19)}] [${l.stream.toUpperCase()}] ${l.message}`)
+      .map((l) => `[${l.timestamp.slice(11, 19)}] [${tagOf(l)}] ${l.message}`)
       .join('\n')
     void navigator.clipboard.writeText(text)
     setCopied(true)
@@ -177,7 +190,7 @@ export function ServiceLogViewer({
 
   const exportLogs = () => {
     const text = filteredLogs
-      .map((l) => `[${l.timestamp.slice(11, 19)}] [${l.stream.toUpperCase()}] ${l.message}`)
+      .map((l) => `[${l.timestamp.slice(11, 19)}] [${tagOf(l)}] ${l.message}`)
       .join('\n')
     const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -331,11 +344,11 @@ export function ServiceLogViewer({
           filteredLogs.map((log) => (
             <div
               key={`${log.timestamp}-${logs.indexOf(log)}`}
-              className={`console-line ${log.stream === 'stderr' ? 'line-stderr' : 'line-stdout'}`}
+              className={`console-line ${log.notice ? 'line-notice' : log.stream === 'stderr' ? 'line-stderr' : 'line-stdout'}`}
             >
               <span className="line-num">{String(logs.indexOf(log) + 1).padStart(3, '0')}</span>
               <span className="line-time">{log.timestamp.slice(11, 19)}</span>
-              <span className={`line-tag line-tag-${log.stream}`}>{log.stream.toUpperCase()}</span>
+              <span className={`line-tag line-tag-${log.notice ? 'notice' : log.stream}`}>{tagOf(log)}</span>
               <span className="line-content">{log.message}</span>
             </div>
           ))

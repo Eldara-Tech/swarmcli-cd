@@ -61,6 +61,7 @@ var (
 	_ capability.ResourceRemover     = (*Backend)(nil)
 	_ capability.SwarmSizer          = (*Backend)(nil)
 	_ capability.NodeRoster          = (*Backend)(nil)
+	_ capability.ServiceLogReader    = (*Backend)(nil)
 )
 
 // WithRegistryAuth returns a copy of the backend that authenticates its image

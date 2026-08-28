@@ -396,6 +396,15 @@ export interface ServiceLogEvent {
   stream: 'stdout' | 'stderr'
   message: string
   timestamp: Timestamp
+  /**
+   * Set on the one class of line the container did not write: the controller
+   * reporting that it dropped output, or truncated a line that would not end.
+   *
+   * Such a line carries `stream: 'stderr'` so the stream filter does not hide
+   * it from the operator looking for trouble, which is exactly why it also
+   * needs marking — without this it is indistinguishable from output.
+   */
+  notice?: boolean
 }
 
 export interface RiskItem {

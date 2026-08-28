@@ -91,6 +91,10 @@ type Server struct {
 	// ui serves the browser UI. Never nil; see Options.UI.
 	ui     http.Handler
 	events *stream
+	// logSlots bounds the number of log streams served at once: one token per
+	// stream, taken non-blocking, so the seventeenth is refused rather than
+	// queued. See maxLogStreams.
+	logSlots chan struct{}
 	// syncing runs a sync detached from the request that asked for it.
 	// Overridable in tests, which otherwise have to race a goroutine.
 	syncing func(app string, run func(context.Context))
@@ -151,7 +155,7 @@ func New(rec Reconciler, o Options) *Server {
 	if o.Features == nil {
 		o.Features = feature.Get()
 	}
-	s := &Server{rec: rec, controller: o.Controller, authz: o.Authorizer, features: o.Features, version: o.Version, log: o.Log, ui: o.UI, events: newStream(o.Log)}
+	s := &Server{rec: rec, controller: o.Controller, authz: o.Authorizer, features: o.Features, version: o.Version, log: o.Log, ui: o.UI, events: newStream(o.Log), logSlots: make(chan struct{}, maxLogStreams)}
 	s.syncing = s.detach
 	return s
 }
