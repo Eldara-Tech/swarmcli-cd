@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 
 import { apiGet } from '../api/client'
+import { useCapability } from '../api/discovery'
 import { listKey } from '../api/queries'
 import type { ApplicationList } from '../api/types'
 import { ServiceLogViewer } from '../components/ServiceLogViewer'
@@ -17,6 +18,10 @@ import { useLive } from '../live'
  */
 export function Monitor() {
   const live = useLive()
+  // Whether this build can tail container output at all. A controller with no
+  // log streamer answers 501, and offering the control anyway means the
+  // operator learns that by clicking it — which is what #259 is about.
+  const logs = useCapability('logs')
   const [streamMode, setStreamMode] = useState<'controller' | 'service'>('controller')
   const [selectedApp, setSelectedApp] = useState<string>('')
   const [selectedService, setSelectedService] = useState<string>('')
@@ -42,6 +47,13 @@ export function Monitor() {
   const currentAppObj = appsList.find((a) => a.name === currentApp)
   const currentService = selectedService || currentAppObj?.services[0] || ''
 
+  // Derived rather than pushed into state by an effect. The capability arrives
+  // asynchronously, so a build that cannot stream logs can have the control
+  // selected before the document lands; reading the mode through the
+  // capability means the pane cannot outlive the button that opened it, and
+  // there is no state to get stuck in.
+  const mode = logs ? streamMode : 'controller'
+
   return (
     <section className="screen monitor-screen">
       <header className="screen-header">
@@ -51,16 +63,18 @@ export function Monitor() {
         </div>
 
         <div className="btn-segment header-segment">
+          {logs && (
+            <button
+              type="button"
+              className={`btn-seg ${mode === 'service' ? 'active' : ''}`}
+              onClick={() => setStreamMode('service')}
+            >
+              Service Container Logs
+            </button>
+          )}
           <button
             type="button"
-            className={`btn-seg ${streamMode === 'service' ? 'active' : ''}`}
-            onClick={() => setStreamMode('service')}
-          >
-            Service Container Logs
-          </button>
-          <button
-            type="button"
-            className={`btn-seg ${streamMode === 'controller' ? 'active' : ''}`}
+            className={`btn-seg ${mode === 'controller' ? 'active' : ''}`}
             onClick={() => setStreamMode('controller')}
           >
             Controller Events
@@ -68,13 +82,13 @@ export function Monitor() {
         </div>
       </header>
 
-      {streamMode === 'service' && currentService === '' ? (
+      {mode === 'service' && currentService === '' ? (
         <Empty icon="service">
           {views.length === 0
             ? 'No applications to read logs from.'
             : 'This application reports no services yet, so there is no container output to tail.'}
         </Empty>
-      ) : streamMode === 'service' ? (
+      ) : mode === 'service' ? (
         <ServiceLogViewer
           app={currentApp}
           service={currentService}

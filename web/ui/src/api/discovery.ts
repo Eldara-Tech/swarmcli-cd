@@ -96,6 +96,22 @@ export interface BootstrapDocument {
 export const featureNames = ['multi-swarm', 'sso', 'projects', 'audit', 'notifications'] as const
 export type FeatureName = (typeof featureNames)[number]
 
+/**
+ * Every capability name the controller reports on, from api.Capabilities().
+ *
+ * Deliberately not a FeatureName. A feature is what a *licence* grants; a
+ * capability is what this build's reconciler is wired to answer, read off the
+ * same type assertions the handlers make. Merging them would let a licensed
+ * reporter turn an endpoint on, and would make the licence document answer a
+ * question about wiring.
+ *
+ * Carried on the same terms as the feature map: the document always has all of
+ * them, so a control can tell false from absent rather than vanishing when a
+ * key goes missing.
+ */
+export const capabilityNames = ['logs', 'nodes'] as const
+export type CapabilityName = (typeof capabilityNames)[number]
+
 /** The five statuses of feature.Status (D25). See LicenceBadge for what each one asks of the reader. */
 export const licenceStatuses = ['valid', 'grace', 'expired', 'invalid', 'absent'] as const
 export type LicenceStatus = (typeof licenceStatuses)[number]
@@ -117,6 +133,13 @@ export interface CapabilityDocument {
   /** "community" until a licence verifies, "business" after. */
   edition: string
   features: Record<FeatureName, boolean>
+  /**
+   * What this build's reconciler is wired to answer, which is a different
+   * question from what its licence grants. Read-scoped like `features`: it is
+   * what the UI decides what to draw from, and a control present for one
+   * subject and absent for another is the dead control #178 forbids.
+   */
+  capabilities: Record<CapabilityName, boolean>
   /**
    * Null in a build with no licensed module linked, which is a different thing
    * from a licensed build with no licence installed: that one reports a status
@@ -212,10 +235,22 @@ export function useCapabilities(): UseQueryResult<CapabilityDocument> {
   })
 }
 
-/** useFeature reports whether this build grants one capability. Off unless the document says otherwise. */
+/** useFeature reports whether this build's licence grants one feature. Off unless the document says otherwise. */
 export function useFeature(name: FeatureName): boolean {
   // Compared against true rather than coerced, because the value is undefined
   // for a document that omitted the key — a controller older than the name, or
   // ahead of it — and a control must not appear on an undefined.
   return useCapabilities().data?.features[name] === true
+}
+
+/**
+ * useCapability reports whether this build is wired to answer one thing.
+ *
+ * Off while the document is in flight and off when it failed, the same bargain
+ * useFeature makes: a control that flickered in and then out on every load is
+ * worse than one that appears a moment late, and a control drawn on a document
+ * that never arrived is the advertisement of a capability this exists to stop.
+ */
+export function useCapability(name: CapabilityName): boolean {
+  return useCapabilities().data?.capabilities[name] === true
 }

@@ -8,7 +8,16 @@ import { App, queryClient } from '../App'
 import { logLimit } from '../api/useEventStream'
 import type { View } from '../api/types'
 import { setToken } from '../auth/session'
-import { clone, communityDiscovery, controller, json, openStream, pushLogStream, pushStream } from '../test/fakeApi'
+import {
+  clone,
+  communityDiscovery,
+  controller,
+  discoveryWith,
+  json,
+  openStream,
+  pushLogStream,
+  pushStream,
+} from '../test/fakeApi'
 import viewFull from '../test/fixtures/view-full.json'
 
 const okStatus = {
@@ -102,12 +111,15 @@ describe('the monitor', () => {
   it('offers the log console for the services an application actually reports', async () => {
     const stream = pushStream()
     controller({
-      ...communityDiscovery(),
+      ...discoveryWith({ logs: true }),
       '/api/v1/status': () => json(200, okStatus),
       '/api/v1/applications': () => json(200, { applications: [edgeRow('edge-web')] }),
       '/api/v1/events': stream.open,
-      // 501 is what an open-source build answers; the viewer must say so
-      // rather than fill the console with lines.
+      // The document said this build streams logs and the endpoint says it
+      // does not. That disagreement is no longer any build's ordinary state —
+      // a controller with no streamer now reports the capability off and the
+      // control is absent — but the viewer must still say so rather than fill
+      // the console with lines, because the endpoint is the authority.
       '/api/v1/applications/edge/services/edge-web/logs': () =>
         json(501, { error: 'this controller does not stream service logs' }),
     })
@@ -130,7 +142,7 @@ describe('the monitor', () => {
     // tailed a service name nothing had ever reported.
     const stream = pushStream()
     controller({
-      ...communityDiscovery(),
+      ...discoveryWith({ logs: true }),
       '/api/v1/status': () => json(200, okStatus),
       '/api/v1/applications': () => json(200, { applications: [edgeRow()] }),
       '/api/v1/events': stream.open,
@@ -260,7 +272,7 @@ describe('pausing the service log console', () => {
   /** A Monitor already switched to the log console, tailing edge/edge-web. */
   async function openLogs(stream: ReturnType<typeof pushLogStream>) {
     controller({
-      ...communityDiscovery(),
+      ...discoveryWith({ logs: true }),
       '/api/v1/status': () => json(200, okStatus),
       '/api/v1/applications': () => json(200, { applications: [edgeRow('edge-web')] }),
       '/api/v1/events': openStream,
@@ -308,5 +320,50 @@ describe('pausing the service log console', () => {
     // The buffer survived both transitions, which it cannot do if the effect
     // re-ran.
     expect(screen.getByText('before the pause')).toBeDefined()
+  })
+})
+
+describe('the log console is gated on the build reporting a streamer', () => {
+  async function openMonitor(): Promise<void> {
+    render(<App />)
+    await screen.findByTestId('application-count')
+    fireEvent.click(screen.getByRole('link', { name: 'Monitor' }))
+    await screen.findByRole('heading', { name: 'Monitor' })
+  }
+
+  // The stock build has no LogStreamer, so /logs answers 501 — and the console
+  // offered the tab anyway, which meant the operator discovered that by
+  // clicking it. The control is now absent, and the controller stream, which
+  // every build serves, is what Monitor is.
+  it('omits the control on a build that cannot stream logs', async () => {
+    const asked = vi.fn(() => json(501, { error: 'this controller does not stream service logs' }))
+    controller({
+      ...discoveryWith({ logs: false }),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [edgeRow('edge-web')] }),
+      '/api/v1/events': openStream,
+      '/api/v1/applications/edge/services/edge-web/logs': asked,
+    })
+    await openMonitor()
+
+    expect(screen.queryByRole('button', { name: 'Service Container Logs' })).toBeNull()
+    // The remaining control is still the one that is selected, so removing the
+    // other one did not leave the segment showing nothing as active.
+    expect(screen.getByRole('button', { name: 'Controller Events' }).className).toContain('active')
+    // And no stream was opened for a service the build cannot tail.
+    expect(asked).not.toHaveBeenCalled()
+  })
+
+  it('offers the control on a build that can', async () => {
+    controller({
+      ...discoveryWith({ logs: true }),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [edgeRow('edge-web')] }),
+      '/api/v1/events': openStream,
+      '/api/v1/applications/edge/services/edge-web/logs': openStream,
+    })
+    await openMonitor()
+
+    expect(screen.getByRole('button', { name: 'Service Container Logs' })).toBeDefined()
   })
 })
