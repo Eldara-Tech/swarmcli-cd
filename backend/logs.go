@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
@@ -267,15 +268,17 @@ func (t *timedReader) Read(p []byte) (int, error) {
 // because the manager was busy would be a worse answer than an unnamed replica.
 type logLabels struct {
 	// slots maps a task id to the replica number swarm gave it. Absent means
-	// unknown; zero is not stored, because a global service's tasks have no
-	// slot and replica zero does not exist.
+	// no listing has named this task; zero means a listing named it and it has
+	// no replica number, which is what every task of a global-mode service is.
+	// Those are two different questions and only the first is worth asking
+	// again.
 	slots map[string]int
 	// hosts maps a node id to its hostname.
 	hosts map[string]string
 
-	// refresh re-reads slots. Nil once the lookup has failed in a way that
-	// asking again will not fix.
-	refresh func(context.Context) map[string]int
+	// refresh re-reads slots and reports whether asking again could ever
+	// answer differently. Nil once it could not.
+	refresh func(context.Context) (map[string]int, bool)
 	// asked is when refresh last ran, so an unseen task id cannot ask more
 	// often than logSlotRefresh.
 	asked time.Time
@@ -291,8 +294,8 @@ func (b *Backend) logLabels(ctx context.Context, serviceID string) *logLabels {
 	l := &logLabels{now: b.now, hosts: map[string]string{}}
 
 	if serviceID != "" {
-		l.refresh = func(ctx context.Context) map[string]int { return b.taskSlots(ctx, serviceID) }
-		l.slots = l.refresh(ctx)
+		l.refresh = func(ctx context.Context) (map[string]int, bool) { return b.taskSlots(ctx, serviceID) }
+		l.reread(ctx)
 	}
 	if l.slots == nil {
 		l.slots = map[string]int{}
@@ -319,29 +322,63 @@ func (b *Backend) logLabels(ctx context.Context, serviceID string) *logLabels {
 	return l
 }
 
-// taskSlots maps each of the service's task ids to its replica number.
+// reread runs the lookup and keeps what it answered.
+//
+// A failure that asking again cannot fix drops the refresh, so one console
+// session does not spend a TaskList and a warning line every thirty seconds on
+// a question that has already been answered no.
+func (l *logLabels) reread(ctx context.Context) {
+	fresh, again := l.refresh(ctx)
+	if fresh != nil {
+		l.slots = fresh
+	}
+	if !again {
+		l.refresh = nil
+	}
+}
+
+// taskSlots maps each of the service's task ids to its replica number, and
+// reports whether a failure is worth asking about again.
 //
 // A nil map means the lookup failed, which is deliberately distinct from an
-// empty one: empty is a service whose tasks are all global, and nil is a
-// question that was not answered.
-func (b *Backend) taskSlots(ctx context.Context, serviceID string) map[string]int {
+// empty one: empty is a service with no tasks at all, and nil is a question
+// that was not answered.
+func (b *Backend) taskSlots(ctx context.Context, serviceID string) (map[string]int, bool) {
 	tasks, err := b.api.TaskList(ctx, swarm.TaskListOptions{
 		Filters: filters.NewArgs(filters.Arg("service", serviceID)),
 	})
 	if err != nil {
 		b.log.Warn("could not name the tasks behind a log stream; lines will carry task ids", "service", serviceID, "error", err)
-		return nil
+		return nil, !refusedForGood(err)
 	}
 	out := make(map[string]int, len(tasks))
 	for _, t := range tasks {
-		// Slot 0 is not stored. It is what a global-mode service reports —
-		// the daemon treats a zero slot as the global case itself — and storing
-		// it would let the console draw a replica that does not exist.
-		if t.Slot > 0 {
-			out[t.ID] = t.Slot
-		}
+		// Slot 0 is stored rather than dropped, and the zero is the point. It
+		// is what a global-mode service reports — the daemon treats a zero slot
+		// as the global case itself — so recording it is how a task known to
+		// have no replica number is told apart from a task no listing has
+		// named yet. The console is unaffected: 0 is the absent slot it
+		// already renders as the node's hostname, and the wire field is
+		// omitempty (#271).
+		out[t.ID] = t.Slot
 	}
-	return out
+	return out, true
+}
+
+// refusedForGood reports whether a failed daemon call is one that asking again
+// cannot fix.
+//
+// Only the answers that are about the caller rather than about the moment: an
+// authorizer in front of the daemon that does not grant this call, a
+// connection that is not authenticated, an endpoint the other side does not
+// serve, a request it will not parse. Everything else — a busy manager, a lost
+// connection, a leader election — is transient by default, because asking again
+// costs one call per interval and refusing to costs the label for the life of
+// the stream, and a rollout is both when the label matters and when a manager
+// is busy.
+func refusedForGood(err error) bool {
+	return errdefs.IsPermissionDenied(err) || errdefs.IsUnauthorized(err) ||
+		errdefs.IsNotImplemented(err) || errdefs.IsInvalidArgument(err)
 }
 
 // slot reports the replica number for a task id, and whether it is known.
@@ -353,10 +390,11 @@ func (b *Backend) taskSlots(ctx context.Context, serviceID string) map[string]in
 // crash-looping through tasks would otherwise turn one log stream into a
 // TaskList loop against the manager, on the goroutine draining the connection.
 //
-// A global service's tasks are never in this map by design, so it pays one
-// lookup per interval for as long as the stream is open. That is the cost of
-// not having a second map to record that a task is known to have no slot, and
-// it is bounded where a per-line lookup would not be.
+// A task the listing has already named has its answer even when that answer is
+// that it has no slot, because the zero is recorded rather than dropped. So a
+// stream tailing a global-mode service reads the task list at open and not
+// again, where it used to read it once per interval for as long as the console
+// stayed open (#271).
 func (l *logLabels) slot(ctx context.Context, taskID string) int {
 	// A nil receiver is "nothing is known", not a wiring mistake. Every label
 	// is optional by design — the line is the product and the name is the
@@ -372,9 +410,7 @@ func (l *logLabels) slot(ctx context.Context, taskID string) int {
 		return 0
 	}
 	l.asked = l.now()
-	if fresh := l.refresh(ctx); fresh != nil {
-		l.slots = fresh
-	}
+	l.reread(ctx)
 	return l.slots[taskID]
 }
 
