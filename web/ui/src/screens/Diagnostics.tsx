@@ -4,6 +4,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { apiGet, hasStatus } from '../api/client'
+import { useCapability } from '../api/discovery'
 import type { DiagnosticsResponse, NodesResponse } from '../api/types'
 import { Icon } from '../components/Icon'
 import { Empty, Loading } from '../components/StateBlock'
@@ -29,12 +30,26 @@ export function Diagnostics() {
     queryFn: () => apiGet<DiagnosticsResponse>('/api/v1/diagnostics'),
   })
 
+  // Whether this build reports a swarm roster at all. A controller whose
+  // reconciler has no node lister answers 501, so the card is left out rather
+  // than drawn as a heading over an apology.
+  const nodesSupported = useCapability('nodes')
+
   const nodes = useQuery({
     queryKey: ['nodes'],
     queryFn: () => apiGet<NodesResponse>('/api/v1/nodes'),
+    // Not asked at all when the build says it cannot answer. The 501 is the
+    // authority on any one request and the handling below stays, but there is
+    // no reason to spend a round trip being told so on every load.
+    enabled: nodesSupported,
   })
 
-  if (diag.isPending || nodes.isPending) return <Loading />
+  // nodes.isLoading, not isPending: a query that is disabled is pending for
+  // ever, so gating the roster fetch on the capability and then waiting on
+  // isPending would leave the whole screen on a spinner for every build that
+  // reports no roster. isLoading is pending *and* fetching, which is the
+  // question actually being asked here — is a request outstanding.
+  if (diag.isPending || nodes.isLoading) return <Loading />
   if (diag.isError) {
     return (
       <p className="error" role="alert">
@@ -186,7 +201,12 @@ export function Diagnostics() {
         </div>
       )}
 
-      {/* Swarm Nodes Topology Matrix */}
+      {/* Swarm Nodes Topology Matrix. Absent entirely on a build that cannot
+          report one: the 501 state below is still reached when the document and
+          the endpoint disagree — a companion backend with no roster answers
+          application.ErrUnsupported while the seam is wired — but it is no
+          longer the ordinary state of every build. */}
+      {nodesSupported && (
       <div className="card-frame full-width-card">
         <div className="card-frame-head">
           <h2>
@@ -276,6 +296,7 @@ export function Diagnostics() {
           )}
         </div>
       </div>
+      )}
     </section>
   )
 }

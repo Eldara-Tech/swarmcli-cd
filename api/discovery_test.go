@@ -24,6 +24,14 @@ import (
 // reporter in force — rather than about the reconciler behind them.
 func discoveryServer(t *testing.T, o Options) http.Handler {
 	t.Helper()
+	return discoveryServerWith(t, &fakeReconciler{}, o)
+}
+
+// discoveryServerWith is discoveryServer for a test that cares which optional
+// seams the reconciler implements — the capability map is read off exactly
+// those, so it is the one thing a fixed reconciler cannot vary.
+func discoveryServerWith(t *testing.T, rec Reconciler, o Options) http.Handler {
+	t.Helper()
 	if o.Log == nil {
 		o.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -33,7 +41,7 @@ func discoveryServer(t *testing.T, o Options) http.Handler {
 	if o.Authorizer == nil {
 		o.Authorizer = &allowAll{}
 	}
-	h, err := New(&fakeReconciler{}, o).Handler()
+	h, err := New(rec, o).Handler()
 	if err != nil {
 		t.Fatalf("building the router: %v", err)
 	}

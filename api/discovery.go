@@ -120,8 +120,11 @@ type capabilityDocument struct {
 	Version  string                `json:"version"`
 	Edition  string                `json:"edition"`
 	Features map[feature.Name]bool `json:"features"`
-	Licence  *feature.Licence      `json:"licence"`
-	Seams    seamsDocument         `json:"seams"`
+	// Capabilities is what this build's reconciler is wired to answer, which is
+	// a different question from what its licence grants. See Capability.
+	Capabilities map[Capability]bool `json:"capabilities"`
+	Licence      *feature.Licence    `json:"licence"`
+	Seams        seamsDocument       `json:"seams"`
 }
 
 // seamsDocument is the "seams" line controller.serve logs at startup, made
@@ -145,9 +148,10 @@ type seamsDocument struct {
 // capabilities serves the build's own capability report.
 //
 // Reachable with ActionRead, and split. Every subject that may read anything
-// gets the edition and the feature map, because that is what the browser draws
-// the UI from and a control that vanished for a tenant would be the dead
-// control #178's criterion forbids. Everything else is ActionController's:
+// gets the edition, the feature map and the capability map, because that is
+// what the browser draws the UI from and a control that vanished for a tenant
+// would be the dead control #178's criterion forbids. Everything else is
+// ActionController's:
 //
 //   - version, which bootstrap.json deliberately withholds from an
 //     unauthenticated caller on the stated grounds that handing out a build
@@ -178,6 +182,13 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request, subject au
 	doc := capabilityDocument{
 		Edition:  report.Edition,
 		Features: features,
+		// Read-scoped, beside the feature map and for the same reason: it is
+		// what the browser draws the UI from, and a control that vanished for a
+		// tenant while another subject could see it would be the dead control
+		// #178's criterion forbids. It also discloses strictly less than the
+		// endpoints it describes, which every subject holding the action can
+		// already ask directly.
+		Capabilities: s.capabilityReport(),
 		// The same shape whichever half this is, so that a client reads one
 		// document type: the two name lists are [] rather than null for the
 		// reason orEmpty exists.

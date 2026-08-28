@@ -48,7 +48,10 @@ Added two new fine-grained permission verbs:
 - **Protocol:** Server-Sent Events (`text/event-stream; charset=utf-8`)
 - **Interface:** `LogStreamer` seam (`ServiceLogs(ctx, app, svc, tail, follow) (io.ReadCloser, error)`)
 - **Unimplemented in this repository.** No reconciler here satisfies `LogStreamer`, so an
-  open-source build answers **501** and the console says the controller does not stream logs.
+  open-source build reports `capabilities.logs: false` and the console leaves the control out
+  entirely (#259). The endpoint still answers **501** and the viewer still renders that state,
+  because the document says what a build is *wired* for and the endpoint is the authority on
+  any one request.
   It must not answer anything else: the first version of this endpoint emitted a synthetic
   line every three seconds — `service X task healthy - 0 active errors` — as container output,
   which is a health claim about a service nothing had contacted.
@@ -131,7 +134,7 @@ Added two new fine-grained permission verbs:
 ## 3. Web UI & Operator Console
 
 ### 3.1 Monitor 2.0 (`web/ui/src/screens/Monitor.tsx`)
-- **Dual Stream Modes:** Segmented pill toggle between **Controller Reconcile Events** and **Service Container Logs**.
+- **Dual Stream Modes:** Segmented pill toggle between **Controller Reconcile Events** and **Service Container Logs**. The log half appears only on a build reporting `capabilities.logs` (#259); everywhere else Monitor is the controller stream, which every build serves.
 - **Unified Header Toolbar:** Embedded Application & Service selectors with pulsing `LIVE` / `PAUSED` stream badge.
 - **High-Performance Log Viewer:**
   - Tabular column alignment: Line numbers (`001`, `002`) → Gutter timestamps → `STDOUT`/`STDERR` chips → Log messages.
@@ -148,7 +151,8 @@ Added two new fine-grained permission verbs:
 - **Integrity Gauge:** Dynamic SVG score ring with status tone.
 - **Audit Checklist:** Operational verification matrix with pass/warn chips.
 - **Swarm Node Matrix:** Pro node cards displaying server icons, live status dots (`● READY`), 4-column metric grids (Engine version, IP address, Availability, and Tasks Allocated with visual progress tracks). The task gauge is an `<svg>` rect rather than a styled `<div>`: a data-driven width is an inline `style` attribute, which `style-src 'self'` refuses — the same constraint the integrity ring beside it is drawn under.
-- **Three states, not one.** A build that cannot report a roster (501), a roster that could not be read, and a swarm reporting no nodes are drawn differently; none of them is an empty grid. The third is now unreachable from this build's own backend, which refuses an empty roster rather than serving one, but the state stays: it is what a reconciler reached through the same interface may still produce.
+- **Gated on the capability (#259).** The card is absent altogether on a build reporting `capabilities.nodes: false`, and the roster is not fetched at all there — a card that could only ever be an apology is not a card.
+- **Three states, not one,** for a build that does report one. A destination that cannot answer (501), a roster that could not be read, and a swarm reporting no nodes are drawn differently; none of them is an empty grid. The third is unreachable from this build's own backend, which refuses an empty roster rather than serving one, but the state stays: it is what a reconciler reached through the same interface may still produce.
 
 ### 3.3 Application Detail & Release Polish (`web/ui/src/screens/ApplicationDetail.tsx`)
 - **Balanced Spec Bento Grid:** Equal-height layout for `GitOps Specification` and `Swarm Runtime & Reconcile` with drift state indicator.

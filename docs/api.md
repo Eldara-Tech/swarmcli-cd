@@ -32,15 +32,17 @@ so the quickest way to see any shape below is to run the matching command with
 | `GET` | `/api/v1/nodes` | the swarm's node roster, with each node's task counts |
 | `GET` | `/api/v1/diagnostics` | the cluster integrity score, its checks and its open risks |
 | `GET` | `/api/v1/events` | a live event stream, so a UI never polls |
-| `GET` | `/api/v1/capabilities` | what this build is, what it grants, and which seam implementations are live |
+| `GET` | `/api/v1/capabilities` | what this build is, what it grants, what it is wired to answer, and which seam implementations are live |
 | `GET` | `/` | the web UI, and the fallback for its client-side routes |
 | `GET` | `/assets/{path...}` | the UI's hashed build output |
 
 Two of those are served behind an optional interface a reconciler either
 implements or does not, and a build whose reconciler does not answers **501**
 rather than inventing a reply — which is what both of them used to do. The node
-roster is implemented here; the log stream is not yet, and its 501 is the normal
-state of every build today.
+roster is implemented here; the log stream is not yet, so its 501 is the normal
+state of every build today. Which of the two a build can serve is reported by
+`capabilities` in the document below, so the console leaves out a control it
+would only be able to apologise for.
 
 The paths are nouns so that writable applications can be added later without any
 of them moving. Applications are read-only over the API in both directions of the
@@ -342,6 +344,7 @@ subject that is not granted it:
   "edition": "community",
   "features": { "multi-swarm": false, "sso": false, "projects": false,
                 "audit": false, "notifications": false },
+  "capabilities": { "logs": false, "nodes": true },
   "licence": null,
   "seams": { "swarms": "local", "authz": "token", "notify": ["log", "api"],
              "secrets": "plaintext", "feature": "community", "extension": [] }
@@ -350,7 +353,18 @@ subject that is not granted it:
 
 `features` always carries every key the build knows about, whatever the reporter
 put in its own map, so a UI hiding a control on `features["sso"]` can tell
-`false` from absent. `licence` is `null` in a build with no licensed module
+`false` from absent.
+
+`capabilities` answers a different question and must not be confused with it:
+`features` is what a **licence** grants, and `capabilities` is what this build's
+reconciler is **wired** to answer. The two key sets do not overlap, and a test
+enforces that. It is read off the same type assertions the endpoints make, so
+there is no second place to keep in step, and it carries every declared key for
+the same reason `features` does. What it does *not* promise is the outcome of
+any one request: whether a reconciler implements a seam is settled at compile
+time, but which backend serves a destination is settled per request, so an
+endpoint can still answer 501 for a capability reported `true`. The document
+says what the build is wired for; the endpoint stays the authority. `licence` is `null` in a build with no licensed module
 linked — which is a different thing from a licensed build with no licence
 installed, which reports a status of `absent`; the other four statuses are
 `valid`, `grace` (expired, still granting, renew before it stops), `expired` and
@@ -359,8 +373,9 @@ has the token but not the logs — which is also why it is behind `controller`: 
 names every implementation loaded into a process holding the docker socket,
 companion modules included, and `version` is the build number that
 `bootstrap.json` deliberately withholds from an unauthenticated caller. What a
-subject without `controller` keeps is `edition` and `features`, because that is
-what a UI decides what to draw from.
+subject without `controller` keeps is `edition`, `features` and `capabilities`,
+because that is what a UI decides what to draw from — a control present for one
+subject and absent for another would be a dead control.
 
 ## Event stream — `GET /api/v1/events`
 

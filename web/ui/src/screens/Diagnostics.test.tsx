@@ -8,7 +8,7 @@ import { App, queryClient } from '../App'
 import type { HealthState, SyncState } from '../api/enums'
 import type { View } from '../api/types'
 import { setToken } from '../auth/session'
-import { clone, communityDiscovery, controller, json, openStream } from '../test/fakeApi'
+import { clone, communityDiscovery, controller, discoveryWith, json, openStream } from '../test/fakeApi'
 import viewFull from '../test/fixtures/view-full.json'
 
 const okStatus = {
@@ -156,7 +156,9 @@ describe('the diagnostics screen', () => {
   it('says the build does not report nodes rather than drawing an empty matrix', async () => {
     // /nodes answered 200 with one invented manager — swarm-manager-01 at
     // 127.0.0.1 on engine 27.5.1 — whenever the reconciler had no node lister,
-    // which is every build. It now answers 501, and this is what that looks like.
+    // which was then every build. Since #260 this build has one, so the state
+    // under test is the other reachable 501: the capability document says the
+    // seam is wired and the destination's backend still cannot answer.
     controller({
       ...communityDiscovery(),
       '/api/v1/status': () => json(200, okStatus),
@@ -173,5 +175,64 @@ describe('the diagnostics screen', () => {
     for (const invented of ['swarm-manager-01', '27.5.1', '127.0.0.1']) {
       expect(screen.queryByText(invented)).toBeNull()
     }
+  })
+})
+
+describe('the node matrix is gated on the build reporting one', () => {
+  const diagnosticsOk = () =>
+    json(200, { score: 100, tone: 'ok', clearCount: 4, totalCount: 4, risks: [], checks: [] })
+
+  // The console used to draw the heading whatever the build could do, so an
+  // operator read "Swarm Node Topology & Health Matrix" and then an apology
+  // under it. A card that is only ever an apology is not a card.
+  it('leaves the card out entirely when the build reports no roster', async () => {
+    const asked = vi.fn(() => json(501, { error: 'this controller does not report swarm node telemetry' }))
+    controller({
+      ...discoveryWith({ nodes: false }),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [row('edge', 'synced', 'healthy')] }),
+      '/api/v1/diagnostics': diagnosticsOk,
+      '/api/v1/nodes': asked,
+      '/api/v1/events': openStream,
+    })
+    await openDiagnostics()
+
+    expect(screen.queryByText(/Swarm Node Topology/)).toBeNull()
+    expect(screen.queryByText(/does not report swarm node telemetry/)).toBeNull()
+    // And not merely hidden: a card that is not drawn should not have cost a
+    // round trip to a controller that already said it cannot answer.
+    expect(asked).not.toHaveBeenCalled()
+  })
+
+  it('draws the card when the build reports one', async () => {
+    controller({
+      ...discoveryWith({ nodes: true }),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [row('edge', 'synced', 'healthy')] }),
+      '/api/v1/diagnostics': diagnosticsOk,
+      '/api/v1/nodes': () =>
+        json(200, {
+          swarm: '',
+          nodes: [
+            {
+              id: 'n1',
+              hostname: 'mgr-1',
+              role: 'manager',
+              availability: 'active',
+              status: 'ready',
+              engineVersion: '28.5.2',
+              addr: '10.0.0.1',
+              leader: true,
+              tasksRunning: 2,
+              tasksDesired: 2,
+            },
+          ],
+        }),
+      '/api/v1/events': openStream,
+    })
+    await openDiagnostics()
+
+    expect(await screen.findByText(/Swarm Node Topology/)).toBeDefined()
+    expect(await screen.findByText('mgr-1')).toBeDefined()
   })
 })

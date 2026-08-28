@@ -55,6 +55,12 @@ export const communityCapabilities = {
   version: '1.2.0',
   edition: 'community',
   features: { 'multi-swarm': false, sso: false, projects: false, audit: false, notifications: false },
+  // What an Apache-2.0 build is *wired* for, which is not what its licence
+  // grants: the node roster is implemented here (#260) and the log streamer is
+  // not, so this pair is asymmetric on purpose. A fixture reporting both off,
+  // or both on, would make the console's own gate untestable in the one shape
+  // that ships.
+  capabilities: { logs: false, nodes: true },
   licence: null,
   seams: {
     swarms: 'local',
@@ -71,6 +77,26 @@ export function communityDiscovery(): Record<string, () => Response> {
   return {
     '/ui/bootstrap.json': () => json(200, tokenBootstrap),
     '/api/v1/capabilities': () => json(200, communityCapabilities),
+  }
+}
+
+/**
+ * communityDiscovery for a build wired for something the stock one is not — a
+ * companion that implements the log streamer, say.
+ *
+ * It exists because the console's controls are gated on the capability map, so
+ * a test of what the log console *does* has to be served a document that says
+ * this build has one. Serving the stock document instead would leave those
+ * tests asserting against a control the screen is now right to omit.
+ */
+export function discoveryWith(
+  capabilities: Partial<Record<'logs' | 'nodes', boolean>>,
+): Record<string, () => Response> {
+  const doc = clone(communityCapabilities)
+  doc.capabilities = { ...doc.capabilities, ...capabilities }
+  return {
+    '/ui/bootstrap.json': () => json(200, tokenBootstrap),
+    '/api/v1/capabilities': () => json(200, doc),
   }
 }
 
