@@ -356,6 +356,27 @@ one that does is rare enough to be worth a reopened console.
 Between the arrival and the refresh, the line carries the short task id — the
 honest fallback, and the same thing a lookup failure produces (D6).
 
+**Amended for #271.** As shipped, `slots` recorded only tasks with a slot above
+zero, so a global-mode service — whose tasks have no slot at all — presented
+every line as a task the map had never seen, and each open console re-read that
+service's task list once every 30 seconds for as long as the tab stayed open.
+The refresh was answering a question already settled at open. Two changes close
+it, both in `backend/logs.go`:
+
+- The zero is recorded rather than dropped. `slots` now says *absent means no
+  listing has named this task* and *zero means a listing named it and it has no
+  replica number*, which is the distinction the refresh needed and did not have.
+  Nothing downstream can tell: `slot` returned 0 for a global task either way,
+  the wire field is `omitempty`, and the console already renders an absent slot
+  as the node's hostname (§5.4).
+- A lookup that failed in a way asking again cannot fix — the manager refused
+  the call, the other side does not serve it, it will not parse the request —
+  drops the refresh for that stream, which is what this section's `refresh`
+  field always claimed and never did.
+
+Everything else here stands: a task that genuinely appears later still triggers
+one throttled refresh and is still named by it.
+
 **What goes on the wire.** `application.ServiceLogEvent` gains two fields:
 
 ```go

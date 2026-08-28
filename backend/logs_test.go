@@ -7,12 +7,15 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
@@ -583,6 +586,96 @@ func TestAGlobalServiceIsNamedByItsNodeAndNotByReplicaZero(t *testing.T) {
 	if got[0].NodeHostname != "swarm-w1" {
 		t.Errorf("hostname = %q, want swarm-w1 — the node is what names a global task", got[0].NodeHostname)
 	}
+}
+
+// A global service's tasks have no slot, ever, so every line from one used to
+// look like a task the map had never seen — and each one asked the manager for
+// the service's task list again, once every thirty seconds, for as long as the
+// console stayed open (#271). The zero the listing reported is the answer, and
+// recording it is what ends the asking.
+func TestAGlobalServiceStopsAskingForTheSlotItWillNeverHave(t *testing.T) {
+	api := labelled(lines("task-g", 5))
+	api.tasks = []swarm.Task{{ID: "task-g", Slot: 0, NodeID: "node-a"}}
+
+	got := tailOnClock(t, api, stepping(time.Minute))
+
+	if len(got) != 5 {
+		t.Fatalf("events = %d, want 5", len(got))
+	}
+	if len(api.taskFilters) != 1 {
+		t.Errorf("TaskList calls = %d, want 1 — the listing at open already said this task has no slot", len(api.taskFilters))
+	}
+	if got[0].Slot != 0 || got[0].NodeHostname != "swarm-w1" {
+		t.Errorf("a global task is still named by its node: %+v", got[0])
+	}
+}
+
+// A lookup the manager refuses is not a lookup worth repeating. A controller
+// behind an authorizer that grants logs and not tasks would otherwise spend a
+// TaskList and a warning line every thirty seconds, per open console, on an
+// answer that cannot change while the console is open.
+func TestARefusedTaskLookupIsNotAskedAgain(t *testing.T) {
+	api := labelled(lines("task-new", 5))
+	api.tasksErr = fmt.Errorf("denied by the authorizer: %w", errdefs.ErrPermissionDenied)
+
+	got := tailOnClock(t, api, stepping(time.Minute))
+
+	if len(got) != 5 {
+		t.Fatalf("events = %d, want 5 — a refused label must not cost the lines", len(got))
+	}
+	if len(api.taskFilters) != 1 {
+		t.Errorf("TaskList calls = %d, want 1 — the call was refused, not failed", len(api.taskFilters))
+	}
+}
+
+// A busy manager is a different answer from one that refused, and a rollout —
+// the thing the refresh exists for — is exactly when a manager is busy. So an
+// error that says nothing about the caller is asked again, throttle permitting.
+func TestABusyManagerIsAskedAgain(t *testing.T) {
+	api := labelled(lines("task-new", 5))
+	api.tasksErr = errors.New("manager busy")
+
+	tailOnClock(t, api, stepping(time.Minute))
+
+	// One at open, and one per line: the clock steps past the throttle between
+	// them, and nothing about the failure says asking again is pointless.
+	if len(api.taskFilters) != 6 {
+		t.Errorf("TaskList calls = %d, want 6 — one at open and one per unnamed line", len(api.taskFilters))
+	}
+}
+
+// lines is n frames of stdout from one task, a second apart.
+func lines(task string, n int) string {
+	var body strings.Builder
+	for i := range n {
+		body.WriteString(frame(frameStdout, swarmLine("2026-08-28T06:00:0"+strconv.Itoa(i)+"Z", "node-a", task, "line")))
+	}
+	return body.String()
+}
+
+// stepping is a clock that moves a step on every read.
+//
+// A step longer than logSlotRefresh is what makes the three tests above assert
+// what they say they do: with the throttle unable to be the reason a second
+// lookup did not happen, a call count of one is the map having recorded the
+// answer rather than half a minute not having passed.
+func stepping(step time.Duration) func() time.Time {
+	at := time.Unix(0, 0).UTC()
+	return func() time.Time {
+		at = at.Add(step)
+		return at
+	}
+}
+
+// tailOnClock is tailFor with the controller's clock supplied.
+func tailOnClock(t *testing.T, api *logAPI, now func() time.Time) []application.ServiceLogEvent {
+	t.Helper()
+	b := New(api, Options{Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: now})
+	ch, err := b.ServiceLogs(context.Background(), capability.ServiceLogRequest{Service: "edge_web", Tail: 100, Follow: true})
+	if err != nil {
+		t.Fatalf("ServiceLogs: %v", err)
+	}
+	return drain(t, ch)
 }
 
 // The two lookups are separate calls filling separate maps, which is what makes
