@@ -169,8 +169,16 @@ func statusWarning(lic *Licence, now time.Time) (msg string, args []any, ok bool
 		// StatusAbsent also carries a managed licence that is installed and
 		// not activated for this swarm, whose operator is holding the key
 		// already and would spend the afternoon installing it again.
+		//
+		// Naming both actions was still one remedy, because 'license sync'
+		// asks the licence service — and the deployment most likely to be
+		// sitting in this state is the one that cannot reach it by design. It
+		// holds the lease file already, so the offline half is named too:
+		// swarmcli-be's docs/managed-licensing.md §7.2 gives ':license lease
+		// install <file>' as what an operator does about NotActivated, and it
+		// is authoritative over what any surface says about it.
 		return "no licence is active — licensed features are off",
-			[]any{"status", lic.Status, "remedy", "install a licence, or run 'swarmcli license sync' on a manager to activate a managed one"}, true
+			[]any{"status", lic.Status, "remedy", "install a licence, or run 'swarmcli license sync' on a manager to activate a managed one; on an air-gapped swarm, ':license lease install <file>' in the TUI"}, true
 
 	case StatusValid:
 		if lic.ExpiresAt == nil {

@@ -211,7 +211,8 @@ test('logs in, watches an application converge without reloading, and reads ever
   // dead control the free product must not grow. The merged binary can never
   // report null, because under D20 the module is always linked; with no licence
   // installed it reports `absent`, and the badge says "no active licence,
-  // install one, or activate a managed one, to turn the licensed features on".
+  // install one, or activate a managed one, to turn the licensed features on;
+  // an air-gapped swarm activates with :license lease install <file>".
   // Both are community builds. Both are right.
   //
   // So it is derived from the document rather than from the edition, which also

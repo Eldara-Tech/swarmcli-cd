@@ -92,8 +92,13 @@ func TestLicenceWarning_WhatIsWorthSaying(t *testing.T) {
 			// licence at all, and a managed one this swarm never activated.
 			// Saying only "install" sends the second one's operator after a
 			// key already in their hand.
+			//
+			// And both routes to the second half. 'license sync' reaches the
+			// licence service, which the swarm most likely to be sitting in
+			// this state cannot do; the lease file it already holds is the
+			// remedy swarmcli-be's managed-licensing doc gives that operator.
 			contains: []string{"no licence is active"},
-			remedy:   []string{"install a licence", "activate a managed one"},
+			remedy:   []string{"install a licence", "activate a managed one", "lease install"},
 		},
 		{
 			name:     "a status from a newer reporter is surfaced rather than swallowed",

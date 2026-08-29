@@ -174,11 +174,23 @@ function describe(
       // all, and a managed one that is installed, verifies, and has not been
       // activated for this swarm. "install one" alone was written for the first
       // and sends the second's reader after a key already in their hand.
+      //
+      // Naming both actions still left one route, and it is the online one:
+      // activating a managed licence normally means asking the licence service.
+      // The operator most likely to be reading this cannot — an air-gapped
+      // swarm is exactly where an activation is not automatic — and the lease
+      // file they were sent is the path they have. Both halves fit both states,
+      // which is the constraint this status puts on every word here.
       return {
         tone: "warn",
         label: "no active licence",
-        detail:
-          "install one, or activate a managed one, to turn the licensed features on",
+        detail: (
+          <>
+            install one, or activate a managed one, to turn the licensed
+            features on; an air-gapped swarm activates with{" "}
+            <code>:license lease install &lt;file&gt;</code>
+          </>
+        ),
       };
     default:
       return {
