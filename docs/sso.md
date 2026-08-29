@@ -281,3 +281,19 @@ the browser there, and a response body is a thing a browser renders.
   decides, and why they are five rather than two
 - [Extensibility](extensibility.md) — the seams a licensed build replaces, and
   the paths reserved for it
+
+## If sign-in loops back to the login screen
+
+v1.1.0 shipped SSO that could never reach a screen. The callback issued its
+`HttpOnly` cookie and redirected to `/`, but the UI's own gate was
+`sessionStorage` holding a token — which SSO never writes. The browser landed
+back on the login screen it had just come from, for ever.
+
+The server contract was met in full; the UI's gate was a separate assumption
+nobody revisited. If you are adding an authentication path, **check what the UI
+tests for**, not only what the server issues: `api/discovery.go` now exposes a
+`session` document so the two agree on what "signed in" means.
+
+The general shape is worth carrying: a seam contract satisfied on one side is not
+a working feature, and the half that was not part of the contract is the half
+nobody looks at.

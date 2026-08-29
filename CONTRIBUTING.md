@@ -51,6 +51,34 @@ npm --prefix web/ui run dev     # the development loop; proxies to a controller 
 the build. `./scripts/check-npm-licences.sh`, `check-npm-scripts.sh` and
 `check-node-pins.sh` are the rest of the UI's gates.
 
+## Two ways a test passes without reaching the code
+
+**Build a rot-catching fixture by reflection, not by hand.** When a test exists to
+catch *a field added later* — a deep-copy check, a round-trip check, an "every
+field is serialised" check — walk the type with `reflect` rather than writing a
+literal.
+
+swarmcli-cd#137 and #143 are the counter-example, hours apart. #137 added
+`Status.Clone`/`Spec.Clone` and a test that walked the value and failed on any
+pointer or slice the clone still shared. Its fixture was hand-written, with a
+comment defending the choice: *"built by hand rather than by a helper that would
+drift with the type."* #135 added `Spec.Allow` — five slices — the same day.
+`Clone` did not copy them, the fixture did not populate them, and an empty slice
+is indistinguishable from a shared one. The guard was written for exactly that
+class of bug and could not see it.
+
+**The Docker API fakes ignore the filters they are handed.** `fakeAPI.ConfigList`
+records the label filter for assertions and then returns the whole store; CE's
+`fakeBackend` does not model server-side filtering either. So a filtered read
+passes CI whether or not the filter is right, **and** a read that should be
+filtered passes whether or not it is. Both directions are invisible.
+
+That cost two bugs on one day: swarmcli-cd#63's release-record lookup returned an
+unrelated config and failed a legitimate test, and swarmcli#510's proposed label
+filter would have refused real installs while CI stayed green. Fix the fake
+before the feature — `backend/service_test.go`'s `ConfigList` now honours the
+filter, with a comment saying why.
+
 ## What every change needs
 
 - **An SPDX header** on every `.go`, `.sh`, `.ts`, `.tsx` and `.css` file, or

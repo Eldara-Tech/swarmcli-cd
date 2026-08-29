@@ -543,3 +543,57 @@ it cannot be tested against a build whose registry resolves one swarm. Neither
 so unlike `swarms.Registry.Backend` there is no now-or-never here: the
 signatures can change the day the companion exists. It is the one item
 [#111](https://github.com/Eldara-Tech/swarmcli-cd/issues/111) stays open on.
+
+
+## Three rules the seam mechanism depends on
+
+### A capability is not a feature
+
+`feature.All()` reports what a **licence grants**. It cannot report what a
+**build is wired to do**, and asking it to is the wrong seam — swarmcli-cd#259
+asked for `logs` and `nodes` there so the console could hide controls no build
+could serve.
+
+They fail differently. A missing *feature* is a licensing answer: the operator
+can fix it by installing a key. A missing *capability* is a build fact: no key
+changes it. Folding the second into the first tells an operator to buy something
+that would not help.
+
+The structural reason is sharper: the reporter is supplied by the very module a
+gate would constrain, so a build that lacks a capability is also the build
+answering the question about it. Compute capabilities from a second, read-scoped
+map derived from the handlers' own type assertions — what is actually wired —
+rather than from the licence seam. `api/capability.go` and
+`TestCapabilitiesAreNotFeatures` are where that split lives.
+
+### An OSS default must stay in the package the companion imports
+
+The mechanism — `init()` self-registration, companion wins by blank import —
+rests on Go initialising an imported package before its importer. **That
+guarantee only holds while the OSS default is registered in the seam package
+itself**, which the companion must import.
+
+Move the default into its own package — as this repo did, so `swarms` would stop
+dragging `backend` in behind it — and the default and the companion become
+siblings with no ordering relationship between them. Whichever `init()` runs last
+wins, which is a build-order coin flip.
+
+So a default that lives outside its seam package must **decline to overwrite**:
+register only if nothing has. `swarms/local`'s `register()` is the worked example.
+
+### Folding a status onto a frozen seam value is only half the change
+
+The seam's values are frozen once a build ships, so a new state on the companion
+side **folds** onto an existing one rather than adding a value. That fold gets
+recorded as a decision in the companion's `statusOf`, and it reads as complete
+there.
+
+It is not. The value's **operator-facing copy lives in this repository** — the
+badge (`web/ui/src/components/LicenceBadge.tsx`) and the log line
+(`feature/watch.go`) — and it was written when the value meant one thing.
+`NotActivated` folded onto `StatusAbsent`, whose copy said *"no licence — install
+one"*, so an operator holding a verified key their swarm was never activated for
+was told to install it again (swarmcli-cd#255).
+
+**When you fold a status, the copy for the value you folded onto is part of the
+change**, and it is in the other repository from the decision.

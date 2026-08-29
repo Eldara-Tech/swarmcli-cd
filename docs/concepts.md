@@ -219,6 +219,29 @@ the release file. The full ownership model, including the orphan-versus-unmanage
 distinction, is documented on the engine:
 [swarmcli charts README § ownership](https://github.com/Eldara-Tech/swarmcli/blob/main/charts/README.md#ownership).
 
+## Declaring a name is not owning it
+
+Swarm secrets and configs are cluster-global and addressed by name, so any guard
+over them is a name comparison — and that is where the trap is.
+
+A compose entry that is **not** marked `external:` can still name itself anything:
+
+```yaml
+secrets:
+  x:
+    name: swarmcli-cd-token     # not this stack's to name
+    file: ./whatever
+```
+
+A guard that only inspects what a manifest *references* sees an ordinary,
+stack-owned secret. The deploy then adopts the cluster-global name — which, for
+`swarmcli-cd-token`, is a token exfiltration (swarmcli-cd#86).
+
+**So a name-based guard must check the declared set, not only the referenced
+one.** `backend/backend.go`'s `externalRefs` / `rejectForbiddenResources` is the
+implementation, and it names that issue in its own comment. Any new guard over a
+cluster-global namespace inherits the same requirement.
+
 ## Rollback comes from Swarm
 
 When `syncPolicy.wait` is set, a release does not just get applied and forgotten:

@@ -239,3 +239,87 @@ schedule.
 - [Concepts](concepts.md) — sync versus health, drift, ownership, rollback
 - [Editions](editions.md) — the two artefacts, and what a licence changes
 - [HTTP API](api.md) — the endpoints behind every command
+
+
+## Cross-repo and release mechanics
+
+### Landing a feature that needs a CE change
+
+This repo depends on CE as a **versioned module** — no `replace`, no sibling
+checkout — so a feature needing a CE change cannot compile until CE publishes.
+The sequence that works, done end to end for sync waves (CE#541 → v1.13.0-rc7 →
+CD#156):
+
+1. Branch-pin CD to the CE **branch** so CI can run at all.
+2. Merge the CE change.
+3. Tag a CE RC.
+4. Re-pin CD to the tag and merge.
+
+`go get` against a branch SHA bloats `go.mod` with transitive requirements;
+`go mod tidy` after re-pinning is part of step 4, not an afterthought.
+
+### `go:embed`'d build output does not travel in a module zip
+
+`web/dist/*` is gitignored except a committed `.gitkeep`, so `//go:embed
+all:dist` compiles without a Node toolchain. The module zip therefore carries
+**one 0-byte file**, and any module depending on this one and building
+`cmd/swarmcli-cd` embeds that sentinel — a right-sized binary that serves
+`web.notBuilt`, with nothing failing until a browser asks.
+
+A consuming build must build the UI itself and cannot rely on the dependency
+having shipped it. The release workflow guards this explicitly; keep that guard.
+
+### A workflow's env derivation must not be hand-copied into prose
+
+`.goreleaser.yml` derives the CE module path from `go.mod` rather than hardcoding
+it, and required `{{.Env.ENGINE_PKG}}` — which goreleaser refuses when the key is
+absent. The same commands were hand-written in `RELEASING.md`, whose
+local-snapshot recipe still exported only `ENGINE_VERSION`, so the documented
+release broke while CI stayed green (fixed in swarmcli-cd#251).
+
+**A code block in a release doc is a second implementation that CI never runs.**
+When the workflow's derivation changes, either change both or make the doc invoke
+the script.
+
+### Do not pin a chart's image tag with `--set`
+
+A chart whose `image.tag` defaults to `.Chart.AppVersion` re-renders the image
+from `appVersion` on every self-apply, and `appVersion` names the last **stable**
+release. An RC install recipe using `--set image.tag=<rc>` therefore holds only
+until the controller first reconciles itself — after which it replaces the RC
+with the stable version and, if that version cannot decode the current app set,
+refuses the whole file.
+
+The pin belongs in the values file the release actually commits, not on the
+command line.
+
+### Reading a pasted log: change-only lines date the failure
+
+`app set loaded` sits behind `if changed` (`appset/loop.go`), and `application
+changed in the app set` fires only on whole-value inequality. Both are therefore
+*edges*, not heartbeats — which makes them the way to date a report. If they
+appear after the error in a paste, the config arrived after the failure and the
+reconcile that actually tested it starts one line past the end of what you were
+given. Ask for the next few lines rather than diagnosing the ones you have.
+
+### A patch parked in an issue rots against HEAD
+
+A patch — or a `file:line` — quoted in an issue is a claim about a tree that has
+since moved. swarmcli-cd-be#17 and #19 both carried one, and additionally recorded
+"the decision, so it is not re-derived later". When the pin finally moved, the
+work was redone from the code, the decision **was** re-derived, and it came out
+differently: `NotActivated` shipped as `StatusAbsent`, not the `StatusInvalid`
+both patches wrote.
+
+Diff a parked patch against HEAD before applying it, and re-read the
+"decided, do not re-derive" section too — it is a claim about a tree as much as
+the patch is.
+
+### Settling what Swarm does to a spec
+
+Read the daemon, do not guess and do not wait for CI.
+`github.com/docker/docker@vX+incompatible` in `$(go env GOMODCACHE)` ships the
+**whole daemon**, not just the API types, so `daemon/cluster/convert/*.go` is the
+authoritative answer for what a `ServiceSpec` looks like on the way back.
+`github.com/moby/swarmkit/v2` is there too. Three premises in swarmcli-cd#76 were
+wrong and reading these settled all of them in minutes.
