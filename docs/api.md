@@ -375,8 +375,15 @@ endpoint can still answer 501 for a capability reported `true`. The document
 says what the build is wired for; the endpoint stays the authority. `licence` is `null` in a build with no licensed module
 linked — which is a different thing from a licensed build with no licence
 installed, which reports a status of `absent`; the other four statuses are
-`valid`, `grace` (expired, still granting, renew before it stops), `expired` and
-`invalid`. `seams` is the startup `seams` log line, readable by an operator who
+`valid`, `grace` (past a deadline, still granting), `expired` and `invalid`.
+Where a licence object is present it carries `expiresAt` — when it stopped or
+will stop being valid — and `featuresOffAt`, the other end of that window: when
+the build actually stops granting. They are two dates rather than one plus a
+period because `grace` covers two windows of different lengths, so no consumer
+can derive the second from the first. Both are explicitly `null` rather than
+absent when they do not apply. `allowance` is the licence issuer's own advisory
+report about the deployment's size — unsigned, so it is displayed and nothing
+more; nothing in this controller grants, denies or hides on it. `seams` is the startup `seams` log line, readable by an operator who
 has the token but not the logs — which is also why it is behind `controller`: it
 names every implementation loaded into a process holding the docker socket,
 companion modules included, and `version` is the build number that

@@ -116,21 +116,45 @@ func reportSafely(ctx context.Context, log *slog.Logger, r Reporter) (rep Report
 // The states it stays silent about are as deliberate as the ones it warns on:
 // a valid licence with time left, a perpetual one, and a build with no
 // licensed module at all.
-func licenceWarning(rep Report, now time.Time) (msg string, args []any, ok bool) {
+func licenceWarning(rep Report, now time.Time) (string, []any, bool) {
 	lic := rep.Licence
 	if lic == nil {
 		// The Apache-2.0 build. There is no licence to lapse.
 		return "", nil, false
 	}
 
+	if msg, args, ok := statusWarning(lic, now); ok {
+		return msg, args, true
+	}
+
+	// Only into a silence, never over the top of one of the lines above. A
+	// swarm over the free tier's node allowance is `valid` here and grants
+	// everything, so nothing about the licence itself is worth saying and this
+	// is the only warning it gets — the cap is judged at the issuer, and the
+	// first enforced sign of it is a term that quietly stops being rolled
+	// forward. Losing to a lapse is the right way round: that one is features
+	// going off on a date, this one is a renewal that will not be offered.
+	return allowanceWarning(lic.Allowance)
+}
+
+// statusWarning is the line the licence's own state is worth, or nothing.
+func statusWarning(lic *Licence, now time.Time) (msg string, args []any, ok bool) {
 	switch lic.Status {
 	case StatusGrace:
-		return "the licence has expired and is in its grace period — features are still granted, but not for long",
-			[]any{"status", lic.Status, "tier", lic.Tier, "expired", expiredArg(lic.ExpiresAt), "remedy", "renew the licence, or run 'swarmcli license sync' on a manager if it is a managed licence"}, true
+		// Not "has expired". Two states fold onto StatusGrace — a licence whose
+		// own term ran out, and a managed one that verifies and has not expired
+		// at all, whose activation renewal is late — and asserting an expiry is
+		// false for the second. Its operator reads "expired", goes looking for
+		// a replacement licence, and the key they already hold plus the sync
+		// this remedy names was the answer all along.
+		args := []any{"status", lic.Status, "tier", lic.Tier, "lapsedAt", dateArg(lic.ExpiresAt)}
+		args = append(args, deadlineArgs(lic.FeaturesOffAt, now)...)
+		return "the licence is in its grace period — features are still granted until 'featuresOffAt'",
+			append(args, "remedy", "renew the licence, or run 'swarmcli license sync' on a manager if it is a managed licence"), true
 
 	case StatusExpired:
 		return "the licence has expired — licensed features are off",
-			[]any{"status", lic.Status, "tier", lic.Tier, "expired", expiredArg(lic.ExpiresAt), "remedy", "install a current licence and restart the controller"}, true
+			[]any{"status", lic.Status, "tier", lic.Tier, "expired", dateArg(lic.ExpiresAt), "remedy", "install a current licence and restart the controller"}, true
 
 	case StatusInvalid:
 		return "the licence did not verify — licensed features are off",
@@ -178,12 +202,61 @@ func licenceWarning(rep Report, now time.Time) (msg string, args []any, ok bool)
 		[]any{"status", lic.Status}, true
 }
 
-// expiredArg is the expiry as a log value, or "unknown" when the reporter sent
-// an expired status with no date — a contradiction worth showing rather than
-// inventing a day for.
-func expiredArg(at *time.Time) string {
+// dateArg is an instant as a log value, or "unknown" when the reporter sent a
+// status that implies one and no date with it — a contradiction worth showing
+// rather than inventing a day for.
+func dateArg(at *time.Time) string {
 	if at == nil {
 		return "unknown"
 	}
 	return at.UTC().Format(time.RFC3339)
+}
+
+// deadlineArgs names when the features actually stop, and how long that leaves.
+//
+// The countdown is what makes somebody act; the date is what they quote when
+// they ask for a renewal. Both are here rather than in the message because the
+// message has to survive being read as a logfmt line, and because a controller
+// too old to have been told the date still says something true — the key reads
+// "unknown", which is the honest answer and the one the grace message points
+// at.
+func deadlineArgs(at *time.Time, now time.Time) []any {
+	if at == nil {
+		return []any{"featuresOffAt", "unknown"}
+	}
+	days := int(at.Sub(now).Hours() / 24)
+	if days < 0 {
+		days = 0
+	}
+	return []any{"featuresOffAt", at.UTC().Format(time.RFC3339), "daysLeft", days}
+}
+
+// allowanceWarning is the licence issuer's advisory node-allowance report as a
+// log line, or nothing to say.
+//
+// Advisory in the strict sense Allowance sets out: this is a report and never a
+// gate, and nothing switches off because of it — not here, and not anywhere
+// downstream. The message says so out loud, because what will actually happen
+// is a renewal that does not arrive months from now, and an operator told
+// "allowance exceeded" with no other detail will reasonably assume something
+// has already broken and go looking for it.
+func allowanceWarning(a *Allowance) (string, []any, bool) {
+	if a == nil || !a.OverLimit {
+		return "", nil, false
+	}
+
+	// Each count only when the issuer sent it: a zero is the issuer saying
+	// nothing, and "nodes=0 maxNodes=0" is a line that reads as a bug in this
+	// controller rather than as a report it passed on.
+	var args []any
+	if a.Nodes > 0 {
+		args = append(args, "nodes", a.Nodes)
+	}
+	if a.MaxNodes > 0 {
+		args = append(args, "maxNodes", a.MaxNodes)
+	}
+	args = append(args, "termEndsAt", dateArg(a.TermEndsAt))
+
+	return "the licence service reports this swarm over its node allowance — nothing is switched off, and the licence term stops being rolled forward",
+		append(args, "remedy", "bring the node count within the allowance, or ask for a larger licence, before that date"), true
 }

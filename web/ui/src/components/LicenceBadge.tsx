@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 import {
   licenceStatuses,
   useCapabilities,
+  type Allowance,
   type Licence,
   type LicenceStatus,
 } from "../api/discovery";
@@ -32,15 +33,27 @@ import { Instant } from "./Instant";
  * A licence in its grace period is granting features and is not valid, so a
  * badge that folded it into either would be wrong in the direction that matters:
  * it reads healthy right up to the morning the features stop. What is rendered
- * for it is how long ago it expired, in the loudest treatment short of a
+ * for it is the day that morning falls on, in the loudest treatment short of a
  * failure.
  *
- * What it cannot render is the day the grace ends, because that is not on the
- * wire: the length of the grace period is the licensed module's, feature.Licence
- * carries only ExpiresAt, and a badge that named a deadline it had derived from
- * a guessed period would be a badge that lies about a date. "expired 4 days ago"
- * is what the document supports, and it is said out loud here so that the next
- * reader adds the field rather than the arithmetic.
+ * That day used to be missing, and this comment used to ask the next reader for
+ * the field rather than the arithmetic. It is `featuresOffAt` now: the length of
+ * a grace period is the licensed module's and is not the same length in the two
+ * states that reach "grace", so a deadline derived here from a guessed period
+ * would have been right for one of them and confidently wrong for the other.
+ *
+ * The same two states are why nothing here says "expired". One of them is a
+ * managed licence that verifies and has not expired at all — its activation
+ * renewal is simply late — and its reader, told the licence expired, goes
+ * looking for a replacement instead of syncing the activation.
+ *
+ * # the allowance is rendered and never acted on
+ *
+ * `allowance` is the licence issuer's own report and is unsigned: it is what a
+ * server said, not something the controller verified against a compiled-in key.
+ * So it is drawn beside the status and never becomes one — it does not colour
+ * the chip, hide a control or change what the build claims to grant. See
+ * feature.Allowance for the argument.
  */
 export function LicenceBadge() {
   const licence = useCapabilities().data?.licence;
@@ -54,11 +67,19 @@ export function LicenceBadge() {
   // and it has to render as something rather than falling through every case.
   const status = decodeEnum(licence.status, licenceStatuses);
   const { tone, label, detail } = describe(licence, status);
+  // Beside the status rather than inside it, because it answers a different
+  // question and is true or false independently of every one of the five.
+  const allowance = describeAllowance(licence.allowance);
 
   return (
     <p className="licence" role="status" data-testid="licence-badge">
       <span className={`chip chip-${tone}`}>{label}</span>
       {detail !== null && <span className="licence-detail">{detail}</span>}
+      {allowance !== null && (
+        <span className="licence-detail" data-testid="licence-allowance">
+          {allowance}
+        </span>
+      )}
     </p>
   );
 }
@@ -117,16 +138,26 @@ function describe(
       // Warn rather than bad: the features are still on, and colouring this the
       // same as a build that has already lost them would leave nothing to
       // escalate to when it does.
+      //
+      // "lapsed" rather than "expired", and the day they stop rather than only
+      // the day something ran out — see the two states named at the top of this
+      // file. Without `featuresOffAt` this reads exactly as it did before the
+      // field existed, which is what an older controller gets.
       return {
         tone: "warn",
         label: "grace period",
-        detail: `${expiredWhen(licence.expiresAt)}, still granting features — renew now`,
+        detail: (
+          <>
+            {agoWhen(licence.expiresAt, "lapsed")}, still granting features
+            {featuresStop(licence.featuresOffAt)} — renew now
+          </>
+        ),
       };
     case "expired":
       return {
         tone: "bad",
         label: "licence expired",
-        detail: `${expiredWhen(licence.expiresAt)}, features are off`,
+        detail: `${agoWhen(licence.expiresAt, "expired")}, features are off`,
       };
     case "invalid":
       // The remedy is a licence from the vendor rather than a change to this
@@ -182,26 +213,92 @@ function daysUntil(at: string): number | null {
 }
 
 /**
- * expiredWhen says how long ago, in whole days.
+ * agoWhen says how long ago, in whole days, under the reader's own word for it.
+ *
+ * The word is a parameter because the two statuses that call this do not mean
+ * the same thing by the date. "expired" is right for a licence that is off; it
+ * is wrong for half of "grace", where the licence verifies and has not expired
+ * and only its activation renewal is late. "lapsed" is true of both of those.
  *
  * Whole days rather than an exact instant because the reader's question is how
  * much time is left, not when the certificate was minted; the exact value is a
- * click away in the capability document. A licence with no expiry that reports
- * one of the expired statuses is a contradiction the controller sent, so it
- * says only that it expired rather than inventing a day for it.
+ * click away in the capability document. A licence with no date under one of
+ * these statuses is a contradiction the controller sent, so it says only the
+ * bare word rather than inventing a day for it.
  *
- * A date in the *future* under one of those statuses is the same contradiction
- * and used to be the one that read plausibly: flooring a negative age gave
- * "expired today", so a licence that lapsed a month ago and one still inside
- * its window rendered identically, and both read as though it had just
- * happened. That is what a companion sending the wrong one of two clocks looks
- * like from here, and hedging is the honest answer to it — this build cannot
- * know which of them the controller meant.
+ * A date in the *future* is the same contradiction and used to be the one that
+ * read plausibly: flooring a negative age gave "expired today", so a licence
+ * that lapsed a month ago and one still inside its window rendered
+ * identically, and both read as though it had just happened. That is what a
+ * companion sending the wrong one of two clocks looks like from here, and
+ * hedging is the honest answer to it — this build cannot know which of them the
+ * controller meant.
  */
-function expiredWhen(expiresAt: string | null): string {
-  if (expiresAt === null) return "expired";
-  const parsed = Date.parse(expiresAt);
-  if (Number.isNaN(parsed) || parsed > Date.now()) return "expired";
+function agoWhen(at: string | null, word: string): string {
+  if (at === null) return word;
+  const parsed = Date.parse(at);
+  if (Number.isNaN(parsed) || parsed > Date.now()) return word;
   const days = Math.floor((Date.now() - parsed) / 86_400_000);
-  return days <= 0 ? "expired today" : `expired ${plural(days, "day")} ago`;
+  return days <= 0 ? `${word} today` : `${word} ${plural(days, "day")} ago`;
+}
+
+/**
+ * featuresStop is the day the grant actually ends, or nothing when the
+ * controller did not send one.
+ *
+ * Nothing, rather than a hedge, because the sentence around it is already true
+ * without this clause: a controller too old to carry the field renders the line
+ * it always rendered instead of growing a phrase about a date nobody has.
+ */
+function featuresStop(at: string | null | undefined): ReactNode {
+  if (at === null || at === undefined) return null;
+  const days = daysUntil(at);
+  if (days === null) return null;
+  return (
+    <>
+      {" — they stop "}
+      {days <= 0 ? "today" : `in ${plural(days, "day")}`} (<Instant at={at} />)
+    </>
+  );
+}
+
+/**
+ * describeAllowance renders the issuer's advisory report, or nothing.
+ *
+ * Only when the issuer says the deployment is over: a swarm inside its
+ * allowance has nothing to be told, and a badge that recited "2 of 3 nodes" on
+ * every healthy licence is a badge an operator stops reading. The verdict is
+ * the issuer's own rather than a comparison made here — see feature.Allowance —
+ * so this reads `overLimit` and never the two counts against each other.
+ *
+ * It says what will happen rather than that something has: nothing is switched
+ * off, and the thing that eventually goes wrong is a term that stops being
+ * renewed on a date months away. That date is the whole point of showing it.
+ */
+function describeAllowance(
+  allowance: Allowance | null | undefined,
+): ReactNode {
+  if (allowance === null || allowance === undefined || !allowance.overLimit)
+    return null;
+
+  // Both counts or neither: a zero is the issuer saying nothing, and "4 nodes"
+  // without the allowance beside it tells an operator something they know.
+  const counts =
+    allowance.nodes > 0 && allowance.maxNodes > 0
+      ? `${allowance.nodes} of ${allowance.maxNodes} nodes`
+      : "over the node allowance";
+
+  return (
+    <>
+      {counts}, as the licence service sees it — the term{" "}
+      {allowance.termEndsAt === null ? (
+        "will stop rolling"
+      ) : (
+        <>
+          stops rolling <Instant at={allowance.termEndsAt} />
+        </>
+      )}{" "}
+      unless the count comes down
+    </>
+  );
 }
