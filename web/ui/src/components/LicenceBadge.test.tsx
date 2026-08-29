@@ -219,6 +219,16 @@ describe("the licence badge", () => {
     expect(text).toContain("activate a managed one");
   });
 
+  // Activating a managed licence normally means reaching the licence service,
+  // and the deployment most likely to be reading this badge cannot: an
+  // air-gapped swarm holds the lease file and has no route out. Naming both
+  // actions and only the online route left it with nothing to do.
+  it("names the offline route to activation, not only the online one", async () => {
+    await show(licensed("absent", null));
+
+    expect(await badgeText()).toContain(":license lease install <file>");
+  });
+
   // A companion that sends the wrong one of two clocks — a managed licence's
   // token expiry instead of its lease's — reports a lapse beside a date that
   // has not happened. Flooring the age made that read "today", which is the one

@@ -148,6 +148,12 @@ const (
 	// sixth that an Apache-2.0 build could never produce is a worse cost than
 	// the ambiguity. What it costs here is the word "install", which is only
 	// half the remedy.
+	//
+	// No other field separates them, and FeaturesOffAt and Allowance did not
+	// change that: the first is nil under both, because nothing is running out
+	// where nothing is granting, and the second is the issuer's answer to a
+	// different question entirely. So a surface serves both by saying what is
+	// true of both, never by branching on a field to pick a remedy.
 	StatusAbsent Status = "absent"
 )
 
