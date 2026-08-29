@@ -106,15 +106,23 @@ const (
 	// StatusValid is a licence that verified and has not expired. Nothing to
 	// do.
 	StatusValid Status = "valid"
-	// StatusGrace is a licence that has expired but is still granting features
-	// for a bounded period. Renew before ExpiresAt plus that period, or the
-	// build silently becomes the community one.
+	// StatusGrace is a licence that is past a deadline and still granting
+	// features, for a bounded period. Renew before FeaturesOffAt, or the build
+	// silently becomes the community one.
+	//
+	// Two states share it, and copy written for this value has to fit both: a
+	// licence whose own term ran out and is inside its grace, and a managed
+	// licence that verifies and has not expired at all, whose activation
+	// renewal is late. Only the first has expired, so a message asserting an
+	// expiry is false for the second and sends its reader after a replacement
+	// licence when what they need is to sync the activation.
 	//
 	// Its own value rather than folded into valid, because collapsing it means
-	// a badge cannot say "expired four days ago, stops working tomorrow" —
-	// which is the single most useful thing a licence badge can say — and
-	// leaving the UI to infer the urgency from ExpiresAt alone relies on every
-	// consumer doing that date arithmetic correctly, forever.
+	// a badge cannot say "still granting features, and they stop on Tuesday" —
+	// which is the single most useful thing a licence badge can say. Working
+	// that out from ExpiresAt is not open to a consumer here: the period is the
+	// licensed module's and is not the same one in the two states above, which
+	// is why FeaturesOffAt is on the wire rather than the arithmetic.
 	StatusGrace Status = "grace"
 	// StatusExpired is a licence that verified and is past every grace it had.
 	// The features are already off; renew to get them back.
@@ -161,6 +169,73 @@ type Licence struct {
 	// No omitempty: an explicit null is what tells a badge "this licence does
 	// not expire" apart from a document it failed to parse.
 	ExpiresAt *time.Time `json:"expiresAt"`
+	// FeaturesOffAt is the other end of that window: when this build actually
+	// stops granting what the licence grants. Nil when nothing is running out —
+	// a valid licence, a perpetual one, one that has already stopped — and nil
+	// from a companion built before this field existed.
+	//
+	// A second date rather than a period, because ExpiresAt plus a period is
+	// arithmetic no consumer here can do. StatusGrace folds two windows whose
+	// lengths have nothing in common: a token's own grace, counted from its
+	// expiry, and a managed licence's lease, which ends on a date the lease
+	// carries and nothing derives. A badge given one date and a guessed period
+	// would be right for one of them and confidently wrong for the other. What
+	// that costs an operator is the whole of this field: "still granting
+	// features" does not say whether that is one more day or twenty-six.
+	//
+	// No omitempty, for ExpiresAt's reason: an explicit null says "nothing is
+	// running out", and a missing key is a document that did not parse.
+	FeaturesOffAt *time.Time `json:"featuresOffAt"`
+	// Allowance is what the licence *issuer* last said about this deployment's
+	// size, or nil when it has said nothing — which is the ordinary state.
+	//
+	// Advisory, and the one thing here that may only ever be rendered. See
+	// Allowance.
+	//
+	// No omitempty, for the reason above.
+	Allowance *Allowance `json:"allowance"`
+}
+
+// Allowance is the licence issuer's own report about this deployment's size, as
+// the companion last received it.
+//
+// # It is unsigned, and nothing may branch on it
+//
+// Every other field on Licence is derived from a document the companion
+// verified against a key compiled into the binary. This one is not: it is what
+// a server said over a network, and a server is exactly what one firewall rule
+// or one /etc/hosts line can stand in for. So it may be rendered and it may be
+// logged, and nothing anywhere may grant, deny, hide or disable on it — a build
+// that switched a feature off on an unsigned status would be switchable off by
+// anyone able to answer a request, and one that switched a feature *on* would
+// be worse. Enforcement is unchanged and stays where it already is: the signed
+// token's expiry and the lease window, judged offline inside the licensed
+// module. swarmcli-be's license/entitlement.go is the fuller argument, and the
+// reason this is a type of its own with no path into any status.
+//
+// The issuer's verdict travels rather than the comparison, for the same reason:
+// a renderer weighing Nodes against MaxNodes would be a second implementation of
+// a judgement that belongs to whoever made it, and it would disagree the first
+// time the issuer's rule changed.
+type Allowance struct {
+	// OverLimit is the issuer's verdict, and the only question to ask of this
+	// block. False is also what a verdict this build has no word for reads as:
+	// a status added upstream is not grounds to warn an operator about
+	// something this build cannot name.
+	OverLimit bool `json:"overLimit"`
+	// Nodes is the count the issuer last recorded for this licence, and
+	// MaxNodes the allowance it compared that count against. Zero means the
+	// issuer said nothing — never a swarm with no nodes, and never an allowance
+	// of none — so a surface holding a zero says less rather than rendering
+	// "0 of 0".
+	Nodes    int `json:"nodes"`
+	MaxNodes int `json:"maxNodes"`
+	// TermEndsAt is when the issuer stops rolling this licence's term forward,
+	// or nil when there is no such date to name. It is most of the value of
+	// this block: a cap judged at the issuer is otherwise invisible until a
+	// term quietly fails to renew, which under a year-long term is a year of
+	// silence ending in the features switching off.
+	TermEndsAt *time.Time `json:"termEndsAt"`
 }
 
 // Report is one answer to "what does this build grant".

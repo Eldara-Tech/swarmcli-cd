@@ -126,6 +126,48 @@ export interface Licence {
    * not expire" apart from a document it failed to parse.
    */
   expiresAt: string | null
+  /**
+   * When the licence actually stops granting features, or null when nothing is
+   * running out. The other end of the window `expiresAt` opens: a status of
+   * "grace" covers two windows of different lengths, so this is the only way a
+   * badge can say whether that means one more day or twenty-six without doing
+   * arithmetic on a period it would have to guess.
+   *
+   * Optional as well as nullable, which `expiresAt` is not: a controller older
+   * than this bundle sends no key at all, and in dev the bundle is served from
+   * Vite against whatever controller is running.
+   */
+  featuresOffAt?: string | null
+  /**
+   * What the licence *issuer* last said about this deployment's size, or null
+   * when it has said nothing. Unsigned and advisory — see feature.Allowance —
+   * so it is rendered and nothing else. Optional for `featuresOffAt`'s reason.
+   */
+  allowance?: Allowance | null
+}
+
+/**
+ * The issuer's advisory report about the node allowance.
+ *
+ * Nothing may branch on this beyond rendering it. It is what a server said
+ * rather than something the controller verified against a compiled-in key, and
+ * a UI that hid a control on it would be a UI anyone able to answer a request
+ * could reconfigure. What it is for is the warning nobody gets today: the free
+ * tier's cap is judged at the issuer, so the first enforced sign of being over
+ * it is a term that quietly stops being renewed.
+ */
+export interface Allowance {
+  /** The issuer's verdict, and the only question to ask of this block. */
+  overLimit: boolean
+  /**
+   * The count the issuer last recorded, and the allowance it compared against.
+   * Zero means the issuer said nothing — never a swarm with no nodes, and never
+   * an allowance of none — so a surface holding a zero says less.
+   */
+  nodes: number
+  maxNodes: number
+  /** When the issuer stops rolling the term forward, or null when there is no date to name. */
+  termEndsAt: string | null
 }
 
 export interface CapabilityDocument {

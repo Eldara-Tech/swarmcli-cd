@@ -265,3 +265,186 @@ func TestWatchLicence_WarnsOnTheFirstPassAndStops(t *testing.T) {
 		t.Fatal("WatchLicence did not stop when its context was cancelled")
 	}
 }
+
+// The deadline, which is the thing an operator in a grace period actually
+// needs: "still granting features" is the same sentence one day and
+// twenty-six days from the end.
+//
+// And the word this line may not use. StatusGrace folds a token that really
+// did expire and a managed licence that verifies, has not expired, and whose
+// activation renewal is late; "the licence has expired" is false for the
+// second, and its reader goes looking for a replacement licence instead of
+// running the sync the remedy already names.
+func TestLicenceWarning_GraceNamesTheDeadlineWithoutAssertingAnExpiry(t *testing.T) {
+	now := at(2026, time.August, 19)
+	lapsed := now.Add(-4 * 24 * time.Hour)
+	off := now.Add(26 * 24 * time.Hour)
+
+	rep := licenceReport(StatusGrace, &lapsed)
+	rep.Licence.FeaturesOffAt = &off
+
+	msg, args, ok := licenceWarning(rep, now)
+	if !ok {
+		t.Fatal("nothing said for a licence in its grace period")
+	}
+	if strings.Contains(msg, "expired") {
+		t.Errorf("message %q asserts an expiry; half the states that reach here have not expired", msg)
+	}
+	if got := argOf(args, "featuresOffAt"); got != off.UTC().Format(time.RFC3339) {
+		t.Errorf("featuresOffAt = %v, want %v", got, off.UTC().Format(time.RFC3339))
+	}
+	if got := argOf(args, "daysLeft"); got != 26 {
+		t.Errorf("daysLeft = %v, want 26", got)
+	}
+	// The date it did lapse on is still worth carrying — it is what a support
+	// ticket quotes — under a key that does not claim which clock it was.
+	if got := argOf(args, "lapsedAt"); got != lapsed.UTC().Format(time.RFC3339) {
+		t.Errorf("lapsedAt = %v, want %v", got, lapsed.UTC().Format(time.RFC3339))
+	}
+}
+
+// A companion built before the field existed sets neither of the two new ones,
+// and the line it produces has to stay a line. The message points at
+// 'featuresOffAt', so the key has to be there saying it does not know rather
+// than absent.
+func TestLicenceWarning_GraceFromACompanionWithNoDeadline(t *testing.T) {
+	now := at(2026, time.August, 19)
+	lapsed := now.Add(-4 * 24 * time.Hour)
+
+	msg, args, ok := licenceWarning(licenceReport(StatusGrace, &lapsed), now)
+	if !ok || !strings.Contains(msg, "grace period") {
+		t.Fatalf("said = %v, msg = %q", ok, msg)
+	}
+	if got := argOf(args, "featuresOffAt"); got != "unknown" {
+		t.Errorf("featuresOffAt = %v, want %q", got, "unknown")
+	}
+	if got := remedyOf(args); got == "" {
+		t.Error("the remedy went missing along with the date")
+	}
+}
+
+// The state defect three is about: a licence the issuer has judged over its
+// node allowance is `valid` here, grants everything, and — before this — said
+// nothing anywhere. The cap is judged at the issuer, so the first enforced
+// sign of it is a term that stops being rolled forward, which under a
+// year-long term is a year of silence ending in the features switching off.
+func TestLicenceWarning_TheIssuersAllowanceIsSaidWhenNothingElseIs(t *testing.T) {
+	now := at(2026, time.August, 19)
+	distant := now.Add(200 * 24 * time.Hour)
+	ends := at(2026, time.October, 1)
+
+	rep := licenceReport(StatusValid, &distant)
+	rep.Licence.Allowance = &Allowance{OverLimit: true, Nodes: 4, MaxNodes: 3, TermEndsAt: &ends}
+
+	msg, args, ok := licenceWarning(rep, now)
+	if !ok {
+		t.Fatal("nothing said about a swarm the licence service reports over its allowance")
+	}
+	// Nothing is switched off, and the line has to say so: an operator told
+	// only "allowance exceeded" assumes something has already broken.
+	if !strings.Contains(msg, "nothing is switched off") {
+		t.Errorf("message %q does not say the features are still on", msg)
+	}
+	if got := argOf(args, "nodes"); got != 4 {
+		t.Errorf("nodes = %v, want 4", got)
+	}
+	if got := argOf(args, "maxNodes"); got != 3 {
+		t.Errorf("maxNodes = %v, want 3", got)
+	}
+	if got := argOf(args, "termEndsAt"); got != ends.UTC().Format(time.RFC3339) {
+		t.Errorf("termEndsAt = %v, want %v", got, ends.UTC().Format(time.RFC3339))
+	}
+	if got := remedyOf(args); got == "" {
+		t.Error("the advisory carries no remedy")
+	}
+}
+
+// Zero is the issuer saying nothing rather than a swarm with no nodes, so the
+// line says less rather than reporting "nodes=0 maxNodes=0" — which reads as a
+// bug in this controller rather than as a report it passed on.
+func TestLicenceWarning_AnAllowanceWithNoCountsOmitsThem(t *testing.T) {
+	now := at(2026, time.August, 19)
+	rep := licenceReport(StatusValid, nil)
+	rep.Licence.Allowance = &Allowance{OverLimit: true}
+
+	_, args, ok := licenceWarning(rep, now)
+	if !ok {
+		t.Fatal("nothing said")
+	}
+	if got := argOf(args, "nodes"); got != nil {
+		t.Errorf("nodes = %v, want the key absent", got)
+	}
+	if got := argOf(args, "maxNodes"); got != nil {
+		t.Errorf("maxNodes = %v, want the key absent", got)
+	}
+	if got := argOf(args, "termEndsAt"); got != "unknown" {
+		t.Errorf("termEndsAt = %v, want %q", got, "unknown")
+	}
+}
+
+// A report inside its allowance is the ordinary state, and the ordinary state
+// is silent — a warning every six hours on a healthy licence is how an
+// operator learns to filter the line that matters.
+func TestLicenceWarning_AnAllowanceInsideItsLimitSaysNothing(t *testing.T) {
+	now := at(2026, time.August, 19)
+	distant := now.Add(200 * 24 * time.Hour)
+
+	rep := licenceReport(StatusValid, &distant)
+	rep.Licence.Allowance = &Allowance{Nodes: 2, MaxNodes: 3}
+
+	if _, _, ok := licenceWarning(rep, now); ok {
+		t.Error("a swarm inside its allowance was warned about")
+	}
+}
+
+// The advisory block is unsigned — it is what a server said, and a server is
+// what one firewall rule can stand in for — so it may fill a silence and may
+// never speak over the licence itself. Anything else would let whoever can
+// answer a request decide what this controller tells an operator about a
+// licence it verified offline.
+//
+// This is as close as the report side gets to pinning "nothing branches on
+// it": every state that has something of its own to say says exactly the same
+// thing with the block present as without it.
+func TestLicenceWarning_TheAdvisoryNeverOverridesTheLicence(t *testing.T) {
+	now := at(2026, time.August, 19)
+	past := now.Add(-3 * 24 * time.Hour)
+	soon := now.Add(10 * 24 * time.Hour)
+	ends := at(2026, time.October, 1)
+
+	for _, tc := range []struct {
+		status  Status
+		expires *time.Time
+	}{
+		{StatusGrace, &past},
+		{StatusExpired, &past},
+		{StatusInvalid, nil},
+		{StatusAbsent, nil},
+		{StatusValid, &soon},
+	} {
+		t.Run(string(tc.status), func(t *testing.T) {
+			plain, _, ok := licenceWarning(licenceReport(tc.status, tc.expires), now)
+			if !ok {
+				t.Fatalf("%s says nothing on its own; this test would pass vacuously", tc.status)
+			}
+
+			rep := licenceReport(tc.status, tc.expires)
+			rep.Licence.Allowance = &Allowance{OverLimit: true, Nodes: 9, MaxNodes: 3, TermEndsAt: &ends}
+			withBlock, _, ok := licenceWarning(rep, now)
+			if !ok || withBlock != plain {
+				t.Errorf("message = %q, want the licence's own %q: an unsigned report displaced a verified one",
+					withBlock, plain)
+			}
+		})
+	}
+}
+
+// argOf is one log argument's value, or nil when the key is not there.
+func argOf(args []any, key string) any {
+	for i := 0; i+1 < len(args); i += 2 {
+		if args[i] == key {
+			return args[i+1]
+		}
+	}
+	return nil
+}

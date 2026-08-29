@@ -47,10 +47,14 @@ function daysAfterNow(days: number): string {
  * status this build has never heard of — which is what a controller ahead of it
  * does.
  */
-function licensed(status: string, expiresAt: string | null): unknown {
+function licensed(
+  status: string,
+  expiresAt: string | null,
+  extra: Record<string, unknown> = {},
+): unknown {
   const capabilities = clone(communityCapabilities) as Record<string, unknown>;
   capabilities.edition = "business";
-  capabilities.licence = { tier: "be", status, expiresAt };
+  capabilities.licence = { tier: "be", status, expiresAt, ...extra };
   return capabilities;
 }
 
@@ -146,17 +150,44 @@ describe("the licence badge", () => {
   // The one the fifth status exists for (D25). A licence in its grace period is
   // granting features and is not valid, so a badge that read healthy would stay
   // green until the morning everything stopped.
-  it("does not read healthy in the grace period, and says how long ago it expired", async () => {
+  //
+  // "lapsed" rather than "expired": two states reach this status, and the
+  // managed one verifies and has not expired at all.
+  it("does not read healthy in the grace period, and says how long ago it lapsed", async () => {
     await show(licensed("grace", daysBeforeNow(4)));
 
     const text = await badgeText();
     expect(text).toContain("grace period");
-    expect(text).toContain("expired 4 days ago");
+    expect(text).toContain("lapsed 4 days ago");
+    expect(text).not.toContain("expired");
     expect(text).toContain("renew now");
     expect(text).not.toContain("valid");
     // Warn, not good: the features are still on, and there has to be somewhere
     // louder to go when they are not.
     expect(screen.getByText("grace period").className).toBe("chip chip-warn");
+  });
+
+  // The whole of defect one. "still granting features" is the same sentence one
+  // day and twenty-six days from the end, and the length of a grace period is
+  // the licensed module's — a badge cannot work it out from `expiresAt`, which
+  // is why the controller now sends the day itself.
+  it("names the day the features stop, not just the day something lapsed", async () => {
+    await show(
+      licensed("grace", daysBeforeNow(4), { featuresOffAt: daysAfterNow(26) }),
+    );
+
+    const text = await badgeText();
+    expect(text).toContain("lapsed 4 days ago");
+    expect(text).toContain("they stop in 26 days");
+  });
+
+  // A controller older than this bundle sends no such key, and the line it
+  // produces has to be the line it always produced rather than a phrase about
+  // a date nobody has.
+  it("says nothing about a deadline a controller did not send", async () => {
+    await show(licensed("grace", daysBeforeNow(4)));
+
+    expect(await badgeText()).not.toContain("they stop");
   });
 
   it("reads expired, and says the features are off", async () => {
@@ -189,16 +220,67 @@ describe("the licence badge", () => {
   });
 
   // A companion that sends the wrong one of two clocks — a managed licence's
-  // token expiry instead of its lease's — reports "expired" beside a date that
-  // has not happened. Flooring the age made that read "expired today", which is
-  // the one wrong answer that looks right.
-  it("does not invent a day for an expiry that has not happened", async () => {
+  // token expiry instead of its lease's — reports a lapse beside a date that
+  // has not happened. Flooring the age made that read "today", which is the one
+  // wrong answer that looks right.
+  it("does not invent a day for a lapse that has not happened", async () => {
     await show(licensed("grace", daysAfterNow(30)));
 
     const text = await badgeText();
     expect(text).toContain("grace period");
-    expect(text).toContain("expired");
-    expect(text).not.toContain("expired today");
+    expect(text).toContain("lapsed");
+    expect(text).not.toContain("lapsed today");
+  });
+
+  // Defect three. The free tier's node cap is judged at the licence service, so
+  // a controller-only deployment over it is `valid` here, grants everything,
+  // and had no surface saying so at all — a year of silence ending in the
+  // features switching off.
+  it("renders the issuer's node allowance when it says the swarm is over it", async () => {
+    await show(
+      licensed("valid", daysAfterNow(200), {
+        allowance: {
+          overLimit: true,
+          nodes: 4,
+          maxNodes: 3,
+          termEndsAt: "2026-10-01T00:00:00Z",
+        },
+      }),
+    );
+
+    const advisory = (await screen.findByTestId("licence-allowance"))
+      .textContent;
+    expect(advisory).toContain("4 of 3 nodes");
+    expect(advisory).toContain("stops rolling");
+    expect(advisory).toContain("unless the count comes down");
+  });
+
+  // It is unsigned — what a server said, not what the controller verified
+  // against a compiled-in key — so it may say something and may not make the
+  // build look like a different licence state. The chip stays exactly what the
+  // signed document earned.
+  it("does not let the unsigned allowance change the licence's own state", async () => {
+    await show(
+      licensed("valid", daysAfterNow(200), {
+        allowance: { overLimit: true, nodes: 4, maxNodes: 3, termEndsAt: null },
+      }),
+    );
+
+    expect(await badgeText()).toContain("licence valid");
+    expect(screen.getByText("licence valid").className).toBe("chip chip-good");
+  });
+
+  // Inside the allowance there is nothing to say, and a badge reciting "2 of 3
+  // nodes" on every healthy licence is a badge an operator stops reading.
+  it("says nothing about an allowance the swarm is inside", async () => {
+    await show(
+      licensed("valid", daysAfterNow(200), {
+        allowance: { overLimit: false, nodes: 2, maxNodes: 3, termEndsAt: null },
+      }),
+    );
+
+    await screen.findByTestId("licence-badge");
+    expect(screen.queryByTestId("licence-allowance")).toBeNull();
   });
 
   // A controller ahead of this build reports a sixth status. It has to render
