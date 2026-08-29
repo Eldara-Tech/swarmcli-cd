@@ -180,10 +180,11 @@ examples/          a commented applications.yaml, a quickstart repo, an app-set
                    repo
 integration-tests/ `-tags integration`, against a real swarm
 scripts/           check-spdx.sh, check-npm-licences.sh, check-npm-scripts.sh,
-                   check-node-pins.sh
+                   check-node-pins.sh, check-oss-artefact.sh, smoke-fixture.sh
 docs/
 .github/workflows/ ci.yml, check_labels.yml, licence.yml, deps.yml,
-                   integration-tests.yml, release.yml
+                   integration-tests.yml, release.yml, govulncheck.yml,
+                   smoke.yml
 ```
 
 Packages land with the code that needs them rather than as empty directories,
@@ -217,8 +218,9 @@ Both are established, with reproductions, in issue #1:
 ## Open-core seams
 
 Per D6 the private `swarmcli-cd-be` companion is deferred to Phase 3, but the
-**seams ship from day one**: `SwarmRegistry`, `Authorizer`, `Notifier`,
-`SecretProvider`, `Extension` and `feature.Reporter`, each replaced via Go
+**seams ship from day one**: `swarms.Registry`, `authz.Authorizer`,
+`notify.Notifier`, `secrets.Provider`, `extension.Extension` and
+`feature.Reporter`, each replaced via Go
 `init()` self-registration (the mechanism swarmcli-be already uses — see its
 `docs/extensibility.md`). No build tags, no stubbed files in the public tree.
 
