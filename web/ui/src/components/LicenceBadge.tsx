@@ -205,11 +205,11 @@ function describe(
  * expiryWarningDays is how long before expiry the badge stops reading healthy.
  *
  * Two weeks, matching the controller's own warning window
- * (`controller/licencewatch.go`): the two surfaces answer the same question and
- * an operator who saw one and not the other would be told two different things
- * about the same date. They are separate constants because they are separate
- * programs — a shared one would have to travel on the wire, and this is not a
- * fact about the deployment.
+ * (`feature/watch.go`'s `licenceExpiryWarning`): the two surfaces answer the
+ * same question and an operator who saw one and not the other would be told two
+ * different things about the same date. They are separate constants because
+ * they are separate programs — a shared one would have to travel on the wire,
+ * and this is not a fact about the deployment.
  */
 const expiryWarningDays = 14;
 

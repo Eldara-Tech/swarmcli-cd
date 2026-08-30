@@ -114,7 +114,7 @@ format:
    reconstructed from it: the `swarmcli-cd-applications` config (static mode
    only), the admin-token secret, the git-credential secret, any `registryAuth`
    secrets, the TLS pair, the OIDC client secret on a deployment using
-   [SSO](sso.md), and the `swarmcli-license` config or secret on a licensed one.
+   [SSO](sso.md), and the `swarmcli-license` config on a licensed one.
    These are the anchor that says which repository is authoritative, and
    [nothing in the app set can repoint it](configuration.md#the-trust-boundary).
 3. **The swarm's raft store**, by Docker's own manager backup procedure
@@ -214,6 +214,24 @@ alert against:
   every controller logs at startup. Those two are worth reading once after every
   deploy: they say which implementation is behind each seam and every path this
   build actually serves.
+
+**On a licensed build, alert on the licence lines.** They are `WARN`, they each
+carry a `remedy` field, and reaching a log pipeline is the whole of why they
+exist: the badge in the UI says the same things, and nobody is looking at the UI
+of a daemon on the day it matters. There are two kinds.
+
+- **The licence's own state** — expiring within fourteen days, in its grace
+  period, expired, invalid, or `no licence is active`. The first is two weeks of
+  notice before the features stop, and the first feature a lapse takes is SSO,
+  which locks out the operators who would have noticed.
+- **`the licence service reports this swarm over its node allowance`** — nothing
+  is switched off, and the line names the date the licence's term stops being
+  rolled forward. On a free-tier licence it is the only notice there is that the
+  deployment has outgrown its allowance; see [editions § the node
+  allowance](editions.md#the-node-allowance).
+
+A build with no licensed module logs neither: there is no licence there to
+lapse.
 
 Full detail, including why the text format quotes the way it does, is in
 [configuration § logs](configuration.md#logs).

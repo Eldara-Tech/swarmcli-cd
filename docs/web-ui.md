@@ -96,6 +96,51 @@ script would arrive as a `200` that renders nothing — and `/assets/` itself is
 not browsable, since a directory listing would enumerate the whole build to a
 caller who has authenticated nothing.
 
+## The licence badge
+
+At the foot of the navigation rail, on every screen, reading the `licence` block
+of [the capability
+document](api.md#discovery--get-uibootstrapjson-and-get-apiv1capabilities). It
+is the operator-facing half of what the controller also writes to its log, and
+it answers two questions: what state the licence is in, and what to do about it.
+
+**It renders nothing in the OSS build.** `licence` is `null` there — no licensed
+module is linked — and a chip reading "community" in a build that has no licence
+to report is a control that can never say anything else. It also renders nothing
+while the capability request is in flight and after one that failed, which is
+what makes a controller with no capability endpoint indistinguishable from a
+free one.
+
+In the merged build it has five statuses, of which `valid` renders two ways, and
+a fallback for a sixth:
+
+| | |
+|---|---|
+| **licence valid** | the tier, and the expiry date or "perpetual" |
+| **licence expiring** | inside fourteen days of expiry: the days left and the date, in amber. It stops reading healthy *before* the licence lapses, because the first thing a lapse takes is SSO, and SSO is what the operators who would have noticed sign in through |
+| **grace period** | past a deadline and still granting: how long ago it lapsed, and the day the features actually stop |
+| **licence expired** | verified, past every grace it had, granting nothing |
+| **licence invalid** | it did not verify — and the remedy is a replacement licence rather than a change to this deployment, which is what the badge says so that nobody spends an afternoon on the controller's configuration |
+| **no active licence** | nothing installed, *or* a managed licence installed and not activated for this swarm. Both remedies are offered, and the offline one with them: install a licence, activate a managed one, or `:license lease install <file>` on an air-gapped swarm |
+| *the status itself, muted* | a status this build does not know, from a controller ahead of this bundle. Drawn rather than guessed at |
+
+The grace rendering says "lapsed" and not "expired" on purpose. One of the two
+states behind that status is a managed licence that verifies and has not expired
+at all — only its activation renewal is late — and its reader, told the licence
+expired, goes looking for a replacement for a key already in their hand. The day
+the features stop comes from the controller rather than from arithmetic here,
+because the two states' windows are not the same length.
+
+**The node allowance sits beside the status and never inside it.** When the
+issuer reports the deployment over its allowance, a second line says so and
+names the date the term stops being rolled forward — which is the point of
+showing it at all, a cap judged at the issuer being otherwise invisible until a
+term quietly fails to renew. It never colours the chip, hides a control or
+changes what the build claims to grant: it is unsigned, and a build that
+switched a feature on or off on it would be one that anyone able to answer a
+request could switch. See [editions § the node
+allowance](editions.md#the-node-allowance).
+
 ## The service log console
 
 On the Monitor screen, behind the **Service Container Logs** tab. It is offered
