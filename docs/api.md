@@ -374,8 +374,27 @@ time, but which backend serves a destination is settled per request, so an
 endpoint can still answer 501 for a capability reported `true`. The document
 says what the build is wired for; the endpoint stays the authority. `licence` is `null` in a build with no licensed module
 linked — which is a different thing from a licensed build with no licence
-installed, which reports a status of `absent`; the other four statuses are
+*active*, which reports a status of `absent`; the other four statuses are
 `valid`, `grace` (past a deadline, still granting), `expired` and `invalid`.
+
+Two of those five cover more than one state, and a consumer that reads them as
+one will send an operator after the wrong remedy. `absent` is both "no licence
+is installed" and "a managed licence is installed, verifies, and has not been
+activated for this swarm" — the operator in the second case is holding the key
+already, and what they need is `swarmcli license sync` on a manager, or
+`swarmcli license lease install <file>` on a swarm with no route out. `invalid` likewise carries a
+payload whose schema is newer than this build accepts: it did not verify here,
+which is what `invalid` says, but the remedy is a newer binary rather than a
+replacement licence. Nothing issues such a payload yet. The status set is frozen
+at five deliberately — a value the Apache-2.0 build could never produce was
+judged worse than the folding — so the distinction is in the remedy a surface
+offers, not in the value.
+
+A consumer must nevertheless tolerate a **sixth**: these five are what this
+build knows, and a controller ahead of it reports whatever it has. The web UI
+renders an unknown status as itself, muted, rather than falling through its
+cases, and the controller logs one instead of interpreting it.
+
 Where a licence object is present it carries `expiresAt` — when it stopped or
 will stop being valid — and `featuresOffAt`, the other end of that window: when
 the build actually stops granting. They are two dates rather than one plus a
@@ -383,7 +402,18 @@ period because `grace` covers two windows of different lengths, so no consumer
 can derive the second from the first. Both are explicitly `null` rather than
 absent when they do not apply. `allowance` is the licence issuer's own advisory
 report about the deployment's size — unsigned, so it is displayed and nothing
-more; nothing in this controller grants, denies or hides on it. `seams` is the startup `seams` log line, readable by an operator who
+more; nothing in this controller grants, denies or hides on it. It carries
+`overLimit`, the issuer's verdict and the only question to ask of the block;
+`nodes` and `maxNodes`, the count it last recorded and the allowance it compared
+that count against, where `0` is the issuer having said nothing rather than a
+swarm with no nodes or an allowance of none; and `termEndsAt`, the date the
+issuer stops rolling this licence's term forward, or `null` when there is no
+such date. The verdict travels rather than the comparison, so no consumer weighs
+the two counts against each other and none disagrees the first time the issuer's
+rule changes. Being over the allowance switches nothing off — see [editions §
+the node allowance](editions.md#the-node-allowance) for what it does cost.
+
+`seams` is the startup `seams` log line, readable by an operator who
 has the token but not the logs — which is also why it is behind `controller`: it
 names every implementation loaded into a process holding the docker socket,
 companion modules included, and `version` is the build number that
