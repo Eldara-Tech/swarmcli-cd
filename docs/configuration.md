@@ -1498,10 +1498,26 @@ set `SWARMCLI_CD_GIT_USERNAME` and a token via `SWARMCLI_CD_GIT_TOKEN_FILE`. The
 same credential is used for the app-set repository in git mode — one credential
 for the controller, not one per repository.
 
-A licensed build reads five more, `SWARMCLI_CD_OIDC_*`, which configure the
-identity provider browsers sign in against. They are set together or not at all —
-a half-configured provider refuses to start — and they are documented with the
-rest of that feature in [single sign-on](sso.md).
+A licensed build reads seven more. Five are `SWARMCLI_CD_OIDC_*`, which
+configure the identity provider browsers sign in against. They are set together
+or not at all — a half-configured provider refuses to start — and they are
+documented with the rest of that feature in [single sign-on](sso.md).
+
+The other two carry no `_CD_` in their names, because they are the licensed
+module's rather than this controller's, and they are the only controls over the
+one request a controller makes on its own initiative: a licensed build renews
+its own licence over HTTPS, from the goroutine that re-reads it, carrying the
+licence token in an `Authorization` header.
+
+| Variable | |
+|---|---|
+| `SWARMCLI_LICENSE_API_URL` | *licensed build only* — the licence service to renew against (default `https://swarmcli.io/api/v1`). A staging deployment or a mirror; a value that is not a URL switches renewal off rather than falling back to the default, so a deployment pointed at its own service never silently talks to ours |
+| `SWARMCLI_DISABLE_LICENSE_RENEWAL` | *licensed build only* — set truthy and the controller makes no outbound licensing call at all. The air-gapped answer, and the same shape as `SWARMCLI_DISABLE_VERSION_CHECK` |
+
+Switching renewal off does not switch licensing off: the installed licence goes
+on granting exactly as it did, and keeping it current becomes a cron job on a
+manager. See [editions § a managed licence has to be kept
+activated](editions.md#a-managed-licence-has-to-be-kept-activated).
 
 ## See also
 
