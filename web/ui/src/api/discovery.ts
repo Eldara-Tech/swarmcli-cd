@@ -117,7 +117,7 @@ export const licenceStatuses = ['valid', 'grace', 'expired', 'invalid', 'absent'
 export type LicenceStatus = (typeof licenceStatuses)[number]
 
 export interface Licence {
-  /** The vendor's own name for the tier: "be", "trial". Nothing here branches on it. */
+  /** The vendor's own name for the tier: "be", "trial", "free". Nothing here branches on it. */
   tier: string
   status: LicenceStatus
   /**
