@@ -12,7 +12,7 @@ COPY web/ui/ ./
 # Writes ../dist, which is /src/web/dist — the directory the Go build embeds.
 RUN npm run build
 
-FROM golang:1.26-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
