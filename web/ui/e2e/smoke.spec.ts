@@ -199,7 +199,7 @@ test('logs in, watches an application converge without reloading, and reads ever
     // it, the callback read it, the controller reported it on
     // /ui/bootstrap.json, and the header drew it. A shell that mounted without
     // this is one that believed a session it could not describe.
-    await expect(page.locator('.session-name')).toHaveText(ssoUser)
+    await expect(page.locator('.rail-user-name')).toHaveText(ssoUser)
   }
 
   // The badge is on a different axis from the edition, and running this against
