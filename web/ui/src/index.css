@@ -237,14 +237,6 @@ code {
   text-decoration: none;
 }
 
-/* Who the identity provider said this is. Drawn only beside the link above, so
-   a build with no session to report has no such element and its header is the
-   one that shipped. */
-.session-name {
-  color: var(--ink-muted);
-  font-size: 0.85rem;
-}
-
 /* The live indicator ---------------------------------------------------- */
 
 .live {
