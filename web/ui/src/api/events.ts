@@ -29,6 +29,34 @@ import { ApiError, authorized } from './client'
 
 export const eventsPath = '/api/v1/events'
 
+/** Where the controller's recent history is read from; see fetchRecentEvents. */
+export const recentEventsPath = '/api/v1/events/recent'
+
+/**
+ * fetchRecentEvents reads what the controller published before this tab asked.
+ *
+ * The stream is still a hint channel that replays nothing — this is the document
+ * that stops that being the only account of what happened. Without it the
+ * terminal opened empty on every load and stayed empty, because a converged
+ * controller raises nothing to fill it with (#292).
+ *
+ * `limit` is sent because the ring is four times what the console keeps, and
+ * this is read again on every reconnect rather than once per load.
+ *
+ * Oldest first, exactly as the stream delivers, so a caller can concatenate the
+ * two without sorting anything.
+ */
+export async function fetchRecentEvents(limit: number): Promise<ControllerEvent[]> {
+  const response = await authorized(`${recentEventsPath}?limit=${limit}`)
+  if (!response.ok) {
+    throw new ApiError(response.status, `the recent events answered ${response.status}`)
+  }
+  const body = (await response.json()) as { events?: ControllerEvent[] }
+  // A controller ahead of this bundle may add keys beside it; one that lost this
+  // one is not a controller this document can be read from.
+  return Array.isArray(body.events) ? body.events : []
+}
+
 /**
  * The eight event types this build knows. There are no others today —
  * docs/api.md states the set — but a controller ahead of this build may add a
@@ -86,6 +114,22 @@ export interface EventStreamOptions {
   signal: AbortSignal
   onEvent: (event: ControllerEvent) => void
   onState: (state: StreamState) => void
+  /**
+   * Run before each connect attempt, including the first.
+   *
+   * This is where the scrollback is seeded from the recent-events document, and
+   * it is before rather than after the subscription on purpose. Seeding after
+   * would show a frame twice — once live, once again in a snapshot taken after
+   * it — where seeding first can only miss one raised inside the gap between the
+   * two calls. This stream already drops frames for a slow subscriber and says
+   * the documents are authoritative, so a gap is a cost it already pays; a
+   * doubled line in a terminal is a defect an operator can see.
+   *
+   * It must not reject. Whatever it was going to seed with is a convenience, and
+   * a stream that refused to open because a history read failed would be worse
+   * than one that opens with nothing.
+   */
+  beforeConnect?: () => Promise<void>
   /** Seams for the tests, which must not spend real seconds proving a backoff. */
   now?: () => number
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
@@ -128,6 +172,8 @@ export async function runEventStream(o: EventStreamOptions): Promise<void> {
     // stops happening.
     const connection: { openedAt: number | null } = { openedAt: null }
     try {
+      if (o.beforeConnect !== undefined) await o.beforeConnect()
+      if (o.signal.aborted) break
       await readStream(o, connection, now)
     } catch (error) {
       if (o.signal.aborted) break

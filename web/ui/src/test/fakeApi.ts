@@ -21,17 +21,29 @@ import type { ControllerEvent } from '../api/events'
  * exists for exactly the window an instantly-resolved fake does not have.
  */
 export function controller(routes: Record<string, () => Response | Promise<Response>>): void {
+  // Every controller serves the recent-events document, and the shell reads it
+  // before it opens the stream — so a fake without it is a controller that does
+  // not exist. Defaulted here rather than added to thirty-seven call sites, and
+  // first in the object so that a test with something to say about it wins.
+  //
+  // Empty is the honest default: it is what a controller that has just started
+  // answers, and it is the seed useEventStream deliberately declines to act on.
+  const withDefaults: Record<string, () => Response | Promise<Response>> = {
+    '/api/v1/events/recent': () => json(200, { events: [] }),
+    ...routes,
+  }
   // Longest prefix wins. The detail path extends the list path, so key order
   // would otherwise decide whether GET /api/v1/applications/edge was answered
   // by the detail route or by the list — silently, and differently per test.
-  const patterns = Object.keys(routes).sort((a, b) => b.length - a.length)
+  // It is also what keeps the recent document above the stream it extends.
+  const patterns = Object.keys(withDefaults).sort((a, b) => b.length - a.length)
   vi.stubGlobal(
     'fetch',
     // A string, because that is all src/api ever passes; see client.test.ts.
     vi.fn((url: string) => {
       const route = patterns.find((path) => url.startsWith(path))
       if (route === undefined) return Promise.reject(new Error(`nothing faked for ${url}`))
-      return Promise.resolve(routes[route]())
+      return Promise.resolve(withDefaults[route]())
     }),
   )
 }
