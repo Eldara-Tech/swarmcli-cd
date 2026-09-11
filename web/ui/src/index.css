@@ -754,10 +754,16 @@ thead th {
   padding: 0;
 }
 
+/* border-box, and it is load-bearing rather than housekeeping: this stylesheet
+   sets box-sizing nowhere, so `height: 100%` resolved to the grid cell's height
+   and then had the padding and the border added to it — every card overhung its
+   own cell by 30.8px, drawing its bottom edge inside the card below and leaving
+   the empty band under the last field that #291 reported. */
 .card {
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r-md);
+  box-sizing: border-box;
   height: 100%;
   padding: 0.9rem 1rem;
 }
