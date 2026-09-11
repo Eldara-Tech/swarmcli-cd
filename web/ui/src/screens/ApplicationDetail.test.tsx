@@ -167,6 +167,23 @@ describe('the release tree', () => {
     expect(await screen.findByRole('rowheader', { name: 'traefik_web' })).toBeDefined()
     expect(screen.getByRole('columnheader', { name: 'Replicas' })).toBeDefined()
   })
+
+  // A migration that exited 0 leaves nothing running, so a ratio built from
+  // `running` alone read 0/1 on a release that had finished — which beside a
+  // health chip saying healthy is the pair an operator reads as a failure
+  // (#290). The count the controller already sends is what says otherwise.
+  it('counts a finished one-shot toward its target rather than showing 0/1', async () => {
+    const view = detail()
+    const services = firstRelease(view).services
+    if (services === undefined || services === null) throw new Error('the fixture declares no services')
+    services[0] = { ...services[0], name: 'traefik_migrate', running: 0, completed: 1, desired: 1, health: 'healthy' }
+    serve(view)
+    render(<App />)
+
+    const row = within(ancestor(await screen.findByRole('rowheader', { name: 'traefik_migrate' }), 'tr'))
+    expect(row.getByText('1/1')).toBeDefined()
+    expect(row.queryByText('0/1')).toBeNull()
+  })
 })
 
 describe('the compatibility gate', () => {

@@ -2,6 +2,7 @@
 // Copyright © 2026 Eldara Tech
 
 import { assess, healthToneOf, toneOf } from '../api/severity'
+import { tasksUp } from '../format'
 import type { ReleaseStatus, ServiceStatus, View } from '../api/types'
 import { Dot } from './Dot'
 import { Icon } from './Icon'
@@ -11,11 +12,11 @@ import { Icon } from './Icon'
  * cards on connector rails.
  *
  * It stops at services for the reason the overview's tree does — that is where
- * the API stops. ServiceStatus carries running and desired counts but no list
- * of tasks, so the replica pips below are a rendering of "running of desired"
- * and not a claim about individual containers the controller never named. A
- * fourth level of pods, as the ArgoCD mockup sketches, would be promising depth
- * no endpoint can answer.
+ * the API stops. ServiceStatus carries task counts but no list of tasks, so the
+ * replica pips below are a rendering of "up of desired" — tasksUp, which counts
+ * a one-shot's completed task as up — and not a claim about individual
+ * containers the controller never named. A fourth level of pods, as the ArgoCD
+ * mockup sketches, would be promising depth no endpoint can answer.
  */
 export function TopologyTree({ view }: { view: View }) {
   const releases = view.status.releases ?? []
@@ -85,6 +86,7 @@ function ServiceNode({ service }: { service: ServiceStatus }) {
   // Cap the pips so a wide service (a global mode across a large swarm) draws a
   // row rather than a paragraph; the exact count is beside them in any case.
   const pips = Math.min(Math.max(service.desired, 0), 12)
+  const up = tasksUp(service)
   const tone = healthToneOf(service.health)
   return (
     <div className="topo-item">
@@ -93,12 +95,12 @@ function ServiceNode({ service }: { service: ServiceStatus }) {
         <Icon name="service" size={16} />
         <span className="topo-name">{service.name}</span>
         <span className="topo-meta">
-          {service.running}/{service.desired}
+          {up}/{service.desired}
         </span>
         {pips > 0 && (
           <span className="pips" aria-hidden="true">
             {Array.from({ length: pips }, (_, index) => (
-              <span key={index} className={index < service.running ? 'pip pip-on' : 'pip pip-off'} />
+              <span key={index} className={index < up ? 'pip pip-on' : 'pip pip-off'} />
             ))}
           </span>
         )}

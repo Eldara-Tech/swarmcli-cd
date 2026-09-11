@@ -9,7 +9,14 @@
 // comparing the two should never have to work out whether "9f3c1ab" and a full
 // SHA name the same commit.
 
-import { zeroTimestamp, type ChartSource, type Destination, type ServiceCounts, type Timestamp } from './api/types'
+import {
+  zeroTimestamp,
+  type ChartSource,
+  type Destination,
+  type ServiceCounts,
+  type ServiceStatus,
+  type Timestamp,
+} from './api/types'
 
 /**
  * shortRevision abbreviates a commit the way git does.
@@ -54,6 +61,20 @@ export function formatInstant(at: Timestamp): string {
 /** serviceCounts renders the "3/4" a row shows. */
 export function serviceCounts(counts: ServiceCounts): string {
   return `${counts.healthy}/${counts.total}`
+}
+
+/**
+ * tasksUp is how many of a service's tasks have done what was asked of them.
+ *
+ * Running alone is not the answer for a one-shot. A migration that exited 0
+ * leaves nothing running, so a ratio built from `running` reads 0/1 on a
+ * release that finished — next to a health chip saying healthy, which is the
+ * pair an operator reads as a failure (#290). `completed` is the controller's
+ * count of the tasks that ended cleanly, absent on every service that is not a
+ * job, and the chart engine's own replica column adds it the same way.
+ */
+export function tasksUp(service: ServiceStatus): number {
+  return service.running + (service.completed ?? 0)
 }
 
 /** chartRef names a chart source the way the spec declares it: a path within the repository, or a pinned repository reference. */

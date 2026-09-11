@@ -6,8 +6,8 @@
 // D19 asks for a component test per screen, and this is a screen: it has its own
 // path, its own empty state and a tree that reads three levels of the detail
 // document. What it must not do is invent a fourth — ServiceStatus carries
-// counts and no task list, so the pips below are a rendering of "running of
-// desired" and not a claim about containers the controller never named.
+// counts and no task list, so the pips below are a rendering of "up of desired"
+// and not a claim about containers the controller never named.
 
 import { cleanup, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -93,6 +93,26 @@ describe('the topology tab', () => {
     const app = screen.getByText('application').closest('.topo-node')
     expect(app?.className).toContain('topo-bad')
     expect(app?.className).not.toContain('topo-ok')
+  })
+
+  // Same arithmetic as the detail table's Replicas cell, and it has to be: a
+  // finished one-shot read 0/1 with an unlit pip beside it here too (#290).
+  it('lights a finished one-shot rather than drawing it as 0 of 1', async () => {
+    serve(
+      view((v) => {
+        const releases = v.status.releases
+        if (releases === undefined) throw new Error('the fixture declares no releases')
+        const services = releases[0].services
+        if (services === undefined || services === null) throw new Error('the fixture declares no services')
+        services[0] = { ...services[0], name: 'migrate', running: 0, completed: 1, desired: 1, health: 'healthy' }
+      }),
+    )
+    render(<App />)
+
+    const node = within((await screen.findByText('migrate')).closest('.topo-node') as HTMLElement)
+    expect(node.getByText('1/1')).toBeDefined()
+    expect(node.queryByText('0/1')).toBeNull()
+    expect(document.querySelectorAll('.topo-node .pip-off').length).toBe(0)
   })
 
   it('reads an application whose axes are unknown as neither clear nor failing', async () => {

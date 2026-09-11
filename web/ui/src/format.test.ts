@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { zeroTimestamp } from './api/types'
-import { chartRef, destination, formatInstant, isUnset, plural, serviceCounts, shortRevision } from './format'
+import { chartRef, destination, formatInstant, isUnset, plural, serviceCounts, shortRevision, tasksUp } from './format'
 
 describe('shortRevision', () => {
   it('abbreviates the way git does and leaves a short one alone', () => {
@@ -48,5 +48,16 @@ describe('the small renderings', () => {
     expect(chartRef({ release: 'traefik', ref: 'oci://r/traefik' })).toBe('oci://r/traefik')
     expect(destination({})).toBe('local swarm')
     expect(destination({ swarm: 'eu-1' })).toBe('eu-1')
+  })
+})
+
+describe('tasksUp', () => {
+  it('counts a one-shot that finished as up, so a done migration is not 0/1', () => {
+    const migrate = { name: 'migrate', mode: 'replicated', running: 0, desired: 1, completed: 1, health: 'healthy' as const }
+    expect(tasksUp(migrate)).toBe(1)
+  })
+
+  it('is the running count on a service with no completed tasks to add', () => {
+    expect(tasksUp({ name: 'web', mode: 'replicated', running: 2, desired: 3, health: 'progressing' as const })).toBe(2)
   })
 })
