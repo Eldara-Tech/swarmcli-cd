@@ -2676,8 +2676,14 @@ select:focus-visible,
   font-style: italic;
 }
 
+/* border-box for the reason .card needs it, and with a different symptom: the
+   6rem of padding was added to the `height: 100%` rather than taken out of it,
+   so the empty state stood 96px taller than the viewport it fills — and that
+   viewport scrolls rather than clips, which put a scrollbar on a panel whose
+   whole message is that there is nothing to scroll. */
 .terminal-empty-state {
   align-items: center;
+  box-sizing: border-box;
   color: var(--ink-muted);
   display: flex;
   flex-direction: column;
