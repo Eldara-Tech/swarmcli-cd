@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { eventTypes } from './events'
+import { eventTypes, isEventType } from './events'
 import { applicationKey, controllerKey, diffKey, historyKey, invalidatedBy, listKey } from './queries'
 
 /** The keys, resolved for one application, so a row reads as a set of names. */
@@ -43,6 +43,7 @@ const expected: Record<string, string[]> = {
   'drift-converged': ['detail', 'list'],
   'resources-pruned': ['detail', 'list', 'diff', 'history', 'controller'],
   'prune-failed': ['detail', 'list'],
+  'self-update-issued': [],
 }
 
 describe('the invalidation map', () => {
@@ -76,14 +77,36 @@ describe('the invalidation map', () => {
     expect(documents('licence-expired')).toEqual(['detail', 'list', 'diff', 'history', 'controller'])
   })
 
-  // Every event is about one application, and every row therefore says
-  // something about that application's own document and about the list it
-  // appears in. A row that said neither would be an event with nothing to
-  // report.
+  // Every event that reports on an application says something about that
+  // application's own document and about the list it appears in. A row that said
+  // neither would be an event with nothing to report — which is exactly what the
+  // one exception below is, and why it is named here rather than left to widen
+  // this rule into one that asserts nothing.
   it('always invalidates the application and the list', () => {
     for (const type of eventTypes) {
+      if (type === 'self-update-issued') continue
       expect(documents(type), type).toEqual(expect.arrayContaining(['detail', 'list']))
     }
+  })
+
+  // The exception, and the reason it is one. This event is stamped with an
+  // application like every other, and reports on the controller: the write
+  // replacing it has been accepted by the daemon, and Swarm stops this task as
+  // the rollout starts. Everything worth reading was already read — the apply
+  // that preceded it dispatched sync-succeeded for the same pass — so a refetch
+  // here is aimed at a controller that is going away and arrives as a failed
+  // request rather than as fresh data.
+  it('asks for nothing when the controller is replacing itself', () => {
+    expect(documents('self-update-issued')).toEqual([])
+  })
+
+  // It was missing from eventTypes until #292, and a missing type does not fall
+  // through to nothing — it falls through to `unrecognised`, which is
+  // everything. So the regression this guards is not "the row is wrong", it is
+  // "the type is absent again", and the two are indistinguishable from the
+  // table's side.
+  it('knows the type at all, rather than treating it as a stranger', () => {
+    expect(isEventType('self-update-issued')).toBe(true)
   })
 })
 

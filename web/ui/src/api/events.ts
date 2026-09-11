@@ -58,10 +58,15 @@ export async function fetchRecentEvents(limit: number): Promise<ControllerEvent[
 }
 
 /**
- * The eight event types this build knows. There are no others today —
- * docs/api.md states the set — but a controller ahead of this build may add a
- * ninth, so a frame's `type` is typed as a string and this list is what a
- * consumer narrows with.
+ * The nine event types this build knows. There are no others today —
+ * docs/api.md states the set, and notify/notify.go is where it is declared — but
+ * a controller ahead of this build may add a tenth, so a frame's `type` is typed
+ * as a string and this list is what a consumer narrows with.
+ *
+ * It listed eight until #292. `self-update-issued` was declared in Go and
+ * emitted by reconcile.replaceSelf, and missing here — so isEventType narrowed
+ * out the one frame that announces the controller is about to replace itself,
+ * and queries.ts had no rule for the event whose rule matters most.
  */
 export const eventTypes = [
   'sync-started',
@@ -72,6 +77,7 @@ export const eventTypes = [
   'drift-converged',
   'resources-pruned',
   'prune-failed',
+  'self-update-issued',
 ] as const
 
 export type ControllerEventType = (typeof eventTypes)[number]

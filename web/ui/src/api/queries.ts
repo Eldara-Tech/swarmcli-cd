@@ -69,10 +69,15 @@ type Document = 'detail' | 'list' | 'diff' | 'history' | 'controller'
 /**
  * What each event type says to re-read.
  *
- * Every row invalidates the detail and the list, and neither is a judgement
- * call: each of these events is raised by a reconcile that has just written the
- * application's status, and the list is that same document a row at a time.
- * What a row actually decides is the other three.
+ * Every row that reports on an application invalidates the detail and the list,
+ * and neither is a judgement call: those events are raised by a reconcile that
+ * has just written the application's status, and the list is that same document
+ * a row at a time. What such a row actually decides is the other three.
+ *
+ * One row reports on the controller instead, and is empty. See
+ * `self-update-issued` at the bottom for why that is the answer rather than an
+ * omission — it is stamped with an application, like every other event, and is
+ * nevertheless not about that application's documents.
  */
 const table: Record<ControllerEventType, readonly Document[]> = {
   // The diff, because the plan is already recorded by the time this is raised:
@@ -126,15 +131,38 @@ const table: Record<ControllerEventType, readonly Document[]> = {
   // Nothing was deleted: what this names is still deployed and still unmanaged,
   // and the next reconcile tries again. No manifest and no revision moved.
   'prune-failed': ['detail', 'list'],
+
+  // Nothing, and it is the one row that invalidates neither the application nor
+  // the list — see the exception in queries.test.ts.
+  //
+  // Three facts make the empty set the right answer rather than a lazy one.
+  // reconcile.replaceSelf is the last statement of reconcileHeld and runs after
+  // the apply, the drift correction, both sweeps and the confirming re-plan have
+  // all been recorded, so nothing is left to read. The apply it followed has
+  // already dispatched sync-succeeded for the same pass and the same
+  // application, so every document worth refetching was invalidated moments ago.
+  // And Swarm's update order is stop-first: this task is stopped as the rollout
+  // starts, so a refetch issued here is aimed at a controller that is going
+  // away, and arrives as a failed request on a screen rather than as fresh data.
+  //
+  // What the operator needs after this event is not a document; it is the
+  // replacement. That is the reconnect path's job — useEventStream re-seeds the
+  // terminal and invalidates everything when the stream comes back up.
+  'self-update-issued': [],
 }
 
 /**
  * What an event type this build does not know invalidates.
  *
  * The application's whole subtree and both collections. A controller ahead of
- * this build is the case — it added a ninth type and this one has no rule for it
+ * this build is the case — it added a tenth type and this one has no rule for it
  * — and over-invalidating costs a refetch, where silently dropping the signal
  * costs a screen that never updates and says nothing about it.
+ *
+ * Which is why a type missing from events.ts is worse than it looks: it does not
+ * fall through to nothing, it falls through to everything. `self-update-issued`
+ * was missing until #292 and so refetched every document off the one event that
+ * means the controller is going away.
  */
 const unrecognised: readonly Document[] = ['detail', 'list', 'diff', 'history', 'controller']
 
