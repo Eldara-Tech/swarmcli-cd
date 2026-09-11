@@ -21,17 +21,29 @@ import type { ControllerEvent } from '../api/events'
  * exists for exactly the window an instantly-resolved fake does not have.
  */
 export function controller(routes: Record<string, () => Response | Promise<Response>>): void {
+  // Every controller serves the recent-events document, and the shell reads it
+  // before it opens the stream — so a fake without it is a controller that does
+  // not exist. Defaulted here rather than added to thirty-seven call sites, and
+  // first in the object so that a test with something to say about it wins.
+  //
+  // Empty is the honest default: it is what a controller that has just started
+  // answers, and it is the seed useEventStream deliberately declines to act on.
+  const withDefaults: Record<string, () => Response | Promise<Response>> = {
+    '/api/v1/events/recent': () => json(200, { events: [] }),
+    ...routes,
+  }
   // Longest prefix wins. The detail path extends the list path, so key order
   // would otherwise decide whether GET /api/v1/applications/edge was answered
   // by the detail route or by the list — silently, and differently per test.
-  const patterns = Object.keys(routes).sort((a, b) => b.length - a.length)
+  // It is also what keeps the recent document above the stream it extends.
+  const patterns = Object.keys(withDefaults).sort((a, b) => b.length - a.length)
   vi.stubGlobal(
     'fetch',
     // A string, because that is all src/api ever passes; see client.test.ts.
     vi.fn((url: string) => {
       const route = patterns.find((path) => url.startsWith(path))
       if (route === undefined) return Promise.reject(new Error(`nothing faked for ${url}`))
-      return Promise.resolve(routes[route]())
+      return Promise.resolve(withDefaults[route]())
     }),
   )
 }
@@ -56,11 +68,18 @@ export const communityCapabilities = {
   edition: 'community',
   features: { 'multi-swarm': false, sso: false, projects: false, audit: false, notifications: false },
   // What an Apache-2.0 build is *wired* for, which is not what its licence
-  // grants: the node roster is implemented here (#260) and the log streamer is
-  // not, so this pair is asymmetric on purpose. A fixture reporting both off,
-  // or both on, would make the console's own gate untestable in the one shape
-  // that ships.
-  capabilities: { logs: false, nodes: true },
+  // grants. Both are on: controller/run.go asserts `var _ api.LogStreamer = rec`
+  // and `var _ api.NodeLister = rec` against the free reconciler at compile
+  // time, so this is the shape that actually ships (#260, #265).
+  //
+  // It read `logs: false` until #292, describing the build as it stood for the
+  // seven hours between #263 gating the console and #265 implementing the
+  // streamer — so every test spreading this fixture was asserting against a
+  // controller that no longer exists. A test about the *gate* says so with
+  // discoveryWith({ logs: false }), which is a build this repository can still
+  // meet: the document is what the reconciler is wired for, and a companion's
+  // need not match.
+  capabilities: { logs: true, nodes: true },
   licence: null,
   seams: {
     swarms: 'local',

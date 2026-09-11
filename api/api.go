@@ -193,6 +193,7 @@ var coreRoutes = []RegisteredRoute{
 	{Pattern: "GET /api/v1/nodes"},
 	{Pattern: "GET /api/v1/diagnostics"},
 	{Pattern: "GET /api/v1/events"},
+	{Pattern: "GET /api/v1/events/recent"},
 	{Pattern: "GET /api/v1/capabilities"},
 	// Public because a browser has no credential until the login screen it is
 	// asking for has loaded. What they serve is the build's own bytes, which
@@ -246,6 +247,7 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.Handle("GET /api/v1/nodes", s.guard(authz.ActionNodes, s.nodes))
 	mux.Handle("GET /api/v1/diagnostics", s.guard(authz.ActionRead, s.diagnostics))
 	mux.Handle("GET /api/v1/events", s.guard(authz.ActionRead, s.stream))
+	mux.Handle("GET /api/v1/events/recent", s.guard(authz.ActionRead, s.recentEvents))
 	mux.Handle("GET /api/v1/capabilities", s.guard(authz.ActionRead, s.capabilities))
 
 	// The UI, and the hashed build output the document it serves asks for.

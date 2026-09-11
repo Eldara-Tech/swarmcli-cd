@@ -102,7 +102,9 @@ describe('the monitor', () => {
 
     fireEvent.click(screen.getByRole('link', { name: 'Monitor' }))
     await screen.findByRole('heading', { name: 'Monitor' })
-    expect(screen.getByText(/Waiting for controller activity/)).toBeDefined()
+    // Not "waiting": a converged controller raises nothing, so a terminal that
+    // implied something was pending read as a broken screen (#292).
+    expect(screen.getByText(/No controller events/)).toBeDefined()
 
     await deliver(() => {
       stream.push({
@@ -117,6 +119,41 @@ describe('the monitor', () => {
     expect(await screen.findByText('sync-succeeded')).toBeDefined()
     expect(screen.getByText('converged')).toBeDefined()
 
+  })
+
+  // Two different emptinesses, where there was one message for both. A filter
+  // that matched nothing said the controller was quiet, which is a terminal
+  // telling an operator something that is not true of their fleet.
+  it('does not report a quiet controller when a filter matched nothing', async () => {
+    const stream = pushStream()
+    controller({
+      ...communityDiscovery(),
+      '/api/v1/status': () => json(200, okStatus),
+      '/api/v1/applications': () => json(200, { applications: [edgeRow()] }),
+      '/api/v1/events': stream.open,
+    })
+    render(<App />)
+    await screen.findByTestId('application-count')
+
+    fireEvent.click(screen.getByRole('link', { name: 'Monitor' }))
+    await screen.findByRole('heading', { name: 'Monitor' })
+
+    await deliver(() => {
+      stream.push({
+        application: 'edge',
+        swarm: '',
+        type: 'sync-succeeded',
+        at: '2026-07-22T09:41:10Z',
+      })
+    })
+    expect(await screen.findByText('sync-succeeded')).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: 'warn' }))
+
+    expect(screen.getByText('No events match this filter.')).toBeDefined()
+    expect(screen.queryByText(/No controller events/)).toBeNull()
+    // The header already told the truth; it is the body that did not.
+    expect(screen.getByText('0 of 1 events')).toBeDefined()
   })
 
   it('offers the log console for the services an application actually reports', async () => {
@@ -409,10 +446,14 @@ describe('the log console is gated on the build reporting a streamer', () => {
     await screen.findByRole('heading', { name: 'Monitor' })
   }
 
-  // The stock build has no LogStreamer, so /logs answers 501 — and the console
-  // offered the tab anyway, which meant the operator discovered that by
-  // clicking it. The control is now absent, and the controller stream, which
-  // every build serves, is what Monitor is.
+  // A build with no LogStreamer answers 501 — and the console offered the tab
+  // anyway, which meant the operator discovered that by clicking it. The
+  // control is now absent, and the controller stream, which every build serves,
+  // is what Monitor is.
+  //
+  // The stock build is not that build: it has been wired for logs since #265,
+  // which is why this names the shape it is testing rather than relying on the
+  // fixture's default.
   it('omits the control on a build that cannot stream logs', async () => {
     const asked = vi.fn(() => json(501, { error: 'this controller does not stream service logs' }))
     controller({

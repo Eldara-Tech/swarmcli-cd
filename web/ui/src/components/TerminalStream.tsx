@@ -132,7 +132,17 @@ export function TerminalStream({
           pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < bottomSlackPx
         }}
       >
-        {filteredEvents.length === 0 && <p className="term-empty">Waiting for controller activity…</p>}
+        {filteredEvents.length === 0 && (
+          <p className="term-empty">
+            {events.length > 0
+              ? 'No events match this filter.'
+              : // Not "waiting", which is what this said and what made a healthy
+                // controller read as a broken screen: the terminal is seeded
+                // with whatever the controller remembers, so empty here means
+                // there is nothing to remember rather than something pending.
+                'No controller events. One is raised when something changes — a sync, drift, a prune — and a converged fleet reports nothing until it does.'}
+          </p>
+        )}
         {filteredEvents.map((event, index) => (
           <div
             className={index === filteredEvents.length - 1 ? 'term-line term-line-new' : 'term-line'}

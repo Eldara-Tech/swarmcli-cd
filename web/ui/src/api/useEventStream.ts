@@ -4,7 +4,7 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 
-import { runEventStream, type ControllerEvent, type StreamState } from './events'
+import { fetchRecentEvents, runEventStream, type ControllerEvent, type StreamState } from './events'
 import { invalidatedBy } from './queries'
 
 export interface LiveStream {
@@ -12,12 +12,18 @@ export interface LiveStream {
   /** The most recent frame, or null before one has arrived. */
   last: ControllerEvent | null
   /**
-   * The frames this tab has seen, oldest first, capped at logLimit. It is a
+   * The controller's recent events, oldest first, capped at logLimit. It is a
    * scrollback for the Monitor and Overview terminals, not a source of truth:
-   * the stream drops frames for a slow subscriber (api/stream.go) and a
-   * reconnect replays nothing, so a gap here is expected and the documents
-   * remain authoritative. Bounded because a tab left open for a week must not
-   * grow without limit.
+   * the documents remain authoritative, and this is a convenience for reading
+   * what happened. Bounded because a tab left open for a week must not grow
+   * without limit.
+   *
+   * Seeded from /api/v1/events/recent before every connect and appended to from
+   * the stream, so it is not only what this tab was delivered. The stream itself
+   * still replays nothing — the document is what closes that gap, and it closes
+   * it as far back as the controller's ring reaches and no further: a controller
+   * that restarted has forgotten, which is why the seed is guarded rather than
+   * trusted to overwrite.
    */
   log: ControllerEvent[]
 }
@@ -55,6 +61,35 @@ export function useEventStream(): LiveStream {
     const controller = new AbortController()
     void runEventStream({
       signal: controller.signal,
+      // Before each connect, including the first. The stream itself still
+      // replays nothing — this reads the document that does, so a terminal
+      // opens with the controller's recent history instead of the empty box a
+      // converged fleet would leave it as for ever (#292).
+      //
+      // It replaces the scrollback rather than merging into it, which is what
+      // keeps a reconnect from drawing every line twice. The ring is deeper
+      // than this cap and is appended before the fan-out, so what comes back is
+      // a superset of what this tab was delivered — except in the one case
+      // guarded below.
+      beforeConnect: async () => {
+        let seed: ControllerEvent[]
+        try {
+          seed = await fetchRecentEvents(logLimit)
+        } catch {
+          // A controller older than this bundle answers 404, and a read can
+          // fail for every ordinary reason. Either way the seed is a
+          // convenience: keep whatever the tab has and open the stream.
+          return
+        }
+        // An empty document is the one case where the ring is not a superset: a
+        // controller that has just restarted has forgotten what this tab is
+        // still showing, and replacing would erase the operator's scrollback at
+        // the exact moment something happened.
+        if (seed.length === 0) return
+        // The client's cap is the client's. The controller clamps to what was
+        // asked for, but a companion or a future build need not.
+        setLog(seed.slice(-logLimit))
+      },
       onEvent: (event) => {
         setLast(event)
         // Appended for the terminals, capped so a long-lived tab does not grow
@@ -81,8 +116,9 @@ export function useEventStream(): LiveStream {
         // Every open after the first is a reconnect, and a reconnect is a
         // refetch. There is no `id:` on the wire, so no Last-Event-ID and no
         // replay: whatever the controller raised while this tab was
-        // disconnected was delivered to nobody and is not coming again. The
-        // documents are the only way to find out what it was.
+        // disconnected was delivered to nobody, and only a document can say what
+        // it was. beforeConnect above has just re-read the one that answers that
+        // for the terminal; this is the same move for every other screen.
         //
         // Without this the screen is stale until the 30-second refetch floor
         // catches it — and the moment a stream drops is the moment a controller

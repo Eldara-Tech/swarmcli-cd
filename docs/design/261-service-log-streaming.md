@@ -320,13 +320,25 @@ minute.
 
 `api/stream.go` deliberately has no idle timer, and this stream deliberately
 does. The difference is not the traffic pattern — a quiet container and a quiet
-controller are both normal — it is the client. A browser opens `/events` with
-`EventSource`, which reconnects on its own, so a proxy closing an idle event
-stream is invisible. `ServiceLogViewer` uses `fetch` and a reader, does not
-reconnect, and renders the close as `ENDED` until the operator changes tab and
-comes back. nginx's `proxy_read_timeout` defaults to 60 seconds, so without this
-every log console watching a service that logs hourly dies a minute after it is
-opened.
+controller are both normal — it is the client, and specifically whether it
+reconnects. The event stream's client retries on its own: `runEventStream` in
+`web/ui/src/api/events.ts` reconnects with a capped exponential backoff, so a
+proxy closing an idle event stream costs one reconnect and is otherwise
+invisible. `ServiceLogViewer` uses `fetch` and a reader, retries nothing, and
+renders the close as `ENDED` until the operator changes tab and comes back.
+nginx's `proxy_read_timeout` defaults to 60 seconds, so without this every log
+console watching a service that logs hourly dies a minute after it is opened.
+
+> **Corrected 2026-09-11 (#292).** The paragraph above read "A browser opens
+> `/events` with `EventSource`, which reconnects on its own", and that was not
+> true of this UI on the tree this document was written against, or on any tree
+> since: `EventSource` cannot set an `Authorization` header, which is
+> [D9](web-ui.md#2-decisions-taken) and the reason `events.ts` reads the event
+> stream with `fetch` as well. The decision D3 records is unaffected — the cause
+> really is the client rather than the traffic — but the property separating the
+> two clients is retrying, not which browser API opened them. The same sentence
+> had been copied into `api/logs.go`, `api/stream.go`, `docs/api.md` and
+> `docs/PHASE-2.0.md`, and was corrected in all four at the same time.
 
 20 seconds is a third of that default, so one lost frame still leaves 20 seconds
 of margin. The comment frame is ignored by the console's parser as written —

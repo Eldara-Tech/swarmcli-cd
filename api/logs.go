@@ -92,12 +92,19 @@ const maxLogStreams = 16
 //
 // api/stream.go has none because a quiet controller is normal. A quiet
 // container is normal too, so the traffic is not the difference — the client
-// is. A browser opens /events with EventSource, which reconnects on its own, so
-// a proxy closing an idle event stream is invisible. The log console uses fetch
-// and a reader, does not reconnect, and renders the close as ENDED until the
-// operator changes tab and comes back. nginx's proxy_read_timeout is 60 seconds
-// by default, so without this every console watching a service that logs hourly
-// dies a minute after it was opened.
+// is. Whether it reconnects: the event stream's client retries with a capped
+// exponential backoff of its own (web/ui/src/api/events.ts, runEventStream), so
+// a proxy closing an idle event stream costs a reconnect and is otherwise
+// invisible. The log console reads with fetch and a reader, retries nothing, and
+// renders the close as ENDED until the operator changes tab and comes back.
+// nginx's proxy_read_timeout is 60 seconds by default, so without this every
+// console watching a service that logs hourly dies a minute after it was opened.
+//
+// This said "a browser opens /events with EventSource, which reconnects on its
+// own" until #292, which was never true of this UI: EventSource cannot set an
+// Authorization header, so the event stream is read with fetch as well and the
+// reconnecting is hand-rolled. The conclusion survives its reason — but a reader
+// checking it against events.ts would have found the opposite of what it said.
 //
 // A third of that default, so one lost frame still leaves 20 seconds of margin.
 // A var so a test does not have to spend it.
