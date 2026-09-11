@@ -633,8 +633,11 @@ failure is never the first frame of a `200`.
 
 An idle stream writes a `: keepalive` comment frame every 20 seconds, which
 conforming SSE clients ignore. The event stream above deliberately has no such
-timer; this one does because its client is `fetch` rather than `EventSource` and
-does not reconnect, so a proxy closing an idle connection would be permanent.
+timer; this one does because its client does not reconnect and the event
+stream's does, so a proxy closing an idle connection is a reconnect there and
+permanent here. Both are read with `fetch` — `EventSource` cannot carry the
+`Authorization` header — so neither gets a browser's built-in retry, and the
+event stream's is hand-rolled.
 The controller re-checks the caller's authorisation on the same tick, so a
 withdrawn grant ends an attached console rather than outliving it.
 

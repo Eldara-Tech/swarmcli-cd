@@ -83,8 +83,8 @@ Added two new fine-grained permission verbs:
   it, so the rule belongs to the reconciler and not to one HTTP handler.
 - **It is bounded, it keeps itself open, and it re-checks.** Sixteen concurrent streams per
   controller, enforced in the handler so the bound covers every implementer of the seam, and a
-  **503** past it. An SSE comment frame every twenty seconds, because the console reads this
-  with `fetch` and does not reconnect where `/events` uses `EventSource` and does — and each of
+  **503** past it. An SSE comment frame every twenty seconds, because this console does not
+  reconnect where the event stream's client does — both read with `fetch` — and each of
   those ticks re-runs authentication and authorisation, so a withdrawn grant reaches a console
   that is already attached. A 256-event buffer that drops rather than blocking, matching what
   `api/stream.go`'s `publish` does for events.

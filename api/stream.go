@@ -229,9 +229,16 @@ func toWire(e notifyEvent) wire {
 //
 // SSE rather than a websocket because nothing here flows upstream: events go
 // controller to client and never back. It is plain HTTP, so the TUI reads it
-// with an ordinary client and no second protocol, browsers reconnect on their
-// own through EventSource, and the Phase 3 rbac-proxy forwards it without
-// needing to handle an upgrade.
+// with an ordinary client and no second protocol, a browser needs no upgrade
+// handshake, and the Phase 3 rbac-proxy forwards it without having to handle
+// one.
+//
+// The wire conforms to SSE and an EventSource could read it — the `event:` name
+// below is there for exactly that — but the web UI does not use one: EventSource
+// cannot set an Authorization header, so the console reads this with fetch and
+// reconnects itself. This comment claimed browsers reconnect "on their own
+// through EventSource" until #292; they do reconnect, and nothing here is what
+// makes them.
 //
 // Every event is authorised against the subject that opened the stream. The
 // guard's one decision was about the endpoint, so without this a tenant with
