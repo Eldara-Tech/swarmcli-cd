@@ -14,7 +14,7 @@ import { Icon } from '../components/Icon'
 import { Instant } from '../components/Instant'
 import { CompatChip, DriftCell, HealthChip, SyncChip } from '../components/StateChip'
 import { TopologyTree } from '../components/TopologyTree'
-import { chartRef, destination, serviceCounts, shortRevision } from '../format'
+import { chartRef, destination, serviceCounts, shortRevision, tasksUp } from '../format'
 import { ErrorState, Loading } from '../components/StateBlock'
 
 /**
@@ -462,7 +462,7 @@ function ReleaseNode({ release }: { release: ReleaseStatus }) {
                 </td>
                 <td>
                   <span className="replicas-badge font-mono">
-                    {service.running}/{service.desired}
+                    {tasksUp(service)}/{service.desired}
                   </span>
                 </td>
                 <td>

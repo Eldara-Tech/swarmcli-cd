@@ -80,6 +80,21 @@ func TestReleaseHealthPerService(t *testing.T) {
 			want:  application.HealthHealthy,
 		},
 		{
+			// The same job on its second deploy. swarmkit counts a task that
+			// leaves RUNNING inside the monitor window as an update failure and
+			// does not exempt a restart policy of none, so the default
+			// failure_action pauses the rollout of every one-shot that has run
+			// before — and that pause says nothing about the job (#290,
+			// Eldara-Tech/swarmcli#649). The engine judges it by its own task;
+			// this case holds the pin that the engine compiled in still does.
+			name: "re-run one-shot job swarm paused",
+			state: charts.ServiceState{
+				Name: "migrate", Running: 0, Completed: 1, Desired: 1, Job: true,
+				UpdateState: "paused", NewestTaskAge: stableAge,
+			},
+			want: application.HealthHealthy,
+		},
+		{
 			name:  "no tasks at all",
 			state: running("api", 0, 3),
 			want:  application.HealthProgressing,
