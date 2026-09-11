@@ -32,6 +32,7 @@ so the quickest way to see any shape below is to run the matching command with
 | `GET` | `/api/v1/nodes` | the swarm's node roster, with each node's task counts |
 | `GET` | `/api/v1/diagnostics` | the cluster integrity score, its checks and its open risks |
 | `GET` | `/api/v1/events` | a live event stream, so a UI never polls |
+| `GET` | `/api/v1/events/recent` | what the stream would have delivered before you connected |
 | `GET` | `/api/v1/capabilities` | what this build is, what it grants, what it is wired to answer, and which seam implementations are live |
 | `GET` | `/` | the web UI, and the fallback for its client-side routes |
 | `GET` | `/assets/{path...}` | the UI's hashed build output |
@@ -492,6 +493,56 @@ completion, and should expect the stream to end immediately after it.
 The stream is fed by the same notifier seam that writes the controller's log,
 which is why a companion adding Slack *appends* a notifier rather than replacing
 one — replacing would silently kill the UI's live updates.
+
+A subscriber is sent only what happens while it is attached: there is no `id:`
+on the wire, so no `Last-Event-ID` and no resume, and a reconnect is a refetch.
+That is unchanged and deliberate — what a client missed is answered by
+[recent events](#recent-events--get-apiv1eventsrecent) and by re-reading the
+documents, not by the stream repeating itself.
+
+## Recent events — `GET /api/v1/events/recent`
+
+What the stream above already delivered, for a client that was not connected
+when it did:
+
+```json
+{ "events": [
+  { "application": "edge", "swarm": "", "type": "sync-started", "at": "2026-07-22T09:41:09Z" },
+  { "application": "edge", "swarm": "", "type": "sync-succeeded", "revision": "9f3c1ab", "at": "2026-07-22T09:41:10Z" }
+] }
+```
+
+Each element is exactly one frame's `data` payload — the same fields, decided in
+the same place — so a client can seed a view from this document and then append
+frames from the stream without a second renderer. Oldest first, which is the
+order the stream delivered them in.
+
+`?limit=n` asks for the newest `n` rather than all of them. Absent means the
+whole ring; above it is clamped rather than refused, because a limit larger than
+the ring asks for events that do not exist, which is what omitting the parameter
+already means. Zero, a negative and anything that is not a whole number are a
+`400`.
+
+**It exists because the stream is not a record and should not become one.** A
+converged controller raises nothing — the events below are transitions, not
+ticks — so a console that could only show what arrived after it loaded showed an
+empty terminal indefinitely on exactly the fleet that was healthiest. The stream
+did not change: still no `id:`, still no replay, still a hint that a document
+should be re-read. This is the document.
+
+**It holds the last 1000 events and lives in memory.** A restarted controller
+answers `{"events":[]}`, exactly as `orphaned` and `pruned` in the status
+document report this process's own account rather than an audit log. The durable
+record of what was deployed is
+[the history endpoint](#history--get-apiv1applicationsapphistory).
+
+What it does *not* inherit from the stream is the dropping. An event is recorded
+before the fan-out and unconditionally, so one dropped for a subscriber that was
+not keeping up is still here — which is what makes this worth reading on
+reconnect and not only on a first load.
+
+Authorised per event, exactly as the stream is: a subject scoped to one
+application reads its events and no others.
 
 ## Service log stream — `GET /api/v1/applications/{app}/services/{svc}/logs`
 

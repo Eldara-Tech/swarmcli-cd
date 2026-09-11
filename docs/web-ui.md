@@ -141,6 +141,36 @@ switched a feature on or off on it would be one that anyone able to answer a
 request could switch. See [editions § the node
 allowance](editions.md#the-node-allowance).
 
+## The controller stream
+
+On the Monitor screen, and again at the foot of Overview. Each line is one event
+from [the event stream](api.md#event-stream--get-apiv1events): the wall clock it
+arrived at, the type, the application, and the sentence the event carried.
+
+**It opens with what the controller already published**, read from
+[recent events](api.md#recent-events--get-apiv1eventsrecent) before the stream is
+connected and read again before every reconnect. That is not a nicety. The
+controller raises an event when something *changes* — a sync, drift, a prune —
+so a converged fleet raises nothing at all, and a terminal holding only what
+arrived after the tab loaded was empty on precisely the deployment that was
+working. It is why the screen looked broken to the operator who reported it.
+
+So an empty terminal now says something. It means the controller has nothing
+recorded — it has just restarted, or it has never had anything to do — rather
+than that something is pending. A filter that matched nothing says *that*
+instead, because a terminal reporting on the reader's own filter must not be
+read as reporting on the fleet.
+
+The four filters are the same three-way reading the chips use: `ok` is a sync or
+a drift that landed, `err` is one that failed, `warn` is drift detected. The
+scrollback holds 250 lines and follows the tail unless you scroll away from it.
+
+What it is not is an audit log. The stream drops frames for a subscriber that
+has stopped reading, the controller's memory of what it published is in memory
+and goes with a restart, and neither is a gap worth closing here: the documents
+each screen reads are authoritative, and per-release history is on the
+application's own History tab.
+
 ## The service log console
 
 On the Monitor screen, behind the **Service Container Logs** tab. It is offered
