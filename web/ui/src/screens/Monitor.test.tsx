@@ -446,10 +446,14 @@ describe('the log console is gated on the build reporting a streamer', () => {
     await screen.findByRole('heading', { name: 'Monitor' })
   }
 
-  // The stock build has no LogStreamer, so /logs answers 501 — and the console
-  // offered the tab anyway, which meant the operator discovered that by
-  // clicking it. The control is now absent, and the controller stream, which
-  // every build serves, is what Monitor is.
+  // A build with no LogStreamer answers 501 — and the console offered the tab
+  // anyway, which meant the operator discovered that by clicking it. The
+  // control is now absent, and the controller stream, which every build serves,
+  // is what Monitor is.
+  //
+  // The stock build is not that build: it has been wired for logs since #265,
+  // which is why this names the shape it is testing rather than relying on the
+  // fixture's default.
   it('omits the control on a build that cannot stream logs', async () => {
     const asked = vi.fn(() => json(501, { error: 'this controller does not stream service logs' }))
     controller({

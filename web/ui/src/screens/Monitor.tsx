@@ -18,9 +18,10 @@ import { useLive } from '../live'
  */
 export function Monitor() {
   const live = useLive()
-  // Whether this build can tail container output at all. A controller with no
-  // log streamer answers 501, and offering the control anyway means the
-  // operator learns that by clicking it — which is what #259 is about.
+  // Whether this build can tail container output at all. The free build is
+  // wired for it and reports true (#265); a controller with no log streamer
+  // answers 501, and offering the control anyway would mean the operator learns
+  // that by clicking it — which is what #259 is about.
   const logs = useCapability('logs')
   const [streamMode, setStreamMode] = useState<'controller' | 'service'>('controller')
   const [selectedApp, setSelectedApp] = useState<string>('')

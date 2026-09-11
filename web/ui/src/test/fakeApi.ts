@@ -68,11 +68,18 @@ export const communityCapabilities = {
   edition: 'community',
   features: { 'multi-swarm': false, sso: false, projects: false, audit: false, notifications: false },
   // What an Apache-2.0 build is *wired* for, which is not what its licence
-  // grants: the node roster is implemented here (#260) and the log streamer is
-  // not, so this pair is asymmetric on purpose. A fixture reporting both off,
-  // or both on, would make the console's own gate untestable in the one shape
-  // that ships.
-  capabilities: { logs: false, nodes: true },
+  // grants. Both are on: controller/run.go asserts `var _ api.LogStreamer = rec`
+  // and `var _ api.NodeLister = rec` against the free reconciler at compile
+  // time, so this is the shape that actually ships (#260, #265).
+  //
+  // It read `logs: false` until #292, describing the build as it stood for the
+  // seven hours between #263 gating the console and #265 implementing the
+  // streamer — so every test spreading this fixture was asserting against a
+  // controller that no longer exists. A test about the *gate* says so with
+  // discoveryWith({ logs: false }), which is a build this repository can still
+  // meet: the document is what the reconciler is wired for, and a companion's
+  // need not match.
+  capabilities: { logs: true, nodes: true },
   licence: null,
   seams: {
     swarms: 'local',
