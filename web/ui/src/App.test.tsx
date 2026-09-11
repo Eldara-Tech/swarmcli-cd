@@ -132,7 +132,11 @@ describe('the shell', () => {
   })
 
   it('never writes the credential to localStorage', async () => {
-    setToken('good')
+    // Distinctive, because the assertion below searches for this string by
+    // value: a shared 'good' would be indistinguishable from anything else a
+    // store happened to hold.
+    const credential = 'root-credential-that-must-not-outlive-the-tab'
+    setToken(credential)
     controller({
       ...communityDiscovery(),
       '/api/v1/status': () => json(200, healthyStatus),
@@ -144,7 +148,16 @@ describe('the shell', () => {
 
     // The token is the swarm's root credential, so it must not outlive the tab.
     // A test rather than a comment because the two APIs differ by one word.
-    expect(localStorage.length).toBe(0)
+    //
+    // By value rather than by key, and no longer by localStorage being empty:
+    // screens/Applications.tsx now remembers a view preference there, so an
+    // empty store stopped being the invariant — and a test that knew the
+    // credential's key would go on passing if the credential moved to another
+    // one. Naming the offending key makes a failure say which write leaked.
+    const leaked = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i) ?? '').filter(
+      (key) => localStorage.getItem(key)?.includes(credential) === true,
+    )
+    expect(leaked).toEqual([])
     expect(window.location.search).toBe('')
     expect(window.location.hash).toBe('')
   })
