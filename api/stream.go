@@ -6,8 +6,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
@@ -28,6 +30,22 @@ type notifyEvent = notify.Event
 // applications reconciling at once, not for a client to go away and come back.
 const subscriberBuffer = 64
 
+// recentLimit is how many published events the controller remembers, and so the
+// most GET /api/v1/events/recent can ever return.
+//
+// The stream carries no `id:` and replays nothing, which is deliberate and
+// documented — but it left the console's terminal empty on every load, and a
+// converged controller raises nothing to fill it with, so the screen looked
+// broken on precisely the fleet that was healthiest (#292). This is where the
+// history it seeds from comes from.
+//
+// Four times the 250 the web UI keeps, because the document is not only the web
+// UI's: a curl or the future TUI view asks for the ring and gets it, while the
+// console asks for the 250 it can hold. It is memory rather than a record —
+// roughly 150KB at this depth, gone on restart, and the history endpoint is
+// still the durable account of what was deployed.
+const recentLimit = 1000
+
 // stream fans notifications out to the connected event-stream clients.
 type stream struct {
 	log *slog.Logger
@@ -35,6 +53,14 @@ type stream struct {
 	mu   sync.Mutex
 	next int
 	subs map[int]chan notifyEvent
+	// recent is the last recentLimit events published, oldest first, under the
+	// same mutex as subs so that publishing stays one critical section.
+	//
+	// Appended before the fan-out rather than after it, and appended
+	// unconditionally: an event dropped for a subscriber that was not keeping up
+	// is still something this controller did, so the document is strictly more
+	// complete than any one connection was.
+	recent []notifyEvent
 	// closed is set once the streams have been ended for shutdown, so a request
 	// already past the listener cannot subscribe to a feed nothing will ever
 	// publish to and then hold the drain open waiting for it.
@@ -91,6 +117,14 @@ func (s *stream) unsubscribe(id int) {
 func (s *stream) publish(_ context.Context, e notifyEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Trimmed from the front by one, which keeps the slice's length at the cap
+	// rather than letting the backing array grow without bound behind it.
+	if len(s.recent) == recentLimit {
+		s.recent = append(s.recent[:0], s.recent[1:]...)
+	}
+	s.recent = append(s.recent, e)
+
 	for id, ch := range s.subs {
 		select {
 		case ch <- e:
@@ -105,6 +139,21 @@ func (s *stream) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.subs)
+}
+
+// snapshot returns the newest n published events, oldest first.
+//
+// A copy, so the caller can authorise and marshal them without holding the lock
+// that every publish takes — the fan-out must never wait on a request.
+func (s *stream) snapshot(n int) []notifyEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > len(s.recent) {
+		n = len(s.recent)
+	}
+	out := make([]notifyEvent, n)
+	copy(out, s.recent[len(s.recent)-n:])
+	return out
 }
 
 // wire is one event as it goes down the stream. notify.Event's own fields are
@@ -156,6 +205,24 @@ type wire struct {
 	// licensed shape it could be surprised by.
 	Actor string `json:"actor,omitempty"`
 	At    string `json:"at"`
+}
+
+// toWire is the one place a notify.Event becomes the JSON a client reads.
+//
+// Shared by the stream and by the recent-events document so that the two cannot
+// drift into two shapes: a frame and a row of history describe the same event,
+// and a consumer seeding a terminal from one and then tailing the other has to
+// be able to render them with the same code.
+func toWire(e notifyEvent) wire {
+	return wire{
+		Application: e.Application,
+		Swarm:       e.Swarm,
+		Type:        string(e.Type),
+		Revision:    e.Revision,
+		Message:     e.Message,
+		Actor:       e.Actor,
+		At:          e.At.UTC().Format("2006-01-02T15:04:05Z07:00"),
+	}
 }
 
 // stream serves server-sent events.
@@ -213,15 +280,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, subject authz.Su
 					"subscriber", id, "application", e.Application, "event", e.Type)
 				continue
 			}
-			payload, err := json.Marshal(wire{
-				Application: e.Application,
-				Swarm:       e.Swarm,
-				Type:        string(e.Type),
-				Revision:    e.Revision,
-				Message:     e.Message,
-				Actor:       e.Actor,
-				At:          e.At.UTC().Format("2006-01-02T15:04:05Z07:00"),
-			})
+			payload, err := json.Marshal(toWire(e))
 			if err != nil {
 				s.log.Warn("could not encode an event", "error", err)
 				continue
@@ -234,4 +293,61 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, subject authz.Su
 			flusher.Flush()
 		}
 	}
+}
+
+// parseRecentLimit reads how many events the caller wants, newest first.
+//
+// Absent means the whole ring, which is what a curl or the TUI view asks for. A
+// value above it is clamped rather than refused, where api/logs.go's `tail`
+// refuses: `tail` over its maximum asks the daemon for work it should not do,
+// while a limit over the ring asks for events that do not exist — which is
+// exactly what omitting the parameter already means, so answering with
+// everything there is says the truth rather than an error about it.
+func parseRecentLimit(r *http.Request) (int, error) {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return recentLimit, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, errors.New("limit must be a positive whole number of events")
+	}
+	return min(n, recentLimit), nil
+}
+
+// recentEvents serves what this controller has published, so a client opening a
+// stream has something to open with.
+//
+// The stream itself is unchanged and still replays nothing: it carries no `id:`,
+// a reconnect is a refetch rather than a resume, and a frame remains a hint that
+// a document should be re-read. This is the document. What it adds is that the
+// hint channel is no longer the only account of what happened — before it, a
+// console on a converged fleet drew an empty terminal for ever, because a
+// controller with nothing to correct raises nothing (#292).
+//
+// Authorised per event, exactly as the stream is and for the same reason. The
+// guard's one decision was about the endpoint; without this, a subject scoped to
+// one application reads every application's syncs, drift and failures out of the
+// ring — the same disclosure the live path refuses, arriving on request instead.
+func (s *Server) recentEvents(w http.ResponseWriter, r *http.Request, subject authz.Subject) {
+	limit, err := parseRecentLimit(r)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	events := s.events.snapshot(limit)
+
+	// Never nil: a client that has to tell "no events" from "the key is missing"
+	// would otherwise be reading the difference between two encodings of the
+	// same empty answer.
+	out := make([]wire, 0, len(events))
+	for _, e := range events {
+		if err := s.authz.Authorize(r.Context(), subject, authz.ActionRead, e.Application); err != nil {
+			continue
+		}
+		out = append(out, toWire(e))
+	}
+
+	write(w, http.StatusOK, map[string]any{"events": out})
 }
