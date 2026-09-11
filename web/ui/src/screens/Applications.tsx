@@ -38,6 +38,9 @@ import { destination, plural, serviceCounts, shortRevision } from '../format'
  * columns appear at all — an operator moving between the CLI and this screen
  * should not have to translate. The cards are the same fields with room for the
  * sentences a cell cannot hold.
+ *
+ * Which of the two is showing is the one thing on this screen that outlives the
+ * URL. See storedView for why that does not bend the filters' rule.
  */
 export function Applications() {
   const [params, setParams] = useSearchParams()
@@ -62,7 +65,8 @@ export function Applications() {
     health: params.get('health') ?? '',
     drift: params.get('drift') ?? '',
   }
-  const cards = params.get('view') === 'cards'
+  // The URL first, then what this browser last chose; see rememberView below.
+  const cards = (params.get('view') ?? storedView()) === 'cards'
 
   function set(key: string, value: string): void {
     const next = new URLSearchParams(params)
@@ -184,7 +188,14 @@ export function Applications() {
           type="button"
           className="view-toggle"
           onClick={() => {
-            set('view', cards ? '' : 'cards')
+            // Written out loud, `table` included, rather than dropping the
+            // parameter for the default: with a stored preference behind it, an
+            // absent `view` no longer means "table", it means "unsaid" — and a
+            // toggle that wrote nothing would be read back as the preference it
+            // had just overruled.
+            const chosen = cards ? 'table' : 'cards'
+            rememberView(chosen)
+            set('view', chosen)
           }}
         >
           {cards ? 'Table view' : 'Card view'}
@@ -209,6 +220,42 @@ const appSetWarning: Record<'stale' | 'partial' | 'never-loaded', string> = {
   stale: 'The running application set is stale — a newer one is being refused, so these rows describe the last set that validated.',
   partial: 'The last application-set load reported an error, so these rows may not be the whole set.',
   'never-loaded': 'No application set has ever loaded. This list is empty for a reason that has nothing to do with your applications.',
+}
+
+/**
+ * The card/table choice, remembered for this browser.
+ *
+ * This does not bend the filters' rule above, because the danger that rule is
+ * about is absent here: a stored filter hides applications on the next visit,
+ * and both presentations show every row that matched. What it fixes is that the
+ * rail's link to this list carries no query of its own (Shell.tsx), so every
+ * route back that was not the Back button dropped the choice — which is #291.
+ *
+ * An explicit `?view=` still wins, so a pasted link opens the way its sender saw
+ * it rather than the way its reader last left this screen.
+ *
+ * Both halves are guarded, because a browser told to keep no site data throws on
+ * the property access itself and a remembered preference must not be able to
+ * take the list down with it. Refused, the screen is what it was before: the
+ * URL, and nothing behind it.
+ */
+const viewKey = 'swarmcli-cd.view'
+
+function storedView(): string | null {
+  try {
+    return localStorage.getItem(viewKey)
+  } catch {
+    return null
+  }
+}
+
+function rememberView(view: string): void {
+  try {
+    localStorage.setItem(viewKey, view)
+  } catch {
+    // Refused, as storedView says. The URL still carries the choice for as long
+    // as the reader stays on it, which is the whole behaviour minus the memory.
+  }
 }
 
 interface Filters {

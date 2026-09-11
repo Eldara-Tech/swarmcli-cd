@@ -69,6 +69,9 @@ function rowFor(name: string): HTMLElement {
 
 beforeEach(() => {
   sessionStorage.clear()
+  // The view preference outlives a tab on purpose, so it has to be cleared
+  // between tests or the first one to choose cards decides for the rest.
+  localStorage.clear()
   queryClient.clear()
   window.history.pushState({}, '', '/')
   setToken('good')
@@ -197,7 +200,17 @@ describe('the filters, which are a link and not a preference', () => {
     expect(screen.queryByRole('link', { name: 'edge' })).toBeNull()
   })
 
-  it('keeps the card/table choice in the URL and out of storage', async () => {
+  it('says the filters are what emptied the list, not the controller', async () => {
+    window.history.pushState({}, '', '/?q=nothing-matches-this')
+    serve([healthy('edge')])
+    render(<App />)
+
+    expect(await screen.findByText('No application matches these filters.')).toBeDefined()
+  })
+})
+
+describe('the two presentations, which are a preference and not a filter', () => {
+  it('keeps the card/table choice in the URL', async () => {
     serve([healthy('edge')])
     render(<App />)
     await screen.findByRole('link', { name: 'edge' })
@@ -210,17 +223,81 @@ describe('the filters, which are a link and not a preference', () => {
     })
     expect(screen.queryByRole('table')).toBeNull()
     expect(screen.getByRole('link', { name: 'edge' })).toBeDefined()
-    expect(localStorage.length).toBe(0)
     // Only the credential, which auth/session.ts put there.
     expect(sessionStorage.length).toBe(1)
   })
 
-  it('says the filters are what emptied the list, not the controller', async () => {
-    window.history.pushState({}, '', '/?q=nothing-matches-this')
+  // The default is named rather than dropped, which the filters' parameters are
+  // not: with a stored preference behind it an absent `view` means "unsaid" and
+  // no longer "table", so a toggle that cleared the parameter would be read back
+  // as the choice it had just replaced.
+  it('names the table in the URL rather than clearing the parameter', async () => {
+    window.history.pushState({}, '', '/?view=cards')
+    serve([healthy('edge')])
+    render(<App />)
+    await screen.findByRole('link', { name: 'edge' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Table view' }))
+
+    await waitFor(() => {
+      expect(window.location.search).toBe('?view=table')
+    })
+    expect(screen.getByRole('table')).toBeDefined()
+  })
+
+  // #291. The rail's link to this list carries no query of its own, so every
+  // route back to it that was not the Back button used to land on the table
+  // however many times the reader had asked for cards.
+  it('remembers the card view when the route back carries no query', async () => {
+    serve([healthy('edge')])
+    render(<App />)
+    await screen.findByRole('link', { name: 'edge' })
+    fireEvent.click(screen.getByRole('button', { name: 'Card view' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('table')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByRole('link', { name: 'Applications' }))
+
+    await waitFor(() => {
+      expect(window.location.search).toBe('')
+    })
+    expect(screen.queryByRole('table')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Table view' })).toBeDefined()
+  })
+
+  // So that a link pasted into an incident channel opens the way its sender saw
+  // it, rather than the way its reader last left this screen.
+  it('lets a view named in the URL win over the remembered one', async () => {
+    localStorage.setItem('swarmcli-cd.view', 'cards')
+    window.history.pushState({}, '', '/?view=table')
     serve([healthy('edge')])
     render(<App />)
 
-    expect(await screen.findByText('No application matches these filters.')).toBeDefined()
+    await screen.findByRole('link', { name: 'edge' })
+    expect(screen.getByRole('table')).toBeDefined()
+  })
+
+  // A browser told to keep no site data throws on the property access itself,
+  // and both halves are reached here: the read on the way in, the write on the
+  // click. The list is what must survive; the preference is what is lost.
+  it('renders the list when the browser refuses storage', async () => {
+    vi.stubGlobal('localStorage', {
+      get getItem() {
+        throw new Error('access is denied for this document')
+      },
+    })
+    serve([healthy('edge')])
+    render(<App />)
+    await screen.findByRole('link', { name: 'edge' })
+    expect(screen.getByRole('table')).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Card view' }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole('table')).toBeNull()
+    })
+    expect(screen.getByRole('link', { name: 'edge' })).toBeDefined()
   })
 })
 
