@@ -311,6 +311,30 @@ test('logs in, watches an application converge without reloading, and reads ever
   const survived = await page.evaluate((key) => (window as unknown as Record<string, unknown>)[key], marker)
   expect(survived, 'the page reloaded: the convergence above was a fresh load, not a live update').toBe('stamped')
 
+  // Monitor, which nothing above has visited — the screen shipped in v1.4.0 with
+  // no browser assertion of any kind, and that is why #292 reached an operator
+  // before it reached a test.
+  //
+  // Read after the sync, because before it the fleet is converged and the
+  // controller raises nothing: a terminal asserted on too early is asserting
+  // that a healthy controller is quiet, which is the thing that looked broken.
+  await page.getByRole('link', { name: 'Monitor' }).click()
+  const terminal = page.locator('.monitor-terminal')
+  await expect(terminal).toContainText('sync-succeeded')
+
+  // The criterion the recent-events document exists for, and the one assertion
+  // here that nothing below a browser can make. A reload drops the stream and
+  // every frame it delivered; the terminal comes back holding them because the
+  // controller remembers what it published and the shell re-reads it before it
+  // reconnects. Without that document this line reads "No controller events",
+  // which is exactly what an operator was looking at.
+  //
+  // It also re-enters on /monitor rather than /, so it proves the deep link
+  // through web.go's GET / fallback on the way past.
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Monitor' })).toBeVisible()
+  await expect(terminal).toContainText('sync-succeeded')
+
   // Signing out, last of all because it is the one action here that deliberately
   // destroys the document — the marker above could not survive it, and nothing
   // after it would have a session.
