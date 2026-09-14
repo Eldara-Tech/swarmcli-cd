@@ -4,8 +4,8 @@ github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEK
 github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
 github.com/BurntSushi/toml v0.3.1 h1:WXkYYl6Yr3qBf1K79EBnL4mak0OimBfB0XUf9Vl28OQ=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
-github.com/Eldara-Tech/swarmcli/v2 v2.0.1 h1:j+ZRW/moWXJeLDGtR7zlRht0eMOPOX/PT+XDJXcSH8Y=
-github.com/Eldara-Tech/swarmcli/v2 v2.0.1/go.mod h1:WxBic2QvtCENA9qb2BIb2mUcagOJB4oAsos4wKHolqE=
+github.com/Eldara-Tech/swarmcli/v2 v2.1.1 h1:t7kxnWuSKBAt4WSs2Zpb4966YzANnLzQbwCXBCPaB+Q=
+github.com/Eldara-Tech/swarmcli/v2 v2.1.1/go.mod h1:pMPrJS7zHpiQEW8nOY5KTJyrOKBeu2Ob9bp/0YPK86g=
 github.com/Masterminds/goutils v1.1.1 h1:5nUrii3FMTL5diU80unEVvNevw1nH4+ZV4DSLVJLSYI=
 github.com/Masterminds/goutils v1.1.1/go.mod h1:8cTjp+g8YejhMuvIA5y2vz3BpJxksy863GQaJW2MFNU=
 github.com/Masterminds/semver/v3 v3.5.0 h1:kQceYJfbupGfZOKZQg0kou0DgAKhzDg2NZPAwZ/2OOE=
