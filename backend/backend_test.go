@@ -2090,27 +2090,36 @@ func TestDeployStackRefusesAStackDeclaringTheControllersOwnConfig(t *testing.T) 
 // record's name — which is why this case, and the integration test
 // TestAStackMayNotClaimAReleaseRecordAsItsOwn, are written as a config the chart
 // ships.
+//
+// Two names, because two rules refuse it. The record's name format is the
+// engine's and unexported, so an existing record is matched by its label too,
+// and the second name is one a renamed format could produce: only that match
+// catches it.
 func TestDeployStackRefusesAStackDeclaringAReleaseRecordName(t *testing.T) {
-	api := asController(&fakeAPI{configs: []swarm.Config{{
-		ID: "rec",
-		Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
-			Name:   "swarmcli.release.other-app.v3",
-			Labels: map[string]string{charts.LabelType: charts.TypeRelease},
-		}},
-	}}})
+	for _, record := range []string{"swarmcli.release.other-app.v3", "records.other-app.3"} {
+		t.Run(record, func(t *testing.T) {
+			api := asController(&fakeAPI{configs: []swarm.Config{{
+				ID: "rec",
+				Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+					Name:   record,
+					Labels: map[string]string{charts.LabelType: charts.TypeRelease},
+				}},
+			}}})
 
-	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
-		Name: "tenant", Manifest: stealsByDeclaring("configs", "swarmcli.release.other-app.v3", true),
-		Resolve: ResolveNever, Files: decoyFiles,
-	})
-	if err == nil {
-		t.Fatal("DeployStack = nil, want the stack refused for declaring a release record's name")
-	}
-	if !strings.Contains(err.Error(), "declares") || !strings.Contains(err.Error(), "release record") {
-		t.Errorf("error %q does not say what was refused", err)
-	}
-	if len(api.order) != 0 || len(api.updatedConfigs) != 0 {
-		t.Errorf("the release record was touched: order=%v updated=%+v", api.order, api.updatedConfigs)
+			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "tenant", Manifest: stealsByDeclaring("configs", record, true),
+				Resolve: ResolveNever, Files: decoyFiles,
+			})
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the stack refused for declaring a release record's name")
+			}
+			if !strings.Contains(err.Error(), "declares") || !strings.Contains(err.Error(), "release record") {
+				t.Errorf("error %q does not say what was refused", err)
+			}
+			if len(api.order) != 0 || len(api.updatedConfigs) != 0 {
+				t.Errorf("the release record was touched: order=%v updated=%+v", api.order, api.updatedConfigs)
+			}
+		})
 	}
 }
 
@@ -2190,6 +2199,37 @@ func TestAnAdoptedConfigCannotBeGivenTheCreationMarker(t *testing.T) {
 	}
 	if len(api.updatedConfigs) != 0 {
 		t.Errorf("the operator's config was relabelled: %+v", api.updatedConfigs)
+	}
+}
+
+// A release record's name is the engine's to allocate — a fixed prefix, the
+// release name and a revision — including the ones it has not written yet. A
+// release whose own name starts with that prefix can make a future record's name
+// look scoped to itself, so a declared config or secret whose name starts with
+// the prefix is refused whatever exists on the swarm, for either kind.
+func TestDeployStackRefusesADeclarationNamedLikeAReleaseRecord(t *testing.T) {
+	for _, tc := range []struct{ name, kind, target string }{
+		{"a config", "configs", "swarmcli.release.team_web.v2"},
+		{"a secret", "secrets", "swarmcli.release.team_web.v2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "swarmcli.release.team", Manifest: stealsByDeclaring(tc.kind, tc.target, true),
+				Resolve: ResolveNever, Files: decoyFiles,
+			})
+			if err == nil {
+				t.Fatalf("DeployStack = nil, want %s named %s refused", tc.kind, tc.target)
+			}
+			for _, want := range []string{"declares", "'" + tc.target + "'", "release record"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not say %q", err, want)
+				}
+			}
+			if len(api.order) != 0 {
+				t.Errorf("created %v, want nothing", api.order)
+			}
+		})
 	}
 }
 

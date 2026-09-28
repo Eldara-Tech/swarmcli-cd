@@ -363,6 +363,9 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if key, ok := reservedLabel(spec.Labels); ok {
 			return declaresReservedLabel("secret", spec.Name, key)
 		}
+		if strings.HasPrefix(spec.Name, releaseRecordPrefix) {
+			return declaresForbidden("secret", spec.Name, whatReleaseRecord)
+		}
 		_, wired := b.forbiddenSecrets[spec.Name]
 		_, mounted := mine.secrets[spec.Name]
 		if wired || mounted {
@@ -375,6 +378,11 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	for _, spec := range stack.Configs {
 		if key, ok := reservedLabel(spec.Labels); ok {
 			return declaresReservedLabel("config", spec.Name, key)
+		}
+		// By name as well as by the records that exist: the engine allocates the
+		// next one at deploy time, so one not written yet is as much its own.
+		if strings.HasPrefix(spec.Name, releaseRecordPrefix) {
+			return declaresForbidden("config", spec.Name, whatReleaseRecord)
 		}
 		if _, forbidden := mine.configs[spec.Name]; forbidden {
 			return declaresForbidden("config", spec.Name, whatControllerConfig)
@@ -531,6 +539,14 @@ func mountsForbidden(service, kind, name, what string) error {
 // release record, that a resource is this controller's to delete — rests on
 // nobody else writing there.
 const reservedLabelPrefix = "com.swarmcli."
+
+// releaseRecordPrefix begins every release record's name. The chart engine
+// names a record "swarmcli.release.<release>.v<revision>" (releaseConfigName in
+// CE's charts/release.go, unexported) and allocates the next one when it deploys,
+// so the names it will need are not all on the swarm yet. A release name may
+// contain '.' and '_', so a release whose own name starts with this prefix could
+// otherwise declare a future record's name as scoped to itself.
+const releaseRecordPrefix = "swarmcli.release."
 
 // reservedLabel returns the first key under reservedLabelPrefix, in sorted order
 // so that a refusal names the same one every time.
