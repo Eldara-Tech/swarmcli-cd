@@ -5,11 +5,21 @@ package compose
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"path"
+	"path/filepath"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/docker/cli/cli/compose/convert"
+	"github.com/docker/cli/cli/compose/loader"
+	composetypes "github.com/docker/cli/cli/compose/types"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/client"
 	"gopkg.in/yaml.v3"
@@ -59,7 +69,7 @@ func convertAllowing(t *testing.T, manifest, stack string, api client.APIClient,
 	if api == nil {
 		api = fakeAPI{}
 	}
-	got, err := Convert(context.Background(), manifest, stack, api, allow)
+	got, err := Convert(context.Background(), manifest, stack, nil, api, allow)
 	if err != nil {
 		t.Fatalf("Convert = %v, want nil", err)
 	}
@@ -103,10 +113,10 @@ networks:
 // Reproducing it would make every reconcile of an unchanged manifest produce a
 // differently ordered work list, so the plan diff would be noise.
 //
-// The secrets are driver-backed and there are no configs, because since #99 that
-// is the whole of what a stack can still own: `file:` is refused, and an
-// `external:` declaration is a reference to an operator's resource rather than
-// something this stack creates, so it never reaches Stack.Configs at all.
+// The secrets are driver-backed, because since #99 that is the one way a stack
+// owns a secret: a secret's `file:` is refused, and an `external:` declaration is
+// a reference to an operator's resource rather than something this stack
+// creates, so it never reaches Stack.Secrets at all.
 func TestConvertOrdersEverythingByName(t *testing.T) {
 	got := convertOK(t, `
 services:
@@ -308,7 +318,7 @@ func TestRelativeBindSourceIsRejected(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Convert(context.Background(),
-				"services:\n  app:\n    image: x\n    volumes: "+tc.volumes+"\n", "s", fakeAPI{}, application.Allow{})
+				"services:\n  app:\n    image: x\n    volumes: "+tc.volumes+"\n", "s", nil, fakeAPI{}, application.Allow{})
 			if err == nil {
 				t.Fatal("Convert = nil, want a relative bind source to be refused")
 			}
@@ -391,7 +401,7 @@ func TestAnUnpermittedHostPathIsRefused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Convert(context.Background(),
 				"services:\n  app:\n    image: traefik:v3.7.1\n    volumes: "+tc.volumes+"\n"+
-					"volumes:\n  certs: {}\n", "s", fakeAPI{}, application.Allow{})
+					"volumes:\n  certs: {}\n", "s", nil, fakeAPI{}, application.Allow{})
 			if err == nil {
 				t.Fatal("Convert = nil, want a host path this application may not bind refused")
 			}
@@ -435,7 +445,7 @@ func TestAPermittedHostPathIsBound(t *testing.T) {
 		{"a path under it", application.Allow{HostPaths: []string{"/var/run/docker.sock/deeper"}}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := Convert(context.Background(), traefik, "edge", fakeAPI{}, tc.allow)
+			got, err := Convert(context.Background(), traefik, "edge", nil, fakeAPI{}, tc.allow)
 			if tc.refused {
 				if err == nil {
 					t.Fatal("Convert = nil, want a bind no entry covers refused")
@@ -453,49 +463,348 @@ func TestAPermittedHostPathIsBound(t *testing.T) {
 	}
 }
 
-// The controller's filesystem is the one place a chart must not be able to
-// reach, and before #99 three keys reached it. The secret case is the whole
-// vulnerability: the chart names its own secret, so every guard downstream — all
-// of which compare names — sees a stack minding its own business, while the data
-// Swarm stores under that name is this controller's admin token.
-func TestFileSourcesAreRefused(t *testing.T) {
-	for _, tc := range []struct{ name, manifest, names string }{
-		{
-			"secret",
-			"services:\n  x:\n    image: alpine\n    secrets: [loot]\n" +
-				"secrets:\n  loot:\n    file: /run/secrets/swarmcli-cd-token\n",
-			`secret 'loot'`,
-		},
-		{
-			"config",
-			"services:\n  x:\n    image: alpine\n    configs: [loot]\n" +
-				"configs:\n  loot:\n    file: /run/secrets/swarmcli-cd-token\n",
-			`config 'loot'`,
-		},
-		{
-			"env_file",
-			"services:\n  x:\n    image: alpine\n    env_file: /run/secrets/swarmcli-cd-token\n",
-			`service 'x'`,
-		},
+// chartConfigs is a chart that ships its configs' content: the shapes a config's
+// file: may take, and the bytes the chart engine resolved them to.
+const chartConfigs = `
+services:
+  web:
+    image: nginx
+configs:
+  site:
+    file: files/site.conf
+    labels:
+      tier: front
+    template_driver: golang
+  operator:
+    file: values/operator.conf
+  pinned:
+    name: s_site-v2
+    file: ./files/nested/../site.conf
+  shared:
+    external: true
+`
+
+var chartConfigFiles = map[string][]byte{
+	"files/site.conf":      []byte("listen 80;\n"),
+	"values/operator.conf": []byte("from --set-file\n"),
+}
+
+// A config takes its content from the files the chart engine handed over with
+// the manifest, and from nowhere else. Each shape a chart writes is here: a file
+// the chart ships, a value the operator supplied, an explicit name, and a path
+// that only becomes a key once cleaned — which is the key the engine stored it
+// under.
+func TestAConfigTakesItsContentFromTheChartsFiles(t *testing.T) {
+	got, err := Convert(context.Background(), chartConfigs, "s", chartConfigFiles, fakeAPI{}, application.Allow{})
+	if err != nil {
+		t.Fatalf("Convert = %v, want a chart's own configs converted", err)
+	}
+
+	byName := map[string]swarm.ConfigSpec{}
+	for _, c := range got.Configs {
+		byName[c.Name] = c
+	}
+	if len(got.Configs) != 3 {
+		t.Fatalf("configs = %v, want three — the external one is a reference, not the stack's", configNames(got))
+	}
+
+	site := byName["s_site"]
+	if string(site.Data) != "listen 80;\n" {
+		t.Errorf("s_site data = %q, want the chart's files/site.conf", site.Data)
+	}
+	if site.Labels["tier"] != "front" || site.Labels["com.docker.stack.namespace"] != "s" {
+		t.Errorf("s_site labels = %v, want its own and the stack's namespace", site.Labels)
+	}
+	if site.Templating == nil || site.Templating.Name != "golang" {
+		t.Errorf("s_site templating = %+v, want the golang template driver", site.Templating)
+	}
+
+	if op := byName["s_operator"]; string(op.Data) != "from --set-file\n" || op.Templating != nil {
+		t.Errorf("s_operator = %+v, want the value's bytes and no template driver", op)
+	}
+
+	pinned, ok := byName["s_site-v2"]
+	if !ok {
+		t.Fatalf("configs = %v, want the explicit name: kept as written", configNames(got))
+	}
+	if string(pinned.Data) != "listen 80;\n" {
+		t.Errorf("s_site-v2 data = %q, want files/site.conf, which is what its path cleans to", pinned.Data)
+	}
+
+	// No files is not an empty chart: the same manifest rendered without them
+	// names content nothing handed over.
+	if _, err := Convert(context.Background(), chartConfigs, "s", nil, fakeAPI{}, application.Allow{}); err == nil {
+		t.Error("Convert with no files = nil, want a config naming a file refused")
+	}
+}
+
+// Every way a config's file: can fail to name something the chart shipped, each
+// refused with its own reason. files holds a key for the shapes whose only fault
+// is the path itself, so what refuses them is the rule rather than a missing key.
+func TestAConfigFileNotShippedByTheChartIsRefused(t *testing.T) {
+	files := map[string][]byte{
+		"files/app.conf":      []byte("x"),
+		"files/${X}/app.conf": []byte("x"),
+		"files/a$$b.conf":     []byte("x"),
+		"app.conf":            []byte("x"),
+	}
+	for _, tc := range []struct{ name, file, why string }{
+		{"absolute", "/run/secrets/swarmcli-cd-token", "is an absolute path"},
+		{"parent", "../app.conf", "escapes the chart"},
+		{"parent after cleaning", "files/../../app.conf", "escapes the chart"},
+		{"outside files and values", "app.conf", "is outside files/ and values/"},
+		{"not shipped", "files/missing.conf", "is not shipped by the chart"},
+		// Interpolation-shaped paths are refused, whether or not a key of that
+		// spelling exists.
+		{"interpolation-shaped", "files/${X}/app.conf", "interpolation-shaped"},
+		{"an escaped dollar", "files/a$$b.conf", "interpolation-shaped"},
+		{"not a string", "42", "must be a path"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Convert(context.Background(), tc.manifest, "s", fakeAPI{}, application.Allow{})
+			manifest := "services:\n  x:\n    image: alpine\n" +
+				"configs:\n  site:\n    file: " + tc.file + "\n"
+			_, err := Convert(context.Background(), manifest, "s", files, fakeAPI{}, application.Allow{})
 			if err == nil {
-				t.Fatal("Convert = nil, want a manifest reading the controller's filesystem to be refused")
+				t.Fatalf("Convert = nil, want file: %s refused", tc.file)
 			}
-			if !strings.Contains(err.Error(), tc.names) {
-				t.Errorf("error %q does not name what was refused", err)
-			}
-			if !strings.Contains(err.Error(), "controller's own filesystem") {
-				t.Errorf("error %q does not say why", err)
+			for _, want := range []string{"config 'site'", tc.why, chartFilesRule} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not say %q", err, want)
+				}
 			}
 		})
 	}
 }
 
-// The refusal is of a key, not of a path, so it must not be reachable by a
-// manifest that names no path at all. An over-eager version of this check would
-// refuse most charts there are.
+// A config with no file: and no external: has nowhere for its content to come
+// from, and is refused rather than created empty.
+func TestAConfigWithoutContentIsRefused(t *testing.T) {
+	_, err := Convert(context.Background(),
+		"services:\n  x:\n    image: alpine\nconfigs:\n  site:\n    labels:\n      a: b\n",
+		"s", chartConfigFiles, fakeAPI{}, application.Allow{})
+	if err == nil {
+		t.Fatal("Convert = nil, want a config with no source refused")
+	}
+	if !strings.Contains(err.Error(), "config 'site' has no content") {
+		t.Errorf("error %q does not say what is missing", err)
+	}
+}
+
+// A secret's file: and a service's env_file: stay refused whatever the chart
+// ships — the files handed over here would satisfy either path. The secret beside
+// external: is refused too: the refusal is of the key.
+func TestASecretFileAndAnEnvFileAreRefused(t *testing.T) {
+	files := map[string][]byte{"files/token": []byte("x"), "files/app.env": []byte("A=1\n")}
+	for _, tc := range []struct{ name, manifest, want string }{
+		{
+			"a secret's file:",
+			"services:\n  x:\n    image: alpine\n    secrets: [token]\n" +
+				"secrets:\n  token:\n    file: files/token\n",
+			"secret 'token': file: is refused",
+		},
+		{
+			"a secret's file: beside external:",
+			"services:\n  x:\n    image: alpine\n" +
+				"secrets:\n  token:\n    external: true\n    file: files/token\n",
+			"secret 'token': file: is refused",
+		},
+		{
+			"env_file: as a string",
+			"services:\n  x:\n    image: alpine\n    env_file: files/app.env\n",
+			"service 'x': env_file: is refused; set variables with environment:",
+		},
+		{
+			"env_file: as a list",
+			"services:\n  x:\n    image: alpine\n    env_file: [files/app.env]\n",
+			"service 'x': env_file: is refused; set variables with environment:",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Convert(context.Background(), tc.manifest, "s", files, fakeAPI{}, application.Allow{})
+			if err == nil {
+				t.Fatal("Convert = nil, want it refused")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not say %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Every secret that reaches conversion is external or driver-backed. That is a
+// property of the value, not of which keys are present, so each of these is
+// refused although none of them names a file.
+func TestASecretThatIsNeitherExternalNorDriverBackedIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, secret string }{
+		{"no source at all", "labels:\n      a: b"},
+		{"external: false", "external: false"},
+		{"an empty driver", `driver: ""`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := "services:\n  x:\n    image: alpine\n" +
+				"secrets:\n  token:\n    " + tc.secret + "\n"
+			_, err := Convert(context.Background(), manifest, "s", nil, fakeAPI{}, application.Allow{})
+			if err == nil {
+				t.Fatal("Convert = nil, want the secret refused")
+			}
+			for _, want := range []string{"secret 'token'", "neither external: nor driver-backed", "declare it external:"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not say %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// A mapping with a key that is not a string arrives as a different Go type, and
+// every other check here would step over it — along with everything beside it,
+// which is why each case carries an env_file: that the check for it would
+// otherwise have refused.
+func TestAMappingWithANonStringKeyIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, manifest, at string }{
+		{
+			"in a section",
+			"services:\n  1:\n    image: alpine\n  web:\n    image: alpine\n    env_file: files/app.env\n",
+			"'services'",
+		},
+		{
+			"in an entry",
+			"services:\n  web:\n    image: alpine\n    env_file: files/app.env\n    1: x\n",
+			"'services.web'",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Convert(context.Background(), tc.manifest, "s", nil, fakeAPI{}, application.Allow{})
+			if err == nil {
+				t.Fatal("Convert = nil, want the mapping refused")
+			}
+			if !strings.Contains(err.Error(), tc.at) || !strings.Contains(err.Error(), "not a string") {
+				t.Errorf("error %q does not say which mapping, or why", err)
+			}
+		})
+	}
+}
+
+// convertConfigs reimplements upstream's conversion minus the read, and this is
+// what keeps the two the same: one manifest converted both ways, upstream reading
+// the same bytes from a directory it was pointed at. A docker/cli bump that
+// changes the upstream conversion fails here.
+func TestConvertConfigsMatchesUpstream(t *testing.T) {
+	got, err := Convert(context.Background(), chartConfigs, "s", chartConfigFiles, fakeAPI{}, application.Allow{})
+	if err != nil {
+		t.Fatalf("Convert = %v, want nil", err)
+	}
+
+	dir := t.TempDir()
+	for key, data := range chartConfigFiles {
+		p := filepath.Join(dir, filepath.FromSlash(key))
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dict, err := loader.ParseYAML([]byte(chartConfigs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loader.Load(composetypes.ConfigDetails{
+		WorkingDir:  dir,
+		ConfigFiles: []composetypes.ConfigFile{{Config: dict}},
+	}, func(o *loader.Options) { o.SkipInterpolation = true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := convert.Configs(convert.NewNamespace("s"), cfg.Configs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byName := func(a, b swarm.ConfigSpec) int { return strings.Compare(a.Name, b.Name) }
+	slices.SortFunc(want, byName)
+	if len(want) != 3 {
+		t.Fatalf("upstream converted %d configs, want 3; the comparison below would prove less than it claims", len(want))
+	}
+	if !reflect.DeepEqual(got.Configs, want) {
+		t.Errorf("configs differ from upstream's.\n--- in memory ---\n%+v\n--- upstream ---\n%+v", got.Configs, want)
+	}
+}
+
+// No production file in this package reads a path. Config content comes from the
+// files a caller hands over, and this is what holds that down: it fails on any
+// reference to the calls that would read one instead — convert.Configs, which
+// reads each config's file:, and the os functions that open a path.
+//
+// Two upstream calls this package keeps have read branches of their own, which a
+// scan of this package cannot see; what keeps each shut is a guard, not this
+// test. loader.Load reads a service's env_file: while resolving its environment
+// — shut because checkFileSources refuses env_file:, and checkStringKeys refuses
+// any block that could hide one from it. convert.Secrets reads a secret's file: —
+// shut because checkSecretSources lets only external and driver-backed secrets
+// through, and it reads for neither. Allowing either key later means revisiting
+// this.
+//
+// Test files are exempt: the parity test above reads through upstream on purpose.
+func TestNoProductionFileReadsAPath(t *testing.T) {
+	banned := map[string][]string{
+		"os": {"ReadFile", "Open", "ReadDir"},
+		"github.com/docker/cli/cli/compose/convert": {"Configs"},
+	}
+
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var scanned []string
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scanned = append(scanned, name)
+
+		// Local name to import path, so an aliased import is caught too.
+		imported := map[string]string{}
+		for _, imp := range f.Imports {
+			p, _ := strconv.Unquote(imp.Path.Value)
+			local := path.Base(p)
+			if imp.Name != nil {
+				local = imp.Name.Name
+			}
+			if _, ok := banned[p]; ok && local == "." {
+				t.Errorf("%s: dot-imports %s, which would hide a banned call from this check", name, p)
+			}
+			imported[local] = p
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := sel.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if slices.Contains(banned[imported[pkg.Name]], sel.Sel.Name) {
+				t.Errorf("%s: %s.%s reads a path; config content comes from the files the caller hands over",
+					fset.Position(sel.Pos()), pkg.Name, sel.Sel.Name)
+			}
+			return true
+		})
+	}
+	if !slices.Contains(scanned, "compose.go") {
+		t.Fatalf("scanned %v, which does not include compose.go; the check would pass without looking", scanned)
+	}
+}
+
+// None of the refusals above may be reachable by a manifest that names no path
+// at all. An over-eager version of these checks would refuse most charts there
+// are.
 func TestAManifestWithoutFileSourcesIsUntouched(t *testing.T) {
 	got := convertAllowing(t, `
 services:
@@ -519,10 +828,10 @@ networks:
 // offline, and getting it wrong means a service that references a secret Swarm
 // will not attach.
 //
-// Both are `external:`, which is also this file's regression test for #99: the
-// key that check refuses is `file:`, and an external declaration carries no path
-// — it names something an operator created on the swarm. Its name is the
-// operator's rather than namespace-scoped, for the same reason.
+// Both are `external:`, which is also this file's regression test for #99: what
+// that check refuses is a path, and an external declaration carries none — it
+// names something an operator created on the swarm. Its name is the operator's
+// rather than namespace-scoped, for the same reason.
 func TestServiceSecretsAndConfigsResolveThroughTheClient(t *testing.T) {
 	api := fakeAPI{
 		secrets: []swarm.Secret{{ID: "sec-id", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "apikey"}}}},
@@ -560,8 +869,8 @@ configs:
 // secret of its own that does not exist until this controller creates it, next to
 // a reference to a config that already does.
 //
-// The secret is driver-backed because since #99 that is the only content a stack
-// can own — `file:` was the other way, and it read the controller's filesystem
+// The secret is driver-backed because since #99 that is the only way a stack owns
+// a secret — `file:` was the other way, and it read the controller's filesystem
 // rather than the chart's.
 const declaresAndMounts = `
 services:
@@ -582,7 +891,7 @@ secrets:
 // config does not exist until this controller creates it. So Convert refuses
 // this manifest, and ConvertUnresolved is what the mount guard reads instead.
 func TestConvertUnresolvedNeedsNothingToExistYet(t *testing.T) {
-	_, err := Convert(context.Background(), declaresAndMounts, "rel", fakeAPI{}, application.Allow{})
+	_, err := Convert(context.Background(), declaresAndMounts, "rel", nil, fakeAPI{}, application.Allow{})
 	if err == nil {
 		t.Fatal("Convert = nil, want a reference to a resource that does not exist yet to fail")
 	}
@@ -590,7 +899,7 @@ func TestConvertUnresolvedNeedsNothingToExistYet(t *testing.T) {
 		t.Errorf("error %q is not the unresolvable reference", err)
 	}
 
-	got, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", fakeAPI{}, application.Allow{})
+	got, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", nil, fakeAPI{}, application.Allow{})
 	if err != nil {
 		t.Fatalf("ConvertUnresolved = %v, want nil", err)
 	}
@@ -622,7 +931,7 @@ func TestConvertUnresolvedDiffersOnlyByTheIds(t *testing.T) {
 	}
 
 	resolved := convertOK(t, declaresAndMounts, "rel", api)
-	unresolved, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", api, application.Allow{})
+	unresolved, err := ConvertUnresolved(context.Background(), declaresAndMounts, "rel", nil, api, application.Allow{})
 	if err != nil {
 		t.Fatalf("ConvertUnresolved = %v, want nil", err)
 	}
@@ -643,7 +952,7 @@ func TestConvertUnresolvedDiffersOnlyByTheIds(t *testing.T) {
 // the loader's, not the daemon's — so it survives the substitution.
 func TestConvertUnresolvedStillNeedsTheReferenceDeclared(t *testing.T) {
 	_, err := ConvertUnresolved(context.Background(),
-		"services:\n  web:\n    image: nginx\n    secrets: [absent]\n", "s", fakeAPI{}, application.Allow{})
+		"services:\n  web:\n    image: nginx\n    secrets: [absent]\n", "s", nil, fakeAPI{}, application.Allow{})
 	if err == nil {
 		t.Fatal("ConvertUnresolved = nil, want a reference the manifest never declared to be refused")
 	}
@@ -661,7 +970,7 @@ func TestInvalidManifestFails(t *testing.T) {
 		{"undefined secret", "services:\n  web:\n    image: nginx\n    secrets: [absent]\n", "converting services"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Convert(context.Background(), tc.manifest, "s", fakeAPI{}, application.Allow{})
+			_, err := Convert(context.Background(), tc.manifest, "s", nil, fakeAPI{}, application.Allow{})
 			if err == nil {
 				t.Fatal("Convert = nil, want an error")
 			}
@@ -697,6 +1006,14 @@ func serviceNames(s *Stack) []string {
 	out := make([]string, 0, len(s.Services))
 	for _, svc := range s.Services {
 		out = append(out, svc.Name)
+	}
+	return out
+}
+
+func configNames(s *Stack) []string {
+	out := make([]string, 0, len(s.Configs))
+	for _, c := range s.Configs {
+		out = append(out, c.Name)
 	}
 	return out
 }

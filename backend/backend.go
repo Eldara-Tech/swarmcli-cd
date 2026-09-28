@@ -1062,22 +1062,16 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 //
 // Nothing is deleted. Phase 1 is explicitly no prune.
 //
-// req.Files is ignored, and that is a decision rather than an oversight. A
-// manifest reaching here can never name a file: this controller converts it
-// in-process, with no checkout for a relative path to resolve against
-// (cdcompose.Convert sets WorkingDir: "/"), and cdcompose.checkFileSources
-// refuses configs.*.file, secrets.*.file and services.*.env_file outright
-// before the loader can read one — swarmcli-cd#99, because the only filesystem
-// those paths could name is the one holding the Docker socket, the application
-// set and /run/secrets. The chart engine fills the map from exactly those keys,
-// so what arrives here is always empty.
-//
-// Making the field mean something is a separate change with its own threat
-// argument, not a line added to this method: it means materialising the files
-// to a temp directory, pointing WorkingDir at that directory, and relaxing
-// checkFileSources from "refuse the key" to "refuse a path that escapes" —
-// reopening half of #99's guard on a process holding the socket. That is #528's
-// CE-side PR 4 and a follow-up issue here.
+// req.Files is the content of every config the manifest sources with file:,
+// keyed by the chart-relative path the manifest names, as the chart engine
+// resolved it while the chart was still in scope. Both conversions take it, and
+// it is the only place a config's content comes from: nothing is written to a
+// directory and no path is opened. cdcompose.checkFileSources accepts a config's
+// file: only when it names one of these keys from inside files/ or values/, and
+// refuses a secret's file: and a service's env_file: whatever is here —
+// swarmcli-cd#99, because the only filesystem a path in a rendered manifest
+// could name is the one holding the Docker socket, the application set and
+// /run/secrets.
 func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) error {
 	// Before the manifest is even converted: a release claiming the controller's
 	// own stack is refused whatever it declares, because the collision is the
@@ -1103,7 +1097,7 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 	if err != nil {
 		return err
 	}
-	unresolved, err := cdcompose.ConvertUnresolved(ctx, req.Manifest, req.Name, b.api, allow)
+	unresolved, err := cdcompose.ConvertUnresolved(ctx, req.Manifest, req.Name, req.Files, b.api, allow)
 	if err != nil {
 		return err
 	}
@@ -1138,7 +1132,7 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 		return err
 	}
 
-	stack, err := cdcompose.Convert(ctx, req.Manifest, req.Name, b.api, allow)
+	stack, err := cdcompose.Convert(ctx, req.Manifest, req.Name, req.Files, b.api, allow)
 	if err != nil {
 		return err
 	}
