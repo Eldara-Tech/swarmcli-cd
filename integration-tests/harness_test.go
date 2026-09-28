@@ -294,10 +294,8 @@ func removeStack(t *testing.T, release string) {
 // must not touch.
 //
 // Configs and secrets are absent here because this fixture does not need them —
-// see richChartFiles for one that references both. Since #99 that has to be an
-// `external:` reference to something already on the swarm: a chart cannot carry
-// content, because the only key that ever did read the controller's own
-// filesystem rather than the chart's.
+// see richChartFiles for one that references both, and
+// chartFilesWithAShippedConfig for a config whose content the chart ships.
 //
 // What this fixture is for is the two behaviours only a real swarm can show — a
 // network that can only be removed once its tasks are gone, and a volume that
@@ -508,9 +506,10 @@ func richApp(name, repoDir, release string, automated bool) application.Spec {
 // Two services, so that "one of them is missing" is a case that exists.
 //
 // It takes t because the mounted config and secret have to exist on the swarm
-// before the deploy: they are `external:`, which since #99 is the only way a
-// chart can reference either. The fixture creates them itself, named after the
-// release so that the twelve tests using it do not share one pair.
+// before the deploy: they are `external:` — since #99 the only way a chart can
+// reference a secret, and the config is referenced the same way. The fixture
+// creates them itself, named after the release so that the twelve tests using it
+// do not share one pair.
 //
 // What the comparison actually reads is the reference on the service — a name,
 // an id and a target path — and an external reference carries all three, so
@@ -671,8 +670,9 @@ func richChartFiles(t *testing.T, release string, replicas int) map[string]strin
 // createExternalConfigAndSecret puts a config and a secret on the swarm for a
 // chart to reference, the way an operator would, and returns their names.
 //
-// Since #99 a chart cannot carry content of its own, so a fixture that needs a
-// mounted config or secret has to be handed one. These carry no namespace label:
+// Since #99 a chart cannot carry a secret's content, so a fixture that mounts a
+// secret has to be handed one, and this hands over a config the same way. These
+// carry no namespace label:
 // they are nobody's stack's, which is the whole point of an external reference,
 // and it also keeps them out of every stack-scoped lister in this file.
 //
@@ -965,13 +965,12 @@ func createServiceByHand(t *testing.T, cli *dockerclient.Client, release, name s
 // namespace would satisfy a fixture that only dropped things, so `keep` is
 // declared in both renders and asserted to survive.
 //
-// It used to drop a config and a secret too, and that was most of what it was
-// for — #80 covered the three kinds #75 left open. Since #99 a stack cannot own
-// either: content came from `file:`, which read the controller's filesystem, and
-// an `external:` declaration is a reference that declaredNames deliberately does
-// not report, so it is never a sweep candidate. There is no manifest left that
-// puts a config or a secret in range of the sweep, so those two are gone rather
-// than converted into a case that would pass while exercising nothing.
+// It used to drop a config and a secret too — #80 covered the three kinds #75
+// left open. Since #99 a chart cannot own a secret with content, and an
+// `external:` declaration is a reference that declaredNames deliberately does not
+// report, so no secret is ever in range of the sweep. A config is again, now that
+// a chart ships its content: chartFilesWithAShippedConfig covers that half, in
+// the shape a chart actually retires one — a rotation rather than a drop.
 //
 // The drop of the `drop` network is what needs the real swarm: the sidecar is
 // attached to it, so it cannot be removed until that service's tasks have
@@ -1005,6 +1004,63 @@ func chartFilesWithPrunables(release string, extras bool) map[string]string {
 		"  drop: {}\n" +
 		"{{- end }}\n"
 	return files
+}
+
+// chartFilesWithAShippedConfig is a chart that ships the content of both configs
+// it mounts: one from a file in the chart, one from a value.
+//
+// The file's config is named after rev, which is how a chart changes a config's
+// content — Swarm will not change a config's data in place, so new content goes
+// under a new name and the old one is left behind. Moving rev and site together
+// is a rotation, and the superseded config is then the sweep's to remove. The
+// value's config keeps its name and content across both renders, so a sweep that
+// deleted everything under the namespace would fail on it.
+func chartFilesWithAShippedConfig(release string, rev int, site string) map[string]string {
+	files := chartFiles(release, 1)
+	files["charts/app/files/site.conf"] = site
+	files["charts/app/values.yaml"] = "rev: " + itoa(rev) + "\noperatorConf: \"from a value\\n\"\n"
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    configs:\n" +
+		"      - source: site-{{ .Values.rev }}\n" +
+		"        target: /etc/site.conf\n" +
+		"      - source: operator\n" +
+		"        target: /etc/operator.conf\n" +
+		"    deploy:\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"configs:\n" +
+		"  site-{{ .Values.rev }}:\n" +
+		"    file: files/site.conf\n" +
+		"  operator:\n" +
+		"    file: values/operatorConf\n"
+	return files
+}
+
+// configData reads one config's content back off the daemon, which is the only
+// place that says what Swarm stored rather than what was sent.
+func configData(t *testing.T, cli *dockerclient.Client, name string) string {
+	t.Helper()
+	cfg, _, err := cli.ConfigInspectWithRaw(context.Background(), name)
+	if err != nil {
+		t.Fatalf("inspecting config %q: %v", name, err)
+	}
+	return string(cfg.Spec.Data)
+}
+
+// configLabels reads one config's labels by name, for asserting that a resource
+// belonging to somebody else was left alone.
+func configLabels(t *testing.T, cli *dockerclient.Client, name string) map[string]string {
+	t.Helper()
+	cfg, _, err := cli.ConfigInspectWithRaw(context.Background(), name)
+	if err != nil {
+		t.Fatalf("inspecting config %q: %v", name, err)
+	}
+	return cfg.Spec.Labels
 }
 
 // stackConfigNames lists a stack's configs by scoped name, excluding the release
