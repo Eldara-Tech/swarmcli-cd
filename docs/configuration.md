@@ -294,6 +294,16 @@ opens no path a manifest names:
   nothing the chart shipped, or contains a `$` is refused. The chart's content is
   stored in its release record, which anyone with Docker access can read — the
   same as the rendered manifest.
+
+  Swarm configs are immutable, so **new content needs a new name**: a config
+  that already exists under its name with different content is refused, not
+  updated. Put a version or a content hash in the config's key or `name:`, and
+  change it with the content; the superseded config is then the
+  [`pruneResources`](#what-a-chart-stops-declaring) sweep's to remove.
+- **Labels under `com.swarmcli.` are refused** on any config or secret a chart
+  declares. They are the chart engine's and this controller's own bookkeeping —
+  the labels that mark a release record, and the marker that says this
+  controller created a resource.
 - **A secret's `file:` is refused**, and so is any secret that is neither
   `external:` nor driver-backed. A secret's content never comes from the chart:
   an operator runs `docker secret create`, and the chart references the result
@@ -784,10 +794,10 @@ all, so a comparison would report a difference on a stack nobody has touched. No
 of them can be changed without replacing the mount, which *is* reported.
 
 A **secret or config reference** is compared by name and by where it lands. The
-ids are not compared even though both sides carry a real one: a config's content is
-hashed into its name, so a change to the content is already a manifest-level
-difference, and comparing ids would report drift on a resource recreated with
-identical content. `uid`, `gid` and `mode` are not compared either, because
+ids are not compared even though both sides carry a real one: a config's content
+cannot change under the same name — the applier refuses that, so new content
+arrives under a new name and is already a manifest-level difference — and
+comparing ids would report drift on a resource recreated with identical content. `uid`, `gid` and `mode` are not compared either, because
 `docker service update` cannot change one without removing and re-adding the
 reference.
 
@@ -1130,6 +1140,12 @@ the ones that accumulate fastest.** They are immutable, so a content change has
 to arrive as a new name; the applier refuses one and tells you to hash the
 content into the name. A chart that does as it is told therefore strands its
 previous copy on **every value change**, not only when you remove a declaration.
+
+A config or secret that a running service's spec, or its **previous** spec,
+still references is not a candidate at all. Swarm refuses to remove one the spec
+references, but not one only the previous spec does — and the previous spec is
+what a rollback deploys. So after a rotation the copy before last is what goes,
+on the pass after the service's next update.
 
 A resource is deleted only when the swarm, git and this controller's own records
 all agree:
