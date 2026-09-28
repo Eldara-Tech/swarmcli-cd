@@ -755,7 +755,7 @@ func readStacks(ctx context.Context, b charts.Backend, releases []string) (map[s
 // A backend that does not implement capability.DeclaredLister gets the resolving
 // one, which is what both callers used before #87: the same answer, unavailable
 // in the same narrow cases, rather than no sweep at all.
-func declaredReader(ldb capability.LiveDrift) func(context.Context, string, string, map[string][]byte) (*compose.Stack, error) {
+func declaredReader(ldb capability.LiveDrift) func(context.Context, capability.ManifestRequest) (*compose.Stack, error) {
 	if dl, ok := ldb.(capability.DeclaredLister); ok {
 		return dl.DeclaredResources
 	}
@@ -964,9 +964,10 @@ func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.
 			continue
 		}
 		var v releaseView
+		req := capability.ManifestRequest{Name: rp.Name, Manifest: rp.Manifest, Files: rp.Files}
 		v.live, v.err = ldb.LiveServices(ctx, rp.Name)
 		if v.err == nil && live && rp.Action == charts.ActionUnchanged {
-			v.desired, v.desiredErr = ldb.DesiredServices(ctx, rp.Manifest, rp.Name, rp.Files)
+			v.desired, v.desiredErr = ldb.DesiredServices(ctx, req)
 		}
 		if v.err == nil && sweep {
 			// The resolving conversion, when there is one, has already answered
@@ -975,7 +976,7 @@ func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.
 			if v.desired != nil {
 				v.declared = v.desired
 			} else {
-				v.declared, v.err = readDeclared(ctx, rp.Manifest, rp.Name, rp.Files)
+				v.declared, v.err = readDeclared(ctx, req)
 			}
 		}
 		if v.err == nil && sweep && rl != nil {
@@ -1248,7 +1249,7 @@ func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb cap
 		if app, ok := prune.Owner(rev, r.controller); !ok || app != spec.Name {
 			continue
 		}
-		stack, err := readDeclared(ctx, rev.Manifest, release, rev.Files)
+		stack, err := readDeclared(ctx, capability.ManifestRequest{Name: release, Manifest: rev.Manifest, Files: rev.Files})
 		if err != nil {
 			r.log.Warn("could not read what a stored revision declared",
 				"application", spec.Name, "release", release,

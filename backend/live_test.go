@@ -18,6 +18,7 @@ import (
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
 
@@ -32,7 +33,7 @@ services:
 // The desired half has to be the same conversion an apply would do, or drift
 // compares against something a sync would never write.
 func TestDesiredServicesConvertsTheManifest(t *testing.T) {
-	stack, err := testBackend(t, &fakeAPI{}, nil).DesiredServices(context.Background(), liveManifest, "s", nil)
+	stack, err := testBackend(t, &fakeAPI{}, nil).DesiredServices(context.Background(), capability.ManifestRequest{Name: "s", Manifest: liveManifest})
 	if err != nil {
 		t.Fatalf("DesiredServices = %v, want nil", err)
 	}
@@ -62,11 +63,11 @@ func TestTheLiveConversionsTakeTheManifestsFiles(t *testing.T) {
 	b := testBackend(t, api, nil)
 	files := map[string][]byte{"files/nginx.conf": []byte("server {}\n")}
 
-	for name, read := range map[string]func(context.Context, string, string, map[string][]byte) (*cdcompose.Stack, error){
+	for name, read := range map[string]func(context.Context, capability.ManifestRequest) (*cdcompose.Stack, error){
 		"DesiredServices":   b.DesiredServices,
 		"DeclaredResources": b.DeclaredResources,
 	} {
-		stack, err := read(context.Background(), shipsAConfig, "s", files)
+		stack, err := read(context.Background(), capability.ManifestRequest{Name: "s", Manifest: shipsAConfig, Files: files})
 		if err != nil {
 			t.Errorf("%s = %v, want the manifest converted with its files", name, err)
 			continue
@@ -78,7 +79,7 @@ func TestTheLiveConversionsTakeTheManifestsFiles(t *testing.T) {
 }
 
 func TestDesiredServicesReportsAnUnusableManifest(t *testing.T) {
-	_, err := testBackend(t, &fakeAPI{}, nil).DesiredServices(context.Background(), "services: [", "s", nil)
+	_, err := testBackend(t, &fakeAPI{}, nil).DesiredServices(context.Background(), capability.ManifestRequest{Name: "s", Manifest: "services: ["})
 	if err == nil {
 		t.Fatal("DesiredServices = nil, want an error for a manifest that does not parse")
 	}

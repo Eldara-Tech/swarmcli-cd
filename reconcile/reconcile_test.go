@@ -2050,14 +2050,14 @@ func (b *driftBackend) unshipped(manifest string, files map[string][]byte) error
 		manifest, len(files))
 }
 
-func (b *driftBackend) DesiredServices(_ context.Context, manifest, stack string, files map[string][]byte) (*compose.Stack, error) {
+func (b *driftBackend) DesiredServices(_ context.Context, req capability.ManifestRequest) (*compose.Stack, error) {
 	if b.readErr != nil {
 		return nil, b.readErr
 	}
-	if err := b.unresolvableErr[manifest]; err != nil {
+	if err := b.unresolvableErr[req.Manifest]; err != nil {
 		return nil, err
 	}
-	return b.answer(manifest, stack, files)
+	return b.answer(req)
 }
 
 // DeclaredResources answers the same manifests as DesiredServices but is not
@@ -2066,27 +2066,27 @@ func (b *driftBackend) DesiredServices(_ context.Context, manifest, stack string
 //
 // readErr still applies. That one models a backend that cannot read at all, and a
 // fake that answered anyway would make the no-backend degradation untestable.
-func (b *driftBackend) DeclaredResources(_ context.Context, manifest, stack string, files map[string][]byte) (*compose.Stack, error) {
+func (b *driftBackend) DeclaredResources(_ context.Context, req capability.ManifestRequest) (*compose.Stack, error) {
 	if b.readErr != nil {
 		return nil, b.readErr
 	}
-	return b.answer(manifest, stack, files)
+	return b.answer(req)
 }
 
 // answer is what both conversions have in common: record the read, refuse a
 // manifest handed the wrong files, then hand back this manifest's stack if the
 // test named one and the release's otherwise.
-func (b *driftBackend) answer(manifest, stack string, files map[string][]byte) (*compose.Stack, error) {
+func (b *driftBackend) answer(req capability.ManifestRequest) (*compose.Stack, error) {
 	b.mu.Lock()
-	b.manifestReads = append(b.manifestReads, manifest)
+	b.manifestReads = append(b.manifestReads, req.Manifest)
 	b.mu.Unlock()
-	if err := b.unshipped(manifest, files); err != nil {
+	if err := b.unshipped(req.Manifest, req.Files); err != nil {
 		return nil, err
 	}
-	if s, ok := b.byManifest[manifest]; ok {
+	if s, ok := b.byManifest[req.Manifest]; ok {
 		return s, nil
 	}
-	return b.desired[stack], nil
+	return b.desired[req.Name], nil
 }
 
 // RemoveService deletes from the fake swarm as well as recording, so that the
@@ -3390,7 +3390,7 @@ func TestAnUnresolvableSettledReleaseLosesItsComparisonAndNotItsSweep(t *testing
 // at all.
 type oldSeamBackend struct{ stack *compose.Stack }
 
-func (o oldSeamBackend) DesiredServices(context.Context, string, string, map[string][]byte) (*compose.Stack, error) {
+func (o oldSeamBackend) DesiredServices(context.Context, capability.ManifestRequest) (*compose.Stack, error) {
 	return o.stack, nil
 }
 
