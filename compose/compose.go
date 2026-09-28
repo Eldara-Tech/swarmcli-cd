@@ -106,8 +106,8 @@ func Convert(ctx context.Context, manifest, stack string, files map[string][]byt
 	if err != nil {
 		return nil, fmt.Errorf("parsing the manifest: %w", err)
 	}
-	// First, because every check after it walks the document as map[string]any
-	// and would step over a block that is not one.
+	// First: after it, every mapping in the document is a map[string]any, which
+	// is the shape the checks below read.
 	if err := checkStringKeys(dict, ""); err != nil {
 		return nil, err
 	}
@@ -459,11 +459,15 @@ func bindSource(v any) (string, bool) {
 //
 // YAML allows any scalar as a key, and the parser hands a mapping with even one
 // such key back as a map[any]any — the whole mapping, not the one entry. Every
-// check in this file walks the document by asserting map[string]any, so a block
-// of that shape would be stepped over by all of them, siblings included, and
-// the loader would be the first thing to look inside it. Compose has no use for
-// a non-string key, so refusing one here, before any other check runs, is what
-// lets the rest of this file treat a block it cannot read as absent.
+// check in this file walks the document by asserting map[string]any, so a
+// mapping of that type, siblings included, would be stepped over by all of them.
+// Compose has no use for a non-string key, so this refuses one before any other
+// check runs.
+//
+// That is the whole guarantee: once this returns nil, every mapping in the
+// document is a map[string]any. A section of another shape altogether — a list
+// where compose wants a mapping — is still skipped by the checks below, and is
+// refused by the loader's schema validation instead.
 //
 // at is where v sits in the document, for the message.
 func checkStringKeys(v any, at string) error {
@@ -521,7 +525,7 @@ const chartFilesRule = "a config's file: names content the chart ships in files/
 // and is then looked up rather than opened: convertConfigs reads the map, not the
 // disk. So a path is refused, in this order, when it
 //
-//   - is not a string;
+//   - is not a string, or is empty;
 //   - contains a $. The engine keys files by the path as the manifest wrote it,
 //     before the $$ escape is undone, and this reads it after, so a $$ path would
 //     name a key that cannot exist. And an interpolation-shaped path is not one
@@ -605,11 +609,17 @@ func checkFileSources(dict map[string]any, files map[string][]byte) (map[string]
 // none. The checks and their order are checkFileSources'.
 func chartFile(raw any, files map[string][]byte) (string, error) {
 	p, ok := raw.(string)
-	if !ok {
-		return "", fmt.Errorf("file: must be a path, not a %T; %s", raw, chartFilesRule)
+	switch {
+	case raw == nil:
+		return "", fmt.Errorf("file: names no path; %s", chartFilesRule)
+	case !ok:
+		return "", fmt.Errorf("file: must be a path, got %v (%T); %s", raw, raw, chartFilesRule)
 	}
 	if strings.Contains(p, "$") {
-		return "", fmt.Errorf("file: '%s' is interpolation-shaped, and a path containing $ is refused; %s", p, chartFilesRule)
+		// Quoted as read, which is after unescapeDollars: the manifest's own
+		// spelling is not kept, so the message says which form it shows.
+		return "", fmt.Errorf("file: '%s' (with $$ read as $) is interpolation-shaped, and a path containing $ "+
+			"is refused; %s", p, chartFilesRule)
 	}
 	if path.IsAbs(p) {
 		return "", fmt.Errorf("file: '%s' is an absolute path; %s", p, chartFilesRule)

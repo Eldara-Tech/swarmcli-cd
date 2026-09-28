@@ -547,18 +547,28 @@ func TestAConfigFileNotShippedByTheChartIsRefused(t *testing.T) {
 		"files/${X}/app.conf": []byte("x"),
 		"files/a$$b.conf":     []byte("x"),
 		"app.conf":            []byte("x"),
+		"files.conf":          []byte("x"),
+		"filesystem/a.conf":   []byte("x"),
+		"values.conf":         []byte("x"),
 	}
 	for _, tc := range []struct{ name, file, why string }{
 		{"absolute", "/run/secrets/swarmcli-cd-token", "is an absolute path"},
 		{"parent", "../app.conf", "escapes the chart"},
 		{"parent after cleaning", "files/../../app.conf", "escapes the chart"},
 		{"outside files and values", "app.conf", "is outside files/ and values/"},
+		// Beside files/ and values/ rather than in them: the directory is the
+		// prefix, slash included.
+		{"a sibling of files/", "files.conf", "is outside files/ and values/"},
+		{"a directory named like files/", "filesystem/a.conf", "is outside files/ and values/"},
+		{"a sibling of values/", "values.conf", "is outside files/ and values/"},
 		{"not shipped", "files/missing.conf", "is not shipped by the chart"},
 		// Interpolation-shaped paths are refused, whether or not a key of that
 		// spelling exists.
 		{"interpolation-shaped", "files/${X}/app.conf", "interpolation-shaped"},
-		{"an escaped dollar", "files/a$$b.conf", "interpolation-shaped"},
-		{"not a string", "42", "must be a path"},
+		// The path is quoted as it is read, which is after the $$ escape.
+		{"an escaped dollar", "files/a$$b.conf", "'files/a$b.conf' (with $$ read as $) is interpolation-shaped"},
+		{"not a string", "42", "must be a path, got 42 (int)"},
+		{"no path at all", "", "names no path"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			manifest := "services:\n  x:\n    image: alpine\n" +
@@ -656,10 +666,9 @@ func TestASecretThatIsNeitherExternalNorDriverBackedIsRefused(t *testing.T) {
 	}
 }
 
-// A mapping with a key that is not a string arrives as a different Go type, and
-// every other check here would step over it — along with everything beside it,
-// which is why each case carries an env_file: that the check for it would
-// otherwise have refused.
+// A mapping with a key that is not a string arrives as a map[any]any rather than
+// the map[string]any every later check reads, so it is refused wherever it sits
+// — in a section, in an entry, or inside a list — and the message says where.
 func TestAMappingWithANonStringKeyIsRefused(t *testing.T) {
 	for _, tc := range []struct{ name, manifest, at string }{
 		{
@@ -671,6 +680,11 @@ func TestAMappingWithANonStringKeyIsRefused(t *testing.T) {
 			"in an entry",
 			"services:\n  web:\n    image: alpine\n    env_file: files/app.env\n    1: x\n",
 			"'services.web'",
+		},
+		{
+			"inside a list",
+			"services:\n  web:\n    image: alpine\n    configs:\n      - source: site\n        1: x\n",
+			"'services.web.configs[0]'",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -734,8 +748,15 @@ func TestConvertConfigsMatchesUpstream(t *testing.T) {
 // No production file in this package reads a path. Config content comes from the
 // files a caller hands over, and this is what holds that down: it fails on any
 // reference to the calls that would read one instead — convert.Configs, which
-// reads each config's file:, and the os and io/ioutil functions that open, read,
-// list or stat a path.
+// reads each config's file:, and the os, io/ioutil and path/filepath functions
+// that open, read, list, walk or stat a path.
+//
+// An *os.Root's methods read too, and a scan without type information cannot
+// see a method call's receiver. So the type itself is banned — os.Root — along
+// with os.OpenRoot, which returns one, and os.OpenInRoot, which opens through
+// one; that leaves no way to name or make a root in this package. One returned by
+// another package's function and held only in an inferred variable would still
+// pass, and nothing this package imports returns one.
 //
 // Two upstream calls this package keeps have read branches of their own, which a
 // scan of this package cannot see; what keeps each shut is a guard, not this
@@ -749,8 +770,10 @@ func TestConvertConfigsMatchesUpstream(t *testing.T) {
 // Test files are exempt: the parity test above reads through upstream on purpose.
 func TestNoProductionFileReadsAPath(t *testing.T) {
 	banned := map[string][]string{
-		"os":        {"ReadFile", "Open", "OpenFile", "OpenRoot", "ReadDir", "DirFS", "Stat", "Lstat"},
-		"io/ioutil": {"ReadFile", "ReadDir"},
+		"os": {"ReadFile", "Open", "OpenFile", "OpenRoot", "OpenInRoot", "ReadDir", "DirFS", "Stat", "Lstat",
+			"Readlink", "Root"},
+		"io/ioutil":     {"ReadFile", "ReadDir"},
+		"path/filepath": {"Glob", "Walk", "WalkDir"},
 		"github.com/docker/cli/cli/compose/convert": {"Configs"},
 	}
 
