@@ -15,6 +15,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -256,10 +257,11 @@ func containedAbs(root, path string) (string, error) {
 // longer looks like one to charts.IsPathRef; only the declared reference still
 // says which kind it is.
 //
-// The root is resolved before containedAbs sees it: containedAbs joins its
-// relative path onto the root's real location, and a release file's directory
-// is already named by its real one (Contained returned it) while the checkout
-// may sit under a symlink.
+// Both sides are made absolute, and the root resolved, before containedAbs sees
+// them: containedAbs joins its relative path onto the root's real location, a
+// release file's directory is already named by its real one (Contained returned
+// it) while the checkout may sit under a symlink, and with a relative data
+// directory one of the two can be relative while the other is not.
 func containedChart(root string, rf *charts.ReleaseFile, r charts.ReleaseSpec) error {
 	if !charts.IsPathRef(r.Chart) {
 		return nil
@@ -267,12 +269,30 @@ func containedChart(root string, rf *charts.ReleaseFile, r charts.ReleaseSpec) e
 	if filepath.IsAbs(r.Chart) {
 		return fmt.Errorf("'%s' must be relative to the repository", r.Chart)
 	}
-	realRoot, err := filepath.EvalSymlinks(root)
+	realRoot, err := filepath.Abs(root)
+	if err == nil {
+		realRoot, err = filepath.EvalSymlinks(realRoot)
+	}
 	if err != nil {
 		return fmt.Errorf("resolving the working tree: %w", err)
 	}
-	_, err = containedAbs(realRoot, rf.ChartRef(r))
-	return err
+	chart, err := filepath.Abs(rf.ChartRef(r))
+	if err == nil {
+		_, err = containedAbs(realRoot, chart)
+	}
+
+	// Contained names the path it computed; say it the way the release file
+	// does. Its own refusals wrap nothing, and a failure to resolve wraps why.
+	switch cause := errors.Unwrap(err); {
+	case err == nil:
+		return nil
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("'%s' is not in the repository at this revision: %w", r.Chart, fs.ErrNotExist)
+	case cause != nil:
+		return fmt.Errorf("resolving '%s': %w", r.Chart, cause)
+	default:
+		return fmt.Errorf("'%s' resolves outside the repository", r.Chart)
+	}
 }
 
 // Contained resolves rel against root and refuses anything that ends up
