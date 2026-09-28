@@ -230,7 +230,7 @@ A compose entry that is **not** marked `external:` can still name itself anythin
 secrets:
   x:
     name: swarmcli-cd-token     # not this stack's to name
-    file: ./whatever
+    driver: vault
 ```
 
 A guard that only inspects what a manifest *references* sees an ordinary,

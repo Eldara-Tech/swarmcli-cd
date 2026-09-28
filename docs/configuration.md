@@ -278,6 +278,28 @@ and mounting its own is unaffected, and needs no entry: its name is
 namespace-scoped to `<release>_<name>`, so it is nobody else's and nobody's to
 permit.
 
+**Content comes from the chart, never from the controller's filesystem.** A
+rendered manifest is a string, not a file in a checkout, so the only filesystem a
+path in it could name is the controller's own — the one holding the Docker
+socket, the application set and `/run/secrets`
+([#99](https://github.com/Eldara-Tech/swarmcli-cd/issues/99)). So the controller
+opens no path a manifest names:
+
+- **A config's `file:`** names a file the chart ships under `files/`, or a value
+  under `values/` — one the release file or its values files set. The chart
+  engine resolves it while the chart is in scope and hands the controller the
+  bytes, which it builds the config from in memory
+  ([#152](https://github.com/Eldara-Tech/swarmcli-cd/issues/152)). A path that
+  is absolute, escapes the chart, lies outside `files/` and `values/`, names
+  nothing the chart shipped, or contains a `$` is refused. The chart's content is
+  stored in its release record, which anyone with Docker access can read — the
+  same as the rendered manifest.
+- **A secret's `file:` is refused**, and so is any secret that is neither
+  `external:` nor driver-backed. A secret's content never comes from the chart:
+  an operator runs `docker secret create`, and the chart references the result
+  with `external: true`.
+- **`env_file:` is refused**; set variables with `environment:`.
+
 **Static credentials only.** The controller image ships no docker credential
 helpers, so a `config.json` using `credsStore` or `credHelpers` is refused at
 startup. Registries with static credentials (Docker Hub, GHCR, Harbor, GitLab,
@@ -1150,11 +1172,14 @@ network created before the label existed.
 before this controller learned to mark them has no marker and cannot gain one —
 from here it is indistinguishable from one somebody else made — so it is
 reported and never deleted, the same answer clause 3 gives a resource older than
-the retained history. Since [#99](https://github.com/Eldara-Tech/swarmcli-cd/issues/99)
-a chart cannot own either kind anyway — `file:` reads the controller's own
-filesystem and is refused, and an `external:` declaration is a reference this
-controller did not create — so in practice clause 4 is a guard against the day
-that changes rather than a narrowing of what is swept today.
+the retained history. A chart owns a config when it ships the content
+([#152](https://github.com/Eldara-Tech/swarmcli-cd/issues/152)), so for configs
+clause 4 is what keeps an operator's pre-seeded copy off the sweep. A chart
+cannot own a secret with content — a secret's `file:` is refused
+([#99](https://github.com/Eldara-Tech/swarmcli-cd/issues/99)), and an `external:`
+declaration is a reference this controller did not create — so for secrets it is
+a guard against the day that changes rather than a narrowing of what is swept
+today.
 
 The four kinds are proved separately, so a config never inherits a same-named
 service's evidence — Swarm scopes all four into one namespace of names, and
