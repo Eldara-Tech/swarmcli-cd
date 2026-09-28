@@ -419,6 +419,7 @@ func TestLocalChartPathMustStayInTheCheckout(t *testing.T) {
 		"an absolute path into the tree": {"swarmcli-release.yaml", filepath.Join(co.Dir, "charts", "hello"), "", "must be relative"},
 		"a symlink out of the tree":      {"swarmcli-release.yaml", "./charts/link", "charts/link", "outside the repository"},
 		"a path that is not committed":   {"swarmcli-release.yaml", "./charts/absent", "", "not in the repository"},
+		"a path through a file":          {"swarmcli-release.yaml", "./charts/hello/Chart.yaml/x", "", "resolving"},
 		"a chart application":            {"", "charts/hello", "", ""},
 		"a chart application's symlink":  {"", "charts/applink", "charts/applink", "outside the repository"},
 	} {
