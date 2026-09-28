@@ -93,6 +93,12 @@ func (b *Builder) Build(ctx context.Context, app string, spec application.Source
 		}
 	}
 
+	for _, r := range rf.Releases {
+		if err := containedChart(co.Dir, rf, r); err != nil {
+			return nil, fmt.Errorf("application '%s': %s: release '%s': chart: %w", app, rf.Path, r.Name, err)
+		}
+	}
+
 	// A repository store per application, rather than the process-wide XDG
 	// default: two applications naming the same repository with different URLs
 	// would otherwise collide, and the engine refuses to repoint an existing
@@ -238,6 +244,35 @@ func containedAbs(root, path string) (string, error) {
 		return "", fmt.Errorf("'%s' is not under the repository", path)
 	}
 	return Contained(root, rel)
+}
+
+// containedChart holds a release's local chart path to the working tree the way
+// valuesReader holds a values file: it is repository content, and the engine
+// resolves it with ChartRef whether it is relative, absolute or climbs out with
+// "../". A repository reference is not a path and is left alone.
+//
+// It runs over the parsed release file rather than inside the chart source the
+// engine calls, because with a relative data directory a resolved local path no
+// longer looks like one to charts.IsPathRef; only the declared reference still
+// says which kind it is.
+//
+// The root is resolved before containedAbs sees it: containedAbs joins its
+// relative path onto the root's real location, and a release file's directory
+// is already named by its real one (Contained returned it) while the checkout
+// may sit under a symlink.
+func containedChart(root string, rf *charts.ReleaseFile, r charts.ReleaseSpec) error {
+	if !charts.IsPathRef(r.Chart) {
+		return nil
+	}
+	if filepath.IsAbs(r.Chart) {
+		return fmt.Errorf("'%s' must be relative to the repository", r.Chart)
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("resolving the working tree: %w", err)
+	}
+	_, err = containedAbs(realRoot, rf.ChartRef(r))
+	return err
 }
 
 // Contained resolves rel against root and refuses anything that ends up

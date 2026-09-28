@@ -379,6 +379,82 @@ func TestSymlinkOutOfTheTreeIsRejected(t *testing.T) {
 	}
 }
 
+// A local chart path in a release file is repository content too, so it is
+// held to the checkout the way a values file is. The boundary is the checkout,
+// not the release file's directory: a chart one level up from a release file in
+// a subdirectory is still the repository's own.
+//
+// The checkout is reached through a symlinked data directory, as it is on macOS
+// and can be anywhere, so the release file's directory (resolved) and the
+// checkout (not) name the same tree two ways.
+func TestLocalChartPathMustStayInTheCheckout(t *testing.T) {
+	all := tree(t, map[string]string{
+		"edge/charts/hello/Chart.yaml":           "apiVersion: v1\nname: hello\nversion: 0.1.0\n",
+		"edge/charts/hello/templates/stack.yaml": "services: {}\n",
+		"other/charts/x/Chart.yaml":              "apiVersion: v1\nname: x\nversion: 0.1.0\n",
+		"other/charts/x/templates/stack.yaml":    "services: {}\n",
+	})
+	data := filepath.Join(t.TempDir(), "data")
+	if err := os.Symlink(all.Dir, data); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	co := git.Checkout{Dir: filepath.Join(data, "edge"), Revision: all.Revision}
+	outside := filepath.Join(all.Dir, "other", "charts", "x")
+
+	for name, tc := range map[string]struct {
+		releaseFile string
+		chart       string
+		symlink     string // created in the checkout, pointing at outside
+		want        string // empty: the chart loads
+	}{
+		"in the repository":              {"swarmcli-release.yaml", "./charts/hello", "", ""},
+		"up from a subdirectory":         {"swarm/prod/swarmcli-release.yaml", "../../charts/hello", "", ""},
+		"a parent directory":             {"swarmcli-release.yaml", "../other/charts/x", "", "outside the repository"},
+		"an absolute path":               {"swarmcli-release.yaml", outside, "", "must be relative"},
+		"an absolute path into the tree": {"swarmcli-release.yaml", filepath.Join(co.Dir, "charts", "hello"), "", "must be relative"},
+		"a symlink out of the tree":      {"swarmcli-release.yaml", "./charts/link", "charts/link", "outside the repository"},
+		"a path that is not committed":   {"swarmcli-release.yaml", "./charts/absent", "", "not in the repository"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if tc.symlink != "" {
+				if err := os.Symlink(outside, filepath.Join(co.Dir, tc.symlink)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(co.Dir, tc.releaseFile)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			doc := "apiVersion: v1\nreleases:\n  - name: hello\n    chart: " + tc.chart + "\n"
+			if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := builder(t).Build(context.Background(), "edge", application.Source{ReleaseFile: tc.releaseFile}, co)
+			if tc.want != "" {
+				if err == nil {
+					t.Fatalf("Build = nil, want an error containing %q", tc.want)
+				}
+				if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "application 'edge'") {
+					t.Errorf("error %q names neither the application nor %q", err, tc.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Build = %v, want nil", err)
+			}
+			spec := got.ReleaseFile.Releases[0]
+			ch, err := got.Charts.Load(got.ReleaseFile.ChartRef(spec), spec.Version)
+			if err != nil {
+				t.Fatalf("Load = %v, want the chart", err)
+			}
+			if ch.Metadata.Name != "hello" {
+				t.Errorf("loaded chart %q, want hello", ch.Metadata.Name)
+			}
+		})
+	}
+}
+
 // decrypter stands in for the Business Edition's SOPS provider.
 type decrypter struct{}
 
