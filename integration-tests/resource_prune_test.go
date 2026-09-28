@@ -121,7 +121,8 @@ func TestAConfigThisControllerNeverDeclaredIsNeverPruned(t *testing.T) {
 
 // A chart's own configs, end to end: the content comes from the chart — one from
 // a file it ships, one from a value — reaches the swarm as those bytes, and a
-// config superseded by new content is removed by the sweep.
+// config superseded by new content is removed by the sweep once nothing running
+// could still use it.
 //
 // The rotation is #80's config half, which #99 took away by leaving a chart no
 // way to own a config. It is the shape a chart actually retires one in: Swarm
@@ -131,6 +132,11 @@ func TestAConfigThisControllerNeverDeclaredIsNeverPruned(t *testing.T) {
 // the stored revision that declared it, and that revision only converts with the
 // files it was deployed with, so this is also the test that a stored revision's
 // files reach the sweep.
+//
+// Two rotations, because the first is not enough to free anything: after it the
+// service's previous spec — what a rollback deploys — still mounts the first
+// config, and Swarm's own in-use check does not look there. So the first config
+// must survive the first rotation and go after the second.
 //
 // One install covers deploy, rotation and prune, for the budget reason the test
 // above gives.
@@ -146,34 +152,49 @@ func TestAShippedConfigIsDeployedRotatedAndPruned(t *testing.T) {
 	}
 	waitForRunning(t, cli, release, 1)
 
-	site, operator := release+"_site-1", release+"_operator"
-	if got, want := stackConfigNames(t, cli, release), []string{operator, site}; !slices.Equal(got, want) {
+	first, operator := release+"_site-1", release+"_operator"
+	if got, want := stackConfigNames(t, cli, release), []string{operator, first}; !slices.Equal(got, want) {
 		t.Fatalf("configs = %v, want %v", got, want)
 	}
-	if got := configData(t, cli, site); got != "listen 8080;\n" {
-		t.Errorf("%s holds %q, want the chart's files/site.conf", site, got)
+	if got := configData(t, cli, first); got != "listen 8080;\n" {
+		t.Errorf("%s holds %q, want the chart's files/site.conf", first, got)
 	}
 	if got := configData(t, cli, operator); got != "from a value\n" {
 		t.Errorf("%s holds %q, want the value it names", operator, got)
 	}
 
+	// The first rotation. The first config is now only the rollback target, and
+	// stays through a pass that would otherwise have removed it.
 	commitChange(t, repo, chartFilesWithAShippedConfig(release, 2, "listen 9090;\n"))
+	second := release + "_site-2"
+	held := []string{operator, first, second}
+	syncUntilConverged(t, rec, "edge", func() bool {
+		return slices.Equal(stackConfigNames(t, cli, release), held)
+	})
+	if err := rec.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := stackConfigNames(t, cli, release); !slices.Equal(got, held) {
+		t.Fatalf("configs = %v, want %v — the rollback target kept", got, held)
+	}
+	if got := configData(t, cli, second); got != "listen 9090;\n" {
+		t.Errorf("%s holds %q, want the new content", second, got)
+	}
 
-	rotated := release + "_site-2"
-	want := []string{operator, rotated}
+	// The second rotation frees the first.
+	commitChange(t, repo, chartFilesWithAShippedConfig(release, 3, "listen 7070;\n"))
+	third := release + "_site-3"
+	want := []string{operator, second, third}
 	syncUntilConverged(t, rec, "edge", func() bool {
 		return slices.Equal(stackConfigNames(t, cli, release), want)
 	})
 
-	if got := configData(t, cli, rotated); got != "listen 9090;\n" {
-		t.Errorf("%s holds %q, want the new content", rotated, got)
-	}
 	var mounted []string
 	for _, ref := range serviceOf(t, cli, release+"_app").Spec.TaskTemplate.ContainerSpec.Configs {
 		mounted = append(mounted, ref.ConfigName)
 	}
 	slices.Sort(mounted)
-	if !slices.Equal(mounted, want) {
+	if want := []string{operator, third}; !slices.Equal(mounted, want) {
 		t.Errorf("the service mounts %v, want %v", mounted, want)
 	}
 }

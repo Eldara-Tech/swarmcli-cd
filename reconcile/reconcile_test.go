@@ -3756,26 +3756,25 @@ func TestResourcesDroppedFromTheChartArePruned(t *testing.T) {
 	}
 }
 
-// A config changed by content arrives under a new name, because Swarm will not
-// change a config's data, and the old one is left behind until the sweep takes
-// it. Both conversions that decide that carry files: the upgrade's manifest names
-// the new content, and the stored revision proving the old name is this
-// application's names the old — so a sweep that dropped either set of files
-// would lose that proof and leave every rotated config on the swarm.
-func TestAConfigRotatedByContentIsPruned(t *testing.T) {
-	app := serviceSpec("whoami_app", 1)
+// rotated is a release whose upgrade renames a config and a secret for new
+// content, with a stored revision that declared the old names, and running as
+// app. Both the upgrade's manifest and the revision name a chart file, so each
+// converts only with its own files.
+func rotated(app swarm.Service) (*driftBackend, *fakeEngine) {
 	oldFiles := map[string][]byte{"files/site.conf": []byte("listen 8080;\n")}
+	stack := func(v string) *compose.Stack {
+		return &compose.Stack{
+			Services: []compose.Service{{Name: "app", Spec: serviceSpec("whoami_app", 1)}},
+			Configs:  []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "whoami_site-" + v}}},
+			Secrets:  []swarm.SecretSpec{{Annotations: swarm.Annotations{Name: "whoami_token-" + v}}},
+		}
+	}
 	backend := &driftBackend{
-		desired: map[string]*compose.Stack{"whoami": {
-			Services: []compose.Service{{Name: "app", Spec: app}},
-			Configs:  []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "whoami_site-v2"}}},
-		}},
-		byManifest: map[string]*compose.Stack{"had-site-v1": {
-			Services: []compose.Service{{Name: "app", Spec: app}},
-			Configs:  []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "whoami_site-v1"}}},
-		}},
-		live:        map[string]map[string]swarm.Service{"whoami": {"whoami_app": {ID: "id-app", Spec: app}}},
+		desired:     map[string]*compose.Stack{"whoami": stack("v2")},
+		byManifest:  map[string]*compose.Stack{"had-site-v1": stack("v1")},
+		live:        map[string]map[string]swarm.Service{"whoami": {"whoami_app": app}},
 		liveConfigs: map[string]map[string]string{"whoami": {"whoami_site-v1": "c-v1", "whoami_site-v2": "c-v2"}},
+		liveSecrets: map[string]map[string]string{"whoami": {"whoami_token-v1": "k-v1", "whoami_token-v2": "k-v2"}},
 		shipped:     map[string]map[string][]byte{shipsASite: siteFiles, "had-site-v1": oldFiles},
 	}
 	history := sweepHistory("edge", "had-site-v1")
@@ -3787,14 +3786,68 @@ func TestAConfigRotatedByContentIsPruned(t *testing.T) {
 		}}}},
 		history: history,
 	}
+	return backend, engine
+}
+
+// mounting is the app's spec with the given version of the config and the
+// secret mounted.
+func mounting(v string) swarm.ServiceSpec {
+	spec := serviceSpec("whoami_app", 1)
+	spec.TaskTemplate.ContainerSpec.Configs = []*swarm.ConfigReference{{ConfigName: "whoami_site-" + v}}
+	spec.TaskTemplate.ContainerSpec.Secrets = []*swarm.SecretReference{{SecretName: "whoami_token-" + v}}
+	return spec
+}
+
+// A config changed by content arrives under a new name, because Swarm will not
+// change a config's data, and the old one is left behind until the sweep takes
+// it. Both conversions that decide that carry files: the upgrade's manifest names
+// the new content, and the stored revision proving the old name is this
+// application's names the old — so a sweep that dropped either set of files
+// would lose that proof and leave every rotated config on the swarm.
+//
+// Nothing running references the old names here, which is the state a rotation
+// reaches once the service has moved on past it; see the test below for the
+// state before that.
+func TestAConfigRotatedByContentIsPruned(t *testing.T) {
+	backend, engine := rotated(swarm.Service{ID: "id-app", Spec: serviceSpec("whoami_app", 1)})
 	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
 		fakeRegistry{backend: backend})
 
 	if err := r.Sync(context.Background(), "edge"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
 	}
-	if got, want := backend.prunedResources(), []string{"config:c-v1"}; !slices.Equal(got, want) {
-		t.Errorf("pruned %v, want %v — the superseded config, and not the one the upgrade declares", got, want)
+	if got, want := backend.prunedResources(), []string{"config:c-v1", "secret:k-v1"}; !slices.Equal(got, want) {
+		t.Errorf("pruned %v, want %v — the superseded pair, and not the one the upgrade declares", got, want)
+	}
+}
+
+// A rotated config or secret stays while a running service could still use it.
+// Swarm refuses to remove one a service's spec references, but not one its
+// previous spec does — and the previous spec is what a rollback deploys, so
+// removing it would leave that rollback nothing to start. The sweep reads the
+// services before the apply that moves each updated spec into PreviousSpec, so
+// both are held.
+func TestARotatedResourceAServiceCanStillUseIsKept(t *testing.T) {
+	previous := mounting("v1")
+	for _, tc := range []struct {
+		name string
+		app  swarm.Service
+	}{
+		{"referenced by the spec a rollback returns to", swarm.Service{ID: "id-app", Spec: mounting("v2"), PreviousSpec: &previous}},
+		{"referenced by the spec running before the apply", swarm.Service{ID: "id-app", Spec: mounting("v1")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend, engine := rotated(tc.app)
+			r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+				fakeRegistry{backend: backend})
+
+			if err := r.Sync(context.Background(), "edge"); err != nil {
+				t.Fatalf("Sync = %v, want nil", err)
+			}
+			if got := backend.attempted(); len(got) != 0 {
+				t.Errorf("attempted %v, want nothing a service could still use removed", got)
+			}
+		})
 	}
 }
 

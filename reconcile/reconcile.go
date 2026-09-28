@@ -1143,9 +1143,10 @@ func (r *Reconciler) departed(ctx context.Context, e *appEntry, spec application
 		// A read that failed proves nothing either way, so the kinds it covered
 		// are candidates for nothing while the services carry on.
 		if v.resErr == nil {
+			configs, secrets := inUse(v.live)
 			candidates.networks = prune.Undeclared(names(v.networks), declared.networks)
-			candidates.configs = prune.Undeclared(names(v.configs), declared.configs)
-			candidates.secrets = prune.Undeclared(names(v.secrets), declared.secrets)
+			candidates.configs = unused(prune.Undeclared(names(v.configs), declared.configs), configs)
+			candidates.secrets = unused(prune.Undeclared(names(v.secrets), declared.secrets), secrets)
 		}
 		if candidates.empty() {
 			continue
@@ -1350,6 +1351,50 @@ func runningNames(live map[string]swarm.Service) []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// inUse names the configs and secrets a running service references, in its spec
+// or in the spec a rollback would return it to.
+//
+// Swarm refuses to remove a config or secret a service's spec references, and
+// that is all it checks. PreviousSpec is what a rollback deploys — `docker
+// service rollback`, or an update whose failure_action is rollback — so one
+// referenced only there is removable, and removing it leaves the rollback nothing
+// to start. The services were read before the apply, which moves each updated
+// spec into PreviousSpec, so the spec read here is held as well: by the time the
+// sweep runs it is the previous one.
+//
+// The cost is one generation per service: a superseded config or secret goes on
+// the pass after the service's next update has moved it out of PreviousSpec,
+// rather than straight after the update that superseded it.
+func inUse(live map[string]swarm.Service) (configs, secrets map[string]struct{}) {
+	configs, secrets = map[string]struct{}{}, map[string]struct{}{}
+	for _, svc := range live {
+		for _, spec := range []*swarm.ServiceSpec{&svc.Spec, svc.PreviousSpec} {
+			if spec == nil || spec.TaskTemplate.ContainerSpec == nil {
+				continue
+			}
+			for _, ref := range spec.TaskTemplate.ContainerSpec.Configs {
+				if ref != nil {
+					configs[ref.ConfigName] = struct{}{}
+				}
+			}
+			for _, ref := range spec.TaskTemplate.ContainerSpec.Secrets {
+				if ref != nil {
+					secrets[ref.SecretName] = struct{}{}
+				}
+			}
+		}
+	}
+	return configs, secrets
+}
+
+// unused is candidates less the names in use.
+func unused(candidates []string, used map[string]struct{}) []string {
+	return slices.DeleteFunc(candidates, func(name string) bool {
+		_, held := used[name]
+		return held
+	})
 }
 
 // names is the keys of a scoped-name-to-id map.
