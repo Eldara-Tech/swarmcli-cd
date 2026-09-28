@@ -248,6 +248,13 @@ const (
 // the secret is relabelled into the stack's namespace, where a later RemoveStack
 // deletes it. Declaring a name is not the same as owning it.
 //
+// The declared half reads labels as well as names, because a chart chooses both.
+// Keys under com.swarmcli. are where the chart engine and this controller keep
+// their own bookkeeping — the labels that mark a config as a release record, and
+// the creation marker the sweep reads as proof that this controller made a
+// resource — so a config or secret a chart declares may not carry one, whatever
+// its name. See reservedLabel.
+//
 // A volume needs no second pass for that, and a network needs no first one.
 // Nothing pre-creates a volume — DeployStack says why — so a top-level `volumes:`
 // entry does nothing at all until a service mounts it, and conversion has already
@@ -353,6 +360,9 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	// legitimate is refused; what is refused is the one release with the most to
 	// gain from #86's trick, which is where that guard is worth keeping whole.
 	for _, spec := range stack.Secrets {
+		if key, ok := reservedLabel(spec.Labels); ok {
+			return declaresReservedLabel("secret", spec.Name, key)
+		}
 		_, wired := b.forbiddenSecrets[spec.Name]
 		_, mounted := mine.secrets[spec.Name]
 		if wired || mounted {
@@ -363,6 +373,9 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		}
 	}
 	for _, spec := range stack.Configs {
+		if key, ok := reservedLabel(spec.Labels); ok {
+			return declaresReservedLabel("config", spec.Name, key)
+		}
 		if _, forbidden := mine.configs[spec.Name]; forbidden {
 			return declaresForbidden("config", spec.Name, whatControllerConfig)
 		}
@@ -510,6 +523,30 @@ func inControllersStack(namespace, name string) bool {
 func mountsForbidden(service, kind, name, what string) error {
 	return fmt.Errorf("service '%s' mounts %s '%s', which is %s; a reconciled stack may not mount it",
 		service, kind, name, what)
+}
+
+// reservedLabelPrefix is the label namespace the chart engine (charts.LabelType
+// and its siblings) and this controller (createdLabel) write their own records
+// under. Everything a reader of those labels concludes — that a config is a
+// release record, that a resource is this controller's to delete — rests on
+// nobody else writing there.
+const reservedLabelPrefix = "com.swarmcli."
+
+// reservedLabel returns the first key under reservedLabelPrefix, in sorted order
+// so that a refusal names the same one every time.
+func reservedLabel(labels map[string]string) (string, bool) {
+	for _, k := range slices.Sorted(maps.Keys(labels)) {
+		if strings.HasPrefix(k, reservedLabelPrefix) {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+func declaresReservedLabel(kind, name, key string) error {
+	return fmt.Errorf("this stack declares %s '%s' with label '%s'; labels under %s are the chart engine's and "+
+		"this controller's own bookkeeping, and a reconciled stack may not set them — rename or drop the label",
+		kind, name, key, reservedLabelPrefix)
 }
 
 func declaresForbidden(kind, name, what string) error {

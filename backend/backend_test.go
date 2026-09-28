@@ -2069,6 +2069,85 @@ func TestDeployStackRefusesAStackDeclaringAReleaseRecordName(t *testing.T) {
 	}
 }
 
+// reservedLabelled is a chart declaring one config of its own and one driver-backed
+// secret, each carrying the given labels — which, unlike a name, the chart
+// chooses freely.
+func reservedLabelled(labels string) string {
+	return "services:\n  app:\n    image: busybox\n    configs: [site]\n    secrets: [token]\n" +
+		"configs:\n  site:\n    file: files/decoy.conf\n    labels:\n" + labels +
+		"secrets:\n  token:\n    driver: vault\n    labels:\n" + labels
+}
+
+// Labels under com.swarmcli. are the chart engine's and this controller's own
+// bookkeeping — what marks a config as a release record, and the marker the sweep
+// reads as proof that this controller created a resource. A declaration carrying
+// one is refused whatever its name, before anything is created, and for either
+// kind.
+func TestDeployStackRefusesADeclarationCarryingAReservedLabel(t *testing.T) {
+	for _, tc := range []struct{ name, labels, key string }{
+		{"a release record's type", "      com.swarmcli.type: release\n      com.swarmcli.release: other-app\n", "com.swarmcli.release"},
+		{"the creation marker", "      com.swarmcli.cd.created: \"2026-01-01T00:00:00Z\"\n", "com.swarmcli.cd.created"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeAPI{}
+			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "rel", Manifest: reservedLabelled(tc.labels), Resolve: ResolveNever, Files: decoyFiles,
+			})
+			if err == nil {
+				t.Fatal("DeployStack = nil, want a declaration carrying a com.swarmcli. label refused")
+			}
+			for _, want := range []string{"declares", "'" + tc.key + "'", "com.swarmcli."} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not say %q", err, want)
+				}
+			}
+			if len(api.order) != 0 || len(api.created) != 0 {
+				t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// The secret half on its own: the config above is refused first, so without this
+// a secret-only regression would pass unseen.
+func TestDeployStackRefusesASecretCarryingAReservedLabel(t *testing.T) {
+	api := &fakeAPI{}
+	manifest := "services:\n  app:\n    image: busybox\n    secrets: [token]\n" +
+		"secrets:\n  token:\n    driver: vault\n    labels:\n      com.swarmcli.cd.created: x\n"
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "rel", Manifest: manifest, Resolve: ResolveNever})
+	if err == nil || !strings.Contains(err.Error(), "declares secret 'rel_token'") {
+		t.Fatalf("DeployStack = %v, want the secret refused for its com.swarmcli. label", err)
+	}
+	if len(api.order) != 0 {
+		t.Errorf("created %v, want nothing", api.order)
+	}
+}
+
+// An operator's config pre-seeded under the name a chart then declares, with the
+// same bytes, is adopted — relabelled into the stack and never given the creation
+// marker, which is what keeps the sweep off it. A chart that brought the marker
+// among its own labels would have it carried onto the operator's config, so the
+// declaration is refused and the config left as it was.
+func TestAnAdoptedConfigCannotBeGivenTheCreationMarker(t *testing.T) {
+	seeded := swarm.Config{ID: "seeded", Spec: swarm.ConfigSpec{
+		Annotations: swarm.Annotations{Name: "rel_site", Labels: map[string]string{"owner": "operator"}},
+		Data:        decoyFiles["files/decoy.conf"],
+	}}
+	api := &fakeAPI{configs: []swarm.Config{seeded}}
+	manifest := "services:\n  app:\n    image: busybox\n    configs: [site]\n" +
+		"configs:\n  site:\n    file: files/decoy.conf\n    labels:\n      com.swarmcli.cd.created: x\n"
+
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+		Name: "rel", Manifest: manifest, Resolve: ResolveNever, Files: decoyFiles,
+	})
+	if err == nil || !strings.Contains(err.Error(), "com.swarmcli.cd.created") {
+		t.Fatalf("DeployStack = %v, want the declaration refused for the creation marker", err)
+	}
+	if len(api.updatedConfigs) != 0 {
+		t.Errorf("the operator's config was relabelled: %+v", api.updatedConfigs)
+	}
+}
+
 // The false-positive check, and the reason the new rule compares names rather
 // than refusing declarations outright: a chart declaring and mounting its own
 // secret is ordinary, and #84 exists so that it works. Its name is
