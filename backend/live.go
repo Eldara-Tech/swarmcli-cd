@@ -38,9 +38,11 @@ import (
 //
 // It is the same conversion DeployStack does before applying, so what drift
 // compares against is what a sync would write, rather than a second reading of
-// the manifest that could disagree with it.
-func (b *Backend) DesiredServices(ctx context.Context, manifest, stack string) (*cdcompose.Stack, error) {
-	return cdcompose.Convert(ctx, manifest, stack, nil, b.api, b.allow)
+// the manifest that could disagree with it. files are the manifest's own, as
+// DeployStack takes them in its request: a manifest whose configs name a file
+// does not convert without them.
+func (b *Backend) DesiredServices(ctx context.Context, manifest, stack string, files map[string][]byte) (*cdcompose.Stack, error) {
+	return cdcompose.Convert(ctx, manifest, stack, files, b.api, b.allow)
 }
 
 // DeclaredResources converts a rendered manifest to the specs it declares,
@@ -56,8 +58,11 @@ func (b *Backend) DesiredServices(ctx context.Context, manifest, stack string) (
 // Not a substitute for DesiredServices. What it returns is what ConvertUnresolved
 // returns, so the config and secret references in it carry a placeholder id and
 // nothing may be applied from it.
-func (b *Backend) DeclaredResources(ctx context.Context, manifest, stack string) (*cdcompose.Stack, error) {
-	return cdcompose.ConvertUnresolved(ctx, manifest, stack, nil, b.api, b.allow)
+//
+// files are the manifest's own, for the reason DesiredServices takes them — for a
+// stored revision, the ones stored with it.
+func (b *Backend) DeclaredResources(ctx context.Context, manifest, stack string, files map[string][]byte) (*cdcompose.Stack, error) {
+	return cdcompose.ConvertUnresolved(ctx, manifest, stack, files, b.api, b.allow)
 }
 
 // LiveServices returns the stack's running services with their full specs, by

@@ -755,7 +755,7 @@ func readStacks(ctx context.Context, b charts.Backend, releases []string) (map[s
 // A backend that does not implement capability.DeclaredLister gets the resolving
 // one, which is what both callers used before #87: the same answer, unavailable
 // in the same narrow cases, rather than no sweep at all.
-func declaredReader(ldb capability.LiveDrift) func(context.Context, string, string) (*compose.Stack, error) {
+func declaredReader(ldb capability.LiveDrift) func(context.Context, string, string, map[string][]byte) (*compose.Stack, error) {
 	if dl, ok := ldb.(capability.DeclaredLister); ok {
 		return dl.DeclaredResources
 	}
@@ -966,7 +966,7 @@ func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.
 		var v releaseView
 		v.live, v.err = ldb.LiveServices(ctx, rp.Name)
 		if v.err == nil && live && rp.Action == charts.ActionUnchanged {
-			v.desired, v.desiredErr = ldb.DesiredServices(ctx, rp.Manifest, rp.Name)
+			v.desired, v.desiredErr = ldb.DesiredServices(ctx, rp.Manifest, rp.Name, rp.Files)
 		}
 		if v.err == nil && sweep {
 			// The resolving conversion, when there is one, has already answered
@@ -975,7 +975,7 @@ func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.
 			if v.desired != nil {
 				v.declared = v.desired
 			} else {
-				v.declared, v.err = readDeclared(ctx, rp.Manifest, rp.Name)
+				v.declared, v.err = readDeclared(ctx, rp.Manifest, rp.Name, rp.Files)
 			}
 		}
 		if v.err == nil && sweep && rl != nil {
@@ -1248,7 +1248,7 @@ func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb cap
 		if app, ok := prune.Owner(rev, r.controller); !ok || app != spec.Name {
 			continue
 		}
-		stack, err := readDeclared(ctx, rev.Manifest, release)
+		stack, err := readDeclared(ctx, rev.Manifest, release, rev.Files)
 		if err != nil {
 			r.log.Warn("could not read what a stored revision declared",
 				"application", spec.Name, "release", release,
@@ -2244,6 +2244,10 @@ func (r *Reconciler) failSync(ctx context.Context, e *appEntry, spec application
 // moving tag change the running image as a side effect of fixing someone's
 // replica count.
 //
+// The files are the plan's as well: they are the content of the configs the
+// manifest names, which the engine attaches on the apply path and nothing else
+// would attach here, so a correction deploys exactly what the apply did.
+//
 // Failures are collected rather than returned at the first: one release that
 // will not converge is no reason to leave the others drifted, and the caller
 // fails the sync on whatever comes back.
@@ -2284,7 +2288,7 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if err := backend.DeployStack(ctx, charts.DeployRequest{Name: rp.Name, Manifest: manifests[rp.Name], Resolve: ""}); err != nil {
+			if err := backend.DeployStack(ctx, charts.DeployRequest{Name: rp.Name, Manifest: manifests[rp.Name], Resolve: "", Files: rp.Files}); err != nil {
 				errs = append(errs, fmt.Errorf("converging release '%s': %w", rp.Name, err))
 				continue
 			}

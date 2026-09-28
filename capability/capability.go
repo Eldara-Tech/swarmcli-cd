@@ -184,8 +184,12 @@ type StacksReader interface {
 //
 // Only the read half needs a capability. Correcting drift is DeployStack, which
 // is on charts.Backend already.
+//
+// DesiredServices takes the manifest's files beside it, as DeployStack does in
+// its request, because a config's content is one of them: a manifest whose
+// configs name a file does not convert without the files it was rendered with.
 type LiveDrift interface {
-	DesiredServices(ctx context.Context, manifest, stack string) (*compose.Stack, error)
+	DesiredServices(ctx context.Context, manifest, stack string, files map[string][]byte) (*compose.Stack, error)
 	LiveServices(ctx context.Context, stack string) (map[string]swarm.Service, error)
 }
 
@@ -222,8 +226,11 @@ type NetworkNamer interface {
 // not its live drift too. And separate from DesiredServices rather than
 // replacing it, because live drift compares whole ServiceSpecs and must never
 // start diffing against a placeholder id.
+//
+// files are the manifest's own, for the reason LiveDrift.DesiredServices takes
+// them; for a stored revision, the ones stored with it (charts.Release.Files).
 type DeclaredLister interface {
-	DeclaredResources(ctx context.Context, manifest, stack string) (*compose.Stack, error)
+	DeclaredResources(ctx context.Context, manifest, stack string, files map[string][]byte) (*compose.Stack, error)
 }
 
 // ResourceLister is the optional interface a backend implements to read the
