@@ -1145,7 +1145,9 @@ A config or secret that a running service's spec, or its **previous** spec,
 still references is not a candidate at all. Swarm refuses to remove one the spec
 references, but not one only the previous spec does — and the previous spec is
 what a rollback deploys. So after a rotation the copy before last is what goes,
-on the pass after the service's next update.
+on the pass after the service's next update. A config or secret dropped together
+with the service that mounts it goes one sweep after that service, because the
+sweep reads the departing service's spec before it removes the service.
 
 A resource is deleted only when the swarm, git and this controller's own records
 all agree:
