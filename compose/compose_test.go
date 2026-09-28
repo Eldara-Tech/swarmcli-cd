@@ -734,7 +734,8 @@ func TestConvertConfigsMatchesUpstream(t *testing.T) {
 // No production file in this package reads a path. Config content comes from the
 // files a caller hands over, and this is what holds that down: it fails on any
 // reference to the calls that would read one instead — convert.Configs, which
-// reads each config's file:, and the os functions that open a path.
+// reads each config's file:, and the os and io/ioutil functions that open, read,
+// list or stat a path.
 //
 // Two upstream calls this package keeps have read branches of their own, which a
 // scan of this package cannot see; what keeps each shut is a guard, not this
@@ -748,7 +749,8 @@ func TestConvertConfigsMatchesUpstream(t *testing.T) {
 // Test files are exempt: the parity test above reads through upstream on purpose.
 func TestNoProductionFileReadsAPath(t *testing.T) {
 	banned := map[string][]string{
-		"os": {"ReadFile", "Open", "ReadDir"},
+		"os":        {"ReadFile", "Open", "OpenFile", "OpenRoot", "ReadDir", "DirFS", "Stat", "Lstat"},
+		"io/ioutil": {"ReadFile", "ReadDir"},
 		"github.com/docker/cli/cli/compose/convert": {"Configs"},
 	}
 
