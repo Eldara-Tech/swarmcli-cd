@@ -618,6 +618,51 @@ func TestListConfigsKeepsOnlyReleasePayloads(t *testing.T) {
 	}
 }
 
+// A config carrying a stack's namespace label was created by a stack deploy, and
+// a release record never is: the engine writes one through CreateConfig with
+// com.swarmcli.* labels and no namespace. So a stack-owned config is not reported
+// as a release record whatever its other labels say — releaseRecorded's rule —
+// and it loses the type label as well as its payload, because the engine falls
+// back to inspecting a typed config whose payload is missing.
+func TestListConfigsDoesNotReportAStackConfigAsARecord(t *testing.T) {
+	labels := map[string]string{
+		charts.LabelType:             charts.TypeRelease,
+		charts.LabelRelease:          "other-app",
+		"com.docker.stack.namespace": "web",
+	}
+	api := &fakeAPI{configs: []swarm.Config{
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli.release.web.v1", Labels: map[string]string{charts.LabelType: charts.TypeRelease}},
+			Data:        []byte("a release record"),
+		}},
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "web_site", Labels: labels},
+			Data:        []byte("a stack's config"),
+		}},
+	}}
+
+	got, err := testBackend(t, api, nil).ListConfigs(context.Background())
+	if err != nil {
+		t.Fatalf("ListConfigs = %v, want nil", err)
+	}
+	if len(got) != 2 || string(got[0].Data) != "a release record" || got[0].Labels[charts.LabelType] != charts.TypeRelease {
+		t.Fatalf("configs = %+v, want the genuine record reported as one", got)
+	}
+	stacked := got[1]
+	if stacked.Name != "web_site" || stacked.Data != nil {
+		t.Errorf("config = %+v, want its name kept and its payload dropped", stacked)
+	}
+	if _, typed := stacked.Labels[charts.LabelType]; typed {
+		t.Errorf("labels = %v, want the type label dropped so the engine does not read it as a record", stacked.Labels)
+	}
+	if stacked.Labels[charts.LabelRelease] != "other-app" {
+		t.Errorf("labels = %v, want the rest carried through", stacked.Labels)
+	}
+	if labels[charts.LabelType] != charts.TypeRelease {
+		t.Error("the swarm's own label map was modified; the listing must copy rather than edit it")
+	}
+}
+
 func TestStackVolumesAreScopedAndSorted(t *testing.T) {
 	api := &fakeAPI{volumes: []volume.Volume{{Name: "zeta"}, {Name: "alpha"}}}
 
