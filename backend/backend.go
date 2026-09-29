@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/containerd/errdefs"
+	"github.com/docker/cli/cli/compose/convert"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
@@ -221,9 +222,17 @@ const (
 // only, it reads the set off the controller's own service spec rather than
 // /run/secrets, and the release records are refused before it is consulted. The
 // name of that release is not the app set's word either — rejectSelfMismatch has
-// already established it is this controller's stack (#235). A name scoped to the release being
-// deployed is the release's own and asks nobody: conversion produces
-// "<release>_<name>" for everything a stack owns.
+// already established it is this controller's stack (#235).
+//
+// What is the release's own asks nobody, and the prefix alone does not make
+// something that. Conversion scopes what a stack owns to "<release>_<name>", but
+// a release name may contain '_', so "web_a_site" is as much stack "web_a"'s as
+// release "web"'s. So an `external:` reference needs the allowlist whatever it
+// is called — the manifest has said it is not the release's — and a declared
+// name is the release's own only if it is scoped under the release and whatever
+// already holds that name carries exactly the release's namespace label
+// (ownDeclared). Which of two names like "web" and "web_a" may be installed at
+// all is the reconciler's question; see reconcile.checkReleaseNames.
 //
 // The direction matters more than the sets do. It is an allowlist because the
 // other way round leaves whatever nobody thought of permitted, and the family
@@ -319,7 +328,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			if wired || mounted {
 				return mountsForbidden(svc.Name, "secret", name, whatControllerSecret)
 			}
-			if !scopedUnder(ns, name) && !permits(b.allow.Secrets, name) {
+			if !permits(b.allow.Secrets, name) {
 				return mountsUnpermitted(svc.Name, "secret", name, "allow.secrets")
 			}
 		}
@@ -342,7 +351,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			if _, forbidden := mine.configs[name]; forbidden {
 				return mountsForbidden(svc.Name, "config", name, whatControllerConfig)
 			}
-			if !scopedUnder(ns, name) && !permits(b.allow.Configs, name) {
+			if !permits(b.allow.Configs, name) {
 				return mountsUnpermitted(svc.Name, "config", name, "allow.configs")
 			}
 		}
@@ -353,7 +362,12 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			if _, forbidden := mine.volumes[name]; forbidden {
 				return mountsForbidden(svc.Name, "volume", name, whatControllerVolume)
 			}
-			if !scopedUnder(ns, name) && !permits(b.allow.Volumes, name) {
+			// A volume the stack declares external: is not its own, however it is
+			// named. One it declares is, if conversion scoped it under the release;
+			// nothing on the swarm can say otherwise, because a volume lives on
+			// whichever node first mounted it.
+			own := !slices.Contains(stack.ExternalVolumes, name) && scopedUnder(ns, name)
+			if !own && !permits(b.allow.Volumes, name) {
 				return mountsUnpermitted(svc.Name, "volume", name, "allow.volumes")
 			}
 		}
@@ -385,8 +399,14 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if wired || mounted {
 			return declaresForbidden("secret", spec.Name, whatControllerSecret)
 		}
-		if !scopedUnder(ns, spec.Name) && !permits(b.allow.Secrets, spec.Name) {
-			return declaresUnpermitted("secret", spec.Name, "allow.secrets")
+		if !permits(b.allow.Secrets, spec.Name) {
+			own, err := ownDeclared(ctx, ns, spec.Name, b.secretLabels)
+			if err != nil {
+				return err
+			}
+			if !own {
+				return declaresUnpermitted("secret", spec.Name, "allow.secrets")
+			}
 		}
 	}
 	for _, spec := range stack.Configs {
@@ -408,8 +428,14 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if _, forbidden := known[strings.ToLower(spec.Name)]; forbidden {
 			return declaresForbidden("config", spec.Name, whatReleaseRecord)
 		}
-		if !scopedUnder(ns, spec.Name) && !permits(b.allow.Configs, spec.Name) {
-			return declaresUnpermitted("config", spec.Name, "allow.configs")
+		if !permits(b.allow.Configs, spec.Name) {
+			own, err := ownDeclared(ctx, ns, spec.Name, b.configLabels)
+			if err != nil {
+				return err
+			}
+			if !own {
+				return declaresUnpermitted("config", spec.Name, "allow.configs")
+			}
 		}
 	}
 
@@ -425,7 +451,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			}
 			continue
 		}
-		if !scopedUnder(ns, name) && !permits(b.allow.Networks, name) {
+		if !permits(b.allow.Networks, name) {
 			return joinsUnpermitted(name)
 		}
 	}
@@ -436,11 +462,79 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			}
 			continue
 		}
-		if !scopedUnder(ns, nw.Name) && !permits(b.allow.Networks, nw.Name) {
-			return joinsUnpermitted(nw.Name)
+		if !permits(b.allow.Networks, nw.Name) {
+			own, err := ownDeclared(ctx, ns, nw.Name, b.networkLabels)
+			if err != nil {
+				return err
+			}
+			if !own {
+				return joinsUnpermitted(nw.Name)
+			}
 		}
 	}
 	return nil
+}
+
+// ownDeclared reports whether a name the stack declares is the release's own: it
+// is scoped under the release's namespace, and nothing holds it yet or what does
+// carries exactly that namespace label. labels answers for what holds the name.
+//
+// The label and not the prefix, because the prefix is ambiguous: a release name
+// may contain '_', so "web_a_site" is scoped under "web" and under "web_a" alike,
+// and declaring an existing secret or config hands it to the stack's services and
+// relabels it as the stack's (applySecrets). Compared exactly, as RemoveStack
+// selects by it. Something holding the name with no namespace label at all —
+// created by hand — is not the release's either, and adopting it needs the
+// allowlist like any other name.
+func ownDeclared(ctx context.Context, ns, name string, labels func(context.Context, string) (map[string]string, bool, error)) (bool, error) {
+	if !scopedUnder(ns, name) {
+		return false, nil
+	}
+	held, found, err := labels(ctx, name)
+	if err != nil {
+		return false, err
+	}
+	return !found || held[convert.LabelNamespace] == ns, nil
+}
+
+// secretLabels, configLabels and networkLabels answer ownDeclared for a secret, a
+// config and a network, each found by name without regard to case, as Swarm
+// keeps names. The daemon's own lookup does that for the first two; a network is
+// listed and matched here, because a network listing filters by name as a
+// pattern and inspecting one by name fails when two share it.
+func (b *Backend) secretLabels(ctx context.Context, name string) (map[string]string, bool, error) {
+	s, _, err := b.api.SecretInspectWithRaw(ctx, name)
+	switch {
+	case errdefs.IsNotFound(err):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("inspecting secret '%s' to check whose it is: %w", name, err)
+	}
+	return s.Spec.Labels, true, nil
+}
+
+func (b *Backend) configLabels(ctx context.Context, name string) (map[string]string, bool, error) {
+	c, _, err := b.api.ConfigInspectWithRaw(ctx, name)
+	switch {
+	case errdefs.IsNotFound(err):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("inspecting config '%s' to check whose it is: %w", name, err)
+	}
+	return c.Spec.Labels, true, nil
+}
+
+func (b *Backend) networkLabels(ctx context.Context, name string) (map[string]string, bool, error) {
+	networks, err := b.api.NetworkList(ctx, network.ListOptions{})
+	if err != nil {
+		return nil, false, fmt.Errorf("listing networks to check whose '%s' is: %w", name, err)
+	}
+	for _, n := range networks {
+		if strings.EqualFold(n.Name, name) {
+			return n.Labels, true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 // allowFor is the allowlist this deploy converts under: the application's own,
@@ -513,16 +607,17 @@ func permits(allowed []string, name string) bool {
 	return slices.Contains(allowed, name)
 }
 
-// scopedUnder reports whether name belongs to the stack deployed as namespace.
+// scopedUnder reports whether name is scoped under namespace, as conversion
+// scopes everything a stack owns to "<namespace>_<name>" (convert.Namespace.Scope).
 //
-// Conversion scopes everything a stack owns to "<namespace>_<name>"
-// (convert.Namespace.Scope), so the prefix is the whole of "this is that stack's
-// own" — for the release being deployed, whose resources need no permission, and
-// for the controller's own stack, whose do not exist.
+// Necessary and not sufficient for "this is that stack's own": a namespace may
+// contain '_', so a name can be scoped under two. ownDeclared adds the label for
+// a release's own declarations; inControllersStack takes the wider reading, which
+// is the safe direction for what it refuses.
 //
 // Compared as written, although Swarm folds case. Folding is the loose direction
-// here: a release named 'Web' would read another stack's 'web_site' as its own
-// and reach it without the app set's permission.
+// here: a release named 'Web' would read another stack's 'web_site' as scoped
+// under it.
 func scopedUnder(namespace, name string) bool {
 	return namespace != "" && strings.HasPrefix(name, namespace+"_")
 }

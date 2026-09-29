@@ -310,6 +310,33 @@ secrets:
 	}
 }
 
+// An external volume is reported by the name its mount carries — its name:, the
+// deprecated external.name, or else its key — sorted, and a volume the stack
+// declares as its own is not among them, although its mount carries a name too.
+func TestExternalVolumesAreReportedByTheirMountName(t *testing.T) {
+	const manifest = `
+services:
+  web:
+    image: nginx
+    volumes: ["data:/data", "shared:/shared", "legacy:/legacy", "plain:/plain"]
+volumes:
+  data: {}
+  shared:
+    external: true
+    name: s_shared-cache
+  legacy:
+    external:
+      name: aa-legacy
+  plain:
+    external: true
+`
+	got := convertOK(t, manifest, "s", nil)
+
+	if want := []string{"aa-legacy", "plain", "s_shared-cache"}; !reflect.DeepEqual(got.ExternalVolumes, want) {
+		t.Errorf("external volumes = %q, want %q", got.ExternalVolumes, want)
+	}
+}
+
 // A service naming no network joins "default", which the stack then has to
 // create — matching `docker stack deploy`, whose behaviour operators already
 // depend on.
@@ -1130,6 +1157,7 @@ func describe(s *Stack) string {
 		ExternalNetworks []string            `yaml:"externalNetworks,omitempty"`
 		ExternalConfigs  []swarm.Annotations `yaml:"externalConfigs,omitempty"`
 		ExternalSecrets  []swarm.Annotations `yaml:"externalSecrets,omitempty"`
+		ExternalVolumes  []string            `yaml:"externalVolumes,omitempty"`
 	}
 	out, err := yaml.Marshal(dump{
 		Namespace:        s.Namespace.Name(),
@@ -1140,6 +1168,7 @@ func describe(s *Stack) string {
 		ExternalNetworks: s.ExternalNetworks,
 		ExternalConfigs:  s.ExternalConfigs,
 		ExternalSecrets:  s.ExternalSecrets,
+		ExternalVolumes:  s.ExternalVolumes,
 	})
 	if err != nil {
 		panic(err)
