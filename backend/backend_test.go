@@ -3047,6 +3047,72 @@ func TestANamespaceInAnotherCaseIsNotTheReleasesOwn(t *testing.T) {
 	}
 }
 
+// A cluster mount names an existing CSI volume, or a whole volume group, as a
+// volume mount names a volume, and passes the same guard: another stack's is
+// refused unless the app set permits the name, the controller's own is refused
+// outright, and the release's own needs nothing.
+func TestAClusterMountPassesTheVolumeGuard(t *testing.T) {
+	mounts := func(source, decl string) string {
+		return "services:\n  app:\n    image: busybox\n    volumes:\n" +
+			"      - {type: cluster, source: " + source + ", target: /data}\n" + decl
+	}
+	for _, tc := range []struct {
+		name, manifest, want string
+		allow                application.Allow
+	}{
+		{"another stack's volume", mounts("shared-csi", "volumes:\n  shared-csi: {external: true}\n"), "allow.volumes", application.Allow{}},
+		{"a volume group", mounts("group:db", ""), "allow.volumes", application.Allow{}},
+		{"the controller's own volume", mounts("data", "volumes:\n  data: {external: true, name: swarmcli-cd_swarmcli-cd-data}\n"),
+			"this controller's own volume", application.Allow{Volumes: []string{"swarmcli-cd_swarmcli-cd-data"}}},
+		{"permitted", mounts("shared-csi", "volumes:\n  shared-csi: {external: true}\n"), "", application.Allow{Volumes: []string{"shared-csi"}}},
+		{"a permitted volume group", mounts("group:db", ""), "", application.Allow{Volumes: []string{"group:db"}}},
+		{"the release's own", mounts("data", "volumes:\n  data: {}\n"), "", application.Allow{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+			err := allowing(t, api, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever})
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("DeployStack = %v, want the cluster mount deployed", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("DeployStack = %v, want the cluster mount refused (%s)", err, tc.want)
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// A controller that keeps its own state on a CSI cluster volume holds that name
+// as it holds a volume's: no app set permits another release to mount it, and
+// the self release may re-declare it.
+func TestTheControllersOwnClusterVolumeIsItsOwn(t *testing.T) {
+	const mountsIt = "services:\n  app:\n    image: busybox\n    volumes:\n" +
+		"      - {type: cluster, source: state, target: /state}\nvolumes:\n  state: {external: true, name: cd-csi}\n"
+	withCSI := func() *fakeAPI {
+		api := asController(&fakeAPI{})
+		cs := api.selfSpec.TaskTemplate.ContainerSpec
+		cs.Mounts = append(cs.Mounts, mount.Mount{Type: mount.TypeCluster, Source: "cd-csi", Target: "/state"})
+		return api
+	}
+
+	api := withCSI()
+	err := allowing(t, api, application.Allow{Volumes: []string{"cd-csi"}}).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsIt, Resolve: ResolveNever})
+	if err == nil || !strings.Contains(err.Error(), "this controller's own volume") {
+		t.Fatalf("DeployStack = %v, want the controller's cluster volume refused whatever the app set says", err)
+	}
+
+	self := testBackend(t, withCSI(), nil).WithSelfRelease(noDeferral)
+	if err := self.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: mountsIt, Resolve: ResolveNever}); err != nil &&
+		strings.Contains(err.Error(), "cd-csi") {
+		t.Errorf("DeployStack(self) = %v, want the controller's own cluster volume recognised as its own", err)
+	}
+}
+
 // The guard is one name, not a mode. Everything else on the swarm deploys and is
 // removed exactly as before, including on a controller that is itself a stack.
 func TestAnyOtherReleaseIsDeployedAndRemovedAsBefore(t *testing.T) {

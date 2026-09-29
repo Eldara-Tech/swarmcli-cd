@@ -333,6 +333,11 @@ func validateAllow(a application.Allow) error {
 		{"allow.networks", a.Networks},
 	} {
 		for i, name := range kind.names {
+			// A cluster mount may name a whole CSI volume group rather than one
+			// volume, as "group:<name>", and is permitted by that same string.
+			if kind.field == "allow.volumes" {
+				name = strings.TrimPrefix(name, "group:")
+			}
 			if !allowNameRE.MatchString(name) {
 				return fmt.Errorf("%s[%d]: invalid name '%s': it is compared against a name on the swarm, so letters, digits, dot, dash and underscore only, starting with a letter or digit", kind.field, i, name)
 			}

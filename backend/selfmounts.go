@@ -217,7 +217,7 @@ func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 	out.binds = make(map[string]struct{}, len(cs.Mounts))
 	for _, m := range cs.Mounts {
 		switch {
-		case m.Type == mount.TypeVolume && m.Source != "":
+		case (m.Type == mount.TypeVolume || m.Type == mount.TypeCluster) && m.Source != "":
 			out.volumes[m.Source] = struct{}{}
 		case m.Type == mount.TypeBind && m.Source != "":
 			out.binds[m.Source] = struct{}{}
