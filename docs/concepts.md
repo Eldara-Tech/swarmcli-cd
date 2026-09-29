@@ -229,7 +229,8 @@ is only declared holds no name. A pair installed together before this rule keeps
 deploying too.
 
 What a release scopes is its own only as far as the swarm can say so: an
-`external:` reference always needs the app set's permission, and a declared
+`external:` reference needs the app set's permission whatever it is called —
+the `self: true` release aside, for what the controller itself holds — and a declared
 config, secret or network is the release's only if nothing holds its name yet or
 what does carries exactly the release's namespace label. A volume is decided by
 its name alone, because a volume lives on whichever node first mounted it and

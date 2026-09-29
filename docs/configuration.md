@@ -134,7 +134,7 @@ one name is the other followed by `_` (`web` and `web_a`, either way round):
 release `web` declaring `a_site` and release `web_a` declaring `site` would both
 be `web_a_site`. Whichever installs first keeps deploying, and the other is
 refused, naming it — so on a fresh swarm a set holding such a pair installs one
-of the two, and a pair already installed together keeps deploying.
+of the two, and a `_` pair already installed together keeps deploying.
 
 The two are separate fields rather than one because a `releaseFile` application
 installs several releases under a single application name, so the application
@@ -1522,7 +1522,7 @@ reading those logs wants. It quotes any value containing a space, and escapes
 any quote inside it so that the value stays one field:
 
 ```
-time=2026-08-02T08:46:57.840Z level=ERROR msg="reconcile failed" application=eldara-zammad failures=1 error="applying: release 'zammad': this stack joins network 'shared-services', which is not scoped to this release"
+time=2026-08-02T08:46:57.840Z level=ERROR msg="reconcile failed" application=eldara-zammad failures=1 error="applying: release 'zammad': this stack joins network 'shared-services', which is not this release's own"
 ```
 
 Messages the controller writes name things in single quotes for that reason —
