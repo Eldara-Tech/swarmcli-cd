@@ -913,6 +913,22 @@ func (f *fakeAPI) VolumeList(_ context.Context, o volume.ListOptions) (volume.Li
 	return volume.ListResponse{Volumes: out}, nil
 }
 
+// VolumeInspect answers as the daemon does: a node-local volume of that name
+// first, and only when there is none, a cluster volume of that name.
+func (f *fakeAPI) VolumeInspect(_ context.Context, name string) (volume.Volume, error) {
+	for _, v := range f.volumes {
+		if v.Name == name {
+			return v, nil
+		}
+	}
+	for _, v := range f.clusterVolumes {
+		if v.Name == name {
+			return *asCluster(v), nil
+		}
+	}
+	return volume.Volume{}, errdefs.ErrNotFound
+}
+
 // asCluster is a cluster volume as the daemon reports one: with its ClusterVolume
 // set, which a node-local volume never has.
 func asCluster(v volume.Volume) *volume.Volume {
@@ -923,11 +939,13 @@ func asCluster(v volume.Volume) *volume.Volume {
 
 // VolumeRemove honours removeErr as the other removals do, so that a volume
 // that went between the list and the delete can be modelled at all.
-
-// VolumeRemove honours removeErr as the other removals do, so that a volume
-// that went between the list and the delete can be modelled at all.
-func (f *fakeAPI) VolumeRemove(_ context.Context, name string, _ bool) error {
+// A forced removal is recorded under its own key: the daemon also tries the
+// cluster store for one (volume_routes.go:170-180), so no caller here may send it.
+func (f *fakeAPI) VolumeRemove(_ context.Context, name string, force bool) error {
 	key := "volume:" + name
+	if force {
+		key = "volume(force):" + name
+	}
 	f.removed = append(f.removed, key)
 	return f.removeErr[key]
 }

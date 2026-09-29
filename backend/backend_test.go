@@ -30,6 +30,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
 
@@ -835,7 +836,7 @@ func TestConfigRoundTrip(t *testing.T) {
 }
 
 func TestRemoveVolume(t *testing.T) {
-	api := &fakeAPI{}
+	api := &fakeAPI{volumes: []volume.Volume{{Name: "s_data"}}}
 	if err := testBackend(t, api, nil).RemoveVolume(context.Background(), "s_data"); err != nil {
 		t.Fatalf("RemoveVolume = %v, want nil", err)
 	}
@@ -990,6 +991,10 @@ func (e *errAPI) VolumeList(context.Context, volume.ListOptions) (volume.ListRes
 }
 
 func (e *errAPI) VolumeRemove(context.Context, string, bool) error { return e.err }
+
+func (e *errAPI) VolumeInspect(context.Context, string) (volume.Volume, error) {
+	return volume.Volume{}, e.err
+}
 
 func (e *errAPI) NodeList(context.Context, swarm.NodeListOptions) ([]swarm.Node, error) {
 	return nil, e.err
@@ -2787,15 +2792,52 @@ func TestStampingTheCreationMarkerDoesNotMutateTheCallersLabels(t *testing.T) {
 // and the caller retries — so the loss was the whole settle budget spent on a
 // volume that had already gone, and then a prune failed naming "still in use".
 func TestRemoveVolumeToleratesOneAlreadyGone(t *testing.T) {
-	api := &fakeAPI{removeErr: map[string]error{"volume:s_data": errdefs.ErrNotFound}}
+	api := &fakeAPI{volumes: []volume.Volume{{Name: "s_data"}}, removeErr: map[string]error{"volume:s_data": errdefs.ErrNotFound}}
 
 	if err := testBackend(t, api, nil).RemoveVolume(context.Background(), "s_data"); err != nil {
 		t.Errorf("RemoveVolume = %v, want nil for one already gone", err)
 	}
 }
 
+// A volume is removed by name, and the daemon falls back to a cluster volume of
+// that name when no node-local one answers it. So a removal inspects first and
+// acts only on a node-local volume — and, asked for one of a stack's volumes,
+// only on one still carrying that stack's namespace. Anything else the name now
+// answers with is left in place.
+func TestAVolumeIsRemovedOnlyWhileItIsTheOneListed(t *testing.T) {
+	ns := func(stack string) map[string]string { return map[string]string{convert.LabelNamespace: stack} }
+	for _, tc := range []struct {
+		name    string
+		api     *fakeAPI
+		stack   string
+		removed bool
+	}{
+		{"the stack's node-local volume", &fakeAPI{volumes: []volume.Volume{{Name: "s_data", Labels: ns("s")}}}, "s", true},
+		{"a node-local volume of another stack", &fakeAPI{volumes: []volume.Volume{{Name: "s_data", Labels: ns("t")}}}, "s", false},
+		{"a node-local volume of a stack named in another case", &fakeAPI{volumes: []volume.Volume{{Name: "s_data", Labels: ns("S")}}}, "s", false},
+		{"a node-local volume of a stack sharing the prefix", &fakeAPI{volumes: []volume.Volume{{Name: "s_data", Labels: ns("s-staging")}}}, "s", false},
+		{"only a cluster volume of that name", &fakeAPI{clusterVolumes: []volume.Volume{{Name: "s_data", Labels: ns("s")}}}, "s", false},
+		{"nothing of that name", &fakeAPI{}, "s", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := testBackend(t, tc.api, nil).RemoveStackVolume(t.Context(), capability.StackVolume{Stack: tc.stack, Name: "s_data"}); err != nil {
+				t.Fatalf("RemoveStackVolume = %v, want nil", err)
+			}
+			if got := slices.Contains(tc.api.removed, "volume:s_data"); got != tc.removed {
+				t.Errorf("removed %v, want the volume removed: %v", tc.api.removed, tc.removed)
+			}
+		})
+	}
+
+	// RemoveVolume, which carries no stack, still acts only on a node-local one.
+	api := &fakeAPI{clusterVolumes: []volume.Volume{{Name: "s_data"}}}
+	if err := testBackend(t, api, nil).RemoveVolume(t.Context(), "s_data"); err != nil || len(api.removed) != 0 {
+		t.Errorf("RemoveVolume = %v, removed %v; want a cluster volume of that name left in place", err, api.removed)
+	}
+}
+
 func TestRemoveVolumeSurfacesARefusal(t *testing.T) {
-	api := &fakeAPI{removeErr: map[string]error{"volume:s_data": errors.New("volume is in use")}}
+	api := &fakeAPI{volumes: []volume.Volume{{Name: "s_data"}}, removeErr: map[string]error{"volume:s_data": errors.New("volume is in use")}}
 
 	err := testBackend(t, api, nil).RemoveVolume(context.Background(), "s_data")
 	if err == nil || !strings.Contains(err.Error(), "in use") {

@@ -286,6 +286,24 @@ type SwarmSizer interface {
 	SwarmNodes(ctx context.Context) (int, error)
 }
 
+// StackVolumeRemover is the optional interface a backend implements to remove
+// one of a stack's volumes only while the name still answers with it: a
+// node-local volume carrying the stack's namespace label.
+//
+// A volume is addressed by name, and a name can answer with another volume by the
+// time it is removed — on a manager the daemon falls back to a cluster volume of
+// that name when no node-local one exists. A purge asks this when it can, and
+// RemoveVolume otherwise.
+type StackVolumeRemover interface {
+	RemoveStackVolume(ctx context.Context, v StackVolume) error
+}
+
+// StackVolume names one volume of one stack, as StackVolumes listed it.
+type StackVolume struct {
+	Stack string
+	Name  string
+}
+
 // NodeRoster is the optional interface a backend implements to describe the
 // swarm's nodes rather than only count them.
 //

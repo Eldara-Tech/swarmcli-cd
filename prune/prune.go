@@ -278,8 +278,9 @@ func purgeEveryNode(ctx context.Context, log *slog.Logger, backend charts.Backen
 		if err != nil {
 			return failed(fmt.Errorf("listing the release's volumes on node %s: %w", nodeName(node), err))
 		}
+		remove := volumeRemover(nb, release)
 		for _, name := range names {
-			if err := settle(ctx, func(ctx context.Context) error { return nb.RemoveVolume(ctx, name) }); err != nil {
+			if err := settle(ctx, func(ctx context.Context) error { return remove(ctx, name) }); err != nil {
 				return failed(fmt.Errorf("removing volume '%s' on node %s: %w", name, nodeName(node), err))
 			}
 			deleted = append(deleted, nodeName(node)+"/"+name)
@@ -407,8 +408,9 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 		return fmt.Errorf("listing the stack's volumes: %w", err)
 	}
 
+	remove := volumeRemover(backend, release)
 	for _, name := range names {
-		if err := settle(ctx, func(ctx context.Context) error { return backend.RemoveVolume(ctx, name) }); err != nil {
+		if err := settle(ctx, func(ctx context.Context) error { return remove(ctx, name) }); err != nil {
 			return fmt.Errorf("removing volume '%s': %w", name, err)
 		}
 	}
@@ -431,6 +433,19 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 		"release", release, "volumes", names,
 		"remedy", "docker volume ls --filter label=com.docker.stack.namespace="+release+", on each node")
 	return nil
+}
+
+// volumeRemover is how a purge removes one of release's volumes from b: by stack
+// when b can check that the name still answers with the release's own volume
+// (capability.StackVolumeRemover), so that another volume by then holding the
+// name is left alone, and by name otherwise.
+func volumeRemover(b swarms.NodeBackend, release string) func(context.Context, string) error {
+	if r, ok := b.(capability.StackVolumeRemover); ok {
+		return func(ctx context.Context, name string) error {
+			return r.RemoveStackVolume(ctx, capability.StackVolume{Stack: release, Name: name})
+		}
+	}
+	return b.RemoveVolume
 }
 
 // swarmSize returns how many nodes the swarm has, and whether that could be

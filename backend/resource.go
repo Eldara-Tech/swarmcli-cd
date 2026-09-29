@@ -20,6 +20,8 @@ import (
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
+
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
 
@@ -401,7 +403,43 @@ func (b *Backend) SwarmNodes(ctx context.Context) (int, error) {
 // missing volume is answered by the local volume store, or on a manager by
 // getVolume, and both wrap in a not-found the client recognises
 // (daemon/cluster/helpers.go:274).
+//
+// Node-local only, as StackVolumes is. A name reaches a cluster volume when no
+// node-local volume answers it — the daemon's delete and inspect both fall back
+// to swarm (volume_routes.go:157-181 and :68-81), and the delete does so for
+// any force=true request too, which is why force stays false — so the volume
+// is inspected first and removed only if that answer is node-local. The inspect
+// and the delete are two calls: a node-local volume removed by something else
+// between them leaves the delete to that same fallback, and at a current API
+// version the daemon offers no node-local-only delete to close it.
 func (b *Backend) RemoveVolume(ctx context.Context, name string) error {
+	return b.removeLocalVolume(ctx, name, func(volume.Volume) bool { return true })
+}
+
+// RemoveStackVolume removes one of a stack's volumes while the name still
+// answers with it: RemoveVolume, and only if the node-local volume carries the
+// stack's namespace label. A volume of that name another stack has created since
+// it was listed is left in place.
+func (b *Backend) RemoveStackVolume(ctx context.Context, v capability.StackVolume) error {
+	return b.removeLocalVolume(ctx, v.Name, func(cur volume.Volume) bool {
+		return cur.Labels[convert.LabelNamespace] == v.Stack
+	})
+}
+
+// removeLocalVolume removes the node-local volume name answers with, if ours
+// accepts it, and leaves anything else the name answers with in place.
+func (b *Backend) removeLocalVolume(ctx context.Context, name string, ours func(volume.Volume) bool) error {
+	cur, err := b.api.VolumeInspect(ctx, name)
+	switch {
+	case errdefs.IsNotFound(err):
+		return nil
+	case err != nil:
+		return fmt.Errorf("inspecting volume '%s': %w", name, err)
+	case cur.ClusterVolume != nil || !ours(cur):
+		b.log.Warn("left a volume in place: its name now answers with a cluster volume, or with another stack's, "+
+			"rather than the node-local volume that was listed", "volume", name)
+		return nil
+	}
 	if err := b.api.VolumeRemove(ctx, name, false); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("removing volume '%s': %w", name, err)
 	}

@@ -60,6 +60,7 @@ var (
 	_ capability.ResourceLister      = (*Backend)(nil)
 	_ capability.ResourceRemover     = (*Backend)(nil)
 	_ capability.SwarmSizer          = (*Backend)(nil)
+	_ capability.StackVolumeRemover  = (*Backend)(nil)
 	_ capability.NodeRoster          = (*Backend)(nil)
 	_ capability.ServiceLogReader    = (*Backend)(nil)
 )

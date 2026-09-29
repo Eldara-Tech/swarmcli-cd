@@ -169,7 +169,11 @@ type NodeBackend interface {
 	StackVolumes(ctx context.Context, stack string) ([]string, error)
 	// RemoveVolume deletes one of them by name. A volume that is already gone
 	// is not an error: a caller retrying a partial sweep must not be failed by
-	// the part that worked.
+	// the part that worked. It must act only on a node-local volume: on a
+	// manager the daemon's delete falls back to a cluster volume of that name
+	// when no node-local one answers it. An implementation that can also check
+	// the volume is still the stack's implements capability.StackVolumeRemover,
+	// and a purge asks that instead.
 	RemoveVolume(ctx context.Context, name string) error
 }
 
