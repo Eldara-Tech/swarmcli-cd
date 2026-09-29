@@ -319,7 +319,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			if err != nil {
 				return err
 			}
-			if _, forbidden := known[name]; forbidden {
+			if _, forbidden := known[strings.ToLower(name)]; forbidden {
 				return mountsForbidden(svc.Name, "config", name, whatReleaseRecord)
 			}
 			if b.ownMount(mine.configs, name) {
@@ -363,7 +363,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if key, ok := reservedLabel(spec.Labels); ok {
 			return declaresReservedLabel("secret", spec.Name, key)
 		}
-		if strings.HasPrefix(spec.Name, releaseRecordPrefix) {
+		if namedLikeARecord(spec.Name) {
 			return declaresForbidden("secret", spec.Name, whatReleaseRecord)
 		}
 		_, wired := b.forbiddenSecrets[spec.Name]
@@ -381,7 +381,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		}
 		// By name as well as by the records that exist: the engine allocates the
 		// next one at deploy time, so one not written yet is as much its own.
-		if strings.HasPrefix(spec.Name, releaseRecordPrefix) {
+		if namedLikeARecord(spec.Name) {
 			return declaresForbidden("config", spec.Name, whatReleaseRecord)
 		}
 		if _, forbidden := mine.configs[spec.Name]; forbidden {
@@ -391,7 +391,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if err != nil {
 			return err
 		}
-		if _, forbidden := known[spec.Name]; forbidden {
+		if _, forbidden := known[strings.ToLower(spec.Name)]; forbidden {
 			return declaresForbidden("config", spec.Name, whatReleaseRecord)
 		}
 		if !scopedUnder(ns, spec.Name) && !permits(b.allow.Configs, spec.Name) {
@@ -547,6 +547,13 @@ const reservedLabelPrefix = "com.swarmcli."
 // contain '.' and '_', so a release whose own name starts with this prefix could
 // otherwise declare a future record's name as scoped to itself.
 const releaseRecordPrefix = "swarmcli.release."
+
+// namedLikeARecord reports whether name starts with releaseRecordPrefix, compared
+// without regard to case: Swarm keeps config and secret names unique regardless
+// of case, so a name differing from a future record's only in case still holds it.
+func namedLikeARecord(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), releaseRecordPrefix)
+}
 
 // reservedLabel returns the first key under reservedLabelPrefix, in sorted order
 // so that a refusal names the same one every time.
@@ -1082,6 +1089,10 @@ func (b *Backend) rejectOwnNamespace(ctx context.Context, release string) error 
 // is unexported and a rename there would silently stop protecting these. The
 // label is part of the contract this repository already reads elsewhere —
 // RemoveStack skips these configs by the same one.
+//
+// Keyed by the name in lower case, and a lookup lowers its name too: Swarm finds
+// a config by name, and refuses to create one, regardless of case, so a name
+// differing from a record's only in case is refused as that record.
 func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, error) {
 	list, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{
 		Filters: filters.NewArgs(filters.Arg("label", charts.LabelType+"="+charts.TypeRelease)),
@@ -1091,7 +1102,7 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 	}
 	out := make(map[string]struct{}, len(list))
 	for _, c := range list {
-		out[c.Spec.Name] = struct{}{}
+		out[strings.ToLower(c.Spec.Name)] = struct{}{}
 	}
 	return out, nil
 }

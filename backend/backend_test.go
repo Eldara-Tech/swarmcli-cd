@@ -2207,15 +2207,23 @@ func TestAnAdoptedConfigCannotBeGivenTheCreationMarker(t *testing.T) {
 // release whose own name starts with that prefix can make a future record's name
 // look scoped to itself, so a declared config or secret whose name starts with
 // the prefix is refused whatever exists on the swarm, for either kind.
+//
+// Swarm keeps config and secret names unique regardless of case, so a name that
+// differs from a future record's only in case would still hold it; the prefix is
+// compared without regard to case.
 func TestDeployStackRefusesADeclarationNamedLikeAReleaseRecord(t *testing.T) {
-	for _, tc := range []struct{ name, kind, target string }{
-		{"a config", "configs", "swarmcli.release.team_web.v2"},
-		{"a secret", "secrets", "swarmcli.release.team_web.v2"},
+	for _, tc := range []struct{ name, kind, release, target string }{
+		{"a config", "configs", "swarmcli.release.team", "swarmcli.release.team_web.v2"},
+		{"a secret", "secrets", "swarmcli.release.team", "swarmcli.release.team_web.v2"},
+		{"an upper-case config", "configs", "SWARMCLI.RELEASE.team", "SWARMCLI.RELEASE.team_web.v2"},
+		{"an upper-case secret", "secrets", "SWARMCLI.RELEASE.team", "SWARMCLI.RELEASE.team_web.v2"},
+		{"a mixed-case config", "configs", "Swarmcli.Release.team", "Swarmcli.Release.team_web.v2"},
+		{"a mixed-case secret", "secrets", "Swarmcli.Release.team", "Swarmcli.Release.team_web.v2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
 			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
-				Name: "swarmcli.release.team", Manifest: stealsByDeclaring(tc.kind, tc.target, true),
+				Name: tc.release, Manifest: stealsByDeclaring(tc.kind, tc.target, true),
 				Resolve: ResolveNever, Files: decoyFiles,
 			})
 			if err == nil {
@@ -2228,6 +2236,39 @@ func TestDeployStackRefusesADeclarationNamedLikeAReleaseRecord(t *testing.T) {
 			}
 			if len(api.order) != 0 {
 				t.Errorf("created %v, want nothing", api.order)
+			}
+		})
+	}
+}
+
+// An existing record is matched by name without regard to case as well, whether
+// the stack declares the name or mounts it, so the stack is refused whole before
+// anything is created, as for the exact name. The record here is named in a
+// format other than the engine's, so only that match refuses it, and the
+// application is permitted the name so that nothing else does. Neither
+// spelling is in lower case, so both sides of the comparison are lowered.
+func TestAReleaseRecordIsMatchedWhateverTheCase(t *testing.T) {
+	const record, variant = "Records.other-app.3", "RECORDS.Other-App.3"
+	for _, tc := range []struct{ name, manifest string }{
+		{"declared", stealsByDeclaring("configs", variant, true)},
+		{"mounted", mountsAConfig(variant)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{configs: []swarm.Config{{
+				ID: "rec",
+				Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+					Name:   record,
+					Labels: map[string]string{charts.LabelType: charts.TypeRelease},
+				}},
+			}}})
+			err := allowing(t, api, application.Allow{Configs: []string{variant}}).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever, Files: decoyFiles,
+			})
+			if err == nil || !strings.Contains(err.Error(), "'"+variant+"'") || !strings.Contains(err.Error(), "release record") {
+				t.Fatalf("DeployStack = %v, want %s refused as a release record", err, variant)
+			}
+			if len(api.order) != 0 || len(api.updatedConfigs) != 0 {
+				t.Errorf("the release record was touched: order=%v updated=%+v", api.order, api.updatedConfigs)
 			}
 		})
 	}
