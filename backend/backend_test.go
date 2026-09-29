@@ -621,7 +621,7 @@ func TestListConfigsKeepsOnlyReleasePayloads(t *testing.T) {
 // A config carrying a stack's namespace label was created by a stack deploy, and
 // a release record never is: the engine writes one through CreateConfig with
 // com.swarmcli.* labels and no namespace. So a stack-owned config is not reported
-// as a release record whatever its other labels say — releaseRecorded's rule —
+// as a release record whatever its other labels say — isReleaseRecord's rule —
 // and it loses the type label as well as its payload, because the engine falls
 // back to inspecting a typed config whose payload is missing.
 func TestListConfigsDoesNotReportAStackConfigAsARecord(t *testing.T) {
@@ -2271,6 +2271,27 @@ func TestAReleaseRecordIsMatchedWhateverTheCase(t *testing.T) {
 				t.Errorf("the release record was touched: order=%v updated=%+v", api.order, api.updatedConfigs)
 			}
 		})
+	}
+}
+
+// A config a stack deploy created is not a release record, whatever its labels
+// say (isReleaseRecord), so the guard does not refuse a stack for mounting one
+// that the app set permits, as it would a record.
+func TestAStackConfigLabelledAsARecordIsNotOneToTheGuard(t *testing.T) {
+	api := asController(&fakeAPI{configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{
+		Annotations: swarm.Annotations{Name: "other_site", Labels: map[string]string{
+			charts.LabelType:       charts.TypeRelease,
+			convert.LabelNamespace: "other",
+		}},
+	}}}})
+	err := allowing(t, api, application.Allow{Configs: []string{"other_site"}}).DeployStack(t.Context(), charts.DeployRequest{
+		Name: "tenant", Manifest: mountsAConfig("other_site"), Resolve: ResolveNever,
+	})
+	if err != nil {
+		t.Fatalf("DeployStack = %v, want a stack's config mounted as the app set permits", err)
+	}
+	if !slices.Contains(api.labelFilters, charts.LabelType+"="+charts.TypeRelease) {
+		t.Errorf("label filters = %q, want the records listed by their type label", api.labelFilters)
 	}
 }
 

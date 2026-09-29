@@ -1088,7 +1088,8 @@ func (b *Backend) rejectOwnNamespace(ctx context.Context, release string) error 
 // "swarmcli.release.<release>.v<n>" name it happens to use, because that format
 // is unexported and a rename there would silently stop protecting these. The
 // label is part of the contract this repository already reads elsewhere —
-// RemoveStack skips these configs by the same one.
+// RemoveStack skips these configs by the same one. A config carrying a stack
+// namespace is not a record here, whatever its labels say (isReleaseRecord).
 //
 // Keyed by the name in lower case, and a lookup lowers its name too: Swarm finds
 // a config by name, and refuses to create one, regardless of case, so a name
@@ -1102,7 +1103,9 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 	}
 	out := make(map[string]struct{}, len(list))
 	for _, c := range list {
-		out[strings.ToLower(c.Spec.Name)] = struct{}{}
+		if isReleaseRecord(c.Spec.Labels) {
+			out[strings.ToLower(c.Spec.Name)] = struct{}{}
+		}
 	}
 	return out, nil
 }
@@ -1283,6 +1286,9 @@ func (b *Backend) RemoveStack(ctx context.Context, name string) error {
 		// to stamp them rather than anything this code enforces. Saying so here
 		// means a future change that did put a namespace on them would not
 		// silently turn uninstall into "delete the history too".
+		//
+		// Label-only on purpose, unlike isReleaseRecord: sparing is the safe
+		// direction for a deletion, so anything typed as a record is kept.
 		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
 			continue
 		}
@@ -1346,6 +1352,8 @@ func (b *Backend) stackRemains(ctx context.Context, name string) (bool, error) {
 		return false, fmt.Errorf("re-checking the stack's configs: %w", err)
 	}
 	for _, c := range configs {
+		// Label-only, as RemoveStack's skip is, so that what it spares is never
+		// counted as left behind.
 		if c.Spec.Labels[charts.LabelType] != charts.TypeRelease {
 			return true, nil
 		}

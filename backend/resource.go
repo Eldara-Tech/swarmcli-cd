@@ -279,7 +279,7 @@ func (b *Backend) CreateConfig(ctx context.Context, name string, data []byte, la
 // config store, on the manager node holding the raft log.
 //
 // A config carrying a stack namespace is never reported as a record, whatever
-// its other labels say — releaseRecorded's rule, for the reason it gives: a stack
+// its other labels say — isReleaseRecord's rule, for the reason it gives: a stack
 // deploy stamps that label on everything it creates, and a genuine record is
 // written through CreateConfig without one. Such a config keeps its name and its
 // other labels and loses the type label too, not only its payload, because the
@@ -292,13 +292,12 @@ func (b *Backend) ListConfigs(ctx context.Context) ([]charts.ConfigMeta, error) 
 	out := make([]charts.ConfigMeta, 0, len(configs))
 	for _, c := range configs {
 		meta := charts.ConfigMeta{Name: c.Spec.Name, Labels: c.Spec.Labels}
-		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
-			if _, stacked := c.Spec.Labels[convert.LabelNamespace]; stacked {
-				meta.Labels = maps.Clone(c.Spec.Labels)
-				delete(meta.Labels, charts.LabelType)
-			} else {
-				meta.Data = c.Spec.Data
-			}
+		switch {
+		case isReleaseRecord(c.Spec.Labels):
+			meta.Data = c.Spec.Data
+		case c.Spec.Labels[charts.LabelType] == charts.TypeRelease:
+			meta.Labels = maps.Clone(c.Spec.Labels)
+			delete(meta.Labels, charts.LabelType)
 		}
 		out = append(out, meta)
 	}

@@ -1125,6 +1125,26 @@ func TestAForgedReleaseRecordIsNotProofOfOwnership(t *testing.T) {
 	}
 }
 
+// The rule itself, which is CE's charts.IsReleaseRecord: typed as a record, and
+// no stack namespace.
+func TestIsReleaseRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{"a record", map[string]string{charts.LabelType: charts.TypeRelease}, true},
+		{"a stack's config typed as one", map[string]string{charts.LabelType: charts.TypeRelease, convert.LabelNamespace: "s"}, false},
+		{"untyped", map[string]string{charts.LabelRelease: "s"}, false},
+		{"typed as something else", map[string]string{charts.LabelType: "other"}, false},
+		{"no labels", nil, false},
+	} {
+		if got := isReleaseRecord(tc.labels); got != tc.want {
+			t.Errorf("%s: isReleaseRecord = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // Any owner counts, including none, and that is a decision rather than an
 // oversight. The stamp answers which application installed a release, so that a
 // sweep does not delete another controller's work; this asks whether the engine

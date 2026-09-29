@@ -178,6 +178,8 @@ func (b *Backend) LiveConfigs(ctx context.Context, stack string) (map[string]str
 	}
 	out := make(map[string]string, len(configs))
 	for _, c := range configs {
+		// Label-only on purpose, unlike isReleaseRecord: sparing is the safe
+		// direction for a sweep, as for RemoveStack.
 		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
 			continue
 		}
