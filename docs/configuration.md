@@ -253,7 +253,16 @@ everything else already on it, and an application permitted that name in
 shared network only if you would grant every application on it the same.
 
 The release records cannot come from a set read once at startup, because a new
-one is written on every deploy. They are matched by their label at deploy time.
+one is written on every deploy. They are matched by their label at deploy time,
+and a config a stack deploy created is never one, whatever its labels say. The
+records not written yet are protected by name: a config or secret a chart
+declares, `external:` or its own, may not take a name starting with
+`swarmcli.release.`, compared without regard to case, as Swarm compares names.
+Do not create a config under that prefix by hand either, even when a deploy
+reports a missing `external:` of that name and suggests the command: the engine
+checks that externals exist before this controller reads the manifest, and a
+name it needs for a record, once taken, stops that release's history from being
+recorded.
 
 One release is not held to the first four, and no allowlist is what spares it:
 the application marked [`self: true`](#self-optional) deploys the stack this
@@ -303,9 +312,9 @@ opens no path a manifest names:
   change it with the content; the superseded config is then the
   [`pruneResources`](#what-a-chart-stops-declaring) sweep's to remove.
 - **Labels under `com.swarmcli.` are refused** on any config or secret a chart
-  declares. They are the chart engine's and this controller's own bookkeeping —
-  the labels that mark a release record, and the marker that says this
-  controller created a resource.
+  declares, `external:` ones included. They are the chart engine's and this
+  controller's own bookkeeping — the labels that mark a release record, and the
+  marker that says this controller created a resource.
 - **A secret's `file:` is refused**, and so is any secret that is neither
   `external:` nor driver-backed. A secret's content never comes from the chart:
   an operator runs `docker secret create`, and the chart references the result
