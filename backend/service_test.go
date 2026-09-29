@@ -72,6 +72,10 @@ type fakeAPI struct {
 	// labelFilters records the label filter of every list call, so a test can
 	// assert that a stack-scoped operation was actually scoped.
 	labelFilters []string
+	// configNameFilters records the name filter of every config list call. The
+	// fake does not apply it: the daemon matches it as a prefix without regard to
+	// case, and a caller filters what comes back by its labels anyway.
+	configNameFilters []string
 	// order records every mutation in the order it was made.
 	order          []string
 	createdNets    map[string]network.CreateOptions
@@ -778,6 +782,7 @@ func (f *fakeAPI) NetworkRemove(_ context.Context, id string) error {
 func (f *fakeAPI) ConfigList(_ context.Context, o swarm.ConfigListOptions) ([]swarm.Config, error) {
 	label := labelOf(o.Filters)
 	f.labelFilters = append(f.labelFilters, label)
+	f.configNameFilters = append(f.configNameFilters, o.Filters.Get("name")...)
 	if label == "" {
 		return f.configs, nil
 	}
@@ -887,11 +892,16 @@ func (f *fakeAPI) ServiceRemove(_ context.Context, id string) error {
 	return err
 }
 
+// VolumeList honours the label filter as ConfigList does.
 func (f *fakeAPI) VolumeList(_ context.Context, o volume.ListOptions) (volume.ListResponse, error) {
-	f.labelFilters = append(f.labelFilters, labelOf(o.Filters))
+	label := labelOf(o.Filters)
+	f.labelFilters = append(f.labelFilters, label)
+	key, value, _ := strings.Cut(label, "=")
 	out := make([]*volume.Volume, 0, len(f.volumes))
 	for i := range f.volumes {
-		out = append(out, &f.volumes[i])
+		if v, ok := f.volumes[i].Labels[key]; label == "" || (ok && v == value) {
+			out = append(out, &f.volumes[i])
+		}
 	}
 	return volume.ListResponse{Volumes: out}, nil
 }

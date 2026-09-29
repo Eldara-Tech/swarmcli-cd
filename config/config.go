@@ -161,7 +161,8 @@ func (f *File) validate() error {
 	seen := make(map[string]bool, len(f.Applications))
 	// Keyed by the release name in lower case: Swarm compares the names a stack
 	// deploy creates without regard to case, so two releases differing only in
-	// case collide on every name they scope, and on their release records.
+	// case collide wherever the names they scope match, and on their release
+	// records.
 	claimed := make(map[string]claim, len(f.Applications))
 	selfApp := ""
 	for i, app := range f.Applications {
@@ -201,7 +202,7 @@ func (f *File) validate() error {
 			key := strings.ToLower(c.Release)
 			if other, taken := claimed[key]; taken {
 				if other.release != c.Release {
-					return fmt.Errorf("applications[%d]: '%s' and '%s' declare the releases '%s' and '%s', which differ only in case, and Swarm compares the names a stack creates without regard to case, so every name they scope would collide", i, other.app, app.Name, other.release, c.Release)
+					return fmt.Errorf("applications[%d]: '%s' and '%s' declare the releases '%s' and '%s', which differ only in case, and Swarm compares the names a stack creates without regard to case, so they would collide on their release records and wherever the names they scope match", i, other.app, app.Name, other.release, c.Release)
 				}
 				return fmt.Errorf("applications[%d]: '%s' and '%s' both declare the release '%s', and a release name is the Swarm stack namespace, so they would share one stack", i, other.app, app.Name, c.Release)
 			}

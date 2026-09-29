@@ -241,16 +241,19 @@ applications:
 	if err == nil {
 		t.Fatal("Parse = nil, want a shared-release error")
 	}
-	for _, want := range []string{"eldara-zammad", "acme-zammad", `'zammad'`, "stack"} {
+	for _, want := range []string{"eldara-zammad", "acme-zammad", `'zammad'`, "share one stack"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %s", err, want)
 		}
 	}
+	if strings.Contains(err.Error(), "case") {
+		t.Errorf("error %q speaks of case for one name written the same way twice", err)
+	}
 }
 
 // Swarm compares the names a stack deploy creates without regard to case, so two
-// releases whose names differ only in case collide on every name they scope, and
-// on their release records, much as one shared name shares a stack. Refused the
+// releases whose names differ only in case collide wherever the names they scope
+// match, and on their release records, much as one shared name shares a stack. Refused the
 // same way, naming both applications and both spellings.
 func TestTwoApplicationsMayNotClaimReleasesDifferingOnlyInCase(t *testing.T) {
 	const src = `
