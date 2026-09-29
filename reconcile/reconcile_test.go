@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -2031,16 +2032,32 @@ type driftBackend struct {
 	// sampled separately because they are ordered separately: pruneFirst moves
 	// the services and deliberately leaves these where they are.
 	resourcesAtApply []int
+	// shipped is, by manifest, the files one whose configs name a chart file was
+	// rendered with. Both conversions and DeployStack refuse such a manifest
+	// unless handed exactly those, as the real backend refuses a file: nothing
+	// supplied — so a caller that stops passing a manifest's files along with it
+	// loses the operation rather than going unnoticed.
+	shipped map[string]map[string][]byte
 }
 
-func (b *driftBackend) DesiredServices(_ context.Context, manifest, stack string) (*compose.Stack, error) {
+// unshipped is the refusal shipped describes.
+func (b *driftBackend) unshipped(manifest string, files map[string][]byte) error {
+	want, ok := b.shipped[manifest]
+	if !ok || maps.EqualFunc(want, files, bytes.Equal) {
+		return nil
+	}
+	return fmt.Errorf("config 'site': file: 'files/site.conf' is not shipped by the chart (manifest '%s' got %d files)",
+		manifest, len(files))
+}
+
+func (b *driftBackend) DesiredServices(_ context.Context, req capability.ManifestRequest) (*compose.Stack, error) {
 	if b.readErr != nil {
 		return nil, b.readErr
 	}
-	if err := b.unresolvableErr[manifest]; err != nil {
+	if err := b.unresolvableErr[req.Manifest]; err != nil {
 		return nil, err
 	}
-	return b.answer(manifest, stack), nil
+	return b.answer(req)
 }
 
 // DeclaredResources answers the same manifests as DesiredServices but is not
@@ -2049,23 +2066,27 @@ func (b *driftBackend) DesiredServices(_ context.Context, manifest, stack string
 //
 // readErr still applies. That one models a backend that cannot read at all, and a
 // fake that answered anyway would make the no-backend degradation untestable.
-func (b *driftBackend) DeclaredResources(_ context.Context, manifest, stack string) (*compose.Stack, error) {
+func (b *driftBackend) DeclaredResources(_ context.Context, req capability.ManifestRequest) (*compose.Stack, error) {
 	if b.readErr != nil {
 		return nil, b.readErr
 	}
-	return b.answer(manifest, stack), nil
+	return b.answer(req)
 }
 
-// answer is what both conversions have in common: record the read, then hand back
-// this manifest's stack if the test named one and the release's otherwise.
-func (b *driftBackend) answer(manifest, stack string) *compose.Stack {
+// answer is what both conversions have in common: record the read, refuse a
+// manifest handed the wrong files, then hand back this manifest's stack if the
+// test named one and the release's otherwise.
+func (b *driftBackend) answer(req capability.ManifestRequest) (*compose.Stack, error) {
 	b.mu.Lock()
-	b.manifestReads = append(b.manifestReads, manifest)
+	b.manifestReads = append(b.manifestReads, req.Manifest)
 	b.mu.Unlock()
-	if s, ok := b.byManifest[manifest]; ok {
-		return s
+	if err := b.unshipped(req.Manifest, req.Files); err != nil {
+		return nil, err
 	}
-	return b.desired[stack]
+	if s, ok := b.byManifest[req.Manifest]; ok {
+		return s, nil
+	}
+	return b.desired[req.Name], nil
 }
 
 // RemoveService deletes from the fake swarm as well as recording, so that the
@@ -2187,6 +2208,9 @@ func (b *driftBackend) attempted() []string {
 }
 
 func (b *driftBackend) DeployStack(_ context.Context, req charts.DeployRequest) error {
+	if err := b.unshipped(req.Manifest, req.Files); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.deployed = append(b.deployed, req.Name+"|"+req.Manifest)
@@ -2676,6 +2700,55 @@ func TestManualApplicationConvergesOnAnExplicitSync(t *testing.T) {
 	}
 	if len(backend.converged()) != 1 {
 		t.Errorf("redeployed %v, want the explicit sync to correct it", backend.converged())
+	}
+}
+
+// shipsASite is a manifest whose config names a file the chart ships, and
+// siteFiles the files it was rendered with. The backend converts and deploys it
+// only when handed exactly those (driftBackend.shipped), so each test using it
+// fails if the path it covers stops carrying a manifest's files with it.
+const shipsASite = "ships-a-site"
+
+var siteFiles = map[string][]byte{"files/site.conf": []byte("listen 80;\n")}
+
+// shipping is the plan's one release rendered from shipsASite, with its files.
+func shipping(plan *charts.Plan) *charts.Plan {
+	plan.Releases[0].Manifest, plan.Releases[0].Files = shipsASite, siteFiles
+	return plan
+}
+
+// Live drift compares against the conversion of the manifest a settled release
+// renders to, and a manifest shipping a config converts only with its files.
+// Without them the comparison is impossible and the release reads as unknown.
+func TestLiveDriftConvertsAManifestWithItsFiles(t *testing.T) {
+	backend := matchingBackend()
+	backend.shipped = map[string]map[string][]byte{shipsASite: siteFiles}
+	engine := &fakeEngine{plans: []*charts.Plan{shipping(synced())}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", false)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	view, _ := r.View("edge")
+	if view.Status.Drift == nil || view.Status.Drift.State != application.DriftStateNone {
+		t.Errorf("drift = %+v, want none — compared against the manifest converted with its files", view.Status.Drift)
+	}
+}
+
+// A correction deploys the release's manifest directly rather than through the
+// engine, so it has to carry the files itself — the engine is what attaches them
+// on the apply path.
+func TestAConvergeRedeploysAManifestWithItsFiles(t *testing.T) {
+	backend := driftedBackend()
+	backend.shipped = map[string]map[string][]byte{shipsASite: siteFiles}
+	engine := &fakeEngine{plans: []*charts.Plan{shipping(synced())}}
+	r := newTestWith(t, []application.Spec{liveSpec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got, want := backend.converged(), []string{"whoami|" + shipsASite}; !slices.Equal(got, want) {
+		t.Errorf("redeployed %v, want %v", got, want)
 	}
 }
 
@@ -3317,7 +3390,7 @@ func TestAnUnresolvableSettledReleaseLosesItsComparisonAndNotItsSweep(t *testing
 // at all.
 type oldSeamBackend struct{ stack *compose.Stack }
 
-func (o oldSeamBackend) DesiredServices(context.Context, string, string) (*compose.Stack, error) {
+func (o oldSeamBackend) DesiredServices(context.Context, capability.ManifestRequest) (*compose.Stack, error) {
 	return o.stack, nil
 }
 
@@ -3680,6 +3753,101 @@ func TestResourcesDroppedFromTheChartArePruned(t *testing.T) {
 		}
 	}); len(got) != 1 {
 		t.Errorf("converted the claiming revision %d times, want once for all four kinds", len(got))
+	}
+}
+
+// rotated is a release whose upgrade renames a config and a secret for new
+// content, with a stored revision that declared the old names, and running as
+// app. Both the upgrade's manifest and the revision name a chart file, so each
+// converts only with its own files.
+func rotated(app swarm.Service) (*driftBackend, *fakeEngine) {
+	oldFiles := map[string][]byte{"files/site.conf": []byte("listen 8080;\n")}
+	stack := func(v string) *compose.Stack {
+		return &compose.Stack{
+			Services: []compose.Service{{Name: "app", Spec: serviceSpec("whoami_app", 1)}},
+			Configs:  []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "whoami_site-" + v}}},
+			Secrets:  []swarm.SecretSpec{{Annotations: swarm.Annotations{Name: "whoami_token-" + v}}},
+		}
+	}
+	backend := &driftBackend{
+		desired:     map[string]*compose.Stack{"whoami": stack("v2")},
+		byManifest:  map[string]*compose.Stack{"had-site-v1": stack("v1")},
+		live:        map[string]map[string]swarm.Service{"whoami": {"whoami_app": app}},
+		liveConfigs: map[string]map[string]string{"whoami": {"whoami_site-v1": "c-v1", "whoami_site-v2": "c-v2"}},
+		liveSecrets: map[string]map[string]string{"whoami": {"whoami_token-v1": "k-v1", "whoami_token-v2": "k-v2"}},
+		shipped:     map[string]map[string][]byte{shipsASite: siteFiles, "had-site-v1": oldFiles},
+	}
+	history := sweepHistory("edge", "had-site-v1")
+	history["whoami"][0].Files = oldFiles
+	engine := &fakeEngine{
+		plans: []*charts.Plan{{Releases: []charts.ReleasePlan{{
+			Name: "whoami", Ref: "repo/whoami", Action: charts.ActionUpgrade, ToVersion: "0.1.9",
+			CurrentManifest: "had-site-v1", Manifest: shipsASite, Files: siteFiles,
+		}}}},
+		history: history,
+	}
+	return backend, engine
+}
+
+// mounting is the app's spec with the given version of the config and the
+// secret mounted.
+func mounting(v string) swarm.ServiceSpec {
+	spec := serviceSpec("whoami_app", 1)
+	spec.TaskTemplate.ContainerSpec.Configs = []*swarm.ConfigReference{{ConfigName: "whoami_site-" + v}}
+	spec.TaskTemplate.ContainerSpec.Secrets = []*swarm.SecretReference{{SecretName: "whoami_token-" + v}}
+	return spec
+}
+
+// A config changed by content arrives under a new name, because Swarm will not
+// change a config's data, and the old one is left behind until the sweep takes
+// it. Both conversions that decide that carry files: the upgrade's manifest names
+// the new content, and the stored revision proving the old name is this
+// application's names the old — so a sweep that dropped either set of files
+// would lose that proof and leave every rotated config on the swarm.
+//
+// Nothing running references the old names here, which is the state a rotation
+// reaches once the service has moved on past it; see the test below for the
+// state before that.
+func TestAConfigRotatedByContentIsPruned(t *testing.T) {
+	backend, engine := rotated(swarm.Service{ID: "id-app", Spec: serviceSpec("whoami_app", 1)})
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got, want := backend.prunedResources(), []string{"config:c-v1", "secret:k-v1"}; !slices.Equal(got, want) {
+		t.Errorf("pruned %v, want %v — the superseded pair, and not the one the upgrade declares", got, want)
+	}
+}
+
+// A rotated config or secret stays while a running service could still use it.
+// Swarm refuses to remove one a service's spec references, but not one its
+// previous spec does — and the previous spec is what a rollback deploys, so
+// removing it would leave that rollback nothing to start. The sweep reads the
+// services before the apply that moves each updated spec into PreviousSpec, so
+// both are held.
+func TestARotatedResourceAServiceCanStillUseIsKept(t *testing.T) {
+	previous := mounting("v1")
+	for _, tc := range []struct {
+		name string
+		app  swarm.Service
+	}{
+		{"referenced by the spec a rollback returns to", swarm.Service{ID: "id-app", Spec: mounting("v2"), PreviousSpec: &previous}},
+		{"referenced by the spec running before the apply", swarm.Service{ID: "id-app", Spec: mounting("v1")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend, engine := rotated(tc.app)
+			r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+				fakeRegistry{backend: backend})
+
+			if err := r.Sync(context.Background(), "edge"); err != nil {
+				t.Fatalf("Sync = %v, want nil", err)
+			}
+			if got := backend.attempted(); len(got) != 0 {
+				t.Errorf("attempted %v, want nothing a service could still use removed", got)
+			}
+		})
 	}
 }
 

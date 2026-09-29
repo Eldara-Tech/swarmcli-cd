@@ -15,12 +15,20 @@
 // never updated, no dry-run, --detach returns before convergence, update order
 // is Go map iteration), but every one of those is a defect of the *command*,
 // not of the conversion underneath it.
+//
+// One piece is not upstream's: a config's conversion, because upstream's reads
+// the config's file: from disk and this package reads no path. convertConfigs
+// builds the same spec from the bytes the chart engine hands over instead, and a
+// parity test holds the two together.
 package compose
 
 import (
 	"context"
 	"fmt"
+	"maps"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -82,30 +90,44 @@ type Network struct {
 // reading the negotiated API version that gates a few spec fields. Nothing is
 // written.
 //
+// files are the chart files the manifest names, keyed by their chart-relative
+// path — charts.DeployRequest.Files, or a stored revision's Release.Files — and
+// are the only place a config's content comes from; see checkFileSources. Nil
+// means the manifest was rendered with none, so one whose configs name a file is
+// refused.
+//
 // allow is the application's own permissions, carried here because the one thing
 // this package refuses on their strength — a bind mount — is legible from the
 // parsed document and from nowhere later. The caller is a backend scoped to one
 // application; the rest of the same value is read there, over the names
 // conversion produces (backend.rejectForbiddenResources).
-func Convert(ctx context.Context, manifest, stack string, api client.APIClient, allow application.Allow) (*Stack, error) {
+func Convert(ctx context.Context, manifest, stack string, files map[string][]byte, api client.APIClient, allow application.Allow) (*Stack, error) {
 	dict, err := loader.ParseYAML([]byte(manifest))
 	if err != nil {
 		return nil, fmt.Errorf("parsing the manifest: %w", err)
+	}
+	// First: after it, every mapping in the document is a map[string]any, which
+	// is the shape the checks below read.
+	if err := checkStringKeys(dict, ""); err != nil {
+		return nil, err
 	}
 	// Before the checks below, so they read the strings the swarm will get.
 	unescapeDollars(dict)
 	if err := checkBindSources(dict, allow); err != nil {
 		return nil, err
 	}
-	if err := checkFileSources(dict); err != nil {
+	sources, err := checkFileSources(dict, files)
+	if err != nil {
 		return nil, err
 	}
 
 	cfg, err := loader.Load(composetypes.ConfigDetails{
 		// A rendered manifest is not a file, so there is no directory for a
-		// relative path to mean anything against; checkBindSources and
-		// checkFileSources have already refused all three of the places the
-		// loader would have used this.
+		// relative path to mean anything against, and nothing reads relative to
+		// this: a bind source must be absolute (checkBindSources), env_file: and
+		// a secret's file: are refused (checkFileSources), and a config's file:
+		// is looked up in files by convertConfigs rather than opened. The loader
+		// still joins a config's path onto it, and nothing reads the result.
 		WorkingDir:  "/",
 		ConfigFiles: []composetypes.ConfigFile{{Config: dict}},
 	}, func(o *loader.Options) {
@@ -121,6 +143,9 @@ func Convert(ctx context.Context, manifest, stack string, api client.APIClient, 
 	})
 	if err != nil {
 		return nil, fmt.Errorf("loading the manifest: %w", err)
+	}
+	if err := checkSecretSources(cfg.Secrets); err != nil {
+		return nil, err
 	}
 
 	ns := convert.NewNamespace(stack)
@@ -149,7 +174,7 @@ func Convert(ctx context.Context, manifest, stack string, api client.APIClient, 
 	}
 	sort.Slice(secrets, func(i, j int) bool { return secrets[i].Name < secrets[j].Name })
 
-	configs, err := convert.Configs(ns, cfg.Configs)
+	configs, err := convertConfigs(ns, cfg.Configs, sources, files)
 	if err != nil {
 		return nil, fmt.Errorf("converting configs: %w", err)
 	}
@@ -190,8 +215,8 @@ const unresolvedID = "unresolved"
 // **The result must not be applied.** Its references carry unresolvedID rather
 // than the id of anything on the swarm; it is for reading names from, and
 // Convert is what a deploy applies.
-func ConvertUnresolved(ctx context.Context, manifest, stack string, api client.APIClient, allow application.Allow) (*Stack, error) {
-	return Convert(ctx, manifest, stack, assumeResolved{api}, allow)
+func ConvertUnresolved(ctx context.Context, manifest, stack string, files map[string][]byte, api client.APIClient, allow application.Allow) (*Stack, error) {
+	return Convert(ctx, manifest, stack, files, assumeResolved{api}, allow)
 }
 
 // assumeResolved is a client that reports every config and secret asked for as
@@ -429,48 +454,141 @@ func bindSource(v any) (string, bool) {
 	}
 }
 
-// checkFileSources refuses a manifest that takes content from a path, before the
-// loader can read one.
+// checkStringKeys refuses a manifest holding a mapping whose keys are not all
+// strings, anywhere in it.
 //
-// Three keys make the loader read: a config's file:, a secret's file:, and a
-// service's env_file:. All three are resolved against the same WorkingDir as a
-// bind source, and for the same reason none of them can mean what a chart author
-// thinks: a rendered manifest is a string, not a file in a checkout, so the only
-// filesystem any of these paths can name is the controller's own. That one holds
-// the Docker socket, the application set and /run/secrets, so
+// YAML allows any scalar as a key, and the parser hands a mapping with even one
+// such key back as a map[any]any — the whole mapping, not the one entry. Every
+// check in this file walks the document by asserting map[string]any, so a
+// mapping of that type, siblings included, would be stepped over by all of them.
+// Compose has no use for a non-string key, so this refuses one before any other
+// check runs.
+//
+// That is the whole guarantee: once this returns nil, every mapping in the
+// document is a map[string]any. A section of another shape altogether — a list
+// where compose wants a mapping — is still skipped by the checks below, and is
+// refused by the loader's schema validation instead.
+//
+// at is where v sits in the document, for the message.
+func checkStringKeys(v any, at string) error {
+	switch v := v.(type) {
+	case map[string]any:
+		for _, k := range sortedKeys(v) {
+			next := k
+			if at != "" {
+				next = at + "." + k
+			}
+			if err := checkStringKeys(v[k], next); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for i, e := range v {
+			if err := checkStringKeys(e, fmt.Sprintf("%s[%d]", at, i)); err != nil {
+				return err
+			}
+		}
+	case map[any]any:
+		return fmt.Errorf("'%s' has a key that is not a string; every compose key is one, so quote it", at)
+	}
+	return nil
+}
+
+// chartFilesRule is the sentence every refusal of a config's file: carries.
+const chartFilesRule = "a config's file: names content the chart ships in files/, or a value in values/"
+
+// checkFileSources refuses every key that would have the controller read a path,
+// and returns, for each config whose content comes from a file, the key in files
+// that content is under.
+//
+// Three compose keys name a path: a config's file:, a secret's file:, and a
+// service's env_file:. The loader resolves all three against WorkingDir, and a
+// rendered manifest is a string rather than a file in a checkout, so the only
+// filesystem any of them could name is the controller's own — the one holding
+// the Docker socket, the application set and /run/secrets. So none of them is
+// ever read here, and that is the guarantee this function exists to keep: a
+// chart declaring
 //
 //	secrets:
 //	  loot:
 //	    file: /run/secrets/swarmcli-cd-token
 //
-// had the controller read its own credential, create a swarm secret holding it
-// and mount that into the chart's container — under a name of the chart's own
-// choosing, which is why rejectForbiddenResources, comparing names, saw nothing
-// to object to (swarmcli-cd#99).
+// once had the controller read its own credential into a swarm secret of the
+// chart's naming (swarmcli-cd#99).
 //
-// So this refuses the key rather than the value: there is no path on the
-// controller a chart has any business reading, and a chart resolving one to
-// something harmless today is one commit away from resolving it elsewhere. A
-// resource whose content a chart cannot carry is external: — an operator creates
-// it on the swarm, and the stack references what it is given.
+// # A config's file:
 //
-// This reads the parsed document rather than the loaded config because loading
-// is the read, so a check that ran afterwards would run too late.
-func checkFileSources(dict map[string]any) error {
-	for _, kind := range []struct{ key, what string }{{"configs", "config"}, {"secrets", "secret"}} {
-		objects, _ := dict[kind.key].(map[string]any)
-		for _, name := range sortedKeys(objects) {
-			obj, ok := objects[name].(map[string]any)
-			if !ok {
-				continue
-			}
-			if _, sourced := obj["file"]; !sourced {
-				continue
-			}
-			return fmt.Errorf("%s '%s': file: reads a path on the controller's own filesystem, not the "+
-				"chart's; a rendered manifest is a string, so there is no chart directory for the path "+
-				"to resolve against — declare the %s external: and have an operator create it on the "+
-				"swarm", kind.what, name, kind.what)
+// The chart engine resolves a config's file: itself, while the chart is still in
+// scope, and hands the bytes over with the manifest — charts.DeployRequest.Files
+// for a deploy, Release.Files on every stored revision. Those bytes are the only
+// content a config here can have. A path is accepted when it names one of them,
+// and is then looked up rather than opened: convertConfigs reads the map, not the
+// disk. So a path is refused, in this order, when it
+//
+//   - is not a string, or is empty;
+//   - contains a $. The engine keys files by the path as the manifest wrote it,
+//     before the $$ escape is undone, and this reads it after, so a $$ path would
+//     name a key that cannot exist. And an interpolation-shaped path is not one
+//     any chart means: interpolation is off (see Convert), so it would only ever
+//     be a literal;
+//   - is absolute, or escapes the chart once cleaned;
+//   - is outside files/ and values/;
+//   - is not in files.
+//
+// The containment is the chart engine's own rule, reproduced exactly: path and
+// not filepath, because the value came from YAML, which is slash-separated
+// whatever the host; and path.Clean resolves every interior "..", so a leading
+// one afterwards is the complete test for leaving the chart. That makes the key
+// computed here the key the engine stored the bytes under. The map is not trusted
+// to have been built that way — a stored revision is only as trustworthy as
+// Docker access to the store — which is why the path is validated on every
+// conversion rather than once, whatever produced files.
+//
+// # A secret's file:
+//
+// Refused. A chart's secrets are created outside it and referenced external:, or
+// are driver-backed. Content shipped in the chart would be stored in the release
+// record, a Docker config anyone with Docker access can read, and a stored
+// secret's data cannot be read back to compare, so a changed file under an
+// unchanged name would silently leave the old secret in place. The refusal is of
+// the key, so it holds beside external: too; checkSecretSources covers a secret
+// that names no source at all.
+//
+// # env_file:
+//
+// Refused, whatever it names: environment: says the same thing in the manifest.
+//
+// This reads the parsed document rather than the loaded config because the
+// loader is what would read env_file:, so a check that ran afterwards would run
+// too late — and because the loaded config no longer holds a config's path as the
+// manifest wrote it.
+func checkFileSources(dict map[string]any, files map[string][]byte) (map[string]string, error) {
+	sources := map[string]string{}
+	configs, _ := dict["configs"].(map[string]any)
+	for _, name := range sortedKeys(configs) {
+		obj, ok := configs[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		raw, sourced := obj["file"]
+		if !sourced {
+			continue
+		}
+		key, err := chartFile(raw, files)
+		if err != nil {
+			return nil, fmt.Errorf("config '%s': %w", name, err)
+		}
+		sources[name] = key
+	}
+
+	secrets, _ := dict["secrets"].(map[string]any)
+	for _, name := range sortedKeys(secrets) {
+		obj, ok := secrets[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, sourced := obj["file"]; sourced {
+			return nil, secretRefused(name, "file: is refused")
 		}
 	}
 
@@ -480,14 +598,113 @@ func checkFileSources(dict map[string]any) error {
 		if !ok {
 			continue
 		}
-		if _, sourced := svc["env_file"]; !sourced {
-			continue
+		if _, sourced := svc["env_file"]; sourced {
+			return nil, fmt.Errorf("service '%s': env_file: is refused; set variables with environment:", name)
 		}
-		return fmt.Errorf("service '%s': env_file: reads a path on the controller's own filesystem, not "+
-			"the chart's; a rendered manifest is a string, so there is no chart directory for the path "+
-			"to resolve against — set the variables with environment: instead", name)
+	}
+	return sources, nil
+}
+
+// chartFile returns the key in files a config's file: names, or why it names
+// none. The checks and their order are checkFileSources'.
+func chartFile(raw any, files map[string][]byte) (string, error) {
+	p, ok := raw.(string)
+	switch {
+	case raw == nil:
+		return "", fmt.Errorf("file: names no path; %s", chartFilesRule)
+	case !ok:
+		return "", fmt.Errorf("file: must be a path, got %v (%T); %s", raw, raw, chartFilesRule)
+	}
+	if strings.Contains(p, "$") {
+		// Quoted as read, which is after unescapeDollars: the manifest's own
+		// spelling is not kept, so the message says which form it shows.
+		return "", fmt.Errorf("file: '%s' (with $$ read as $) is interpolation-shaped, and a path containing $ "+
+			"is refused; %s", p, chartFilesRule)
+	}
+	if path.IsAbs(p) {
+		return "", fmt.Errorf("file: '%s' is an absolute path; %s", p, chartFilesRule)
+	}
+	clean := path.Clean(p)
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("file: '%s' escapes the chart; %s", p, chartFilesRule)
+	}
+	if !strings.HasPrefix(clean, "files/") && !strings.HasPrefix(clean, "values/") {
+		return "", fmt.Errorf("file: '%s' is outside files/ and values/; %s", p, chartFilesRule)
+	}
+	if _, ok := files[clean]; !ok {
+		return "", fmt.Errorf("file: '%s' is not shipped by the chart; %s", p, chartFilesRule)
+	}
+	return clean, nil
+}
+
+// checkSecretSources refuses a secret that is neither external: nor
+// driver-backed.
+//
+// checkFileSources has already refused a secret's file:, and this is not a second
+// copy of that. A secret naming no source at all still gets one: the loader fills
+// the missing file: in as WorkingDir itself, and convert.Secrets would then try to
+// read it. So every secret reaching convert.Secrets has to be one it does not
+// read for — external, which it skips, or driver-backed, which it builds without
+// content — and that is decided here, on the loaded config, because both are
+// properties of a value rather than of a key: external: false and driver: "" are
+// present, and both mean no.
+//
+// Loading reads no secret's file, so after the load is still before any read.
+func checkSecretSources(secrets map[string]composetypes.SecretConfig) error {
+	for _, name := range slices.Sorted(maps.Keys(secrets)) {
+		if s := secrets[name]; !s.External.External && s.Driver == "" {
+			return secretRefused(name, "it is neither external: nor driver-backed")
+		}
 	}
 	return nil
+}
+
+// secretRefused is the one refusal both secret checks give: what they refuse
+// differs, and what to do instead does not.
+func secretRefused(name, why string) error {
+	return fmt.Errorf("secret '%s': %s; a chart does not carry a secret's content — declare it external: "+
+		"and have an operator create it on the swarm, or give it a driver:", name, why)
+}
+
+// convertConfigs is convert.Configs with each config's content taken from files
+// rather than read from a path.
+//
+// Everything else is upstream's, field for field — fileObjectConfig and Configs
+// in docker/cli's cli/compose/convert/compose.go: the name is the entry's own
+// name: when it set one and the namespace-scoped key otherwise, the labels gain
+// the stack's namespace, and template_driver becomes Templating. The parity test
+// holds it to that, so a docker/cli bump that changes the upstream conversion
+// fails there rather than drifting apart from it here.
+//
+// sources is checkFileSources' answer — the key in files each entry's file:
+// named — and not the loaded config's File, which the loader has rewritten
+// against WorkingDir. An entry that is neither external nor in sources named no
+// file at all, and there is nothing to give it.
+func convertConfigs(ns convert.Namespace, configs map[string]composetypes.ConfigObjConfig, sources map[string]string, files map[string][]byte) ([]swarm.ConfigSpec, error) {
+	out := []swarm.ConfigSpec{}
+	for _, name := range slices.Sorted(maps.Keys(configs)) {
+		obj := configs[name]
+		if obj.External.External {
+			continue
+		}
+		key, ok := sources[name]
+		if !ok {
+			return nil, fmt.Errorf("config '%s' has no content; %s, or declare it external:", name, chartFilesRule)
+		}
+		scoped := obj.Name
+		if scoped == "" {
+			scoped = ns.Scope(name)
+		}
+		spec := swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: scoped, Labels: convert.AddStackLabel(ns, obj.Labels)},
+			Data:        files[key],
+		}
+		if obj.TemplateDriver != "" {
+			spec.Templating = &swarm.Driver{Name: obj.TemplateDriver}
+		}
+		out = append(out, spec)
+	}
+	return out, nil
 }
 
 // sortedKeys is a manifest section's names in a fixed order. A manifest with two

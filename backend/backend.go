@@ -248,6 +248,13 @@ const (
 // the secret is relabelled into the stack's namespace, where a later RemoveStack
 // deletes it. Declaring a name is not the same as owning it.
 //
+// The declared half reads labels as well as names, because a chart chooses both.
+// Keys under com.swarmcli. are where the chart engine and this controller keep
+// their own bookkeeping — the labels that mark a config as a release record, and
+// the creation marker the sweep reads as proof that this controller made a
+// resource — so a config or secret a chart declares may not carry one, whatever
+// its name. See reservedLabel.
+//
 // A volume needs no second pass for that, and a network needs no first one.
 // Nothing pre-creates a volume — DeployStack says why — so a top-level `volumes:`
 // entry does nothing at all until a service mounts it, and conversion has already
@@ -353,6 +360,12 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	// legitimate is refused; what is refused is the one release with the most to
 	// gain from #86's trick, which is where that guard is worth keeping whole.
 	for _, spec := range stack.Secrets {
+		if key, ok := reservedLabel(spec.Labels); ok {
+			return declaresReservedLabel("secret", spec.Name, key)
+		}
+		if strings.HasPrefix(spec.Name, releaseRecordPrefix) {
+			return declaresForbidden("secret", spec.Name, whatReleaseRecord)
+		}
 		_, wired := b.forbiddenSecrets[spec.Name]
 		_, mounted := mine.secrets[spec.Name]
 		if wired || mounted {
@@ -363,6 +376,14 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		}
 	}
 	for _, spec := range stack.Configs {
+		if key, ok := reservedLabel(spec.Labels); ok {
+			return declaresReservedLabel("config", spec.Name, key)
+		}
+		// By name as well as by the records that exist: the engine allocates the
+		// next one at deploy time, so one not written yet is as much its own.
+		if strings.HasPrefix(spec.Name, releaseRecordPrefix) {
+			return declaresForbidden("config", spec.Name, whatReleaseRecord)
+		}
 		if _, forbidden := mine.configs[spec.Name]; forbidden {
 			return declaresForbidden("config", spec.Name, whatControllerConfig)
 		}
@@ -510,6 +531,38 @@ func inControllersStack(namespace, name string) bool {
 func mountsForbidden(service, kind, name, what string) error {
 	return fmt.Errorf("service '%s' mounts %s '%s', which is %s; a reconciled stack may not mount it",
 		service, kind, name, what)
+}
+
+// reservedLabelPrefix is the label namespace the chart engine (charts.LabelType
+// and its siblings) and this controller (createdLabel) write their own records
+// under. Everything a reader of those labels concludes — that a config is a
+// release record, that a resource is this controller's to delete — rests on
+// nobody else writing there.
+const reservedLabelPrefix = "com.swarmcli."
+
+// releaseRecordPrefix begins every release record's name. The chart engine
+// names a record "swarmcli.release.<release>.v<revision>" (releaseConfigName in
+// CE's charts/release.go, unexported) and allocates the next one when it deploys,
+// so the names it will need are not all on the swarm yet. A release name may
+// contain '.' and '_', so a release whose own name starts with this prefix could
+// otherwise declare a future record's name as scoped to itself.
+const releaseRecordPrefix = "swarmcli.release."
+
+// reservedLabel returns the first key under reservedLabelPrefix, in sorted order
+// so that a refusal names the same one every time.
+func reservedLabel(labels map[string]string) (string, bool) {
+	for _, k := range slices.Sorted(maps.Keys(labels)) {
+		if strings.HasPrefix(k, reservedLabelPrefix) {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+func declaresReservedLabel(kind, name, key string) error {
+	return fmt.Errorf("this stack declares %s '%s' with label '%s'; labels under %s are the chart engine's and "+
+		"this controller's own bookkeeping, and a reconciled stack may not set them — rename or drop the label",
+		kind, name, key, reservedLabelPrefix)
 }
 
 func declaresForbidden(kind, name, what string) error {
@@ -1062,22 +1115,16 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 //
 // Nothing is deleted. Phase 1 is explicitly no prune.
 //
-// req.Files is ignored, and that is a decision rather than an oversight. A
-// manifest reaching here can never name a file: this controller converts it
-// in-process, with no checkout for a relative path to resolve against
-// (cdcompose.Convert sets WorkingDir: "/"), and cdcompose.checkFileSources
-// refuses configs.*.file, secrets.*.file and services.*.env_file outright
-// before the loader can read one — swarmcli-cd#99, because the only filesystem
-// those paths could name is the one holding the Docker socket, the application
-// set and /run/secrets. The chart engine fills the map from exactly those keys,
-// so what arrives here is always empty.
-//
-// Making the field mean something is a separate change with its own threat
-// argument, not a line added to this method: it means materialising the files
-// to a temp directory, pointing WorkingDir at that directory, and relaxing
-// checkFileSources from "refuse the key" to "refuse a path that escapes" —
-// reopening half of #99's guard on a process holding the socket. That is #528's
-// CE-side PR 4 and a follow-up issue here.
+// req.Files is the content of every config the manifest sources with file:,
+// keyed by the chart-relative path the manifest names, as the chart engine
+// resolved it while the chart was still in scope. Both conversions take it, and
+// it is the only place a config's content comes from: nothing is written to a
+// directory and no path is opened. cdcompose.checkFileSources accepts a config's
+// file: only when it names one of these keys from inside files/ or values/, and
+// refuses a secret's file: and a service's env_file: whatever is here —
+// swarmcli-cd#99, because the only filesystem a path in a rendered manifest
+// could name is the one holding the Docker socket, the application set and
+// /run/secrets.
 func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) error {
 	// Before the manifest is even converted: a release claiming the controller's
 	// own stack is refused whatever it declares, because the collision is the
@@ -1103,7 +1150,7 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 	if err != nil {
 		return err
 	}
-	unresolved, err := cdcompose.ConvertUnresolved(ctx, req.Manifest, req.Name, b.api, allow)
+	unresolved, err := cdcompose.ConvertUnresolved(ctx, req.Manifest, req.Name, req.Files, b.api, allow)
 	if err != nil {
 		return err
 	}
@@ -1138,7 +1185,7 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 		return err
 	}
 
-	stack, err := cdcompose.Convert(ctx, req.Manifest, req.Name, b.api, allow)
+	stack, err := cdcompose.Convert(ctx, req.Manifest, req.Name, req.Files, b.api, allow)
 	if err != nil {
 		return err
 	}

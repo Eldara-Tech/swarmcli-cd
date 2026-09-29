@@ -185,7 +185,7 @@ type StacksReader interface {
 // Only the read half needs a capability. Correcting drift is DeployStack, which
 // is on charts.Backend already.
 type LiveDrift interface {
-	DesiredServices(ctx context.Context, manifest, stack string) (*compose.Stack, error)
+	DesiredServices(ctx context.Context, req ManifestRequest) (*compose.Stack, error)
 	LiveServices(ctx context.Context, stack string) (map[string]swarm.Service, error)
 }
 
@@ -223,7 +223,29 @@ type NetworkNamer interface {
 // replacing it, because live drift compares whole ServiceSpecs and must never
 // start diffing against a placeholder id.
 type DeclaredLister interface {
-	DeclaredResources(ctx context.Context, manifest, stack string) (*compose.Stack, error)
+	DeclaredResources(ctx context.Context, req ManifestRequest) (*compose.Stack, error)
+}
+
+// ManifestRequest names one rendered manifest to convert, with the chart files
+// it was rendered with.
+//
+// A struct rather than a parameter list, for the reason this package's doc
+// comment gives: a capability that needs to grow grows by taking a struct. The
+// fields are the three charts.DeployRequest carries for the same manifest, under
+// the same names, because the conversions that take this — live drift's and the
+// sweep's — must agree with the deploy, and so are handed what the deploy is.
+type ManifestRequest struct {
+	// Name is the stack, which is also the release name. It scopes every name
+	// the manifest declares.
+	Name string
+	// Manifest is the rendered compose document.
+	Manifest string
+	// Files are the chart files the manifest's configs name, keyed by their
+	// chart-relative path: charts.ReleasePlan.Files for the current render, and
+	// charts.Release.Files for a stored revision. A config's content is one of
+	// them, so a manifest whose configs name a file does not convert without
+	// them.
+	Files map[string][]byte
 }
 
 // ResourceLister is the optional interface a backend implements to read the

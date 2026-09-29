@@ -15,6 +15,7 @@ import (
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
 
@@ -39,8 +40,8 @@ import (
 // It is the same conversion DeployStack does before applying, so what drift
 // compares against is what a sync would write, rather than a second reading of
 // the manifest that could disagree with it.
-func (b *Backend) DesiredServices(ctx context.Context, manifest, stack string) (*cdcompose.Stack, error) {
-	return cdcompose.Convert(ctx, manifest, stack, b.api, b.allow)
+func (b *Backend) DesiredServices(ctx context.Context, req capability.ManifestRequest) (*cdcompose.Stack, error) {
+	return cdcompose.Convert(ctx, req.Manifest, req.Name, req.Files, b.api, b.allow)
 }
 
 // DeclaredResources converts a rendered manifest to the specs it declares,
@@ -56,8 +57,8 @@ func (b *Backend) DesiredServices(ctx context.Context, manifest, stack string) (
 // Not a substitute for DesiredServices. What it returns is what ConvertUnresolved
 // returns, so the config and secret references in it carry a placeholder id and
 // nothing may be applied from it.
-func (b *Backend) DeclaredResources(ctx context.Context, manifest, stack string) (*cdcompose.Stack, error) {
-	return cdcompose.ConvertUnresolved(ctx, manifest, stack, b.api, b.allow)
+func (b *Backend) DeclaredResources(ctx context.Context, req capability.ManifestRequest) (*cdcompose.Stack, error) {
+	return cdcompose.ConvertUnresolved(ctx, req.Manifest, req.Name, req.Files, b.api, b.allow)
 }
 
 // LiveServices returns the stack's running services with their full specs, by

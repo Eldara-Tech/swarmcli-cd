@@ -76,9 +76,10 @@ func TestDeployStackCreatesReferencesBeforeServices(t *testing.T) {
 }
 
 // declaresAndMounts is the shape #84 was filed for: a chart that brings its own
-// secret and mounts it. Driver-backed, because since #99 that is the whole of
-// what a stack can own — the other way was a path, and compose resolves a path
-// against the controller's filesystem rather than the chart's.
+// secret and mounts it. Driver-backed, because since #99 that is the one way a
+// stack owns a secret — the other way was a path, and compose resolves a path
+// against the controller's filesystem rather than the chart's. shipsAConfig is
+// the config half.
 const declaresAndMounts = `
 services:
   app:
@@ -117,40 +118,74 @@ func TestDeployStackCreatesASecretItThenMounts(t *testing.T) {
 	}
 }
 
-// DeployRequest.Files is ignored, and this asserts that it is ignored on purpose
-// rather than dropped by accident. Since #99 no manifest reaching this backend
-// can name a file — configs.*.file, secrets.*.file and services.*.env_file are
-// all refused before the loader runs — so a request carrying files describes a
-// chart whose files nothing here will ever read. Two things follow, and both are
-// checked: the deploy proceeds exactly as it would without them, and the bytes
-// are not written anywhere. The temp directory is the probe for the second
-// because it is where materialising them would put them — CE's own
-// docker.DeployStackInContext writes its manifest there — so an empty one after
-// the deploy is the evidence that this method did nothing with the field.
-func TestDeployStackIgnoresTheChartsFiles(t *testing.T) {
+// shipsAConfig is a chart that brings a config's content with it and mounts it:
+// the file: names a path in the chart, and the bytes arrive beside the manifest
+// as DeployRequest.Files.
+const shipsAConfig = `
+services:
+  app:
+    image: busybox
+    configs: [site]
+configs:
+  site:
+    file: files/nginx.conf
+`
+
+// DeployRequest.Files is where a config's content comes from, and the only
+// place. Three things are checked: the config is created with those bytes, the
+// service is created holding the id the daemon reported for it — so the applied
+// conversion ran after the create, as #84 needs — and nothing was written to
+// disk on the way. The temp directory is the probe for the last because it is
+// where materialising them would put them: CE's own docker.DeployStackInContext
+// writes its manifest there.
+func TestDeployStackAppliesTheChartsFiles(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("TMPDIR", tmp)
 	api := &fakeAPI{}
 
 	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
 		Name:     "rel",
-		Manifest: declaresAndMounts,
+		Manifest: shipsAConfig,
 		Resolve:  ResolveNever,
 		Files:    map[string][]byte{"files/nginx.conf": []byte("server {}\n")},
 	})
 	if err != nil {
-		t.Fatalf("DeployStack = %v, want a request carrying files deployed like any other", err)
+		t.Fatalf("DeployStack = %v, want a chart's own config deployed from its files", err)
 	}
 
-	if len(api.created) != 1 || api.created[0].Name != "rel_app" {
-		t.Errorf("created services %+v, want the deploy to have run as it does without files", api.created)
+	if want := []string{"network:rel_default", "config:rel_site"}; !reflect.DeepEqual(api.order, want) {
+		t.Errorf("mutation order = %v, want %v", api.order, want)
+	}
+	if len(api.createdConfigs) != 1 || string(api.createdConfigs[0].Data) != "server {}\n" {
+		t.Errorf("created configs %+v, want rel_site holding the chart's files/nginx.conf", api.createdConfigs)
+	}
+	if len(api.created) != 1 {
+		t.Fatalf("created %d services, want 1", len(api.created))
+	}
+	cs := api.created[0].TaskTemplate.ContainerSpec
+	if len(cs.Configs) != 1 || cs.Configs[0].ConfigName != "rel_site" || cs.Configs[0].ConfigID != "cfg-rel_site" {
+		t.Errorf("configs = %+v, want the id the daemon reported for the config just created", cs.Configs)
 	}
 	left, err := os.ReadDir(tmp)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(left) != 0 {
-		t.Errorf("%d entries under %s, want the files ignored rather than materialised", len(left), tmp)
+		t.Errorf("%d entries under %s, want the files used in memory rather than materialised", len(left), tmp)
+	}
+}
+
+// The same chart handed no files names content nothing supplied. It is refused
+// whole, before anything is created, rather than deployed with an empty config.
+func TestDeployStackRefusesAConfigItWasNotGivenTheFilesFor(t *testing.T) {
+	api := &fakeAPI{}
+
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "rel", Manifest: shipsAConfig, Resolve: ResolveNever})
+	if err == nil || !strings.Contains(err.Error(), "not shipped by the chart") {
+		t.Fatalf("DeployStack = %v, want the config refused for content nothing supplied", err)
+	}
+	if len(api.order) != 0 || len(api.created) != 0 {
+		t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
 	}
 }
 
@@ -580,6 +615,51 @@ func TestListConfigsKeepsOnlyReleasePayloads(t *testing.T) {
 	// carrying no swarmcli label at all.
 	if len(api.labelFilters) != 1 || api.labelFilters[0] != "" {
 		t.Errorf("label filters = %q, want one unfiltered list call", api.labelFilters)
+	}
+}
+
+// A config carrying a stack's namespace label was created by a stack deploy, and
+// a release record never is: the engine writes one through CreateConfig with
+// com.swarmcli.* labels and no namespace. So a stack-owned config is not reported
+// as a release record whatever its other labels say — releaseRecorded's rule —
+// and it loses the type label as well as its payload, because the engine falls
+// back to inspecting a typed config whose payload is missing.
+func TestListConfigsDoesNotReportAStackConfigAsARecord(t *testing.T) {
+	labels := map[string]string{
+		charts.LabelType:             charts.TypeRelease,
+		charts.LabelRelease:          "other-app",
+		"com.docker.stack.namespace": "web",
+	}
+	api := &fakeAPI{configs: []swarm.Config{
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "swarmcli.release.web.v1", Labels: map[string]string{charts.LabelType: charts.TypeRelease}},
+			Data:        []byte("a release record"),
+		}},
+		{Spec: swarm.ConfigSpec{
+			Annotations: swarm.Annotations{Name: "web_site", Labels: labels},
+			Data:        []byte("a stack's config"),
+		}},
+	}}
+
+	got, err := testBackend(t, api, nil).ListConfigs(context.Background())
+	if err != nil {
+		t.Fatalf("ListConfigs = %v, want nil", err)
+	}
+	if len(got) != 2 || string(got[0].Data) != "a release record" || got[0].Labels[charts.LabelType] != charts.TypeRelease {
+		t.Fatalf("configs = %+v, want the genuine record reported as one", got)
+	}
+	stacked := got[1]
+	if stacked.Name != "web_site" || stacked.Data != nil {
+		t.Errorf("config = %+v, want its name kept and its payload dropped", stacked)
+	}
+	if _, typed := stacked.Labels[charts.LabelType]; typed {
+		t.Errorf("labels = %v, want the type label dropped so the engine does not read it as a record", stacked.Labels)
+	}
+	if stacked.Labels[charts.LabelRelease] != "other-app" {
+		t.Errorf("labels = %v, want the rest carried through", stacked.Labels)
+	}
+	if labels[charts.LabelType] != charts.TypeRelease {
+		t.Error("the swarm's own label map was modified; the listing must copy rather than edit it")
 	}
 }
 
@@ -1899,24 +1979,30 @@ func TestDeployStackRefusesAControllerSecretRenamedOnTheWayIn(t *testing.T) {
 
 // ------------------------------------ a stack that claims one of our names (#86)
 
-// stealsByDeclaring is a manifest that takes a secret over instead of
+// stealsByDeclaring is a manifest that takes a resource over instead of
 // referencing it: the entry is not `external:`, so it is one of the stack's own
 // as far as conversion and the guard's reference check are concerned, and `name:`
 // points it at something that already exists.
 //
-// Driver-backed, and secrets only. This fixture used to carry a `file:` and to
-// take a kind, which is how it covered the config half of the same rule too —
-// but #99 refuses a path before the guard ever runs, and a config has no
-// `driver:` to fall back on, so a manifest can no longer express a stack-owned
-// config at all. The two config cases below therefore address the guard
-// directly.
-func stealsByDeclaring(name string, mount bool) string {
+// kind is "secrets" or "configs". A secret is driver-backed, since a chart cannot
+// ship a secret's content; a config takes its content from the chart's own
+// files/decoy.conf, which is what decoyFiles carries.
+func stealsByDeclaring(kind, name string, mount bool) string {
 	svc := "services:\n  thief:\n    image: alpine\n"
 	if mount {
-		svc += "    secrets: [x]\n"
+		svc += "    " + kind + ": [x]\n"
 	}
-	return svc + "secrets:\n  x:\n    name: " + name + "\n    driver: vault\n"
+	source := "    driver: vault\n"
+	if kind == "configs" {
+		source = "    file: files/decoy.conf\n"
+	}
+	return svc + kind + ":\n  x:\n    name: " + name + "\n" + source
 }
+
+// decoyFiles is what a config-claiming stealsByDeclaring ships. It never reaches
+// the swarm — a config that already exists is not created — so what is in it does
+// not matter, which is exactly why this is not hard to write.
+var decoyFiles = map[string][]byte{"files/decoy.conf": []byte("not the real thing\n")}
 
 // The controller's own token, taken by declaring it rather than by referencing
 // it. Before #86 this deployed: the reference check saw a name the stack declares
@@ -1935,7 +2021,7 @@ func TestDeployStackRefusesAStackDeclaringAControllerSecret(t *testing.T) {
 	}}})
 	b := testBackend(t, api, nil).WithForbiddenSecrets(map[string]struct{}{"swarmcli-cd-token": {}}).(*Backend)
 
-	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: stealsByDeclaring("swarmcli-cd-token", true), Resolve: ResolveNever})
+	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: stealsByDeclaring("secrets", "swarmcli-cd-token", true), Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want the stack refused for declaring the controller's own secret")
 	}
@@ -1962,7 +2048,7 @@ func TestDeployStackRefusesADeclarationNoServiceMounts(t *testing.T) {
 		Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-token"}},
 	}}})
 
-	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: stealsByDeclaring("swarmcli-cd-token", false), Resolve: ResolveNever})
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: stealsByDeclaring("secrets", "swarmcli-cd-token", false), Resolve: ResolveNever})
 	if err == nil {
 		t.Fatal("DeployStack = nil, want a declaration of the controller's secret refused even unmounted")
 	}
@@ -1975,59 +2061,175 @@ func TestDeployStackRefusesADeclarationNoServiceMounts(t *testing.T) {
 // immutability check rather than by the guard — an error about configs being
 // immutable, for what is actually an attempt to take the application set over,
 // and only after applySecrets had already run.
-//
-// It reaches the guard directly rather than through DeployStack because #99
-// closed the only route a manifest had to a stack-owned config: content came
-// from `file:`, a config has no `driver:` to declare it without content, and an
-// `external:` entry is a reference rather than a declaration. Put back through
-// DeployStack it would be refused for the file source and prove nothing about
-// this rule. The rule stays under test because the route can reopen — it is
-// compose's inability to carry content that shuts it, not anything here.
 func TestDeployStackRefusesAStackDeclaringTheControllersOwnConfig(t *testing.T) {
 	api := asController(&fakeAPI{configs: []swarm.Config{{
 		ID:   "app-set",
 		Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"}, Data: []byte("real")},
 	}}})
-	st := stack("tenant")
-	st.Configs = []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "swarmcli-cd-applications"}}}
 
-	err := testBackend(t, api, nil).rejectForbiddenResources(t.Context(), st)
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+		Name: "tenant", Manifest: stealsByDeclaring("configs", "swarmcli-cd-applications", true),
+		Resolve: ResolveNever, Files: decoyFiles,
+	})
 	if err == nil {
-		t.Fatal("rejectForbiddenResources = nil, want the stack refused for declaring the controller's own config")
+		t.Fatal("DeployStack = nil, want the stack refused for declaring the controller's own config")
 	}
 	if !strings.Contains(err.Error(), "declares") || !strings.Contains(err.Error(), "controller") {
 		t.Errorf("error %q does not say what was refused", err)
 	}
-	if len(api.order) != 0 {
-		t.Errorf("resources were created despite the refusal: %v", api.order)
+	if len(api.order) != 0 || len(api.updatedConfigs) != 0 {
+		t.Errorf("the controller's own config was touched: order=%v updated=%+v", api.order, api.updatedConfigs)
 	}
 }
 
 // A release record, taken the same way. Not immutability's business at all: the
 // record it names does not exist yet, so nothing would have refused this.
 //
-// Through the guard rather than through DeployStack for the reason above, and
-// this is the one the integration suite used to prove end to end — see the note
-// where TestAStackMayNotClaimAReleaseRecordAsItsOwn was. Do not "restore" the
-// DeployStack form: no manifest can declare a config since #99, so it would fail
-// on the file-source refusal and prove nothing about this rule.
+// Configs and secrets are separate namespaces on the swarm, and the guard's
+// config half compares configs only, so a config is the one kind that can claim a
+// record's name — which is why this case, and the integration test
+// TestAStackMayNotClaimAReleaseRecordAsItsOwn, are written as a config the chart
+// ships.
+//
+// Two names, because two rules refuse it. The record's name format is the
+// engine's and unexported, so an existing record is matched by its label too,
+// and the second name is one a renamed format could produce: only that match
+// catches it.
 func TestDeployStackRefusesAStackDeclaringAReleaseRecordName(t *testing.T) {
-	api := asController(&fakeAPI{configs: []swarm.Config{{
-		ID: "rec",
-		Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
-			Name:   "swarmcli.release.other-app.v3",
-			Labels: map[string]string{charts.LabelType: charts.TypeRelease},
-		}},
-	}}})
-	st := stack("tenant")
-	st.Configs = []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "swarmcli.release.other-app.v3"}}}
+	for _, record := range []string{"swarmcli.release.other-app.v3", "records.other-app.3"} {
+		t.Run(record, func(t *testing.T) {
+			api := asController(&fakeAPI{configs: []swarm.Config{{
+				ID: "rec",
+				Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+					Name:   record,
+					Labels: map[string]string{charts.LabelType: charts.TypeRelease},
+				}},
+			}}})
 
-	err := testBackend(t, api, nil).rejectForbiddenResources(t.Context(), st)
-	if err == nil {
-		t.Fatal("rejectForbiddenResources = nil, want the stack refused for declaring a release record's name")
+			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "tenant", Manifest: stealsByDeclaring("configs", record, true),
+				Resolve: ResolveNever, Files: decoyFiles,
+			})
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the stack refused for declaring a release record's name")
+			}
+			if !strings.Contains(err.Error(), "declares") || !strings.Contains(err.Error(), "release record") {
+				t.Errorf("error %q does not say what was refused", err)
+			}
+			if len(api.order) != 0 || len(api.updatedConfigs) != 0 {
+				t.Errorf("the release record was touched: order=%v updated=%+v", api.order, api.updatedConfigs)
+			}
+		})
 	}
-	if !strings.Contains(err.Error(), "release record") {
-		t.Errorf("error %q does not say what was refused", err)
+}
+
+// reservedLabelled is a chart declaring one config of its own and one driver-backed
+// secret, each carrying the given labels — which, unlike a name, the chart
+// chooses freely.
+func reservedLabelled(labels string) string {
+	return "services:\n  app:\n    image: busybox\n    configs: [site]\n    secrets: [token]\n" +
+		"configs:\n  site:\n    file: files/decoy.conf\n    labels:\n" + labels +
+		"secrets:\n  token:\n    driver: vault\n    labels:\n" + labels
+}
+
+// Labels under com.swarmcli. are the chart engine's and this controller's own
+// bookkeeping — what marks a config as a release record, and the marker the sweep
+// reads as proof that this controller created a resource. A declaration carrying
+// one is refused whatever its name, before anything is created, and for either
+// kind.
+func TestDeployStackRefusesADeclarationCarryingAReservedLabel(t *testing.T) {
+	for _, tc := range []struct{ name, labels, key string }{
+		{"a release record's type", "      com.swarmcli.type: release\n      com.swarmcli.release: other-app\n", "com.swarmcli.release"},
+		{"the creation marker", "      com.swarmcli.cd.created: \"2026-01-01T00:00:00Z\"\n", "com.swarmcli.cd.created"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeAPI{}
+			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "rel", Manifest: reservedLabelled(tc.labels), Resolve: ResolveNever, Files: decoyFiles,
+			})
+			if err == nil {
+				t.Fatal("DeployStack = nil, want a declaration carrying a com.swarmcli. label refused")
+			}
+			for _, want := range []string{"declares", "'" + tc.key + "'", "com.swarmcli."} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not say %q", err, want)
+				}
+			}
+			if len(api.order) != 0 || len(api.created) != 0 {
+				t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// The secret half on its own: the config above is refused first, so without this
+// a secret-only regression would pass unseen.
+func TestDeployStackRefusesASecretCarryingAReservedLabel(t *testing.T) {
+	api := &fakeAPI{}
+	manifest := "services:\n  app:\n    image: busybox\n    secrets: [token]\n" +
+		"secrets:\n  token:\n    driver: vault\n    labels:\n      com.swarmcli.cd.created: x\n"
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "rel", Manifest: manifest, Resolve: ResolveNever})
+	if err == nil || !strings.Contains(err.Error(), "declares secret 'rel_token'") {
+		t.Fatalf("DeployStack = %v, want the secret refused for its com.swarmcli. label", err)
+	}
+	if len(api.order) != 0 {
+		t.Errorf("created %v, want nothing", api.order)
+	}
+}
+
+// An operator's config pre-seeded under the name a chart then declares, with the
+// same bytes, is adopted — relabelled into the stack and never given the creation
+// marker, which is what keeps the sweep off it. A chart that brought the marker
+// among its own labels would have it carried onto the operator's config, so the
+// declaration is refused and the config left as it was.
+func TestAnAdoptedConfigCannotBeGivenTheCreationMarker(t *testing.T) {
+	seeded := swarm.Config{ID: "seeded", Spec: swarm.ConfigSpec{
+		Annotations: swarm.Annotations{Name: "rel_site", Labels: map[string]string{"owner": "operator"}},
+		Data:        decoyFiles["files/decoy.conf"],
+	}}
+	api := &fakeAPI{configs: []swarm.Config{seeded}}
+	manifest := "services:\n  app:\n    image: busybox\n    configs: [site]\n" +
+		"configs:\n  site:\n    file: files/decoy.conf\n    labels:\n      com.swarmcli.cd.created: x\n"
+
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+		Name: "rel", Manifest: manifest, Resolve: ResolveNever, Files: decoyFiles,
+	})
+	if err == nil || !strings.Contains(err.Error(), "com.swarmcli.cd.created") {
+		t.Fatalf("DeployStack = %v, want the declaration refused for the creation marker", err)
+	}
+	if len(api.updatedConfigs) != 0 {
+		t.Errorf("the operator's config was relabelled: %+v", api.updatedConfigs)
+	}
+}
+
+// A release record's name is the engine's to allocate — a fixed prefix, the
+// release name and a revision — including the ones it has not written yet. A
+// release whose own name starts with that prefix can make a future record's name
+// look scoped to itself, so a declared config or secret whose name starts with
+// the prefix is refused whatever exists on the swarm, for either kind.
+func TestDeployStackRefusesADeclarationNamedLikeAReleaseRecord(t *testing.T) {
+	for _, tc := range []struct{ name, kind, target string }{
+		{"a config", "configs", "swarmcli.release.team_web.v2"},
+		{"a secret", "secrets", "swarmcli.release.team_web.v2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "swarmcli.release.team", Manifest: stealsByDeclaring(tc.kind, tc.target, true),
+				Resolve: ResolveNever, Files: decoyFiles,
+			})
+			if err == nil {
+				t.Fatalf("DeployStack = nil, want %s named %s refused", tc.kind, tc.target)
+			}
+			for _, want := range []string{"declares", "'" + tc.target + "'", "release record"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not say %q", err, want)
+				}
+			}
+			if len(api.order) != 0 {
+				t.Errorf("created %v, want nothing", api.order)
+			}
+		})
 	}
 }
 
@@ -2963,9 +3165,14 @@ func TestAStackMayReferenceOnlyWhatItsApplicationPermits(t *testing.T) {
 			application.Allow{Configs: []string{"another-site"}},
 		},
 		{
-			"a secret it declares under another stack's name", stealsByDeclaring("shared-apikey", true), "allow.secrets",
+			"a secret it declares under another stack's name", stealsByDeclaring("secrets", "shared-apikey", true), "allow.secrets",
 			application.Allow{Secrets: []string{"shared-apikey"}},
 			application.Allow{Secrets: []string{"another-apikey"}},
+		},
+		{
+			"a config it declares under another stack's name", stealsByDeclaring("configs", "shared-conf", true), "allow.configs",
+			application.Allow{Configs: []string{"shared-conf"}},
+			application.Allow{Configs: []string{"another-conf"}},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2978,7 +3185,7 @@ func TestAStackMayReferenceOnlyWhatItsApplicationPermits(t *testing.T) {
 				})
 			}
 
-			if err := allowing(t, existing(), tc.permitted).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever}); err != nil {
+			if err := allowing(t, existing(), tc.permitted).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever, Files: decoyFiles}); err != nil {
 				t.Fatalf("DeployStack = %v, want the permitted reference deployed", err)
 			}
 
@@ -2992,7 +3199,7 @@ func TestAStackMayReferenceOnlyWhatItsApplicationPermits(t *testing.T) {
 				t.Run(refused.why, func(t *testing.T) {
 					api := existing()
 
-					err := allowing(t, api, refused.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever})
+					err := allowing(t, api, refused.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever, Files: decoyFiles})
 					if err == nil {
 						t.Fatal("DeployStack = nil, want the reference refused")
 					}

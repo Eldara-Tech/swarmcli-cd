@@ -277,6 +277,13 @@ func (b *Backend) CreateConfig(ctx context.Context, name string, data []byte, la
 // length of a plan. On a swarm whose stacks mount configs of their own that is
 // the difference between retaining the release store and retaining the whole
 // config store, on the manager node holding the raft log.
+//
+// A config carrying a stack namespace is never reported as a record, whatever
+// its other labels say — releaseRecorded's rule, for the reason it gives: a stack
+// deploy stamps that label on everything it creates, and a genuine record is
+// written through CreateConfig without one. Such a config keeps its name and its
+// other labels and loses the type label too, not only its payload, because the
+// engine inspects a typed config whose payload the listing did not carry.
 func (b *Backend) ListConfigs(ctx context.Context) ([]charts.ConfigMeta, error) {
 	configs, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{})
 	if err != nil {
@@ -286,7 +293,12 @@ func (b *Backend) ListConfigs(ctx context.Context) ([]charts.ConfigMeta, error) 
 	for _, c := range configs {
 		meta := charts.ConfigMeta{Name: c.Spec.Name, Labels: c.Spec.Labels}
 		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
-			meta.Data = c.Spec.Data
+			if _, stacked := c.Spec.Labels[convert.LabelNamespace]; stacked {
+				meta.Labels = maps.Clone(c.Spec.Labels)
+				delete(meta.Labels, charts.LabelType)
+			} else {
+				meta.Data = c.Spec.Data
+			}
 		}
 		out = append(out, meta)
 	}

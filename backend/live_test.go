@@ -17,6 +17,9 @@ import (
 	"github.com/docker/docker/api/types/swarm"
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
+
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
+	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
 
 const liveManifest = `version: "3.9"
@@ -30,7 +33,7 @@ services:
 // The desired half has to be the same conversion an apply would do, or drift
 // compares against something a sync would never write.
 func TestDesiredServicesConvertsTheManifest(t *testing.T) {
-	stack, err := testBackend(t, &fakeAPI{}, nil).DesiredServices(context.Background(), liveManifest, "s")
+	stack, err := testBackend(t, &fakeAPI{}, nil).DesiredServices(context.Background(), capability.ManifestRequest{Name: "s", Manifest: liveManifest})
 	if err != nil {
 		t.Fatalf("DesiredServices = %v, want nil", err)
 	}
@@ -52,8 +55,31 @@ func TestDesiredServicesConvertsTheManifest(t *testing.T) {
 	}
 }
 
+// Both conversions the reconciler reads take the manifest's files, as DeployStack
+// does, because a config's content is one of them: what drift compares against
+// and what the sweep reads names from are the same stack a deploy would apply.
+func TestTheLiveConversionsTakeTheManifestsFiles(t *testing.T) {
+	api := &fakeAPI{configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}}}
+	b := testBackend(t, api, nil)
+	files := map[string][]byte{"files/nginx.conf": []byte("server {}\n")}
+
+	for name, read := range map[string]func(context.Context, capability.ManifestRequest) (*cdcompose.Stack, error){
+		"DesiredServices":   b.DesiredServices,
+		"DeclaredResources": b.DeclaredResources,
+	} {
+		stack, err := read(context.Background(), capability.ManifestRequest{Name: "s", Manifest: shipsAConfig, Files: files})
+		if err != nil {
+			t.Errorf("%s = %v, want the manifest converted with its files", name, err)
+			continue
+		}
+		if len(stack.Configs) != 1 || string(stack.Configs[0].Data) != "server {}\n" {
+			t.Errorf("%s configs = %+v, want s_site holding files/nginx.conf", name, stack.Configs)
+		}
+	}
+}
+
 func TestDesiredServicesReportsAnUnusableManifest(t *testing.T) {
-	_, err := testBackend(t, &fakeAPI{}, nil).DesiredServices(context.Background(), "services: [", "s")
+	_, err := testBackend(t, &fakeAPI{}, nil).DesiredServices(context.Background(), capability.ManifestRequest{Name: "s", Manifest: "services: ["})
 	if err == nil {
 		t.Fatal("DesiredServices = nil, want an error for a manifest that does not parse")
 	}
@@ -416,8 +442,8 @@ func TestLiveConfigsAndSecretsIgnoreWhatWasAdoptedRatherThanCreated(t *testing.T
 // cannot be applied here by eye. applyNetworks never relabels an existing
 // network into a stack's namespace, so there is no adoption to catch — and
 // requiring a marker would instead stop the sweep touching every network created
-// before the label existed, silently, which is the one kind the sweep can act on
-// at all now that a chart cannot own a config or secret (#99).
+// before the label existed, silently — and networks are most of what the sweep
+// acts on, since a chart owns a secret only when it is driver-backed (#99).
 func TestLiveNetworksDoNotRequireTheCreationMarker(t *testing.T) {
 	api := &fakeAPI{networks: []network.Summary{stackNetwork("n1", "s_front", "s")}}
 

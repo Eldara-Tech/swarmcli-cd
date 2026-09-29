@@ -255,21 +255,149 @@ func mountsOf(t *testing.T, cli *dockerclient.Client, name string) []mount.Mount
 	return svc.Spec.TaskTemplate.ContainerSpec.Mounts
 }
 
-// The other way to get at a name — the config is one of the stack's **own**, no
-// `external:` anywhere, and `name:` points it at something that already exists —
-// used to be covered here by TestAStackMayNotClaimAReleaseRecordAsItsOwn.
+// claimerChartFiles is the other way to get at a name: the config is one of the
+// stack's **own** — no `external:` anywhere — and `name:` points it at something
+// that already exists. Conversion namespace-scopes a declaration by default,
+// which is what makes an unscoped one worth refusing.
 //
-// #99 removed the route rather than the rule. That shape needs a stack-owned
-// config, a config's only content is `file:`, and `file:` read the controller's
-// own filesystem, so it is refused before conversion. A config has no `driver:`
-// to declare it without content the way a secret does, so there is no manifest
-// left that reaches the declared-name branch of the guard for a config, and no
-// honest way to deploy this against a real swarm.
+// The content is a file the chart ships, which is the only way a config gets
+// any. Its contents are irrelevant: a resource that already exists is never
+// created from them.
+func claimerChartFiles(release, target string) map[string]string {
+	files := chartFiles(release, 1)
+	files["charts/app/files/decoy.conf"] = "not the real thing\n"
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  claimer:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    configs: [\"mine\"]\n" +
+		"    deploy:\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"configs:\n" +
+		"  mine:\n" +
+		"    name: \"" + target + "\"\n" +
+		"    file: files/decoy.conf\n"
+	return files
+}
+
+// A tenant stack may not claim one of the engine's release records as its own
+// (#86).
 //
-// The rule is still enforced and still tested: backend's
-// TestDeployStackRefusesAStackDeclaringAReleaseRecordName addresses
-// rejectForbiddenResources directly. What is gone is the end-to-end proof — that
-// the record exists under the claimed name, that the refusal comes from the
-// applier rather than from something upstream, and that a refused deploy leaves
-// the victim's record unlabelled. Restore this test if a chart is ever given a
-// way to carry content of its own.
+// This is the same theft as TestAStackMayNotMountAReleaseRecord by a different
+// route, and the route is the point: nothing here is an `external:` reference, so
+// the guard's reference check sees a name the stack declares and passes it, and
+// CE's external-reference pre-flight has nothing to pre-flight either. What used
+// to stop it was the applier noticing, three steps later, that a config with that
+// name already held different content — an error about immutability, for an
+// attempt to take another release's rendered manifest over, after a network had
+// already been created.
+//
+// A real swarm is what makes it a proof: the record exists under the name the
+// manifest claims, the daemon would have handed it over, and the refusal comes
+// from the declared-name guard rather than from something upstream declining for
+// an unrelated reason — the chart's path is one the chart ships, so nothing that
+// checks paths has anything to say about it.
+func TestAStackMayNotClaimAReleaseRecordAsItsOwn(t *testing.T) {
+	cli := dockerClient(t)
+	const (
+		victim  = "e2e-claim-victim"
+		claimer = "e2e-claim-claimer"
+	)
+	victimRepo := gitRepo(t, chartFiles(victim, 1))
+	t.Cleanup(func() { removeStack(t, victim); removeStack(t, claimer) })
+
+	ctx := context.Background()
+	rec := reconciler(t, releaseApp("victim", victimRepo, true))
+	if err := rec.SyncNow(ctx, "victim"); err != nil {
+		t.Fatalf("SyncNow(victim) = %v, want nil", err)
+	}
+	waitForRunning(t, cli, victim, 1)
+
+	record := "swarmcli.release." + victim + ".v1"
+	claimerRepo := gitRepo(t, claimerChartFiles(claimer, record))
+
+	rec2 := reconciler(t, releaseApp("claimer", claimerRepo, true))
+	err := rec2.SyncNow(ctx, "claimer")
+	if err == nil {
+		t.Fatal("SyncNow(claimer) = nil, want the deploy refused for claiming a release record")
+	}
+	if !strings.Contains(err.Error(), "declares") || !strings.Contains(err.Error(), "release record") {
+		t.Fatalf("SyncNow(claimer) = %v, want it refused by the mount guard for declaring the name", err)
+	}
+
+	if names := serviceNamesOf(t, cli, claimer); len(names) != 0 {
+		t.Errorf("services = %v, want none created by a refused deploy", names)
+	}
+	// The victim's record is still the victim's, with its own content and no
+	// tenant namespace label on it.
+	if got := configLabels(t, cli, record)["com.docker.stack.namespace"]; got != "" {
+		t.Errorf("the release record carries namespace label %q; a refused deploy relabelled it", got)
+	}
+}
+
+// pathChartFiles is a chart declaring one config or secret whose file: is path,
+// and shipping a file of its own so that the chart has one to name.
+func pathChartFiles(release, kind, path string) map[string]string {
+	files := chartFiles(release, 1)
+	files["charts/app/files/token"] = "s3cr3t\n"
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    deploy:\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		kind + ":\n" +
+		"  loot:\n" +
+		"    file: " + path + "\n"
+	return files
+}
+
+// A chart's file: names content the chart ships and nothing else, through the
+// whole chain — CE resolving the chart, the plan, and this applier. A path
+// outside the chart is refused, and so is a secret's file: even when it names
+// something the chart does ship; either way nothing is created.
+//
+// Which layer refuses the first two is deliberately not asserted: the chart
+// engine refuses them while planning, and this applier would refuse them again.
+// The secret case reaches the applier, because the engine resolves a secret's
+// files/ path like any other.
+func TestAChartMayNotReadAPathItDoesNotShip(t *testing.T) {
+	cli := dockerClient(t)
+	for _, tc := range []struct{ name, release, kind, path, why string }{
+		{"an absolute path", "e2e-path-absolute", "configs", "/etc/hostname", "is an absolute path"},
+		{"an escaping path", "e2e-path-escaping", "configs", "files/../../swarmcli-release.yaml", "escapes the chart"},
+		{"a secret file", "e2e-path-secret", "secrets", "files/token", "file: is refused"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(func() { removeStack(t, tc.release) })
+
+			rec := reconciler(t, releaseApp("path", gitRepo(t, pathChartFiles(tc.release, tc.kind, tc.path)), true))
+			err := rec.SyncNow(context.Background(), "path")
+			if err == nil {
+				t.Fatalf("SyncNow = nil, want file: %s refused", tc.path)
+			}
+			if !strings.Contains(err.Error(), tc.why) {
+				t.Errorf("SyncNow = %v, want it to say %q", err, tc.why)
+			}
+			if names := serviceNamesOf(t, cli, tc.release); len(names) != 0 {
+				t.Errorf("services = %v, want none created by a refused deploy", names)
+			}
+			if names := stackConfigNames(t, cli, tc.release); len(names) != 0 {
+				t.Errorf("configs = %v, want none created by a refused deploy", names)
+			}
+			secrets, err := cli.SecretList(context.Background(), swarm.SecretListOptions{Filters: stackFilter(tc.release)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(secrets) != 0 {
+				t.Errorf("%d secrets created by a refused deploy, want none", len(secrets))
+			}
+		})
+	}
+}

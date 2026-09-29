@@ -13,15 +13,13 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 )
 
-// The case in #80, for the one kind of #75's three that a manifest can still put
-// in range. A network dropped from a template is removed; the one the chart still
-// declares is not.
+// The case in #80, for networks. A network dropped from a template is removed;
+// the one the chart still declares is not.
 //
 // It covered configs and secrets too until #99 refused the only key that let a
-// chart declare either. Nothing in the sweep changed — an `external:` reference
-// is not a declaration, so no manifest can produce a stack-owned config or secret
-// for it to consider — and rather than assert over two kinds that can no longer
-// be there, this now covers the one that can. See chartFilesWithPrunables.
+// chart declare either. A secret is still out of range — an `external:` reference
+// is not a declaration — and a config is back in it, covered by
+// TestAShippedConfigIsDeployedRotatedAndPruned below. See chartFilesWithPrunables.
 //
 // Deliberately the default drift mode, for the reason the service sweep is:
 // dropping something from a template is git moving, not the swarm moving, and a
@@ -88,11 +86,10 @@ func TestResourcesDroppedFromATemplateArePruned(t *testing.T) {
 // label that no revision of ours ever declared is not ours to delete, whatever
 // the label says — the label says where it lives, not who put it there.
 //
-// #99 made this the load-bearing test of the config sweep rather than a corner of
-// it. No manifest can declare a config any more, so declaredNames reports none
-// for every release there is, and every namespace-labelled config on the swarm is
-// now something the sweep sees as undeclared. The ownership check is the only
-// thing between that and deleting all of them, and this is what holds it down.
+// A fixture that declares no config makes this the sharp case: declaredNames
+// reports none for the release, so every namespace-labelled config on it is
+// something the sweep sees as undeclared, and the ownership check is the only
+// thing between that and deleting all of them.
 func TestAConfigThisControllerNeverDeclaredIsNeverPruned(t *testing.T) {
 	cli := dockerClient(t)
 	const release = "e2e-res-stranger"
@@ -119,5 +116,85 @@ func TestAConfigThisControllerNeverDeclaredIsNeverPruned(t *testing.T) {
 
 	if got := stackConfigNames(t, cli, release); !slices.Contains(got, stranger) {
 		t.Errorf("configs = %v, want the hand-made %q left alone — it was never proved ours", got, stranger)
+	}
+}
+
+// A chart's own configs, end to end: the content comes from the chart — one from
+// a file it ships, one from a value — reaches the swarm as those bytes, and a
+// config superseded by new content is removed by the sweep once nothing running
+// could still use it.
+//
+// The rotation is #80's config half, which #99 took away by leaving a chart no
+// way to own a config. It is the shape a chart actually retires one in: Swarm
+// will not change a config's data, so new content arrives under a new name, and
+// the old name stays behind — still carrying the release's namespace label —
+// until something proves it is this application's and deletes it. The proof is
+// the stored revision that declared it, and that revision only converts with the
+// files it was deployed with, so this is also the test that a stored revision's
+// files reach the sweep.
+//
+// Two rotations, because the first is not enough to free anything: after it the
+// service's previous spec — what a rollback deploys — still mounts the first
+// config, and Swarm's own in-use check does not look there. So the first config
+// must survive the first rotation and go after the second.
+//
+// One install covers deploy, rotation and prune, for the budget reason the test
+// above gives.
+func TestAShippedConfigIsDeployedRotatedAndPruned(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-res-rotate"
+	repo := gitRepo(t, chartFilesWithAShippedConfig(release, 1, "listen 8080;\n"))
+	t.Cleanup(func() { removeStack(t, release) })
+
+	rec := reconciler(t, sweepingApp("edge", repo, application.DriftManifest))
+	if err := rec.SyncNow(context.Background(), "edge"); err != nil {
+		t.Fatalf("SyncNow = %v, want the chart's own configs deployed", err)
+	}
+	waitForRunning(t, cli, release, 1)
+
+	first, operator := release+"_site-1", release+"_operator"
+	if got, want := stackConfigNames(t, cli, release), []string{operator, first}; !slices.Equal(got, want) {
+		t.Fatalf("configs = %v, want %v", got, want)
+	}
+	if got := configData(t, cli, first); got != "listen 8080;\n" {
+		t.Errorf("%s holds %q, want the chart's files/site.conf", first, got)
+	}
+	if got := configData(t, cli, operator); got != "from a value\n" {
+		t.Errorf("%s holds %q, want the value it names", operator, got)
+	}
+
+	// The first rotation. The first config is now only the rollback target, and
+	// stays through a pass that would otherwise have removed it.
+	commitChange(t, repo, chartFilesWithAShippedConfig(release, 2, "listen 9090;\n"))
+	second := release + "_site-2"
+	held := []string{operator, first, second}
+	syncUntilConverged(t, rec, "edge", func() bool {
+		return slices.Equal(stackConfigNames(t, cli, release), held)
+	})
+	if err := rec.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := stackConfigNames(t, cli, release); !slices.Equal(got, held) {
+		t.Fatalf("configs = %v, want %v — the rollback target kept", got, held)
+	}
+	if got := configData(t, cli, second); got != "listen 9090;\n" {
+		t.Errorf("%s holds %q, want the new content", second, got)
+	}
+
+	// The second rotation frees the first.
+	commitChange(t, repo, chartFilesWithAShippedConfig(release, 3, "listen 7070;\n"))
+	third := release + "_site-3"
+	want := []string{operator, second, third}
+	syncUntilConverged(t, rec, "edge", func() bool {
+		return slices.Equal(stackConfigNames(t, cli, release), want)
+	})
+
+	var mounted []string
+	for _, ref := range serviceOf(t, cli, release+"_app").Spec.TaskTemplate.ContainerSpec.Configs {
+		mounted = append(mounted, ref.ConfigName)
+	}
+	slices.Sort(mounted)
+	if want := []string{operator, third}; !slices.Equal(mounted, want) {
+		t.Errorf("the service mounts %v, want %v", mounted, want)
 	}
 }

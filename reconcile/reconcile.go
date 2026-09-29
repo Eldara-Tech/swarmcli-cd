@@ -755,7 +755,7 @@ func readStacks(ctx context.Context, b charts.Backend, releases []string) (map[s
 // A backend that does not implement capability.DeclaredLister gets the resolving
 // one, which is what both callers used before #87: the same answer, unavailable
 // in the same narrow cases, rather than no sweep at all.
-func declaredReader(ldb capability.LiveDrift) func(context.Context, string, string) (*compose.Stack, error) {
+func declaredReader(ldb capability.LiveDrift) func(context.Context, capability.ManifestRequest) (*compose.Stack, error) {
 	if dl, ok := ldb.(capability.DeclaredLister); ok {
 		return dl.DeclaredResources
 	}
@@ -964,9 +964,10 @@ func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.
 			continue
 		}
 		var v releaseView
+		req := capability.ManifestRequest{Name: rp.Name, Manifest: rp.Manifest, Files: rp.Files}
 		v.live, v.err = ldb.LiveServices(ctx, rp.Name)
 		if v.err == nil && live && rp.Action == charts.ActionUnchanged {
-			v.desired, v.desiredErr = ldb.DesiredServices(ctx, rp.Manifest, rp.Name)
+			v.desired, v.desiredErr = ldb.DesiredServices(ctx, req)
 		}
 		if v.err == nil && sweep {
 			// The resolving conversion, when there is one, has already answered
@@ -975,7 +976,7 @@ func (r *Reconciler) observe(ctx context.Context, e *appEntry, spec application.
 			if v.desired != nil {
 				v.declared = v.desired
 			} else {
-				v.declared, v.err = readDeclared(ctx, rp.Manifest, rp.Name)
+				v.declared, v.err = readDeclared(ctx, req)
 			}
 		}
 		if v.err == nil && sweep && rl != nil {
@@ -1142,9 +1143,10 @@ func (r *Reconciler) departed(ctx context.Context, e *appEntry, spec application
 		// A read that failed proves nothing either way, so the kinds it covered
 		// are candidates for nothing while the services carry on.
 		if v.resErr == nil {
+			configs, secrets := inUse(v.live)
 			candidates.networks = prune.Undeclared(names(v.networks), declared.networks)
-			candidates.configs = prune.Undeclared(names(v.configs), declared.configs)
-			candidates.secrets = prune.Undeclared(names(v.secrets), declared.secrets)
+			candidates.configs = unused(prune.Undeclared(names(v.configs), declared.configs), configs)
+			candidates.secrets = unused(prune.Undeclared(names(v.secrets), declared.secrets), secrets)
 		}
 		if candidates.empty() {
 			continue
@@ -1248,7 +1250,7 @@ func (r *Reconciler) claimed(ctx context.Context, spec application.Spec, ldb cap
 		if app, ok := prune.Owner(rev, r.controller); !ok || app != spec.Name {
 			continue
 		}
-		stack, err := readDeclared(ctx, rev.Manifest, release)
+		stack, err := readDeclared(ctx, capability.ManifestRequest{Name: release, Manifest: rev.Manifest, Files: rev.Files})
 		if err != nil {
 			r.log.Warn("could not read what a stored revision declared",
 				"application", spec.Name, "release", release,
@@ -1349,6 +1351,50 @@ func runningNames(live map[string]swarm.Service) []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// inUse names the configs and secrets a running service references, in its spec
+// or in the spec a rollback would return it to.
+//
+// Swarm refuses to remove a config or secret a service's spec references, and
+// that is all it checks. PreviousSpec is what a rollback deploys — `docker
+// service rollback`, or an update whose failure_action is rollback — so one
+// referenced only there is removable, and removing it leaves the rollback nothing
+// to start. The services were read before the apply, which moves each updated
+// spec into PreviousSpec, so the spec read here is held as well: by the time the
+// sweep runs it is the previous one.
+//
+// The cost is one generation per service: a superseded config or secret goes on
+// the pass after the service's next update has moved it out of PreviousSpec,
+// rather than straight after the update that superseded it.
+func inUse(live map[string]swarm.Service) (configs, secrets map[string]struct{}) {
+	configs, secrets = map[string]struct{}{}, map[string]struct{}{}
+	for _, svc := range live {
+		for _, spec := range []*swarm.ServiceSpec{&svc.Spec, svc.PreviousSpec} {
+			if spec == nil || spec.TaskTemplate.ContainerSpec == nil {
+				continue
+			}
+			for _, ref := range spec.TaskTemplate.ContainerSpec.Configs {
+				if ref != nil {
+					configs[ref.ConfigName] = struct{}{}
+				}
+			}
+			for _, ref := range spec.TaskTemplate.ContainerSpec.Secrets {
+				if ref != nil {
+					secrets[ref.SecretName] = struct{}{}
+				}
+			}
+		}
+	}
+	return configs, secrets
+}
+
+// unused is candidates less the names in use.
+func unused(candidates []string, used map[string]struct{}) []string {
+	return slices.DeleteFunc(candidates, func(name string) bool {
+		_, held := used[name]
+		return held
+	})
 }
 
 // names is the keys of a scoped-name-to-id map.
@@ -2244,6 +2290,10 @@ func (r *Reconciler) failSync(ctx context.Context, e *appEntry, spec application
 // moving tag change the running image as a side effect of fixing someone's
 // replica count.
 //
+// The files are the plan's as well: they are the content of the configs the
+// manifest names, which the engine attaches on the apply path and nothing else
+// would attach here, so a correction deploys exactly what the apply did.
+//
 // Failures are collected rather than returned at the first: one release that
 // will not converge is no reason to leave the others drifted, and the caller
 // fails the sync on whatever comes back.
@@ -2284,7 +2334,7 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if err := backend.DeployStack(ctx, charts.DeployRequest{Name: rp.Name, Manifest: manifests[rp.Name], Resolve: ""}); err != nil {
+			if err := backend.DeployStack(ctx, charts.DeployRequest{Name: rp.Name, Manifest: manifests[rp.Name], Resolve: "", Files: rp.Files}); err != nil {
 				errs = append(errs, fmt.Errorf("converging release '%s': %w", rp.Name, err))
 				continue
 			}

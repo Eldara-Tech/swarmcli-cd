@@ -280,6 +280,38 @@ and mounting its own is unaffected, and needs no entry: its name is
 namespace-scoped to `<release>_<name>`, so it is nobody else's and nobody's to
 permit.
 
+**Content comes from the chart, never from the controller's filesystem.** A
+rendered manifest is a string, not a file in a checkout, so the only filesystem a
+path in it could name is the controller's own — the one holding the Docker
+socket, the application set and `/run/secrets`
+([#99](https://github.com/Eldara-Tech/swarmcli-cd/issues/99)). So the controller
+opens no path a manifest names:
+
+- **A config's `file:`** names a file the chart ships under `files/`, or a value
+  under `values/` — one the release file or its values files set. The chart
+  engine resolves it while the chart is in scope and hands the controller the
+  bytes, which it builds the config from in memory
+  ([#152](https://github.com/Eldara-Tech/swarmcli-cd/issues/152)). A path that
+  is absolute, escapes the chart, lies outside `files/` and `values/`, names
+  nothing the chart shipped, or contains a `$` is refused. The chart's content is
+  stored in its release record, which anyone with Docker access can read — the
+  same as the rendered manifest.
+
+  Swarm configs are immutable, so **new content needs a new name**: a config
+  that already exists under its name with different content is refused, not
+  updated. Put a version or a content hash in the config's key or `name:`, and
+  change it with the content; the superseded config is then the
+  [`pruneResources`](#what-a-chart-stops-declaring) sweep's to remove.
+- **Labels under `com.swarmcli.` are refused** on any config or secret a chart
+  declares. They are the chart engine's and this controller's own bookkeeping —
+  the labels that mark a release record, and the marker that says this
+  controller created a resource.
+- **A secret's `file:` is refused**, and so is any secret that is neither
+  `external:` nor driver-backed. A secret's content never comes from the chart:
+  an operator runs `docker secret create`, and the chart references the result
+  with `external: true`.
+- **`env_file:` is refused**; set variables with `environment:`.
+
 **Static credentials only.** The controller image ships no docker credential
 helpers, so a `config.json` using `credsStore` or `credHelpers` is refused at
 startup. Registries with static credentials (Docker Hub, GHCR, Harbor, GitLab,
@@ -764,10 +796,10 @@ all, so a comparison would report a difference on a stack nobody has touched. No
 of them can be changed without replacing the mount, which *is* reported.
 
 A **secret or config reference** is compared by name and by where it lands. The
-ids are not compared even though both sides carry a real one: a config's content is
-hashed into its name, so a change to the content is already a manifest-level
-difference, and comparing ids would report drift on a resource recreated with
-identical content. `uid`, `gid` and `mode` are not compared either, because
+ids are not compared even though both sides carry a real one: a config's content
+cannot change under the same name — the applier refuses that, so new content
+arrives under a new name and is already a manifest-level difference — and
+comparing ids would report drift on a resource recreated with identical content. `uid`, `gid` and `mode` are not compared either, because
 `docker service update` cannot change one without removing and re-adding the
 reference.
 
@@ -1111,6 +1143,14 @@ to arrive as a new name; the applier refuses one and tells you to hash the
 content into the name. A chart that does as it is told therefore strands its
 previous copy on **every value change**, not only when you remove a declaration.
 
+A config or secret that a running service's spec, or its **previous** spec,
+still references is not a candidate at all. Swarm refuses to remove one the spec
+references, but not one only the previous spec does — and the previous spec is
+what a rollback deploys. So after a rotation the copy before last is what goes,
+on the pass after the service's next update. A config or secret dropped together
+with the service that mounts it goes one sweep after that service, because the
+sweep reads the departing service's spec before it removes the service.
+
 A resource is deleted only when the swarm, git and this controller's own records
 all agree:
 
@@ -1152,11 +1192,14 @@ network created before the label existed.
 before this controller learned to mark them has no marker and cannot gain one —
 from here it is indistinguishable from one somebody else made — so it is
 reported and never deleted, the same answer clause 3 gives a resource older than
-the retained history. Since [#99](https://github.com/Eldara-Tech/swarmcli-cd/issues/99)
-a chart cannot own either kind anyway — `file:` reads the controller's own
-filesystem and is refused, and an `external:` declaration is a reference this
-controller did not create — so in practice clause 4 is a guard against the day
-that changes rather than a narrowing of what is swept today.
+the retained history. A chart owns a config when it ships the content
+([#152](https://github.com/Eldara-Tech/swarmcli-cd/issues/152)), so for configs
+clause 4 is what keeps an operator's pre-seeded copy off the sweep. A chart
+cannot own a secret with content — a secret's `file:` is refused
+([#99](https://github.com/Eldara-Tech/swarmcli-cd/issues/99)), and an `external:`
+declaration is a reference this controller did not create — so for secrets it is
+a guard against the day that changes rather than a narrowing of what is swept
+today.
 
 The four kinds are proved separately, so a config never inherits a same-named
 service's evidence — Swarm scopes all four into one namespace of names, and
