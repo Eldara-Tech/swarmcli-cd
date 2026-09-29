@@ -78,3 +78,29 @@ func TestValidateControllerID(t *testing.T) {
 		}
 	}
 }
+
+// Swarm folds case, and a '_' continues a name rather than ending it. The rule is
+// symmetric, so every pair is asked both ways round.
+func TestReleasesCollide(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"web", "web", false},
+		{"web", "WEB", true},
+		{"web", "web_a", true},
+		{"Web_A", "web", true},
+		{"a_b", "a_b_c", true},
+		{"web", "webapp", false},
+		{"web", "web-a", false},
+		{"web", "web.a", false},
+		{"web_a", "web_b", false},
+	} {
+		if got := ReleasesCollide(tc.a, tc.b); got != tc.want {
+			t.Errorf("ReleasesCollide(%s, %s) = %t, want %t", tc.a, tc.b, got, tc.want)
+		}
+		if got := ReleasesCollide(tc.b, tc.a); got != tc.want {
+			t.Errorf("ReleasesCollide(%s, %s) = %t, want %t", tc.b, tc.a, got, tc.want)
+		}
+	}
+}

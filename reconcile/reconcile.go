@@ -184,6 +184,9 @@ type Reconciler struct {
 	// entries' leases are the other half. See drain.
 	root context.Context
 	wg   sync.WaitGroup
+	// installing names, for each application whose apply is under way, the
+	// releases that apply installs. Guarded by mu; see claimInstalls.
+	installing map[*appEntry][]string
 }
 
 // New returns a Reconciler for the given applications.
@@ -219,9 +222,10 @@ func New(apps []application.Spec, o Options) *Reconciler {
 		controller: o.ControllerID,
 		// Copied, not adopted: the map is written to as the set changes, and the
 		// caller's copy — built once at startup — is not ours to mutate.
-		regAuth: make(map[string]regauth.Resolver, len(o.RegistryAuth)),
-		apps:    make(map[string]*appEntry, len(apps)),
-		order:   make([]string, 0, len(apps)),
+		regAuth:    make(map[string]regauth.Resolver, len(o.RegistryAuth)),
+		apps:       make(map[string]*appEntry, len(apps)),
+		order:      make([]string, 0, len(apps)),
+		installing: map[*appEntry][]string{},
 	}
 	maps.Copy(r.regAuth, o.RegistryAuth)
 	for _, spec := range apps {
@@ -1963,9 +1967,11 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	if err := checkCompat(plan); err != nil {
 		return err
 	}
-	if err := r.checkReleaseNames(spec.Name, plan); err != nil {
+	release, err := r.claimInstalls(e, plan)
+	if err != nil {
 		return err
 	}
+	defer release()
 	if err := r.apply(ctx, e, spec, backend, engine, plan, built, checkout, live, doomed); err != nil {
 		return err
 	}
@@ -2002,56 +2008,55 @@ func checkCompat(plan *charts.Plan) error {
 	return fmt.Errorf("refusing to apply: %s", strings.Join(refused, "; "))
 }
 
-// checkReleaseNames refuses a plan that would install a release whose name
-// collides with another release declared in the set — by another application,
-// or by this plan itself.
+// claimInstalls marks the releases a plan installs as being installed by e, and
+// returns the call that clears the mark. It refuses the plan while another
+// application is installing a release whose name collides with one of them
+// (application.ReleasesCollide).
 //
-// Two names collide when Swarm cannot keep what they scope apart: they differ
-// only in case, since Swarm folds case in the names a stack creates and in the
-// release records, or one is the other followed by '_', since release 'a'
-// declaring 'b_x' and release 'a_b' declaring 'x' both scope to 'a_b_x'. A
-// release file chooses its own release names, so the loader cannot see this; the
-// backend can refuse a case variant only once the other has records, which the
-// chart engine writes after DeployStack returns, and applications deploy in
-// their own goroutines.
+// The backend refuses an install that collides with a release that has records
+// (rejectRecordedCollision), but the chart engine writes those only after
+// DeployStack returns, and applications deploy in their own goroutines: two
+// colliding installs at once would both find none. So the mark is taken and
+// compared under one lock, and held until the apply is over — by when the
+// release that got there first has records, and the other is refused by those.
+// Only what is being installed marks and is compared: a release another
+// application declares and has not installed holds nothing, so declaring a name
+// is not a way to hold one, and a release already installed keeps deploying.
 //
-// Only an install is refused, so a release already on the swarm keeps deploying
-// and the one that arrives second is the one held. Each application records the
-// releases its plan declares before it reaches here, and this reads the set under
-// the same lock, so of two colliding installs at most one gets past it. The same
-// name in two applications is not a collision here: declaredElsewhere says why
-// that is held rather than refused.
-func (r *Reconciler) checkReleaseNames(app string, plan *charts.Plan) error {
-	elsewhere := r.declaredElsewhere(app)
-	others := slices.Sorted(maps.Keys(elsewhere))
+// Keyed by entry rather than by name, so that a retired entry still finishing
+// its apply and its successor under the same name each clear only their own. An
+// entry's own marks are never there to compare against: it holds its lease, and
+// its last apply cleared them.
+func (r *Reconciler) claimInstalls(e *appEntry, plan *charts.Plan) (func(), error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var mine []string
 	for _, rp := range plan.Releases {
 		if rp.Action != charts.ActionInstall {
 			continue
 		}
-		for _, sibling := range plan.Releases {
-			if collides(rp.Name, sibling.Name) {
-				return fmt.Errorf("refusing to install release '%s': this application also declares release '%s', and %s",
-					rp.Name, sibling.Name, whyCollide)
+		var held []string
+		for _, names := range r.installing {
+			for _, name := range names {
+				if application.ReleasesCollide(rp.Name, name) {
+					held = append(held, name)
+				}
 			}
 		}
-		for _, other := range others {
-			if collides(rp.Name, other) {
-				return fmt.Errorf("refusing to install release '%s': application '%s' declares release '%s', and %s",
-					rp.Name, elsewhere[other], other, whyCollide)
-			}
+		if len(held) > 0 {
+			return nil, fmt.Errorf("refusing to install release '%s' while release '%s' is being installed: Swarm "+
+				"cannot keep apart what the two scope — names differing only in case are one name to it, and a "+
+				"name followed by '_' is the other's prefix — so only one of them may be installed. Give the "+
+				"release a name of its own", rp.Name, slices.Min(held))
 		}
+		mine = append(mine, rp.Name)
 	}
-	return nil
-}
-
-const whyCollide = "Swarm cannot keep apart what the two scope: names that differ only in case are one name to it, " +
-	"and a name followed by '_' is the other's prefix. Give the release a name of its own"
-
-// collides reports whether two release names are distinct yet scope names Swarm
-// cannot tell apart; see checkReleaseNames.
-func collides(a, b string) bool {
-	la, lb := strings.ToLower(a), strings.ToLower(b)
-	return a != b && (la == lb || strings.HasPrefix(la, lb+"_") || strings.HasPrefix(lb, la+"_"))
+	r.installing[e] = mine
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		delete(r.installing, e)
+	}, nil
 }
 
 // unsettled names the releases a plan would still change, in plan order.
@@ -2905,8 +2910,7 @@ func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec appli
 
 // declaredElsewhere maps each release some application in the set other than
 // app declares to the application declaring it. Nothing named here is deleted by
-// app's sweeps, whatever its owner stamp says, and checkReleaseNames reads it for
-// what app may install beside them.
+// app's sweeps, whatever its owner stamp says.
 //
 // The declaring application is carried rather than a bare set because it is half
 // of what the operator has to fix: a log line naming only the release says a

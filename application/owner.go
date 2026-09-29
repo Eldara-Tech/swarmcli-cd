@@ -103,3 +103,20 @@ func ValidateControllerID(id string) error {
 	}
 	return nil
 }
+
+// ReleasesCollide reports whether two distinct release names scope names Swarm
+// cannot keep apart, so that at most one of them may be installed on a swarm.
+//
+// A release name is the stack namespace, and a stack scopes what it owns to
+// "<release>_<name>". So two names collide when they differ only in case —
+// Swarm folds case in the names a stack creates and in the release records — or
+// when one is the other followed by '_': release 'a' declaring 'b_x' and release
+// 'a_b' declaring 'x' both scope to 'a_b_x'. The same name twice is not a
+// collision; it is one release.
+//
+// It lives here because the reconciler and the backend both refuse by it, and two
+// copies that drifted apart would each let through what the other refuses.
+func ReleasesCollide(a, b string) bool {
+	la, lb := strings.ToLower(a), strings.ToLower(b)
+	return a != b && (la == lb || strings.HasPrefix(la, lb+"_") || strings.HasPrefix(lb, la+"_"))
+}

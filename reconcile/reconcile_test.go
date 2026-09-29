@@ -1687,79 +1687,74 @@ func installing(releases ...string) *charts.Plan {
 	return plan
 }
 
-// A release is not installed beside another release in the set whose name Swarm
-// cannot keep apart from it: one differing only in case, or one that is the
-// other's name followed by '_', in either direction. The other may be declared by
-// a chart application's spec or by this plan itself. Nothing is applied, and the
-// refusal names both releases and where the other comes from.
-func TestAReleaseCollidingWithOneDeclaredInTheSetIsNotInstalled(t *testing.T) {
-	for _, tc := range []struct {
-		name, installs, declared string
-		plan                     *charts.Plan
-		want                     []string
-	}{
-		{"differs only in case", "web", "Web", nil, []string{"'web'", "'acme'", "'Web'"}},
-		{"extends the other with '_'", "web_a", "web", nil, []string{"'web_a'", "'acme'", "'web'"}},
-		{"is extended by the other", "web", "WEB_a", nil, []string{"'web'", "'acme'", "'WEB_a'"}},
-		{"in the same plan", "web", "", &charts.Plan{Releases: []charts.ReleasePlan{
-			{Name: "web", Action: charts.ActionInstall}, {Name: "Web", Action: charts.ActionUnchanged},
-		}}, []string{"'web'", "this application", "'Web'"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			plan := tc.plan
-			if plan == nil {
-				plan = installing(tc.installs)
-			}
-			engine := &fakeEngine{plans: []*charts.Plan{plan}}
-			apps := []application.Spec{spec("edge", true)}
-			if tc.declared != "" {
-				apps = append(apps, chartApp("acme", tc.declared))
-			}
-			r := newTest(t, apps, engine, nil)
+// While one application is installing a release, another may not install one
+// whose name collides with it: one differing only in case, or one that is the
+// other followed by '_', in either direction. The same name is not a collision,
+// nor is an upgrade, nor a name that merely starts with the other's; and once
+// the first install is over the mark is gone — by then the release has records,
+// and the backend refuses by those.
+func TestAnInstallIsRefusedWhileACollidingOneIsBeingInstalled(t *testing.T) {
+	r := newTest(t, []application.Spec{spec("one", true), spec("two", true)}, &fakeEngine{}, nil)
+	one, two := r.apps["one"], r.apps["two"]
+	done, err := r.claimInstalls(one, installing("web"))
+	if err != nil {
+		t.Fatalf("claimInstalls(one) = %v, want the first install marked", err)
+	}
 
-			err := r.Sync(t.Context(), "edge")
-			if err == nil {
-				t.Fatal("Sync = nil, want the install refused")
-			}
-			for _, want := range tc.want {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("error %q does not mention %s", err, want)
-				}
-			}
-			if engine.applyCount() != 0 {
-				t.Error("the plan was applied despite the refusal")
-			}
-		})
+	for _, name := range []string{"Web", "web_a", "WEB_a"} {
+		if _, err := r.claimInstalls(two, installing(name)); err == nil || !strings.Contains(err.Error(), "'web'") {
+			t.Errorf("claimInstalls(two, %s) = %v, want it refused naming the release being installed", name, err)
+		}
+	}
+	for _, plan := range []*charts.Plan{outOfSyncRelease("Web"), installing("webapp"), installing("web-a"), installing("web")} {
+		release, err := r.claimInstalls(two, plan)
+		if err != nil {
+			t.Errorf("claimInstalls(two, %s %s) = %v, want nil", plan.Releases[0].Action, plan.Releases[0].Name, err)
+			continue
+		}
+		release()
+	}
+	// Neither another application installing the same name, nor that one's
+	// clearing its mark, clears this one's.
+	if _, err := r.claimInstalls(two, installing("WEB")); err == nil {
+		t.Error("claimInstalls(two, WEB) = nil, want the first install still marked")
+	}
+	done()
+	release, err := r.claimInstalls(two, installing("Web"))
+	if err != nil {
+		t.Fatalf("claimInstalls(two, Web) after the first install = %v, want the mark gone", err)
+	}
+	release()
+
+	// Colliding with two at once, it names the same one every time.
+	three := newEntry(spec("three", true))
+	for _, claim := range []struct {
+		e    *appEntry
+		name string
+	}{{one, "a_c"}, {three, "a_b"}} {
+		if _, err := r.claimInstalls(claim.e, installing(claim.name)); err != nil {
+			t.Fatalf("claimInstalls(%s) = %v, want it marked", claim.name, err)
+		}
+	}
+	if _, err := r.claimInstalls(two, installing("a")); err == nil || !strings.Contains(err.Error(), "'a_b' is being installed") {
+		t.Errorf("claimInstalls(two, a) = %v, want it refused naming 'a_b', the first of the two in order", err)
 	}
 }
 
-// What is not refused. A release already installed keeps deploying whatever else
-// the set declares, so the one that arrived second is the one held. The same name
-// in two applications is declaredElsewhere's case, held at prune rather than
-// refused. And a name that merely starts with the other's, without the '_', or
-// with another separator, scopes nothing the other does.
-func TestReleaseNamesSwarmKeepsApartAreInstalled(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		plan     *charts.Plan
-		declared string
-	}{
-		{"an upgrade", outOfSyncRelease("web"), "Web"},
-		{"the same name", installing("web"), "web"},
-		{"a longer name", installing("webapp"), "web"},
-		{"another separator", installing("web-a"), "web"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			engine := &fakeEngine{plans: []*charts.Plan{tc.plan, declaring(tc.plan.Releases[0].Name)}}
-			r := newTest(t, []application.Spec{spec("edge", true), chartApp("acme", tc.declared)}, engine, nil)
+// Declaring a release holds no name. A chart application that has not installed
+// its release — refused, failing, or not yet reconciled — does not keep another
+// application from installing a release whose name collides with it; whichever
+// installs first holds the name, and the backend refuses the other by its
+// records.
+func TestADeclaredReleaseThatIsNotBeingInstalledHoldsNoName(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{installing("web"), declaring("web")}}
+	r := newTest(t, []application.Spec{spec("edge", true), chartApp("acme", "Web"), chartApp("shop", "web_a")}, engine, nil)
 
-			if err := r.Sync(t.Context(), "edge"); err != nil {
-				t.Fatalf("Sync = %v, want the plan applied", err)
-			}
-			if engine.applyCount() != 1 {
-				t.Errorf("applied %d times, want 1", engine.applyCount())
-			}
-		})
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want the install applied", err)
+	}
+	if engine.applyCount() != 1 {
+		t.Errorf("applied %d times, want 1", engine.applyCount())
 	}
 }
 
@@ -1770,45 +1765,54 @@ func outOfSyncRelease(name string) *charts.Plan {
 	return plan
 }
 
-// racingEngine plans one install per application and holds each application's
-// first plan until every application has planned, so that their installs reach
-// the release-name check with each other's plans already recorded — the window a
-// check against release records alone leaves open, because the chart engine
-// writes those after the deploy.
+// racingEngine installs one release per application and holds every Apply until
+// the test lets it go, so that one application's install is still in flight
+// when the other's reaches claimInstalls. Its first plans are held too, until
+// both applications have planned.
 type racingEngine struct {
 	*fakeEngine
 	releases map[string]string // application → the release it installs
-	arrived  chan string
-	proceed  chan struct{}
+	planned  chan string
+	plan     chan struct{}
+	applying chan string
+	apply    chan struct{}
 
-	mu      sync.Mutex
-	planned map[string]bool
+	mu    sync.Mutex
+	plans map[string]int
 }
 
 func (e *racingEngine) PlanApply(_ context.Context, _ *charts.ReleaseFile, _ charts.ChartSource, opts charts.PlanOptions) (*charts.Plan, error) {
 	app := opts.Owner[strings.LastIndex(opts.Owner, "/")+1:]
 	e.mu.Lock()
-	first := !e.planned[app]
-	e.planned[app] = true
+	e.plans[app]++
+	first := e.plans[app] == 1
 	e.mu.Unlock()
 	if !first {
 		return declaring(e.releases[app]), nil
 	}
-	e.arrived <- app
-	<-e.proceed
+	e.planned <- app
+	<-e.plan
 	return installing(e.releases[app]), nil
 }
 
-// Two applications installing releases that differ only in case, at once: at most
-// one is deployed, whichever way the two goroutines interleave, and the other is
-// refused naming it.
-func TestOfTwoCollidingInstallsAtOnceAtMostOneIsDeployed(t *testing.T) {
+func (e *racingEngine) Apply(ctx context.Context, plan *charts.Plan, opts charts.InstallOptions) ([]charts.ApplyResult, error) {
+	e.applying <- plan.Releases[0].Name
+	<-e.apply
+	return e.fakeEngine.Apply(ctx, plan, opts)
+}
+
+// Two applications installing releases that differ only in case, at once: the
+// one that reaches the check first is deployed, and the other is refused naming
+// it while the first is still being installed.
+func TestOfTwoCollidingInstallsAtOnceTheFirstIsDeployed(t *testing.T) {
 	engine := &racingEngine{
 		fakeEngine: &fakeEngine{},
 		releases:   map[string]string{"one": "web", "two": "Web"},
-		arrived:    make(chan string, 2),
-		proceed:    make(chan struct{}),
-		planned:    map[string]bool{},
+		planned:    make(chan string, 2),
+		plan:       make(chan struct{}),
+		applying:   make(chan string, 2),
+		apply:      make(chan struct{}),
+		plans:      map[string]int{},
 	}
 	r := newTest(t, []application.Spec{spec("one", true), spec("two", true)}, engine, nil)
 
@@ -1816,45 +1820,39 @@ func TestOfTwoCollidingInstallsAtOnceAtMostOneIsDeployed(t *testing.T) {
 	for _, app := range []string{"one", "two"} {
 		go func() { errs <- r.Sync(t.Context(), app) }()
 	}
-	<-engine.arrived
-	<-engine.arrived
-	close(engine.proceed)
-
-	var refused int
+	timeout := time.After(10 * time.Second)
 	for range 2 {
-		if err := <-errs; err != nil {
-			if !strings.Contains(err.Error(), "differ only in case") {
-				t.Errorf("Sync = %v, want a refusal naming the collision", err)
-			}
-			refused++
+		select {
+		case <-engine.planned:
+		case <-timeout:
+			t.Fatal("both applications did not plan")
 		}
 	}
-	if applied := engine.applyCount(); applied > 1 || applied+refused != 2 {
-		t.Errorf("applied %d and refused %d, want at most one applied and the rest refused", applied, refused)
-	}
-}
+	close(engine.plan)
 
-// Swarm folds case, and a '_' continues a name rather than ending it.
-func TestCollides(t *testing.T) {
-	for _, tc := range []struct {
-		a, b string
-		want bool
-	}{
-		{"web", "web", false},
-		{"web", "WEB", true},
-		{"web", "web_a", true},
-		{"Web_A", "web", true},
-		{"web", "webapp", false},
-		{"web", "web-a", false},
-		{"web_a", "web_b", false},
-		{"a_b", "a_b_c", true},
-	} {
-		if got := collides(tc.a, tc.b); got != tc.want {
-			t.Errorf("collides(%s, %s) = %t, want %t", tc.a, tc.b, got, tc.want)
+	var first string
+	select {
+	case first = <-engine.applying:
+	case <-timeout:
+		t.Fatal("neither install reached the apply")
+	}
+	select {
+	case err := <-errs:
+		other := map[string]string{"web": "'Web'", "Web": "'web'"}[first]
+		if err == nil || !strings.Contains(err.Error(), "'"+first+"'") || !strings.Contains(err.Error(), other) {
+			t.Errorf("Sync = %v, want the second install refused naming '%s'", err, first)
 		}
-		if got := collides(tc.b, tc.a); got != tc.want {
-			t.Errorf("collides(%s, %s) = %t, want %t", tc.b, tc.a, got, tc.want)
-		}
+	case name := <-engine.applying:
+		t.Fatalf("both installs reached the apply: %s and %s", first, name)
+	case <-timeout:
+		t.Fatal("the second install was neither refused nor applied")
+	}
+	close(engine.apply)
+	if err := <-errs; err != nil {
+		t.Errorf("Sync = %v, want the first install applied", err)
+	}
+	if applied := engine.applyCount(); applied != 1 {
+		t.Errorf("applied %d times, want 1", applied)
 	}
 }
 
