@@ -1854,6 +1854,12 @@ func TestOfTwoCollidingInstallsAtOnceTheFirstIsDeployed(t *testing.T) {
 	if applied := engine.applyCount(); applied != 1 {
 		t.Errorf("applied %d times, want 1", applied)
 	}
+	// And the mark goes with the apply: nothing is being installed any more.
+	release, err := r.claimInstalls(r.apps["two"], installing(first+"_x"))
+	if err != nil {
+		t.Fatalf("claimInstalls after both syncs = %v, want the first install's mark gone", err)
+	}
+	release()
 }
 
 // The D-e default. An orphan is reported and left running unless the

@@ -1279,7 +1279,10 @@ func (b *Backend) rejectOwnNamespaceInAnotherCase(ctx context.Context, release s
 // install is refused for it, so the release recorded first keeps deploying, and
 // so does a pair installed before this was refused. Records outlive the process,
 // so this holds across a restart and against a release installed from outside
-// the app set, neither of which the reconciler's claimInstalls sees.
+// the app set, neither of which the reconciler's claimInstalls sees. The self
+// release is not refused for it either: its stack is the one this controller
+// already runs as, so refusing to adopt it would keep nothing apart, and the name
+// it would ask for is the one rejectSelfMismatch requires.
 //
 // Listed by name prefix, which the daemon matches without regard to case: this
 // release's own records and its case variants', those of every release named
@@ -1316,7 +1319,7 @@ func (b *Backend) rejectRecordedCollision(ctx context.Context, release string) e
 			extends = other
 		}
 	}
-	if extends != "" && !own {
+	if extends != "" && !own && !b.selfRelease {
 		return fmt.Errorf("refusing to install release '%s': release '%s' already has release records on this swarm, and "+
 			"one name is the other followed by '_', so what the two scope collides — release 'a' declaring 'b_x' and "+
 			"release 'a_b' declaring 'x' are both 'a_b_x'. Give the release a name of its own", release, extends)

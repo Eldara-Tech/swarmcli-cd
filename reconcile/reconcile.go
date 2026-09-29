@@ -2019,6 +2019,8 @@ func checkCompat(plan *charts.Plan) error {
 // colliding installs at once would both find none. So the mark is taken and
 // compared under one lock, and held until the apply is over — by when the
 // release that got there first has records, and the other is refused by those.
+// An apply that deployed and then failed to write the record leaves none behind,
+// which lets the other install in, and the first is then refused by its records.
 // Only what is being installed marks and is compared: a release another
 // application declares and has not installed holds nothing, so declaring a name
 // is not a way to hold one, and a release already installed keeps deploying.

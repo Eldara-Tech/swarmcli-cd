@@ -2420,8 +2420,9 @@ func TestDeployStackAllowsAnOrdinaryExternalConfig(t *testing.T) {
 // a release name is compared against the controller's own namespace whatever the
 // manifest declares (#102). It costs one pair of round trips for the life of the
 // process, which is what TestTheControllersOwnMountsAreReadOnce pins. So is the
-// read of this release's own records by name prefix (rejectRecordedCollision),
-// which is bounded by the release's own history rather than by every release's.
+// read of the records by name prefix (rejectRecordedCollision), which is bounded
+// by this release's own history and those of the releases its name collides with,
+// rather than by every release's.
 func TestAStackThatReachesForNothingCostsNoReleaseLookup(t *testing.T) {
 	const selfContained = `
 services:
@@ -3019,6 +3020,24 @@ func TestDeployStackRefusesInstallingAReleaseCollidingWithARecordedOne(t *testin
 		case tc.refused != "" && (len(api.created) != 0 || len(api.order) != 0):
 			t.Errorf("DeployStack(%s) created %v and %d services, want nothing", tc.release, api.order, len(api.created))
 		}
+	}
+
+	// Beside two, the refusal names the first in order, whatever order the
+	// daemon lists them in.
+	for _, listed := range [][]string{{"web_b", "web_a"}, {"web_a", "web_b"}} {
+		api := asController(&fakeAPI{configs: []swarm.Config{record(listed[0]), record(listed[1])}})
+		err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: trivialStack, Resolve: ResolveNever})
+		if err == nil || !strings.Contains(err.Error(), "'web_a'") {
+			t.Errorf("DeployStack(web) beside %v = %v, want it refused naming 'web_a'", listed, err)
+		}
+	}
+
+	// The self release adopts the stack this controller already runs as, so a
+	// recorded release whose name extends it does not refuse it.
+	self := selfAPI()
+	self.configs = append(self.configs, record("swarmcli-cd_x"))
+	if err := testBackend(t, self, nil).WithSelfRelease(noDeferral).DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: selfStack, Resolve: ResolveNever}); err != nil {
+		t.Errorf("DeployStack(self) beside a recorded 'swarmcli-cd_x' = %v, want the self release adopted", err)
 	}
 
 	api := asController(&fakeAPI{})
