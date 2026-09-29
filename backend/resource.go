@@ -344,6 +344,15 @@ func (b *Backend) DeleteConfig(ctx context.Context, name string) error {
 // release named for the controller's stack would name the volume holding every
 // application's git clone and chart cache, so the refusal has to be on the read
 // that produces the list rather than only on the removal that precedes it (#102).
+//
+// The label is checked here as well as sent as a filter, because on a manager
+// the daemon applies the filter only to the node-local volumes: it appends every
+// cluster volume unfiltered (volume_routes.go:41-51 and
+// daemon/cluster/volumes.go:37, which sends an empty ListVolumesRequest). Only a
+// node-local volume carrying this stack's namespace is returned. A cluster volume
+// never is, labelled or not: a stack deploy neither creates nor labels one
+// (docker/cli's convert gives a cluster mount empty ClusterOptions), so one was
+// provisioned outside the release, and removing it deletes its storage.
 func (b *Backend) StackVolumes(ctx context.Context, name string) ([]string, error) {
 	if err := b.rejectOwnNamespace(ctx, name); err != nil {
 		return nil, err
@@ -354,7 +363,9 @@ func (b *Backend) StackVolumes(ctx context.Context, name string) ([]string, erro
 	}
 	out := make([]string, 0, len(resp.Volumes))
 	for _, v := range resp.Volumes {
-		out = append(out, v.Name)
+		if v.ClusterVolume == nil && v.Labels[convert.LabelNamespace] == name {
+			out = append(out, v.Name)
+		}
 	}
 	sort.Strings(out)
 	return out, nil

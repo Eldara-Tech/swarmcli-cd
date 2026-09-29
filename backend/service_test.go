@@ -57,6 +57,10 @@ type fakeAPI struct {
 	nodes      []swarm.Node
 	tasks      []swarm.Task
 	networkErr error
+	// clusterVolumes are CSI cluster volumes, which a manager appends to every
+	// volume listing whatever its filter (docker v28.5.2
+	// api/server/router/volume/volume_routes.go:41-51).
+	clusterVolumes []volume.Volume
 	// nodeErr fails the node listing, which is what a worker node answers: only
 	// a manager can enumerate the swarm.
 	nodeErr error
@@ -903,8 +907,22 @@ func (f *fakeAPI) VolumeList(_ context.Context, o volume.ListOptions) (volume.Li
 			out = append(out, &f.volumes[i])
 		}
 	}
+	for _, v := range f.clusterVolumes {
+		out = append(out, asCluster(v))
+	}
 	return volume.ListResponse{Volumes: out}, nil
 }
+
+// asCluster is a cluster volume as the daemon reports one: with its ClusterVolume
+// set, which a node-local volume never has.
+func asCluster(v volume.Volume) *volume.Volume {
+	v.Scope = "global"
+	v.ClusterVolume = &volume.ClusterVolume{ID: "csi-" + v.Name}
+	return &v
+}
+
+// VolumeRemove honours removeErr as the other removals do, so that a volume
+// that went between the list and the delete can be modelled at all.
 
 // VolumeRemove honours removeErr as the other removals do, so that a volume
 // that went between the list and the delete can be modelled at all.

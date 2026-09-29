@@ -679,6 +679,35 @@ func TestStackVolumesAreScopedAndSorted(t *testing.T) {
 	}
 }
 
+// On a manager the daemon appends every CSI cluster volume to a volume listing
+// without applying its filter, so what comes back is not only the stack's. What
+// StackVolumes returns is what a purge removes, so it keeps only the node-local
+// volumes carrying this stack's namespace. A cluster volume is never one of
+// them, even labelled with it: a stack deploy neither creates nor labels one, so
+// it was provisioned outside the release, and removing it deletes its storage.
+func TestStackVolumesKeepOnlyTheStacksOwn(t *testing.T) {
+	ns := func(stack string) map[string]string { return map[string]string{convert.LabelNamespace: stack} }
+	api := &fakeAPI{
+		volumes: []volume.Volume{{Name: "s_data", Labels: map[string]string{convert.LabelNamespace: "s", "tier": "db"}}},
+		clusterVolumes: []volume.Volume{
+			{Name: "shared-csi"},
+			{Name: "other_db", Labels: ns("other")},
+			{Name: "s_csi", Labels: ns("s")},
+			{Name: "S_csi", Labels: ns("S")},
+			{Name: "s-staging_db", Labels: ns("s-staging")},
+			{Name: "s_orphan"},
+		},
+	}
+
+	got, err := testBackend(t, api, nil).StackVolumes(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("StackVolumes = %v, want nil", err)
+	}
+	if want := []string{"s_data"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("volumes = %v, want %v", got, want)
+	}
+}
+
 func TestNetworkScopesAndSecretNames(t *testing.T) {
 	api := &fakeAPI{
 		networks: []network.Summary{{Name: "traefik-public", Scope: "swarm"}, {Name: "bridge", Scope: "local"}},
