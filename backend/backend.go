@@ -519,6 +519,10 @@ func permits(allowed []string, name string) bool {
 // (convert.Namespace.Scope), so the prefix is the whole of "this is that stack's
 // own" — for the release being deployed, whose resources need no permission, and
 // for the controller's own stack, whose do not exist.
+//
+// Compared as written, although Swarm folds case. Folding is the loose direction
+// here: a release named 'Web' would read another stack's 'web_site' as its own
+// and reach it without the app set's permission.
 func scopedUnder(namespace, name string) bool {
 	return namespace != "" && strings.HasPrefix(name, namespace+"_")
 }
@@ -1116,6 +1120,68 @@ func (b *Backend) rejectOwnNamespace(ctx context.Context, release string) error 
 		"application `self: true` in the app set", release, capability.ErrOwnStack)
 }
 
+// rejectOwnNamespaceInAnotherCase refuses to deploy a release whose name differs
+// from the stack this controller runs as only in case.
+//
+// Swarm's name index folds case, so the services, networks, configs and secrets
+// such a release scopes collide with the controller's wherever their names match
+// regardless of case. The daemon refuses each collision rather than handing the
+// controller's resources over (an update may not change a name, and a reference
+// resolves by exact name), but only as the backend reaches each one, after
+// creating whatever came first. This refuses the deploy before the backend
+// creates any of it.
+//
+// Deploy only. RemoveStack selects by the namespace label, whose value Swarm
+// compares exactly, so a spelling that differs only in case does not select the
+// controller's services, networks, configs or secrets, and refusing it would
+// leave such a stack for every later sweep to fail on; StackVolumes is left as it
+// was for the same reason. The self release needs no case of its own here:
+// rejectSelfMismatch requires its name to be the namespace exactly.
+func (b *Backend) rejectOwnNamespaceInAnotherCase(ctx context.Context, release string) error {
+	mine, err := b.mounts(ctx)
+	if err != nil {
+		return err
+	}
+	if mine.namespace == release || strings.ToLower(mine.namespace) != strings.ToLower(release) {
+		return nil
+	}
+	return fmt.Errorf("refusing to deploy release '%s': this controller runs as the stack '%s', and Swarm compares "+
+		"the names a stack creates without regard to case, so what this release scopes would collide with the "+
+		"controller's wherever the names match. Give the release a name of its own", release, mine.namespace)
+}
+
+// rejectRecordedInAnotherCase refuses to deploy a release whose name differs only
+// in case from a release that already has records on this swarm.
+//
+// A record is a config named after its release (releaseRecordPrefix), and Swarm
+// keeps config names unique regardless of case, so the two would need the same
+// record names: this release's deploy would land and then fail to be recorded,
+// and every later deploy be refused for want of a record (rejectForeignNamespace).
+// The release already recorded holds the names, so it is the other that is
+// refused, whatever source declared it — the app-set loader sees only chart
+// sources.
+//
+// Listed by name prefix, which the daemon matches without regard to case, so the
+// answer is this release's own records and its case variants' rather than the
+// whole store. The labels decide what each one is.
+func (b *Backend) rejectRecordedInAnotherCase(ctx context.Context, release string) error {
+	list, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{
+		Filters: filters.NewArgs(filters.Arg("name", releaseRecordPrefix+release+".")),
+	})
+	if err != nil {
+		return fmt.Errorf("listing release records to check release '%s' against: %w", release, err)
+	}
+	for _, c := range list {
+		other := c.Spec.Labels[charts.LabelRelease]
+		if isReleaseRecord(c.Spec.Labels) && other != release && strings.ToLower(other) == strings.ToLower(release) {
+			return fmt.Errorf("refusing to deploy release '%s': release '%s' already has release records on this swarm, "+
+				"and Swarm compares config names without regard to case, so the two would need the same record names. "+
+				"Give the release a name of its own", release, other)
+		}
+	}
+	return nil
+}
+
 // releaseConfigNames names the chart engine's release records.
 //
 // Matched by the engine's own exported label rather than by the
@@ -1192,6 +1258,12 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 		if err := b.rejectOwnNamespace(ctx, req.Name); err != nil {
 			return err
 		}
+		if err := b.rejectOwnNamespaceInAnotherCase(ctx, req.Name); err != nil {
+			return err
+		}
+	}
+	if err := b.rejectRecordedInAnotherCase(ctx, req.Name); err != nil {
+		return err
 	}
 
 	allow, err := b.allowFor(ctx)

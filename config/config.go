@@ -159,7 +159,11 @@ func (f *File) validate() error {
 	}
 
 	seen := make(map[string]bool, len(f.Applications))
-	claimed := make(map[string]string, len(f.Applications))
+	// Keyed by the release name in lower case: Swarm compares the names a stack
+	// deploy creates without regard to case, so two releases differing only in
+	// case collide wherever the names they scope match, and on their release
+	// records.
+	claimed := make(map[string]claim, len(f.Applications))
 	selfApp := ""
 	for i, app := range f.Applications {
 		if err := validateApplication(app); err != nil {
@@ -195,14 +199,21 @@ func (f *File) validate() error {
 		// set declares — but this is the half with an operator present to fix
 		// it, which is where a name collision belongs.
 		if c := app.Source.Chart; c != nil {
-			if other, taken := claimed[c.Release]; taken {
-				return fmt.Errorf("applications[%d]: '%s' and '%s' both declare the release '%s', and a release name is the Swarm stack namespace, so they would share one stack", i, other, app.Name, c.Release)
+			key := strings.ToLower(c.Release)
+			if other, taken := claimed[key]; taken {
+				if other.release != c.Release {
+					return fmt.Errorf("applications[%d]: '%s' and '%s' declare the releases '%s' and '%s', which differ only in case, and Swarm compares the names a stack creates without regard to case, so they would collide on their release records and wherever the names they scope match", i, other.app, app.Name, other.release, c.Release)
+				}
+				return fmt.Errorf("applications[%d]: '%s' and '%s' both declare the release '%s', and a release name is the Swarm stack namespace, so they would share one stack", i, other.app, app.Name, c.Release)
 			}
-			claimed[c.Release] = app.Name
+			claimed[key] = claim{app: app.Name, release: c.Release}
 		}
 	}
 	return nil
 }
+
+// claim is the application holding a release name, and that name as it wrote it.
+type claim struct{ app, release string }
 
 func validateApplication(app application.Spec) error {
 	if app.Name == "" {

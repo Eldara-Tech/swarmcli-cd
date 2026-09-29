@@ -211,6 +211,15 @@ reconcile time, where **no application deletes a release, or anything inside one
 that another application in the set still declares**. It is held rather than
 deleted, and the log line says which two applications to look at.
 
+Swarm compares the names a stack creates without regard to case, so two release
+names differing only in case collide on their release records and wherever the
+names they scope match. The loader refuses that pair of `chart` applications
+like one shared name. On deploy, whatever the source, a release is refused when
+its name differs only in case from one that already has release records, or
+from the controller's own stack. A release's own names are still the ones scoped
+under its name exactly as written: another stack's names in another case need
+the app set's permission.
+
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by
 swarmcli-cd, **its own `owner:` field is ignored** — the controller substitutes

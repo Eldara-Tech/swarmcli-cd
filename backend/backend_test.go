@@ -664,7 +664,8 @@ func TestListConfigsDoesNotReportAStackConfigAsARecord(t *testing.T) {
 }
 
 func TestStackVolumesAreScopedAndSorted(t *testing.T) {
-	api := &fakeAPI{volumes: []volume.Volume{{Name: "zeta"}, {Name: "alpha"}}}
+	scoped := map[string]string{convert.LabelNamespace: "s"}
+	api := &fakeAPI{volumes: []volume.Volume{{Name: "zeta", Labels: scoped}, {Name: "alpha", Labels: scoped}, {Name: "other"}}}
 
 	got, err := testBackend(t, api, nil).StackVolumes(context.Background(), "s")
 	if err != nil {
@@ -2413,7 +2414,9 @@ func TestDeployStackAllowsAnOrdinaryExternalConfig(t *testing.T) {
 // The read about this controller itself is no longer conditional and cannot be:
 // a release name is compared against the controller's own namespace whatever the
 // manifest declares (#102). It costs one pair of round trips for the life of the
-// process, which is what TestTheControllersOwnMountsAreReadOnce pins.
+// process, which is what TestTheControllersOwnMountsAreReadOnce pins. So is the
+// read of this release's own records by name prefix (rejectRecordedInAnotherCase),
+// which is bounded by the release's own history rather than by every release's.
 func TestAStackThatReachesForNothingCostsNoReleaseLookup(t *testing.T) {
 	const selfContained = `
 services:
@@ -2891,6 +2894,127 @@ func TestStackVolumesRefusesTheControllersOwnStackName(t *testing.T) {
 	}
 	if vols != nil {
 		t.Errorf("StackVolumes = %v, want nothing for a purge to delete", vols)
+	}
+}
+
+// Swarm compares the names a deploy creates without regard to case, so a release
+// named like the controller's stack in another case scopes names the swarm
+// already holds for the controller. The deploy is refused before anything is
+// created, rather than left to fail partway on the first name that collides.
+func TestDeployStackRefusesTheControllersStackNameInAnotherCase(t *testing.T) {
+	for _, tc := range []struct{ namespace, release string }{
+		{"swarmcli-cd", "SWARMCLI-CD"},
+		{"SwarmCD", "swarmcd"},
+	} {
+		api := controllerStack()
+		api.selfSpec.Labels[convert.LabelNamespace] = tc.namespace
+
+		err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: tc.release, Manifest: trivialStack, Resolve: ResolveNever})
+		if err == nil {
+			t.Fatalf("DeployStack(%s) = nil, want a release named like the controller's stack '%s' in another case refused", tc.release, tc.namespace)
+		}
+		for _, want := range []string{"'" + tc.release + "'", "'" + tc.namespace + "'", "case"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not say %s", err, want)
+			}
+		}
+		if len(api.created) != 0 || len(api.updated) != 0 || len(api.order) != 0 {
+			t.Errorf("the swarm was written to: created=%d updated=%d order=%v", len(api.created), len(api.updated), api.order)
+		}
+	}
+	// The exact name is rejectOwnNamespace's, whose refusal names the other way
+	// out; this one answers only for another case, and for no other name.
+	for _, name := range []string{"swarmcli-cd", "swarmcli-cd-edge"} {
+		if err := testBackend(t, controllerStack(), nil).rejectOwnNamespaceInAnotherCase(t.Context(), name); err != nil {
+			t.Errorf("rejectOwnNamespaceInAnotherCase(%s) = %v, want nil", name, err)
+		}
+	}
+}
+
+// A release's records are Swarm configs, named after the release, so a release
+// whose name differs from one that already has records only in case would need
+// record names the swarm already holds: its deploy would land and then fail to
+// be recorded, and every later deploy be refused for want of a record. Refused
+// before anything is created, whichever source declared it, naming the release
+// that holds the names; the release that holds them deploys as before.
+func TestDeployStackRefusesAReleaseDifferingOnlyInCaseFromARecordedOne(t *testing.T) {
+	record := func(release string) swarm.Config {
+		return swarm.Config{ID: "rec-" + release, Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+			Name:   "swarmcli.release." + release + ".v1",
+			Labels: map[string]string{charts.LabelType: charts.TypeRelease, charts.LabelRelease: release},
+		}}}
+	}
+	api := asController(&fakeAPI{configs: []swarm.Config{record("WEB"), record("web.x")}})
+
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: trivialStack, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a release differing only in case from a recorded one refused")
+	}
+	for _, want := range []string{"'web'", "'WEB'", "case"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not say %s", err, want)
+		}
+	}
+	if len(api.created) != 0 || len(api.order) != 0 {
+		t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
+	}
+	if !slices.Contains(api.configNameFilters, "swarmcli.release.web.") {
+		t.Errorf("config name filters = %q, want the records listed by this release's name prefix", api.configNameFilters)
+	}
+
+	// A stack's config typed as a record is not one (isReleaseRecord), so it
+	// holds no names for this check either.
+	stacked := record("API")
+	stacked.Spec.Labels[convert.LabelNamespace] = "API"
+	for _, release := range []string{"WEB", "web.x", "api"} {
+		api := asController(&fakeAPI{configs: []swarm.Config{record("WEB"), record("web.x"), stacked}})
+		err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: release, Manifest: trivialStack, Resolve: ResolveNever})
+		if err != nil {
+			t.Errorf("DeployStack(%s) = %v, want a release holding its own names deployed", release, err)
+		}
+	}
+}
+
+// Removing it is not refused. RemoveStack and StackVolumes select by the
+// namespace label, whose value Swarm compares exactly, so they reach only what
+// carries that spelling — never the controller's — and refusing would leave such
+// a stack for every later sweep to fail on.
+//
+// The controller's service is left out of the fixture: the fake's ServiceList
+// returns every service whatever the filter, where its config, network and
+// volume listings filter as the daemon does.
+func TestRemovingTheControllersStackNameInAnotherCaseLeavesTheControllerAlone(t *testing.T) {
+	api := controllerStack()
+	api.existing = nil
+	api.configs = append(api.configs, swarm.Config{ID: "variant", Spec: swarm.ConfigSpec{Annotations: stackScoped("SWARMCLI-CD_site", "SWARMCLI-CD")}})
+	api.volumes = append(api.volumes, volume.Volume{Name: "SWARMCLI-CD_data", Labels: map[string]string{convert.LabelNamespace: "SWARMCLI-CD"}})
+
+	if err := testBackend(t, api, nil).RemoveStack(t.Context(), "SWARMCLI-CD"); err != nil {
+		t.Fatalf("RemoveStack = %v, want the variant's own stack removed", err)
+	}
+	if !reflect.DeepEqual(api.removed, []string{"config:variant"}) {
+		t.Errorf("removed %v, want only what carries the variant's namespace", api.removed)
+	}
+	vols, err := testBackend(t, api, nil).StackVolumes(t.Context(), "SWARMCLI-CD")
+	if err != nil || !reflect.DeepEqual(vols, []string{"SWARMCLI-CD_data"}) {
+		t.Errorf("StackVolumes = %v, %v; want the variant's own volume alone", vols, err)
+	}
+}
+
+// A release's own names are those scoped under its namespace as written, and
+// scopedUnder does not fold case although Swarm does. Folding would be the loose
+// direction: a release named 'Web' would read another application's 'web_site'
+// as its own and mount it without the app set's permission, where it now needs
+// that permission like any other name outside the release.
+func TestANamespaceInAnotherCaseIsNotTheReleasesOwn(t *testing.T) {
+	api := asController(&fakeAPI{configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: stackScoped("web_site", "web")}}}})
+
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "Web", Manifest: mountsAConfig("web_site"), Resolve: ResolveNever})
+	if err == nil || !strings.Contains(err.Error(), "allow.configs") {
+		t.Fatalf("DeployStack = %v, want another stack's config refused as not permitted", err)
+	}
+	if len(api.created) != 0 {
+		t.Errorf("created %d services, want none", len(api.created))
 	}
 }
 

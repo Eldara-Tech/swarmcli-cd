@@ -127,7 +127,8 @@ default for `source.helm.releaseName` and the one choice that cannot collide:
 application names are unique within an app set, so a file that never writes a
 release name down can never have two applications claiming one stack. Write one
 down to install under a different name; two applications that write the same one
-are refused at load.
+are refused at load, and so are two whose names differ only in case, because
+Swarm compares the names a stack creates without regard to case.
 
 The two are separate fields rather than one because a `releaseFile` application
 installs several releases under a single application name, so the application
