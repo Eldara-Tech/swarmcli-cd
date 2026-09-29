@@ -323,10 +323,7 @@ func (b *Backend) rejectForeignNamespace(ctx context.Context, namespace string, 
 
 // isReleaseRecord reports whether a config's labels mark it as a release record:
 // typed as one, and not created by a stack deploy. Every reader here that trusts
-// a record applies it. The removal paths — RemoveStack, its re-check
-// stackRemains, and LiveConfigs for the sweep — do not: they list by stack
-// namespace, so this would call nothing they see a record, and they spare
-// anything typed as one instead, which is the safe direction for them.
+// a record applies it; the removal paths apply mayBeReleaseRecord instead.
 //
 // It is CE's charts.IsReleaseRecord (Eldara-Tech/swarmcli#677), which the CE
 // version this module pins predates. On the next CE bump, call that instead and
@@ -343,6 +340,16 @@ func (b *Backend) rejectForeignNamespace(ctx context.Context, namespace string, 
 func isReleaseRecord(labels map[string]string) bool {
 	_, stacked := labels[convert.LabelNamespace]
 	return labels[charts.LabelType] == charts.TypeRelease && !stacked
+}
+
+// mayBeReleaseRecord reports whether a config's labels type it as a release
+// record, whatever else they carry. It is the rule of the removal paths —
+// RemoveStack, its re-check stackRemains, and LiveConfigs for the sweep — and
+// deliberately wider than isReleaseRecord: those paths list by stack namespace,
+// so isReleaseRecord would call nothing they see a record, and sparing anything
+// typed as one is the safe direction for a removal.
+func mayBeReleaseRecord(labels map[string]string) bool {
+	return labels[charts.LabelType] == charts.TypeRelease
 }
 
 // releaseRecorded reports whether the chart engine holds a release record for

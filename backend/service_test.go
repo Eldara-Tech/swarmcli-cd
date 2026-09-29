@@ -1125,22 +1125,28 @@ func TestAForgedReleaseRecordIsNotProofOfOwnership(t *testing.T) {
 	}
 }
 
-// The rule itself, which is CE's charts.IsReleaseRecord: typed as a record, and
-// no stack namespace.
-func TestIsReleaseRecord(t *testing.T) {
+// The two rules side by side. isReleaseRecord, CE's charts.IsReleaseRecord, is
+// what a reader trusting a record applies: typed as one, and no stack namespace.
+// mayBeReleaseRecord is what a removal spares: typed as one, whatever else. They
+// differ on exactly one shape, a stack's config typed as a record.
+func TestReleaseRecordPredicates(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		labels map[string]string
-		want   bool
+		name          string
+		labels        map[string]string
+		record, maybe bool
 	}{
-		{"a record", map[string]string{charts.LabelType: charts.TypeRelease}, true},
-		{"a stack's config typed as one", map[string]string{charts.LabelType: charts.TypeRelease, convert.LabelNamespace: "s"}, false},
-		{"untyped", map[string]string{charts.LabelRelease: "s"}, false},
-		{"typed as something else", map[string]string{charts.LabelType: "other"}, false},
-		{"no labels", nil, false},
+		{"a record", map[string]string{charts.LabelType: charts.TypeRelease}, true, true},
+		{"a stack's config typed as one", map[string]string{charts.LabelType: charts.TypeRelease, convert.LabelNamespace: "s"}, false, true},
+		{"a stack's config", map[string]string{convert.LabelNamespace: "s"}, false, false},
+		{"untyped", map[string]string{charts.LabelRelease: "s"}, false, false},
+		{"typed as something else", map[string]string{charts.LabelType: "other"}, false, false},
+		{"no labels", nil, false, false},
 	} {
-		if got := isReleaseRecord(tc.labels); got != tc.want {
-			t.Errorf("%s: isReleaseRecord = %v, want %v", tc.name, got, tc.want)
+		if got := isReleaseRecord(tc.labels); got != tc.record {
+			t.Errorf("%s: isReleaseRecord = %v, want %v", tc.name, got, tc.record)
+		}
+		if got := mayBeReleaseRecord(tc.labels); got != tc.maybe {
+			t.Errorf("%s: mayBeReleaseRecord = %v, want %v", tc.name, got, tc.maybe)
 		}
 	}
 }

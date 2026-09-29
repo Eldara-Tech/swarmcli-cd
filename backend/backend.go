@@ -1321,9 +1321,8 @@ func (b *Backend) RemoveStack(ctx context.Context, name string) error {
 		// means a future change that did put a namespace on them would not
 		// silently turn uninstall into "delete the history too".
 		//
-		// Label-only on purpose, unlike isReleaseRecord: sparing is the safe
-		// direction for a deletion, so anything typed as a record is kept.
-		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
+		// mayBeReleaseRecord, not isReleaseRecord; its doc says why.
+		if mayBeReleaseRecord(c.Spec.Labels) {
 			continue
 		}
 		if err := b.api.ConfigRemove(ctx, c.ID); err != nil && !errdefs.IsNotFound(err) {
@@ -1386,9 +1385,9 @@ func (b *Backend) stackRemains(ctx context.Context, name string) (bool, error) {
 		return false, fmt.Errorf("re-checking the stack's configs: %w", err)
 	}
 	for _, c := range configs {
-		// Label-only, as RemoveStack's skip is, so that what it spares is never
-		// counted as left behind.
-		if c.Spec.Labels[charts.LabelType] != charts.TypeRelease {
+		// mayBeReleaseRecord, as RemoveStack's skip, so that what it spares is
+		// never counted as left behind.
+		if !mayBeReleaseRecord(c.Spec.Labels) {
 			return true, nil
 		}
 	}

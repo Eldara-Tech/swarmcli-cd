@@ -13,8 +13,6 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/swarm"
 
-	"github.com/Eldara-Tech/swarmcli/v2/charts"
-
 	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
@@ -178,9 +176,8 @@ func (b *Backend) LiveConfigs(ctx context.Context, stack string) (map[string]str
 	}
 	out := make(map[string]string, len(configs))
 	for _, c := range configs {
-		// Label-only on purpose, unlike isReleaseRecord: sparing is the safe
-		// direction for a sweep, as for RemoveStack.
-		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
+		// mayBeReleaseRecord, not isReleaseRecord; its doc says why.
+		if mayBeReleaseRecord(c.Spec.Labels) {
 			continue
 		}
 		if _, ours := c.Spec.Labels[createdLabel]; !ours {
