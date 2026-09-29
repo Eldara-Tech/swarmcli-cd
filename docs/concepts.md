@@ -220,6 +220,17 @@ from the controller's own stack. A release's own names are still the ones scoped
 under its name exactly as written: another stack's names in another case need
 the app set's permission.
 
+The records are written only after a deploy, and applications reconcile in
+parallel, so the set is asked as well: a release is not installed while another
+release in the set — declared by another application, or by the same release
+file — differs from it only in case, or is its name followed by `_`. The second
+is the same collision by another route: release `a` declaring `b_x` and release
+`a_b` declaring `x` both scope to `a_b_x`. A release already installed keeps
+deploying, and the one arriving second is refused. For what is on the swarm
+whatever the set says, a declared name belongs to a release only if whatever
+already holds it carries exactly that release's namespace label, and an
+`external:` reference always needs the app set's permission.
+
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by
 swarmcli-cd, **its own `owner:` field is ignored** — the controller substitutes

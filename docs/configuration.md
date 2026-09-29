@@ -128,7 +128,12 @@ application names are unique within an app set, so a file that never writes a
 release name down can never have two applications claiming one stack. Write one
 down to install under a different name; two applications that write the same one
 are refused at load, and so are two whose names differ only in case, because
-Swarm compares the names a stack creates without regard to case.
+Swarm compares the names a stack creates without regard to case. A release is
+also not *installed* beside another release in the set whose name differs from
+it only in case, or is its name followed by `_` (`web` and `web_a`): release
+`web` declaring `a_site` and release `web_a` declaring `site` would both be
+`web_a_site`. The one already installed keeps deploying and the newcomer is
+refused, naming the other.
 
 The two are separate fields rather than one because a `releaseFile` application
 installs several releases under a single application name, so the application
@@ -220,7 +225,11 @@ handed the real one — and its labels rewritten into the stack's namespace, whe
 uninstalling that release would delete it. Declared names are therefore checked
 against the same sets as referenced ones, whether or not any service mounts them
 (swarmcli-cd#86). A chart's own config or secret is unaffected: its name is
-namespace-scoped to `<release>_<name>`, so it is nobody else's.
+namespace-scoped to `<release>_<name>`, and on every later deploy what holds that
+name carries the release's namespace label. A declared name that something else
+already holds — another stack's, or one created by hand — needs the app set's
+permission like any other, even when it starts with `<release>_`: a release name
+may contain `_`, so the prefix alone does not say whose a name is.
 
 Five things are off limits **whatever the app set says**. They are not a
 permission an operator withholds and could grant; permitting one would not be
@@ -288,7 +297,9 @@ shared config, secret, volume or network, and any path on a node — is refused
 unless the application's [`allow`](#allow-optional) names it. A chart declaring
 and mounting its own is unaffected, and needs no entry: its name is
 namespace-scoped to `<release>_<name>`, so it is nobody else's and nobody's to
-permit.
+permit. An `external:` reference is never that, whatever it is called — a name
+starting with `<release>_` included — because the chart has said the thing is not
+its own.
 
 **Content comes from the chart, never from the controller's filesystem.** A
 rendered manifest is a string, not a file in a checkout, so the only filesystem a
@@ -475,7 +486,8 @@ resources some other stack owns.
 It is an **allowlist**. Anything not named here is refused, so an application
 that omits the field entirely — every application written before this build —
 can install a chart that declares and mounts its own resources, and nothing else.
-A chart's own are namespace-scoped to `<release>_<name>` and need no entry.
+A chart's own are namespace-scoped to `<release>_<name>` and need no entry; an
+`external:` reference needs one whatever its name.
 
 #### Deploying Traefik, Portainer or an autoheal sidecar
 
