@@ -2894,6 +2894,75 @@ func TestStackVolumesRefusesTheControllersOwnStackName(t *testing.T) {
 	}
 }
 
+// Swarm compares the names a deploy creates without regard to case, so a release
+// named like the controller's stack in another case scopes names the swarm
+// already holds for the controller. The deploy is refused before anything is
+// created, rather than left to fail partway on the first name that collides.
+func TestDeployStackRefusesTheControllersStackNameInAnotherCase(t *testing.T) {
+	api := controllerStack()
+
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "SWARMCLI-CD", Manifest: trivialStack, Resolve: ResolveNever})
+	if err == nil {
+		t.Fatal("DeployStack = nil, want a release named like the controller's stack in another case refused")
+	}
+	for _, want := range []string{"'SWARMCLI-CD'", "'swarmcli-cd'", "case"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not say %s", err, want)
+		}
+	}
+	if len(api.created) != 0 || len(api.updated) != 0 || len(api.order) != 0 {
+		t.Errorf("the swarm was written to: created=%d updated=%d order=%v", len(api.created), len(api.updated), api.order)
+	}
+	// The exact name is rejectOwnNamespace's, whose refusal names the other way
+	// out; this one answers only for another case, and for no other name.
+	for _, name := range []string{"swarmcli-cd", "swarmcli-cd-edge"} {
+		if err := testBackend(t, controllerStack(), nil).rejectOwnNamespaceInAnotherCase(t.Context(), name); err != nil {
+			t.Errorf("rejectOwnNamespaceInAnotherCase(%s) = %v, want nil", name, err)
+		}
+	}
+}
+
+// Removing it is not refused. RemoveStack and StackVolumes select by the
+// namespace label, whose value Swarm compares exactly, so they reach only what
+// carries that spelling — never the controller's — and refusing would leave such
+// a stack for every later sweep to fail on.
+//
+// The controller's service is left out of the fixture: the fake's ServiceList
+// returns every service whatever the filter, where its config, network and
+// volume listings filter as the daemon does.
+func TestRemovingTheControllersStackNameInAnotherCaseLeavesTheControllerAlone(t *testing.T) {
+	api := controllerStack()
+	api.existing = nil
+	api.configs = append(api.configs, swarm.Config{ID: "variant", Spec: swarm.ConfigSpec{Annotations: stackScoped("SWARMCLI-CD_site", "SWARMCLI-CD")}})
+
+	if err := testBackend(t, api, nil).RemoveStack(t.Context(), "SWARMCLI-CD"); err != nil {
+		t.Fatalf("RemoveStack = %v, want the variant's own stack removed", err)
+	}
+	if !reflect.DeepEqual(api.removed, []string{"config:variant"}) {
+		t.Errorf("removed %v, want only what carries the variant's namespace", api.removed)
+	}
+	if _, err := testBackend(t, api, nil).StackVolumes(t.Context(), "SWARMCLI-CD"); err != nil {
+		t.Errorf("StackVolumes = %v, want the variant's volumes listed like any other release's", err)
+	}
+}
+
+// A release's own names are those scoped under its namespace as written, and
+// scopedUnder does not fold case although Swarm does. Folding would be the loose
+// direction: a release named 'Web' would read another application's 'web_site'
+// as its own and mount it without the app set's permission, where it now needs
+// that permission like any other name outside the release.
+func TestANamespaceInAnotherCaseIsNotTheReleasesOwn(t *testing.T) {
+	api := asController(&fakeAPI{configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: stackScoped("web_site", "web")}}}})
+
+	err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "Web", Manifest: mountsAConfig("web_site"), Resolve: ResolveNever})
+	if err == nil || !strings.Contains(err.Error(), "allow.configs") {
+		t.Fatalf("DeployStack = %v, want another stack's config refused as not permitted", err)
+	}
+	if len(api.created) != 0 {
+		t.Errorf("created %d services, want none", len(api.created))
+	}
+}
+
 // The guard is one name, not a mode. Everything else on the swarm deploys and is
 // removed exactly as before, including on a controller that is itself a stack.
 func TestAnyOtherReleaseIsDeployedAndRemovedAsBefore(t *testing.T) {

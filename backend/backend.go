@@ -519,6 +519,10 @@ func permits(allowed []string, name string) bool {
 // (convert.Namespace.Scope), so the prefix is the whole of "this is that stack's
 // own" — for the release being deployed, whose resources need no permission, and
 // for the controller's own stack, whose do not exist.
+//
+// Compared as written, although Swarm folds case. Folding is the loose direction
+// here: a release named 'Web' would read another stack's 'web_site' as its own
+// and reach it without the app set's permission.
 func scopedUnder(namespace, name string) bool {
 	return namespace != "" && strings.HasPrefix(name, namespace+"_")
 }
@@ -1116,6 +1120,34 @@ func (b *Backend) rejectOwnNamespace(ctx context.Context, release string) error 
 		"application `self: true` in the app set", release, capability.ErrOwnStack)
 }
 
+// rejectOwnNamespaceInAnotherCase refuses to deploy a release whose name differs
+// from the stack this controller runs as only in case.
+//
+// Swarm's name index folds case, so every name such a release scopes is one the
+// swarm already holds for the controller, or will refuse it later. The daemon
+// refuses each collision rather than handing the controller's resources over
+// (an update may not change a name, and a reference resolves by exact name), but
+// only as it reaches each one, after creating whatever came first. This refuses
+// the deploy before any of it.
+//
+// Deploy only. RemoveStack and StackVolumes select by the namespace label, whose
+// value Swarm compares exactly, so they reach only what carries this spelling —
+// never the controller's — and refusing them would leave such a stack for every
+// later sweep to fail on. The self release needs no case of its own here:
+// rejectSelfMismatch requires its name to be the namespace exactly.
+func (b *Backend) rejectOwnNamespaceInAnotherCase(ctx context.Context, release string) error {
+	mine, err := b.mounts(ctx)
+	if err != nil {
+		return err
+	}
+	if mine.namespace == release || strings.ToLower(mine.namespace) != strings.ToLower(release) {
+		return nil
+	}
+	return fmt.Errorf("refusing to deploy release '%s': this controller runs as the stack '%s', and Swarm compares "+
+		"the names a stack creates without regard to case, so every name this release scopes would be one of the "+
+		"controller's. Give the release a name of its own", release, mine.namespace)
+}
+
 // releaseConfigNames names the chart engine's release records.
 //
 // Matched by the engine's own exported label rather than by the
@@ -1190,6 +1222,9 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 	// not be — see RemoveStack and StackVolumes.
 	if !b.selfRelease {
 		if err := b.rejectOwnNamespace(ctx, req.Name); err != nil {
+			return err
+		}
+		if err := b.rejectOwnNamespaceInAnotherCase(ctx, req.Name); err != nil {
 			return err
 		}
 	}
