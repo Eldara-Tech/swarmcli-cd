@@ -268,6 +268,48 @@ func TestExternalNetworksAreReportedNotCreated(t *testing.T) {
 	}
 }
 
+// An external config or secret is reported like an external network: by the
+// name it has on the swarm — its name:, the deprecated external.name, or else
+// its key — with the labels it was declared with, and never among what the stack
+// creates. Sorted by that name rather than by key, which here differ in order;
+// an entry that is not external is not among them.
+func TestExternalConfigsAndSecretsAreReportedNotCreated(t *testing.T) {
+	const manifest = `
+services:
+  web:
+    image: nginx
+configs:
+  site:
+    external: true
+    labels:
+      team: web
+  legacy:
+    external:
+      name: zz-legacy
+secrets:
+  key:
+    external: true
+    name: shared-key
+  own:
+    driver: vault
+`
+	got := convertOK(t, manifest, "s", nil)
+
+	wantConfigs := []swarm.Annotations{
+		{Name: "site", Labels: map[string]string{"team": "web"}},
+		{Name: "zz-legacy"},
+	}
+	if !reflect.DeepEqual(got.ExternalConfigs, wantConfigs) {
+		t.Errorf("external configs = %+v, want %+v", got.ExternalConfigs, wantConfigs)
+	}
+	if want := []swarm.Annotations{{Name: "shared-key"}}; !reflect.DeepEqual(got.ExternalSecrets, want) {
+		t.Errorf("external secrets = %+v, want %+v", got.ExternalSecrets, want)
+	}
+	if len(got.Configs) != 0 || len(got.Secrets) != 1 || got.Secrets[0].Name != "s_own" {
+		t.Errorf("configs %+v and secrets %+v, want only s_own to create", got.Configs, got.Secrets)
+	}
+}
+
 // A service naming no network joins "default", which the stack then has to
 // create — matching `docker stack deploy`, whose behaviour operators already
 // depend on.
@@ -1080,12 +1122,14 @@ func mustRead(t *testing.T, path string) string {
 // thought to list.
 func describe(s *Stack) string {
 	type dump struct {
-		Namespace        string             `yaml:"namespace"`
-		Services         []Service          `yaml:"services"`
-		Networks         []Network          `yaml:"networks"`
-		Configs          []swarm.ConfigSpec `yaml:"configs,omitempty"`
-		Secrets          []swarm.SecretSpec `yaml:"secrets,omitempty"`
-		ExternalNetworks []string           `yaml:"externalNetworks,omitempty"`
+		Namespace        string              `yaml:"namespace"`
+		Services         []Service           `yaml:"services"`
+		Networks         []Network           `yaml:"networks"`
+		Configs          []swarm.ConfigSpec  `yaml:"configs,omitempty"`
+		Secrets          []swarm.SecretSpec  `yaml:"secrets,omitempty"`
+		ExternalNetworks []string            `yaml:"externalNetworks,omitempty"`
+		ExternalConfigs  []swarm.Annotations `yaml:"externalConfigs,omitempty"`
+		ExternalSecrets  []swarm.Annotations `yaml:"externalSecrets,omitempty"`
 	}
 	out, err := yaml.Marshal(dump{
 		Namespace:        s.Namespace.Name(),
@@ -1094,6 +1138,8 @@ func describe(s *Stack) string {
 		Configs:          s.Configs,
 		Secrets:          s.Secrets,
 		ExternalNetworks: s.ExternalNetworks,
+		ExternalConfigs:  s.ExternalConfigs,
+		ExternalSecrets:  s.ExternalSecrets,
 	})
 	if err != nil {
 		panic(err)

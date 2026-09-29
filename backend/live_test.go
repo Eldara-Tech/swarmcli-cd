@@ -222,12 +222,16 @@ func TestLiveResourceListersAreScopedToTheStack(t *testing.T) {
 // A release record is the evidence the sweep proves ownership with. Sweeping one
 // up would delete the history that says what this controller installed — the
 // same guard RemoveStack applies, one scope down.
+//
+// The fixture carries the creation marker, so the marker check after the skip
+// would include it: only the skip itself keeps it out.
 func TestLiveConfigsNeverIncludesAReleaseRecord(t *testing.T) {
 	record := swarm.ConfigSpec{Annotations: swarm.Annotations{
 		Name: "swarmcli.release.s.v1",
 		Labels: map[string]string{
 			convert.LabelNamespace: "s",
 			charts.LabelType:       charts.TypeRelease,
+			createdLabel:           "x",
 		},
 	}}
 	api := &fakeAPI{configs: []swarm.Config{

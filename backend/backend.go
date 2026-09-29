@@ -293,6 +293,20 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	// against below.
 	ns := stack.Namespace.Name()
 
+	// What the stack declares external:, first. Nothing here creates or relabels
+	// one, but a name in the space release records are named in, or a label
+	// under com.swarmcli., is refused on one as on the stack's own declarations —
+	// mounted or not, and before the allowlist below, so that no permission is
+	// what the refusal asks for. CE's charts.CheckReserved (Eldara-Tech/swarmcli#677)
+	// refuses the same on the command line; it runs in CE's own DeployStack
+	// rather than the engine, so a CE bump does not replace this.
+	if err := rejectReservedExternals("secret", stack.ExternalSecrets); err != nil {
+		return err
+	}
+	if err := rejectReservedExternals("config", stack.ExternalConfigs); err != nil {
+		return err
+	}
+
 	// What a service reaches outside the stack for.
 	for _, svc := range stack.Services {
 		secrets, configs := externalRefs(stack, svc)
@@ -319,7 +333,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			if err != nil {
 				return err
 			}
-			if _, forbidden := known[name]; forbidden {
+			if _, forbidden := known[strings.ToLower(name)]; forbidden {
 				return mountsForbidden(svc.Name, "config", name, whatReleaseRecord)
 			}
 			if b.ownMount(mine.configs, name) {
@@ -363,7 +377,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if key, ok := reservedLabel(spec.Labels); ok {
 			return declaresReservedLabel("secret", spec.Name, key)
 		}
-		if strings.HasPrefix(spec.Name, releaseRecordPrefix) {
+		if namedLikeARecord(spec.Name) {
 			return declaresForbidden("secret", spec.Name, whatReleaseRecord)
 		}
 		_, wired := b.forbiddenSecrets[spec.Name]
@@ -381,7 +395,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		}
 		// By name as well as by the records that exist: the engine allocates the
 		// next one at deploy time, so one not written yet is as much its own.
-		if strings.HasPrefix(spec.Name, releaseRecordPrefix) {
+		if namedLikeARecord(spec.Name) {
 			return declaresForbidden("config", spec.Name, whatReleaseRecord)
 		}
 		if _, forbidden := mine.configs[spec.Name]; forbidden {
@@ -391,7 +405,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		if err != nil {
 			return err
 		}
-		if _, forbidden := known[spec.Name]; forbidden {
+		if _, forbidden := known[strings.ToLower(spec.Name)]; forbidden {
 			return declaresForbidden("config", spec.Name, whatReleaseRecord)
 		}
 		if !scopedUnder(ns, spec.Name) && !permits(b.allow.Configs, spec.Name) {
@@ -548,6 +562,13 @@ const reservedLabelPrefix = "com.swarmcli."
 // otherwise declare a future record's name as scoped to itself.
 const releaseRecordPrefix = "swarmcli.release."
 
+// namedLikeARecord reports whether name starts with releaseRecordPrefix, compared
+// without regard to case: Swarm keeps config and secret names unique regardless
+// of case, so a name differing from a future record's only in case still holds it.
+func namedLikeARecord(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), releaseRecordPrefix)
+}
+
 // reservedLabel returns the first key under reservedLabelPrefix, in sorted order
 // so that a refusal names the same one every time.
 func reservedLabel(labels map[string]string) (string, bool) {
@@ -557,6 +578,26 @@ func reservedLabel(labels map[string]string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// rejectReservedExternals refuses the first external: declaration of kind that
+// carries a label under reservedLabelPrefix or is named like a release record.
+func rejectReservedExternals(kind string, externals []swarm.Annotations) error {
+	for _, ext := range externals {
+		if key, ok := reservedLabel(ext.Labels); ok {
+			return declaresReservedLabel("external "+kind, ext.Name, key)
+		}
+		if namedLikeARecord(ext.Name) {
+			return declaresReservedExternal(kind, ext.Name)
+		}
+	}
+	return nil
+}
+
+func declaresReservedExternal(kind, name string) error {
+	return fmt.Errorf("this stack declares external %s '%s', whose name starts with '%s' (compared without "+
+		"regard to case), which names %s; a reconciled stack may not reference one — reference a %s of another name",
+		kind, name, releaseRecordPrefix, whatReleaseRecord, kind)
 }
 
 func declaresReservedLabel(kind, name, key string) error {
@@ -1081,7 +1122,12 @@ func (b *Backend) rejectOwnNamespace(ctx context.Context, release string) error 
 // "swarmcli.release.<release>.v<n>" name it happens to use, because that format
 // is unexported and a rename there would silently stop protecting these. The
 // label is part of the contract this repository already reads elsewhere —
-// RemoveStack skips these configs by the same one.
+// RemoveStack skips these configs by the same one. A config carrying a stack
+// namespace is not a record here, whatever its labels say (isReleaseRecord).
+//
+// Keyed by the name in lower case, and a lookup lowers its name too: Swarm finds
+// a config by name, and refuses to create one, regardless of case, so a name
+// differing from a record's only in case is refused as that record.
 func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, error) {
 	list, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{
 		Filters: filters.NewArgs(filters.Arg("label", charts.LabelType+"="+charts.TypeRelease)),
@@ -1091,7 +1137,9 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 	}
 	out := make(map[string]struct{}, len(list))
 	for _, c := range list {
-		out[c.Spec.Name] = struct{}{}
+		if isReleaseRecord(c.Spec.Labels) {
+			out[strings.ToLower(c.Spec.Name)] = struct{}{}
+		}
 	}
 	return out, nil
 }
@@ -1272,7 +1320,9 @@ func (b *Backend) RemoveStack(ctx context.Context, name string) error {
 		// to stamp them rather than anything this code enforces. Saying so here
 		// means a future change that did put a namespace on them would not
 		// silently turn uninstall into "delete the history too".
-		if c.Spec.Labels[charts.LabelType] == charts.TypeRelease {
+		//
+		// mayBeReleaseRecord, not isReleaseRecord; its doc says why.
+		if mayBeReleaseRecord(c.Spec.Labels) {
 			continue
 		}
 		if err := b.api.ConfigRemove(ctx, c.ID); err != nil && !errdefs.IsNotFound(err) {
@@ -1335,7 +1385,9 @@ func (b *Backend) stackRemains(ctx context.Context, name string) (bool, error) {
 		return false, fmt.Errorf("re-checking the stack's configs: %w", err)
 	}
 	for _, c := range configs {
-		if c.Spec.Labels[charts.LabelType] != charts.TypeRelease {
+		// mayBeReleaseRecord, as RemoveStack's skip, so that what it spares is
+		// never counted as left behind.
+		if !mayBeReleaseRecord(c.Spec.Labels) {
 			return true, nil
 		}
 	}

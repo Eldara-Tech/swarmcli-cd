@@ -321,13 +321,13 @@ func (b *Backend) rejectForeignNamespace(ctx context.Context, namespace string, 
 		"managed from here", namespace, strings.Join(names, ", "))
 }
 
-// releaseRecorded reports whether the chart engine holds a release record for
-// this release — the proof that the stack under its namespace is one this
-// controller deployed.
+// isReleaseRecord reports whether a config's labels mark it as a release record:
+// typed as one, and not created by a stack deploy. Every reader here that trusts
+// a record applies it; the removal paths apply mayBeReleaseRecord instead.
 //
-// Matched by the engine's exported labels rather than by the config name, for the
-// reason releaseConfigNames gives: that name format is unexported, and a rename
-// there would silently stop this proving anything.
+// It is CE's charts.IsReleaseRecord (Eldara-Tech/swarmcli#677), which the CE
+// version this module pins predates. On the next CE bump, call that instead and
+// delete this.
 //
 // A record carrying a stack namespace is not a record. A chart can put any
 // labels it likes on a config it declares, so these labels are forgeable — but a
@@ -337,6 +337,29 @@ func (b *Backend) rejectForeignNamespace(ctx context.Context, namespace string, 
 // com.swarmcli.* labels and no namespace at all. That absence is already
 // load-bearing — it is what keeps RemoveStack from deleting a release's history —
 // and it is what tells a record from a chart claiming to be one.
+func isReleaseRecord(labels map[string]string) bool {
+	_, stacked := labels[convert.LabelNamespace]
+	return labels[charts.LabelType] == charts.TypeRelease && !stacked
+}
+
+// mayBeReleaseRecord reports whether a config's labels type it as a release
+// record, whatever else they carry. It is the rule of the removal paths —
+// RemoveStack, its re-check stackRemains, and LiveConfigs for the sweep — and
+// deliberately wider than isReleaseRecord: those paths list by stack namespace,
+// so isReleaseRecord would call nothing they see a record, and sparing anything
+// typed as one is the safe direction for a removal.
+func mayBeReleaseRecord(labels map[string]string) bool {
+	return labels[charts.LabelType] == charts.TypeRelease
+}
+
+// releaseRecorded reports whether the chart engine holds a release record for
+// this release — the proof that the stack under its namespace is one this
+// controller deployed.
+//
+// Matched by the engine's exported labels rather than by the config name, for the
+// reason releaseConfigNames gives: that name format is unexported, and a rename
+// there would silently stop this proving anything. A config carrying a stack
+// namespace is not one, whatever its labels say (isReleaseRecord).
 //
 // Any owner counts, including none. The stamp answers a different question than
 // this does: which of this controller's applications installed a release, so that
@@ -354,13 +377,9 @@ func (b *Backend) releaseRecorded(ctx context.Context, release string) (bool, er
 			release, err)
 	}
 	for _, c := range list {
-		if c.Spec.Labels[charts.LabelType] != charts.TypeRelease {
-			continue
+		if isReleaseRecord(c.Spec.Labels) {
+			return true, nil
 		}
-		if _, stacked := c.Spec.Labels[convert.LabelNamespace]; stacked {
-			continue
-		}
-		return true, nil
 	}
 	return false, nil
 }
