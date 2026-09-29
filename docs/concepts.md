@@ -216,20 +216,24 @@ names differing only in case collide on their release records and wherever the
 names they scope match. The loader refuses that pair of `chart` applications
 like one shared name. On deploy, whatever the source, a release is refused when
 its name differs only in case from one that already has release records, or
-from the controller's own stack. A release's own names are still the ones scoped
-under its name exactly as written: another stack's names in another case need
-the app set's permission.
+from the controller's own stack. Another stack's names in another case need the
+app set's permission.
 
-The records are written only after a deploy, and applications reconcile in
-parallel, so the set is asked as well: a release is not installed while another
-release in the set — declared by another application, or by the same release
-file — differs from it only in case, or is its name followed by `_`. The second
-is the same collision by another route: release `a` declaring `b_x` and release
-`a_b` declaring `x` both scope to `a_b_x`. A release already installed keeps
-deploying, and the one arriving second is refused. For what is on the swarm
-whatever the set says, a declared name belongs to a release only if whatever
-already holds it carries exactly that release's namespace label, and an
-`external:` reference always needs the app set's permission.
+The same holds, for an install, when one name is the other followed by `_`,
+either way round: release `a` declaring `b_x` and release `a_b` declaring `x`
+both scope to `a_b_x`. A release is not installed while one it collides with
+that way has records, or is being installed by another application at that
+moment — the records are written only after a deploy, and applications
+reconcile in parallel. Whichever installs first keeps deploying; a release that
+is only declared holds no name. A pair installed together before this rule keeps
+deploying too.
+
+What a release scopes is its own only as far as the swarm can say so: an
+`external:` reference always needs the app set's permission, and a declared
+config, secret or network is the release's only if nothing holds its name yet or
+what does carries exactly the release's namespace label. A volume is decided by
+its name alone, because a volume lives on whichever node first mounted it and
+there is no cluster-wide label to read.
 
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by

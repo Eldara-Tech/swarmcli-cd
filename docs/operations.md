@@ -33,7 +33,7 @@ interrupted either — Swarm is the thing performing it, including any
 `app sync --wait` running at that moment reports a failure it cannot distinguish
 from the real thing.
 
-Two things do change with the binary, and both are worth reading the release
+Some things do change with the binary, and all are worth reading the release
 notes for.
 
 **The chart engine version** is stamped into each build from the swarmcli
@@ -50,6 +50,15 @@ introduced is *refused* by an older one, which is what a downgrade means in
 practice. `swarmcli-cd validate --file applications.yaml` run with the binary you
 are moving *to* answers that before the deployment does — it needs neither a
 controller nor a swarm.
+
+**What a release may reach without `allow` has narrowed.** An `external:`
+reference now needs an [`allow`](configuration.md#allow-optional) entry whatever
+it is called, including a name starting with the release's own `<release>_` — a
+chart whose default secret is `postgres_password`, installed as release
+`postgres`, is the common case. A declared config or secret whose name something
+else already holds needs one too. Neither is caught by `validate`: the deploy is
+refused, naming the entry to add, and the release keeps running as it was until
+the entry is in the app set.
 
 ## Restarting, and what survives one
 

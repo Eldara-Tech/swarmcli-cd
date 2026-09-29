@@ -123,17 +123,18 @@ they cannot select its version, which is why a `ref` carries its own `version`.
 **The release name is the stack name.** A release name *is* the Swarm stack
 namespace, so `release` — not the application's `name` — is what `docker stack
 ls` shows. Omit it and the application's own name is used, which is Argo CD's
-default for `source.helm.releaseName` and the one choice that cannot collide:
-application names are unique within an app set, so a file that never writes a
-release name down can never have two applications claiming one stack. Write one
+default for `source.helm.releaseName` and the one choice that cannot share a
+stack: application names are unique within an app set, so a file that never
+writes a release name down can never have two applications claiming one. Write one
 down to install under a different name; two applications that write the same one
 are refused at load, and so are two whose names differ only in case, because
-Swarm compares the names a stack creates without regard to case. A release is
-also not *installed* beside another release in the set whose name differs from
-it only in case, or is its name followed by `_` (`web` and `web_a`): release
-`web` declaring `a_site` and release `web_a` declaring `site` would both be
-`web_a_site`. The one already installed keeps deploying and the newcomer is
-refused, naming the other.
+Swarm compares the names a stack creates without regard to case. Nor is a
+release *installed* beside one whose name differs from it only in case, or where
+one name is the other followed by `_` (`web` and `web_a`, either way round):
+release `web` declaring `a_site` and release `web_a` declaring `site` would both
+be `web_a_site`. Whichever installs first keeps deploying, and the other is
+refused, naming it — so on a fresh swarm a set holding such a pair installs one
+of the two, and a pair already installed together keeps deploying.
 
 The two are separate fields rather than one because a `releaseFile` application
 installs several releases under a single application name, so the application
@@ -226,10 +227,13 @@ uninstalling that release would delete it. Declared names are therefore checked
 against the same sets as referenced ones, whether or not any service mounts them
 (swarmcli-cd#86). A chart's own config or secret is unaffected: its name is
 namespace-scoped to `<release>_<name>`, and on every later deploy what holds that
-name carries the release's namespace label. A declared name that something else
-already holds — another stack's, or one created by hand — needs the app set's
-permission like any other, even when it starts with `<release>_`: a release name
-may contain `_`, so the prefix alone does not say whose a name is.
+name carries the release's namespace label. A declared config or secret that
+something else already holds — another stack's, or one created by hand — needs
+the app set's permission like any other, even when it starts with `<release>_`: a
+release name may contain `_`, so the prefix alone does not say whose a name is. A
+declared network already held that way is refused whatever the app set says,
+because a declared network is created and Swarm keeps network names unique; to
+join one, declare it `external:` and permit it.
 
 Five things are off limits **whatever the app set says**. They are not a
 permission an operator withholds and could grant; permitting one would not be
@@ -295,11 +299,10 @@ mounted": only an answer is.
 Everything else a chart reaches outside its own release for — an operator's
 shared config, secret, volume or network, and any path on a node — is refused
 unless the application's [`allow`](#allow-optional) names it. A chart declaring
-and mounting its own is unaffected, and needs no entry: its name is
-namespace-scoped to `<release>_<name>`, so it is nobody else's and nobody's to
-permit. An `external:` reference is never that, whatever it is called — a name
-starting with `<release>_` included — because the chart has said the thing is not
-its own.
+and mounting its own is unaffected, and needs no entry: what it declares is
+namespace-scoped to `<release>_<name>`. An `external:` reference is never that,
+whatever it is called — a name starting with `<release>_` included — because the
+chart has said the thing is not its own.
 
 **Content comes from the chart, never from the controller's filesystem.** A
 rendered manifest is a string, not a file in a checkout, so the only filesystem a
