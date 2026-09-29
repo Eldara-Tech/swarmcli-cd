@@ -379,6 +379,128 @@ func TestSymlinkOutOfTheTreeIsRejected(t *testing.T) {
 	}
 }
 
+// A local chart path in a release file is repository content too, so it is
+// held to the checkout the way a values file is. The boundary is the checkout,
+// not the release file's directory: a chart one level up from a release file in
+// a subdirectory is still the repository's own.
+//
+// The checkout is reached through a symlinked data directory, as it is on macOS
+// and can be anywhere, so the release file's directory (resolved) and the
+// checkout (not) name the same tree two ways. The directory holding the link is
+// itself resolved, so the two names differ in depth as well as in spelling.
+func TestLocalChartPathMustStayInTheCheckout(t *testing.T) {
+	all := tree(t, map[string]string{
+		"edge/charts/hello/Chart.yaml":           "apiVersion: v1\nname: hello\nversion: 0.1.0\n",
+		"edge/charts/hello/templates/stack.yaml": "services: {}\n",
+		"other/charts/x/Chart.yaml":              "apiVersion: v1\nname: x\nversion: 0.1.0\n",
+		"other/charts/x/templates/stack.yaml":    "services: {}\n",
+	})
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(parent, "data")
+	if err := os.Symlink(all.Dir, data); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	co := git.Checkout{Dir: filepath.Join(data, "edge"), Revision: all.Revision}
+	outside := filepath.Join(all.Dir, "other", "charts", "x")
+
+	for name, tc := range map[string]struct {
+		releaseFile string // empty: a chart application whose path is chart
+		chart       string
+		symlink     string // created in the checkout, pointing at outside
+		want        string // empty: the chart loads
+	}{
+		"in the repository":              {"swarmcli-release.yaml", "./charts/hello", "", ""},
+		"up from a subdirectory":         {"swarm/prod/swarmcli-release.yaml", "../../charts/hello", "", ""},
+		"a parent directory":             {"swarmcli-release.yaml", "../other/charts/x", "", "outside the repository"},
+		"an absolute path":               {"swarmcli-release.yaml", outside, "", "must be relative"},
+		"an absolute path into the tree": {"swarmcli-release.yaml", filepath.Join(co.Dir, "charts", "hello"), "", "must be relative"},
+		"a symlink out of the tree":      {"swarmcli-release.yaml", "./charts/link", "charts/link", "outside the repository"},
+		"a path that is not committed":   {"swarmcli-release.yaml", "./charts/absent", "", "not in the repository"},
+		"a path through a file":          {"swarmcli-release.yaml", "./charts/hello/Chart.yaml/x", "", "resolving"},
+		"a chart application":            {"", "charts/hello", "", ""},
+		"a chart application's symlink":  {"", "charts/applink", "charts/applink", "outside the repository"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if tc.symlink != "" {
+				if err := os.Symlink(outside, filepath.Join(co.Dir, tc.symlink)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			spec := application.Source{Chart: &application.ChartSource{Release: "hello", Path: tc.chart}}
+			if tc.releaseFile != "" {
+				path := filepath.Join(co.Dir, tc.releaseFile)
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				doc := "apiVersion: v1\nreleases:\n  - name: hello\n    chart: " + tc.chart + "\n"
+				if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				spec = application.Source{ReleaseFile: tc.releaseFile}
+			}
+
+			got, err := builder(t).Build(context.Background(), "edge", spec, co)
+			if tc.want != "" {
+				if err == nil {
+					t.Fatalf("Build = nil, want an error containing %q", tc.want)
+				}
+				// Named as the release file wrote it, not as the check computed it.
+				for _, part := range []string{tc.want, "application 'edge'", tc.chart} {
+					if !strings.Contains(err.Error(), part) {
+						t.Errorf("error %q does not contain %q", err, part)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Build = %v, want nil", err)
+			}
+			release := got.ReleaseFile.Releases[0]
+			ch, err := got.Charts.Load(got.ReleaseFile.ChartRef(release), release.Version)
+			if err != nil {
+				t.Fatalf("Load = %v, want the chart", err)
+			}
+			if ch.Metadata.Name != "hello" {
+				t.Errorf("loaded chart %q, want hello", ch.Metadata.Name)
+			}
+		})
+	}
+}
+
+// A relative --data is resolved against the working directory, and through a
+// symlink its real location can be absolute while the engine's path to the
+// chart stays relative. A chart inside the checkout still loads.
+func TestLocalChartPathUnderARelativeDataDirectory(t *testing.T) {
+	all := tree(t, map[string]string{
+		"edge/charts/hello/Chart.yaml":           "apiVersion: v1\nname: hello\nversion: 0.1.0\n",
+		"edge/charts/hello/templates/stack.yaml": "services: {}\n",
+	})
+	cwd := t.TempDir()
+	if err := os.Symlink(all.Dir, filepath.Join(cwd, "data")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	t.Chdir(cwd)
+	co := git.Checkout{Dir: filepath.Join("data", "edge"), Revision: all.Revision}
+
+	got, err := builder(t).Build(context.Background(), "edge", application.Source{
+		Chart: &application.ChartSource{Release: "hello", Path: "charts/hello"},
+	}, co)
+	if err != nil {
+		t.Fatalf("Build = %v, want nil", err)
+	}
+	spec := got.ReleaseFile.Releases[0]
+	ch, err := got.Charts.Load(got.ReleaseFile.ChartRef(spec), spec.Version)
+	if err != nil {
+		t.Fatalf("Load = %v, want the chart", err)
+	}
+	if ch.Metadata.Name != "hello" {
+		t.Errorf("loaded chart %q, want hello", ch.Metadata.Name)
+	}
+}
+
 // decrypter stands in for the Business Edition's SOPS provider.
 type decrypter struct{}
 

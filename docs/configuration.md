@@ -148,7 +148,9 @@ relative and stay inside the checkout: an absolute path, or one that escapes wit
 `../`, is rejected at load. A path that resolves outside the repository through a
 symlink is refused again at render time — repository content is not trusted the
 way your own configuration is, and a values file pointing at `/run/secrets` would
-otherwise be read and merged into a manifest.
+otherwise be read and merged into a manifest. A local `chart:` path inside a
+committed release file is held to the same rule when the controller reads the
+file: it must be relative and resolve inside the checkout.
 
 **Chart repositories are https-only.** A chart repository serves the tarball
 that *becomes* the workload, so anyone on the path to it chooses what runs on

@@ -15,6 +15,7 @@ package source
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -90,6 +91,12 @@ func (b *Builder) Build(ctx context.Context, app string, spec application.Source
 	for _, r := range rf.Repositories {
 		if !application.ValidRepositoryName(r.Name) {
 			return nil, fmt.Errorf("application '%s': %s declares chart repository '%s': the name becomes a file in the chart cache, so letters, digits, dot, dash and underscore only, starting with a letter or digit", app, rf.Path, r.Name)
+		}
+	}
+
+	for _, r := range rf.Releases {
+		if err := containedChart(co.Dir, rf, r); err != nil {
+			return nil, fmt.Errorf("application '%s': %s: release '%s': chart: %w", app, rf.Path, r.Name, err)
 		}
 	}
 
@@ -238,6 +245,54 @@ func containedAbs(root, path string) (string, error) {
 		return "", fmt.Errorf("'%s' is not under the repository", path)
 	}
 	return Contained(root, rel)
+}
+
+// containedChart holds a release's local chart path to the working tree the way
+// valuesReader holds a values file: it is repository content, and the engine
+// resolves it with ChartRef whether it is relative, absolute or climbs out with
+// "../". A repository reference is not a path and is left alone.
+//
+// It runs over the parsed release file rather than inside the chart source the
+// engine calls, because with a relative data directory a resolved local path no
+// longer looks like one to charts.IsPathRef; only the declared reference still
+// says which kind it is.
+//
+// Both sides are made absolute, and the root resolved, before containedAbs sees
+// them: containedAbs joins its relative path onto the root's real location, a
+// release file's directory is already named by its real one (Contained returned
+// it) while the checkout may sit under a symlink, and with a relative data
+// directory one of the two can be relative while the other is not.
+func containedChart(root string, rf *charts.ReleaseFile, r charts.ReleaseSpec) error {
+	if !charts.IsPathRef(r.Chart) {
+		return nil
+	}
+	if filepath.IsAbs(r.Chart) {
+		return fmt.Errorf("'%s' must be relative to the repository", r.Chart)
+	}
+	realRoot, err := filepath.Abs(root)
+	if err == nil {
+		realRoot, err = filepath.EvalSymlinks(realRoot)
+	}
+	if err != nil {
+		return fmt.Errorf("resolving the working tree: %w", err)
+	}
+	chart, err := filepath.Abs(rf.ChartRef(r))
+	if err == nil {
+		_, err = containedAbs(realRoot, chart)
+	}
+
+	// Contained names the path it computed; say it the way the release file
+	// does. Its own refusals wrap nothing, and a failure to resolve wraps why.
+	switch cause := errors.Unwrap(err); {
+	case err == nil:
+		return nil
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("'%s' is not in the repository at this revision: %w", r.Chart, fs.ErrNotExist)
+	case cause != nil:
+		return fmt.Errorf("resolving '%s': %w", r.Chart, cause)
+	default:
+		return fmt.Errorf("'%s' resolves outside the repository", r.Chart)
+	}
 }
 
 // Contained resolves rel against root and refuses anything that ends up
