@@ -2295,6 +2295,91 @@ func TestAStackConfigLabelledAsARecordIsNotOneToTheGuard(t *testing.T) {
 	}
 }
 
+// declaresExternal is a chart declaring one config or secret external:, named
+// name, with the given labels (none when empty). No service mounts it unless
+// mounted says so.
+func declaresExternal(kind, name, labels string, mounted bool) string {
+	svc := "services:\n  app:\n    image: busybox\n"
+	if mounted {
+		svc += "    " + kind + ": [x]\n"
+	}
+	decl := kind + ":\n  x:\n    external: true\n    name: " + name + "\n"
+	if labels != "" {
+		decl += "    labels:\n" + labels
+	}
+	return svc + decl
+}
+
+// An external: declaration creates and relabels nothing, but a name in the space
+// release records are named in, or a label under com.swarmcli., is refused on one
+// as on a stack's own declaration — whether or not a service mounts it, whatever
+// the app set permits, and before the app set is consulted, so that the refusal
+// never asks for a permission that would not help.
+func TestDeployStackRefusesAReservedExternalDeclaration(t *testing.T) {
+	const record = "swarmcli.release.other.v2"
+	behindAnOrdinaryOne := "services:\n  app:\n    image: busybox\nconfigs:\n" +
+		"  a:\n    external: true\n    name: a-shared\n  x:\n    external: true\n    name: " + record + "\n"
+	named := func(kind, name string) []string {
+		return []string{"external " + kind + " '" + name + "'", "'swarmcli.release.'", "release record"}
+	}
+	for _, tc := range []struct {
+		name, manifest, target string
+		permit                 bool
+		want                   []string
+	}{
+		{"a config named like a record", declaresExternal("configs", record, "", false), record, true, named("config", record)},
+		{"an upper-case secret name", declaresExternal("secrets", "SWARMCLI.RELEASE.other.v2", "", false),
+			"SWARMCLI.RELEASE.other.v2", true, named("secret", "SWARMCLI.RELEASE.other.v2")},
+		{"a mixed-case config name, mounted and permitted", declaresExternal("configs", "Swarmcli.Release.other.v2", "", true),
+			"Swarmcli.Release.other.v2", true, named("config", "Swarmcli.Release.other.v2")},
+		{"a config named like a record, mounted and not permitted", declaresExternal("configs", record, "", true),
+			record, false, named("config", record)},
+		{"a record's name behind an ordinary external", behindAnOrdinaryOne, record, true, named("config", record)},
+		{"a config labelled as a record", declaresExternal("configs", "shared-site", "      com.swarmcli.type: release\n", false),
+			"shared-site", true, []string{"external config 'shared-site'", "'com.swarmcli.type'"}},
+		{"a secret carrying the creation marker", declaresExternal("secrets", "shared-key", "      com.swarmcli.cd.created: x\n", false),
+			"shared-key", true, []string{"external secret 'shared-key'", "'com.swarmcli.cd.created'"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{
+				configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: tc.target}}}},
+				secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: tc.target}}}},
+			})
+			var allow application.Allow
+			if tc.permit {
+				allow = application.Allow{Configs: []string{tc.target}, Secrets: []string{tc.target}}
+			}
+			err := allowing(t, api, allow).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever,
+			})
+			if err == nil {
+				t.Fatalf("DeployStack = nil, want the external '%s' refused", tc.target)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not say %q", err, want)
+				}
+			}
+			if len(api.order) != 0 || len(api.created) != 0 {
+				t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// And the other side: an external whose labels are ordinary, and whose name
+// holds the prefix anywhere but at the start, is referenced like any other.
+func TestDeployStackAllowsAnOrdinaryLabelledExternal(t *testing.T) {
+	const name = "app.swarmcli.release.v2"
+	api := asController(&fakeAPI{configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: name}}}}})
+	err := allowing(t, api, application.Allow{Configs: []string{name}}).DeployStack(t.Context(), charts.DeployRequest{
+		Name: "tenant", Manifest: declaresExternal("configs", name, "      team: web\n", true), Resolve: ResolveNever,
+	})
+	if err != nil {
+		t.Fatalf("DeployStack = %v, want an ordinary labelled external mounted", err)
+	}
+}
+
 // The false-positive check, and the reason the new rule compares names rather
 // than refusing declarations outright: a chart declaring and mounting its own
 // secret is ordinary, and #84 exists so that it works. Its name is

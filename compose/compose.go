@@ -62,6 +62,13 @@ type Stack struct {
 	// They are not ours to create, and a missing one is a pre-flight failure
 	// rather than something to conjure.
 	ExternalNetworks []string
+	// ExternalConfigs and ExternalSecrets are the entries the manifest declares
+	// external:, each by its name on the swarm and with the labels it was
+	// declared with. Nothing is created or relabelled for one; they are here so
+	// that what a manifest declares can be judged whether or not a service
+	// mounts it.
+	ExternalConfigs []swarm.Annotations
+	ExternalSecrets []swarm.Annotations
 }
 
 // Service pairs the name the manifest used with the spec it produced.
@@ -187,7 +194,24 @@ func Convert(ctx context.Context, manifest, stack string, files map[string][]byt
 		Configs:          configs,
 		Secrets:          secrets,
 		ExternalNetworks: external,
+		ExternalConfigs:  externals(cfg.Configs),
+		ExternalSecrets:  externals(cfg.Secrets),
 	}, nil
+}
+
+// externals is the entries of a configs: or secrets: section declared external:,
+// by the name the loader resolved for each — its name:, the deprecated
+// external.name, or else its key — and sorted by it.
+func externals[T composetypes.ConfigObjConfig | composetypes.SecretConfig](section map[string]T) []swarm.Annotations {
+	var out []swarm.Annotations
+	for _, key := range slices.Sorted(maps.Keys(section)) {
+		obj := composetypes.FileObjectConfig(section[key])
+		if obj.External.External {
+			out = append(out, swarm.Annotations{Name: obj.Name, Labels: obj.Labels})
+		}
+	}
+	slices.SortStableFunc(out, func(a, b swarm.Annotations) int { return strings.Compare(a.Name, b.Name) })
+	return out
 }
 
 // unresolvedID is the id ConvertUnresolved reports for every reference it is

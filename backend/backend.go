@@ -293,6 +293,20 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	// against below.
 	ns := stack.Namespace.Name()
 
+	// What the stack declares external:, first. Nothing here creates or relabels
+	// one, but a name in the space release records are named in, or a label
+	// under com.swarmcli., is refused on one as on the stack's own declarations —
+	// mounted or not, and before the allowlist below, so that no permission is
+	// what the refusal asks for. CE's charts.CheckReserved (Eldara-Tech/swarmcli#677)
+	// refuses the same on the command line; it runs in CE's own DeployStack
+	// rather than the engine, so a CE bump does not replace this.
+	if err := rejectReservedExternals("secret", stack.ExternalSecrets); err != nil {
+		return err
+	}
+	if err := rejectReservedExternals("config", stack.ExternalConfigs); err != nil {
+		return err
+	}
+
 	// What a service reaches outside the stack for.
 	for _, svc := range stack.Services {
 		secrets, configs := externalRefs(stack, svc)
@@ -564,6 +578,26 @@ func reservedLabel(labels map[string]string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// rejectReservedExternals refuses the first external: declaration of kind that
+// carries a label under reservedLabelPrefix or is named like a release record.
+func rejectReservedExternals(kind string, externals []swarm.Annotations) error {
+	for _, ext := range externals {
+		if key, ok := reservedLabel(ext.Labels); ok {
+			return declaresReservedLabel("external "+kind, ext.Name, key)
+		}
+		if namedLikeARecord(ext.Name) {
+			return declaresReservedExternal(kind, ext.Name)
+		}
+	}
+	return nil
+}
+
+func declaresReservedExternal(kind, name string) error {
+	return fmt.Errorf("this stack declares external %s '%s', whose name starts with '%s' (compared without "+
+		"regard to case), which names %s; a reconciled stack may not reference one — reference a %s of another name",
+		kind, name, releaseRecordPrefix, whatReleaseRecord, kind)
 }
 
 func declaresReservedLabel(kind, name, key string) error {
