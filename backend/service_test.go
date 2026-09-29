@@ -754,7 +754,14 @@ func (f *fakeAPI) NetworkList(_ context.Context, o network.ListOptions) ([]netwo
 	return out, nil
 }
 
+// NetworkCreate refuses a name a swarm-scoped network already holds, in any case,
+// as swarmkit does.
 func (f *fakeAPI) NetworkCreate(_ context.Context, name string, o network.CreateOptions) (network.CreateResponse, error) {
+	for _, n := range f.networks {
+		if n.Scope == "swarm" && strings.EqualFold(n.Name, name) {
+			return network.CreateResponse{}, errdefs.ErrConflict
+		}
+	}
 	if f.createdNets == nil {
 		f.createdNets = map[string]network.CreateOptions{}
 	}
@@ -796,9 +803,12 @@ func (f *fakeAPI) ConfigList(_ context.Context, o swarm.ConfigListOptions) ([]sw
 	return out, nil
 }
 
+// ConfigInspectWithRaw finds a config by name without regard to case, as the
+// daemon does: swarmkit's name index folds case, and the daemon's lookup goes
+// through it.
 func (f *fakeAPI) ConfigInspectWithRaw(_ context.Context, name string) (swarm.Config, []byte, error) {
 	for _, c := range f.configs {
-		if c.Spec.Name == name {
+		if strings.EqualFold(c.Spec.Name, name) {
 			return c, nil, nil
 		}
 	}
@@ -849,9 +859,10 @@ func (f *fakeAPI) SecretList(_ context.Context, o swarm.SecretListOptions) ([]sw
 	return out, nil
 }
 
+// SecretInspectWithRaw folds case for the reason ConfigInspectWithRaw does.
 func (f *fakeAPI) SecretInspectWithRaw(_ context.Context, name string) (swarm.Secret, []byte, error) {
 	for _, s := range f.secrets {
-		if s.Spec.Name == name {
+		if strings.EqualFold(s.Spec.Name, name) {
 			return s, nil, nil
 		}
 	}

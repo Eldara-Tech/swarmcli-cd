@@ -232,7 +232,8 @@ const (
 // name is the release's own only if it is scoped under the release and whatever
 // already holds that name carries exactly the release's namespace label
 // (ownDeclared). Which of two names like "web" and "web_a" may be installed at
-// all is the reconciler's question; see reconcile.checkReleaseNames.
+// all is asked before this: rejectRecordedCollision, and the reconciler's
+// claimInstalls for two installs at once.
 //
 // The direction matters more than the sets do. It is an allowlist because the
 // other way round leaves whatever nobody thought of permitted, and the family
@@ -442,8 +443,7 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 	// And the networks, which are neither reached for nor claimed so much as
 	// joined. Both lists: an `external:` entry names a network the manifest
 	// expects to find, and a declared one carries whatever `name:` said, which
-	// applyNetworks then finds already there, leaves alone, and attaches the
-	// stack's services to.
+	// applyNetworks creates unless one labelled as this stack's is already there.
 	for _, name := range stack.ExternalNetworks {
 		if inControllersStack(mine.namespace, name) {
 			if !b.selfRelease {
@@ -462,14 +462,19 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			}
 			continue
 		}
-		if !permits(b.allow.Networks, nw.Name) {
-			own, err := ownDeclared(ctx, ns, nw.Name, b.networkLabels)
-			if err != nil {
-				return err
-			}
-			if !own {
-				return joinsUnpermitted(nw.Name)
-			}
+		// A declared network is created, and Swarm keeps network names unique,
+		// so one already held by something that is not this release's cannot be
+		// its own whatever the allowlist says: the create would fail. Joining it
+		// is what external: is for.
+		held, found, err := b.networkLabels(ctx, nw.Name)
+		if err != nil {
+			return err
+		}
+		if found && held[convert.LabelNamespace] != ns {
+			return declaresHeldNetwork(nw.Name)
+		}
+		if !scopedUnder(ns, nw.Name) && !permits(b.allow.Networks, nw.Name) {
+			return joinsUnpermitted(nw.Name)
 		}
 	}
 	return nil
@@ -485,7 +490,12 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 // relabels it as the stack's (applySecrets). Compared exactly, as RemoveStack
 // selects by it. Something holding the name with no namespace label at all —
 // created by hand — is not the release's either, and adopting it needs the
-// allowlist like any other name.
+// allowlist like any other name. applySecrets and applyConfigs ask the same of
+// what they find at the moment they adopt it (adoptable).
+//
+// The label says which stack a name belongs to, not whose that stack is: a
+// release named exactly like a stack somebody else deployed is that stack's
+// namespace, which rejectForeignNamespace answers.
 func ownDeclared(ctx context.Context, ns, name string, labels func(context.Context, string) (map[string]string, bool, error)) (bool, error) {
 	if !scopedUnder(ns, name) {
 		return false, nil
@@ -497,11 +507,11 @@ func ownDeclared(ctx context.Context, ns, name string, labels func(context.Conte
 	return !found || held[convert.LabelNamespace] == ns, nil
 }
 
-// secretLabels, configLabels and networkLabels answer ownDeclared for a secret, a
-// config and a network, each found by name without regard to case, as Swarm
-// keeps names. The daemon's own lookup does that for the first two; a network is
-// listed and matched here, because a network listing filters by name as a
-// pattern and inspecting one by name fails when two share it.
+// secretLabels and configLabels answer ownDeclared for a secret and a config,
+// found by name without regard to case, as Swarm keeps names. networkLabels
+// answers the same for a network, among the swarm-scoped ones — a service can
+// join no other — listed and matched here, because a network listing filters by
+// name as a pattern and inspecting one by name fails when two share it.
 func (b *Backend) secretLabels(ctx context.Context, name string) (map[string]string, bool, error) {
 	s, _, err := b.api.SecretInspectWithRaw(ctx, name)
 	switch {
@@ -530,7 +540,7 @@ func (b *Backend) networkLabels(ctx context.Context, name string) (map[string]st
 		return nil, false, fmt.Errorf("listing networks to check whose '%s' is: %w", name, err)
 	}
 	for _, n := range networks {
-		if strings.EqualFold(n.Name, name) {
+		if n.Scope == "swarm" && strings.EqualFold(n.Name, name) {
 			return n.Labels, true, nil
 		}
 	}
@@ -723,16 +733,22 @@ func mountsUnpermitted(service, kind, name, field string) error {
 }
 
 func declaresUnpermitted(kind, name, field string) error {
-	return fmt.Errorf("this stack declares %s '%s', which is not scoped to this release and which this "+
+	return fmt.Errorf("this stack declares %s '%s', which is not this release's own and which this "+
 		"application is not permitted to reference. A declaration carrying a name that already exists is "+
 		"handed the existing %s and relabels it as this stack's, so declaring one is not owning it — add "+
 		"the name to %s in the app set if that is what is meant", kind, name, kind, field)
 }
 
 func joinsUnpermitted(name string) error {
-	return fmt.Errorf("this stack joins network '%s', which is not scoped to this release and which this "+
+	return fmt.Errorf("this stack joins network '%s', which is not this release's own and which this "+
 		"application is not permitted to join. Everything already on a shared network is reachable from "+
 		"it — add the name to allow.networks in the app set if that is what is meant", name)
+}
+
+func declaresHeldNetwork(name string) error {
+	return fmt.Errorf("this stack declares network '%s', which already exists on this swarm and is not this release's "+
+		"own. A declared network is created, and Swarm keeps network names unique, so it cannot be this release's — "+
+		"declare it external: and add it to allow.networks in the app set to join it, or give it a name of its own", name)
 }
 
 func joinsForbidden(name, namespace string) error {
@@ -1245,34 +1261,65 @@ func (b *Backend) rejectOwnNamespaceInAnotherCase(ctx context.Context, release s
 		"controller's wherever the names match. Give the release a name of its own", release, mine.namespace)
 }
 
-// rejectRecordedInAnotherCase refuses to deploy a release whose name differs only
-// in case from a release that already has records on this swarm.
+// rejectRecordedCollision refuses to deploy a release whose name collides
+// (application.ReleasesCollide) with a release that already has records on this
+// swarm: one differing only in case, always, and one that is the other's name
+// followed by '_', while this release has no records of its own.
 //
 // A record is a config named after its release (releaseRecordPrefix), and Swarm
-// keeps config names unique regardless of case, so the two would need the same
-// record names: this release's deploy would land and then fail to be recorded,
-// and every later deploy be refused for want of a record (rejectForeignNamespace).
-// The release already recorded holds the names, so it is the other that is
-// refused, whatever source declared it — the app-set loader sees only chart
-// sources.
+// keeps config names unique regardless of case, so two names differing only in
+// case would need the same record names: this release's deploy would land and
+// then fail to be recorded, and every later deploy be refused for want of a
+// record (rejectForeignNamespace). The release already recorded holds the names,
+// so it is the other that is refused, whatever source declared it — the app-set
+// loader sees only chart sources.
 //
-// Listed by name prefix, which the daemon matches without regard to case, so the
-// answer is this release's own records and its case variants' rather than the
-// whole store. The labels decide what each one is.
-func (b *Backend) rejectRecordedInAnotherCase(ctx context.Context, release string) error {
-	list, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{
-		Filters: filters.NewArgs(filters.Arg("name", releaseRecordPrefix+release+".")),
-	})
+// A name followed by '_' collides on what the two scope instead: release 'a'
+// declaring 'b_x' and release 'a_b' declaring 'x' both scope to 'a_b_x'. Only an
+// install is refused for it, so the release recorded first keeps deploying, and
+// so does a pair installed before this was refused. Records outlive the process,
+// so this holds across a restart and against a release installed from outside
+// the app set, neither of which the reconciler's claimInstalls sees.
+//
+// Listed by name prefix, which the daemon matches without regard to case: this
+// release's own records and its case variants', those of every release named
+// like it followed by '_', and those of each release its own name extends —
+// rather than the whole store. The labels decide what each one is.
+func (b *Backend) rejectRecordedCollision(ctx context.Context, release string) error {
+	names := filters.NewArgs(
+		filters.Arg("name", releaseRecordPrefix+release+"."),
+		filters.Arg("name", releaseRecordPrefix+release+"_"),
+	)
+	for i := range len(release) {
+		if release[i] == '_' {
+			names.Add("name", releaseRecordPrefix+release[:i]+".")
+		}
+	}
+	list, err := b.api.ConfigList(ctx, swarm.ConfigListOptions{Filters: names})
 	if err != nil {
 		return fmt.Errorf("listing release records to check release '%s' against: %w", release, err)
 	}
+	own, extends := false, ""
 	for _, c := range list {
+		if !isReleaseRecord(c.Spec.Labels) {
+			continue
+		}
 		other := c.Spec.Labels[charts.LabelRelease]
-		if isReleaseRecord(c.Spec.Labels) && other != release && strings.ToLower(other) == strings.ToLower(release) {
+		switch {
+		case other == release:
+			own = true
+		case strings.ToLower(other) == strings.ToLower(release):
 			return fmt.Errorf("refusing to deploy release '%s': release '%s' already has release records on this swarm, "+
 				"and Swarm compares config names without regard to case, so the two would need the same record names. "+
 				"Give the release a name of its own", release, other)
+		case application.ReleasesCollide(other, release) && (extends == "" || other < extends):
+			extends = other
 		}
+	}
+	if extends != "" && !own {
+		return fmt.Errorf("refusing to install release '%s': release '%s' already has release records on this swarm, and "+
+			"one name is the other followed by '_', so what the two scope collides — release 'a' declaring 'b_x' and "+
+			"release 'a_b' declaring 'x' are both 'a_b_x'. Give the release a name of its own", release, extends)
 	}
 	return nil
 }
@@ -1357,7 +1404,7 @@ func (b *Backend) DeployStack(ctx context.Context, req charts.DeployRequest) err
 			return err
 		}
 	}
-	if err := b.rejectRecordedInAnotherCase(ctx, req.Name); err != nil {
+	if err := b.rejectRecordedCollision(ctx, req.Name); err != nil {
 		return err
 	}
 
