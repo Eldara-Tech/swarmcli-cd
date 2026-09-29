@@ -1963,6 +1963,9 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	if err := checkCompat(plan); err != nil {
 		return err
 	}
+	if err := r.checkReleaseNames(spec.Name, plan); err != nil {
+		return err
+	}
 	if err := r.apply(ctx, e, spec, backend, engine, plan, built, checkout, live, doomed); err != nil {
 		return err
 	}
@@ -1997,6 +2000,58 @@ func checkCompat(plan *charts.Plan) error {
 		return nil
 	}
 	return fmt.Errorf("refusing to apply: %s", strings.Join(refused, "; "))
+}
+
+// checkReleaseNames refuses a plan that would install a release whose name
+// collides with another release declared in the set — by another application,
+// or by this plan itself.
+//
+// Two names collide when Swarm cannot keep what they scope apart: they differ
+// only in case, since Swarm folds case in the names a stack creates and in the
+// release records, or one is the other followed by '_', since release 'a'
+// declaring 'b_x' and release 'a_b' declaring 'x' both scope to 'a_b_x'. A
+// release file chooses its own release names, so the loader cannot see this; the
+// backend can refuse a case variant only once the other has records, which the
+// chart engine writes after DeployStack returns, and applications deploy in
+// their own goroutines.
+//
+// Only an install is refused, so a release already on the swarm keeps deploying
+// and the one that arrives second is the one held. Each application records the
+// releases its plan declares before it reaches here, and this reads the set under
+// the same lock, so of two colliding installs at most one gets past it. The same
+// name in two applications is not a collision here: declaredElsewhere says why
+// that is held rather than refused.
+func (r *Reconciler) checkReleaseNames(app string, plan *charts.Plan) error {
+	elsewhere := r.declaredElsewhere(app)
+	others := slices.Sorted(maps.Keys(elsewhere))
+	for _, rp := range plan.Releases {
+		if rp.Action != charts.ActionInstall {
+			continue
+		}
+		for _, sibling := range plan.Releases {
+			if collides(rp.Name, sibling.Name) {
+				return fmt.Errorf("refusing to install release '%s': this application also declares release '%s', and %s",
+					rp.Name, sibling.Name, whyCollide)
+			}
+		}
+		for _, other := range others {
+			if collides(rp.Name, other) {
+				return fmt.Errorf("refusing to install release '%s': application '%s' declares release '%s', and %s",
+					rp.Name, elsewhere[other], other, whyCollide)
+			}
+		}
+	}
+	return nil
+}
+
+const whyCollide = "Swarm cannot keep apart what the two scope: names that differ only in case are one name to it, " +
+	"and a name followed by '_' is the other's prefix. Give the release a name of its own"
+
+// collides reports whether two release names are distinct yet scope names Swarm
+// cannot tell apart; see checkReleaseNames.
+func collides(a, b string) bool {
+	la, lb := strings.ToLower(a), strings.ToLower(b)
+	return a != b && (la == lb || strings.HasPrefix(la, lb+"_") || strings.HasPrefix(lb, la+"_"))
 }
 
 // unsettled names the releases a plan would still change, in plan order.
@@ -2850,7 +2905,8 @@ func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec appli
 
 // declaredElsewhere maps each release some application in the set other than
 // app declares to the application declaring it. Nothing named here is deleted by
-// app's sweeps, whatever its owner stamp says.
+// app's sweeps, whatever its owner stamp says, and checkReleaseNames reads it for
+// what app may install beside them.
 //
 // The declaring application is carried rather than a bare set because it is half
 // of what the operator has to fix: a log line naming only the release says a

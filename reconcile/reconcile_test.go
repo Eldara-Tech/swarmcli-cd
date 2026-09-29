@@ -1678,6 +1678,186 @@ func TestAnApplicationDoesNotProtectAReleaseFromItself(t *testing.T) {
 	}
 }
 
+// installing is a plan installing each named release.
+func installing(releases ...string) *charts.Plan {
+	plan := &charts.Plan{}
+	for _, name := range releases {
+		plan.Releases = append(plan.Releases, charts.ReleasePlan{Name: name, Ref: "repo/" + name, Action: charts.ActionInstall, ToVersion: "0.1.0"})
+	}
+	return plan
+}
+
+// A release is not installed beside another release in the set whose name Swarm
+// cannot keep apart from it: one differing only in case, or one that is the
+// other's name followed by '_', in either direction. The other may be declared by
+// a chart application's spec or by this plan itself. Nothing is applied, and the
+// refusal names both releases and where the other comes from.
+func TestAReleaseCollidingWithOneDeclaredInTheSetIsNotInstalled(t *testing.T) {
+	for _, tc := range []struct {
+		name, installs, declared string
+		plan                     *charts.Plan
+		want                     []string
+	}{
+		{"differs only in case", "web", "Web", nil, []string{"'web'", "'acme'", "'Web'"}},
+		{"extends the other with '_'", "web_a", "web", nil, []string{"'web_a'", "'acme'", "'web'"}},
+		{"is extended by the other", "web", "WEB_a", nil, []string{"'web'", "'acme'", "'WEB_a'"}},
+		{"in the same plan", "web", "", &charts.Plan{Releases: []charts.ReleasePlan{
+			{Name: "web", Action: charts.ActionInstall}, {Name: "Web", Action: charts.ActionUnchanged},
+		}}, []string{"'web'", "this application", "'Web'"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := tc.plan
+			if plan == nil {
+				plan = installing(tc.installs)
+			}
+			engine := &fakeEngine{plans: []*charts.Plan{plan}}
+			apps := []application.Spec{spec("edge", true)}
+			if tc.declared != "" {
+				apps = append(apps, chartApp("acme", tc.declared))
+			}
+			r := newTest(t, apps, engine, nil)
+
+			err := r.Sync(t.Context(), "edge")
+			if err == nil {
+				t.Fatal("Sync = nil, want the install refused")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %s", err, want)
+				}
+			}
+			if engine.applyCount() != 0 {
+				t.Error("the plan was applied despite the refusal")
+			}
+		})
+	}
+}
+
+// What is not refused. A release already installed keeps deploying whatever else
+// the set declares, so the one that arrived second is the one held. The same name
+// in two applications is declaredElsewhere's case, held at prune rather than
+// refused. And a name that merely starts with the other's, without the '_', or
+// with another separator, scopes nothing the other does.
+func TestReleaseNamesSwarmKeepsApartAreInstalled(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		plan     *charts.Plan
+		declared string
+	}{
+		{"an upgrade", outOfSyncRelease("web"), "Web"},
+		{"the same name", installing("web"), "web"},
+		{"a longer name", installing("webapp"), "web"},
+		{"another separator", installing("web-a"), "web"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := &fakeEngine{plans: []*charts.Plan{tc.plan, declaring(tc.plan.Releases[0].Name)}}
+			r := newTest(t, []application.Spec{spec("edge", true), chartApp("acme", tc.declared)}, engine, nil)
+
+			if err := r.Sync(t.Context(), "edge"); err != nil {
+				t.Fatalf("Sync = %v, want the plan applied", err)
+			}
+			if engine.applyCount() != 1 {
+				t.Errorf("applied %d times, want 1", engine.applyCount())
+			}
+		})
+	}
+}
+
+// outOfSyncRelease is outOfSync for a named release.
+func outOfSyncRelease(name string) *charts.Plan {
+	plan := outOfSync()
+	plan.Releases[0].Name = name
+	return plan
+}
+
+// racingEngine plans one install per application and holds each application's
+// first plan until every application has planned, so that their installs reach
+// the release-name check with each other's plans already recorded — the window a
+// check against release records alone leaves open, because the chart engine
+// writes those after the deploy.
+type racingEngine struct {
+	*fakeEngine
+	releases map[string]string // application → the release it installs
+	arrived  chan string
+	proceed  chan struct{}
+
+	mu      sync.Mutex
+	planned map[string]bool
+}
+
+func (e *racingEngine) PlanApply(_ context.Context, _ *charts.ReleaseFile, _ charts.ChartSource, opts charts.PlanOptions) (*charts.Plan, error) {
+	app := opts.Owner[strings.LastIndex(opts.Owner, "/")+1:]
+	e.mu.Lock()
+	first := !e.planned[app]
+	e.planned[app] = true
+	e.mu.Unlock()
+	if !first {
+		return declaring(e.releases[app]), nil
+	}
+	e.arrived <- app
+	<-e.proceed
+	return installing(e.releases[app]), nil
+}
+
+// Two applications installing releases that differ only in case, at once: at most
+// one is deployed, whichever way the two goroutines interleave, and the other is
+// refused naming it.
+func TestOfTwoCollidingInstallsAtOnceAtMostOneIsDeployed(t *testing.T) {
+	engine := &racingEngine{
+		fakeEngine: &fakeEngine{},
+		releases:   map[string]string{"one": "web", "two": "Web"},
+		arrived:    make(chan string, 2),
+		proceed:    make(chan struct{}),
+		planned:    map[string]bool{},
+	}
+	r := newTest(t, []application.Spec{spec("one", true), spec("two", true)}, engine, nil)
+
+	errs := make(chan error, 2)
+	for _, app := range []string{"one", "two"} {
+		go func() { errs <- r.Sync(t.Context(), app) }()
+	}
+	<-engine.arrived
+	<-engine.arrived
+	close(engine.proceed)
+
+	var refused int
+	for range 2 {
+		if err := <-errs; err != nil {
+			if !strings.Contains(err.Error(), "differ only in case") {
+				t.Errorf("Sync = %v, want a refusal naming the collision", err)
+			}
+			refused++
+		}
+	}
+	if applied := engine.applyCount(); applied > 1 || applied+refused != 2 {
+		t.Errorf("applied %d and refused %d, want at most one applied and the rest refused", applied, refused)
+	}
+}
+
+// Swarm folds case, and a '_' continues a name rather than ending it.
+func TestCollides(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"web", "web", false},
+		{"web", "WEB", true},
+		{"web", "web_a", true},
+		{"Web_A", "web", true},
+		{"web", "webapp", false},
+		{"web", "web-a", false},
+		{"web_a", "web_b", false},
+		{"a_b", "a_b_c", true},
+	} {
+		if got := collides(tc.a, tc.b); got != tc.want {
+			t.Errorf("collides(%s, %s) = %t, want %t", tc.a, tc.b, got, tc.want)
+		}
+		if got := collides(tc.b, tc.a); got != tc.want {
+			t.Errorf("collides(%s, %s) = %t, want %t", tc.b, tc.a, got, tc.want)
+		}
+	}
+}
+
 // The D-e default. An orphan is reported and left running unless the
 // application's own sync policy asks for it to go.
 func TestOrphansSurviveWhenPruneIsOff(t *testing.T) {
