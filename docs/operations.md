@@ -59,7 +59,10 @@ controller nor a swarm.
 - a `type: cluster` mount needs one whatever it is called, since a stack never
   creates a cluster volume;
 - a declared config or secret named outside the release, or whose name
-  something other than the release already holds, needs one too.
+  something other than the release already holds, needs one too;
+- so does a volume of the release's own given a `driver:` other than `local` or
+  any non-empty `driver_opts:`, named `<release>_<key>` (see
+  [`volumes`](configuration.md#secrets-configs-volumes-and-networks)).
 
 The common case is a chart that references a secret the operator creates, under
 a default name starting with the chart's own, installed under the chart's name.
