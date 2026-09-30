@@ -933,7 +933,9 @@ func (f *fakeAPI) VolumeInspect(_ context.Context, name string) (volume.Volume, 
 // set, which a node-local volume never has.
 func asCluster(v volume.Volume) *volume.Volume {
 	v.Scope = "global"
-	v.ClusterVolume = &volume.ClusterVolume{ID: "csi-" + v.Name}
+	if v.ClusterVolume == nil {
+		v.ClusterVolume = &volume.ClusterVolume{ID: "csi-" + v.Name}
+	}
 	return &v
 }
 

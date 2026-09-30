@@ -1060,11 +1060,16 @@ than one node, this deletes the departed release's volumes on the controller's
 node and cannot see, let alone remove, the ones its tasks left elsewhere. There
 is no swarm-wide listing of named volumes to ask for instead.
 
-A purge never removes a CSI cluster volume, labelled or not: a stack deploy
+A purge does not list a CSI cluster volume, labelled or not: a stack deploy
 neither creates nor labels one, so it was provisioned outside the release, and
 removing it would delete its storage. The daemon adds cluster volumes to a
 listing without applying its label filter, so the controller checks every
-volume it is handed.
+volume it is handed. Docker removes a volume by name, and when the node-local
+volume is gone it resolves that name to a cluster volume instead, so the
+controller also leaves out a node-local volume whose name a listed cluster
+volume answers to, and inspects each volume just before removing it. That
+narrows the case rather than closing it: the inspect and the removal are two
+calls, and nothing the daemon offers makes them one.
 
 The controller does not pretend otherwise. On a multi-node swarm every purge
 logs what it actually removed and says the listing was node-local, with the

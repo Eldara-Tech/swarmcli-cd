@@ -8,7 +8,9 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -355,6 +357,15 @@ func (b *Backend) DeleteConfig(ctx context.Context, name string) error {
 // never is, labelled or not: a stack deploy neither creates nor labels one
 // (docker/cli's convert gives a cluster mount empty ClusterOptions), so one was
 // provisioned outside the release, and removing it deletes its storage.
+//
+// A node-local volume whose name a cluster volume in the same listing also
+// answers to is left out as well. Removal is by name, and if the node-local one
+// is gone by then the daemon resolves the name in the swarm store instead — by a
+// cluster volume's name, without regard to case, or as a prefix of its ID
+// (daemon/cluster/helpers.go:248-270) — where a delete of an idle volume marks it
+// for deletion for good. A declared cluster mount is named <stack>_<volume>
+// exactly as a node-local volume is, so the two can share a name. A cluster
+// volume created after this listing is not seen here.
 func (b *Backend) StackVolumes(ctx context.Context, name string) ([]string, error) {
 	if err := b.rejectOwnNamespace(ctx, name); err != nil {
 		return nil, err
@@ -363,11 +374,26 @@ func (b *Backend) StackVolumes(ctx context.Context, name string) ([]string, erro
 	if err != nil {
 		return nil, fmt.Errorf("listing the stack's volumes: %w", err)
 	}
+	var clusters []*volume.ClusterVolume
+	var clusterNames []string
+	for _, v := range resp.Volumes {
+		if v.ClusterVolume != nil {
+			clusters = append(clusters, v.ClusterVolume)
+			clusterNames = append(clusterNames, strings.ToLower(v.Name))
+		}
+	}
 	out := make([]string, 0, len(resp.Volumes))
 	for _, v := range resp.Volumes {
-		if v.ClusterVolume == nil && v.Labels[convert.LabelNamespace] == name {
-			out = append(out, v.Name)
+		if v.ClusterVolume != nil || v.Labels[convert.LabelNamespace] != name {
+			continue
 		}
+		if slices.Contains(clusterNames, strings.ToLower(v.Name)) ||
+			slices.ContainsFunc(clusters, func(c *volume.ClusterVolume) bool { return strings.HasPrefix(c.ID, v.Name) }) {
+			b.log.Warn("left a volume out of the purge: a cluster volume answers to the same name, and a removal "+
+				"by name would reach it once the node-local volume is gone", "stack", name, "volume", v.Name)
+			continue
+		}
+		out = append(out, v.Name)
 	}
 	sort.Strings(out)
 	return out, nil

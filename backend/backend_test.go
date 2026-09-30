@@ -700,6 +700,74 @@ func TestStackVolumesKeepOnlyTheStacksOwn(t *testing.T) {
 		},
 	}
 
+	var logged bytes.Buffer
+	b := New(api, Options{Log: slog.New(slog.NewTextHandler(&logged, nil))})
+	got, err := b.StackVolumes(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("StackVolumes = %v, want nil", err)
+	}
+	if want := []string{"s_data"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("volumes = %v, want %v", got, want)
+	}
+	// A cluster volume is simply not a candidate; it is not a node-local volume
+	// left out for sharing a name, and is not reported as one.
+	if strings.Contains(logged.String(), "left a volume out") {
+		t.Errorf("log %q reports a cluster volume as a node-local one left out", logged.String())
+	}
+}
+
+// A volume is removed by name, and when the node-local volume of that name is
+// gone by the time it is removed the daemon resolves the name in the swarm store
+// instead: by a cluster volume's name, without regard to case, or as a prefix of
+// its ID. So a node-local name a cluster volume in the same listing also answers
+// to is left out of the purge.
+func TestStackVolumesLeaveOutANameACLusterVolumeAlsoAnswers(t *testing.T) {
+	ns := map[string]string{convert.LabelNamespace: "s"}
+	api := &fakeAPI{
+		volumes: []volume.Volume{
+			{Name: "s_data", Labels: ns},
+			{Name: "s_logs", Labels: ns},
+			{Name: "abc", Labels: ns},
+		},
+		clusterVolumes: []volume.Volume{
+			{Name: "S_DATA"},
+			{Name: "other", ClusterVolume: &volume.ClusterVolume{ID: "abcdef0123456789"}},
+		},
+	}
+
+	got, err := testBackend(t, api, nil).StackVolumes(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("StackVolumes = %v, want nil", err)
+	}
+	if want := []string{"s_logs"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("volumes = %v, want %v", got, want)
+	}
+}
+
+// unfilteredVolumes hands back extra node-local volumes whatever the listing's
+// filter, so that the label StackVolumes checks is what keeps them out.
+type unfilteredVolumes struct {
+	*fakeAPI
+	extra []volume.Volume
+}
+
+func (u unfilteredVolumes) VolumeList(ctx context.Context, o volume.ListOptions) (volume.ListResponse, error) {
+	resp, err := u.fakeAPI.VolumeList(ctx, o)
+	for i := range u.extra {
+		resp.Volumes = append(resp.Volumes, &u.extra[i])
+	}
+	return resp, err
+}
+
+// The label is checked on what comes back, for node-local volumes too: a listing
+// that returned another stack's, or an unlabelled one, does not put it in a purge.
+func TestStackVolumesCheckTheLabelOfEveryVolume(t *testing.T) {
+	api := unfilteredVolumes{fakeAPI: &fakeAPI{}, extra: []volume.Volume{
+		{Name: "s_data", Labels: map[string]string{convert.LabelNamespace: "s"}},
+		{Name: "t_data", Labels: map[string]string{convert.LabelNamespace: "t"}},
+		{Name: "loose"},
+	}}
+
 	got, err := testBackend(t, api, nil).StackVolumes(context.Background(), "s")
 	if err != nil {
 		t.Fatalf("StackVolumes = %v, want nil", err)
