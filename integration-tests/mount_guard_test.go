@@ -283,8 +283,8 @@ func TestAVolumeWithDriverOptionsNeedsAllowVolumes(t *testing.T) {
 	if err == nil {
 		t.Fatal("SyncNow(driveropts) = nil, want the deploy refused for a volume with driver options")
 	}
-	if !strings.Contains(err.Error(), "allow.volumes") {
-		t.Fatalf("SyncNow(driveropts) = %v, want it refused by the volume guard", err)
+	if !strings.Contains(err.Error(), "driver_opts") || !strings.Contains(err.Error(), "allow.volumes") {
+		t.Fatalf("SyncNow(driveropts) = %v, want it refused for the volume's driver options", err)
 	}
 	if names := serviceNamesOf(t, cli, release); len(names) != 0 {
 		t.Errorf("services = %v, want none created by a refused deploy", names)

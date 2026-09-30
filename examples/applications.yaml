@@ -43,7 +43,7 @@ applications:
     # install. It is an allowlist: omit it and a chart can declare and mount its
     # own resources and nothing else, because everything a release owns is scoped
     # to `<release>_<name>` and needs no entry — except a volume of its own given a
-    # driver: or driver_opts:, which needs one in volumes: below.
+    # driver: other than local or any driver_opts:, which needs one in volumes:.
     #
     # It lives here and nowhere a chart author can write, so that being able to
     # change an app's chart is not the same permission as being able to add an

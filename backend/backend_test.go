@@ -3481,7 +3481,7 @@ func TestAVolumeWithDriverOptionsNeedsAllowVolumes(t *testing.T) {
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the volume refused")
 			}
-			for _, want := range []string{"service 'app'", "tenant_data", "allow.volumes"} {
+			for _, want := range []string{"service 'app'", "tenant_data", "driver_opts", "allow.volumes"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("error %q does not mention %q", err, want)
 				}
@@ -3507,16 +3507,18 @@ func TestAVolumeWithDriverOptionsDeploysWhenPermitted(t *testing.T) {
 }
 
 // What the rule leaves alone: a declaration naming the default driver and no
-// options is a plain named volume, and needs no entry.
+// options is a plain named volume, and an anonymous one has no declaration at all
+// — its mount carries no VolumeOptions. None needs an entry.
 func TestAVolumeWithoutDriverOptionsNeedsNoEntry(t *testing.T) {
-	for _, tc := range []struct{ name, block string }{
-		{"a plain declaration", "    {}\n"},
-		{"the local driver named", "    driver: local\n"},
-		{"empty driver_opts", "    driver_opts: {}\n"},
+	for _, tc := range []struct{ name, manifest string }{
+		{"a plain declaration", declaresAVolume("    {}\n")},
+		{"the local driver named", declaresAVolume("    driver: local\n")},
+		{"empty driver_opts", declaresAVolume("    driver_opts: {}\n")},
+		{"an anonymous volume", "services:\n  app:\n    image: busybox\n    volumes: [\"/data\"]\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := allowing(t, asController(&fakeAPI{}), application.Allow{}).DeployStack(t.Context(),
-				charts.DeployRequest{Name: "tenant", Manifest: declaresAVolume(tc.block), Resolve: ResolveNever}); err != nil {
+				charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever}); err != nil {
 				t.Fatalf("DeployStack = %v, want the volume deployed", err)
 			}
 		})
