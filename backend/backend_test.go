@@ -3506,6 +3506,40 @@ func TestAVolumeWithDriverOptionsDeploysWhenPermitted(t *testing.T) {
 	}
 }
 
+// Driver options belong only on a volume named within the release. Another
+// stack's volume is shared by declaring it external:, which carries none, so a
+// declaration naming one with options is refused even when allow.volumes lists
+// it — while the same name as an external: reference, and a release-scoped name:
+// with options, deploy under the same entry.
+func TestDriverOptionsNeedAVolumeNamedWithinTheRelease(t *testing.T) {
+	const opts = "    driver: local\n    driver_opts:\n      type: nfs\n      o: \"addr=10.0.0.1,rw\"\n      device: \":/export\"\n"
+	for _, tc := range []struct {
+		name, manifest, allowed, want string
+	}{
+		{"another stack's name with options", declaresAVolume("    name: shared-cache\n" + opts), "shared-cache", "external:"},
+		{"another stack's name as external", mountsAVolume("shared-cache", true), "shared-cache", ""},
+		{"a release-scoped name with options", declaresAVolume("    name: tenant_custom\n" + opts), "tenant_custom", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+			err := allowing(t, api, application.Allow{Volumes: []string{tc.allowed}}).DeployStack(t.Context(),
+				charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever})
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("DeployStack = %v, want the volume deployed", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), tc.allowed) {
+				t.Fatalf("DeployStack = %v, want it refused naming %q and %q", err, tc.allowed, tc.want)
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+			}
+		})
+	}
+}
+
 // What the rule leaves alone: a declaration naming the default driver and no
 // options is a plain named volume, and an anonymous one has no declaration at all
 // — its mount carries no VolumeOptions. None needs an entry.
