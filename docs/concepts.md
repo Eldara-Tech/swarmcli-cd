@@ -226,15 +226,25 @@ that way has records, or is being installed by another application at that
 moment — the records are written only after a deploy, and applications
 reconcile in parallel. Whichever installs first keeps deploying; a release that
 is only declared holds no name. A pair installed together before this rule keeps
-deploying too.
+deploying too, with a warning on each of its deploys, because the rules in the
+next paragraph are then all that keeps the two apart, and they do not cover
+volumes.
 
 What a release scopes is its own only as far as the swarm can say so: an
 `external:` reference needs the app set's permission whatever it is called —
 the `self: true` release aside, for what the controller itself holds — and a declared
 config, secret or network is the release's only if nothing holds its name yet or
-what does carries exactly the release's namespace label. A volume is decided by
-its name alone, because a volume lives on whichever node first mounted it and
-there is no cluster-wide label to read.
+what does carries exactly the release's namespace label. A `type: cluster`
+mount is never the release's own, since a stack never creates a cluster volume.
+Any other volume is decided by its name alone, because it lives on whichever
+node first mounted it and there is no cluster-wide label to read.
+
+That leaves one thing open, and only between releases the rules above cannot
+keep apart: a pair whose names collide by `_` and which were installed together
+before this was refused, or a release beside a stack deployed without the
+controller. There, a volume one of them declares under a name scoped into the
+other's — release `a` declaring `b_data` beside release `a_b`'s `data` — is the
+same volume on a node that runs both. Give one of the pair a name of its own.
 
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by

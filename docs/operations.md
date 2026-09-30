@@ -51,14 +51,58 @@ practice. `swarmcli-cd validate --file applications.yaml` run with the binary yo
 are moving *to* answers that before the deployment does — it needs neither a
 controller nor a swarm.
 
-**What a release may reach without `allow` has narrowed.** An `external:`
-reference now needs an [`allow`](configuration.md#allow-optional) entry whatever
-it is called, including a name starting with the release's own `<release>_` — a
-chart whose default secret is `postgres_password`, installed as release
-`postgres`, is the common case. A declared config or secret whose name something
-else already holds needs one too. Neither is caught by `validate`: the deploy is
-refused, naming the entry to add, and the release keeps running as it was until
-the entry is in the app set.
+**What a release may reach without `allow` has narrowed.** From this version:
+
+- an `external:` reference — config, secret, volume or network — needs an
+  [`allow`](configuration.md#allow-optional) entry whatever it is called,
+  including a name that starts with the release's own `<release>_`;
+- a `type: cluster` mount needs one whatever it is called, since a stack never
+  creates a cluster volume;
+- a declared config or secret whose name something other than the release
+  already holds needs one too.
+
+The common case is a chart that references a secret the operator creates, under
+a default name starting with the chart's own, installed under the chart's name.
+In [swarmcli-charts](https://github.com/Eldara-Tech/swarmcli-charts), eleven do:
+
+| chart | default external secrets |
+|---|---|
+| gitlab | `gitlab_root_password`, `gitlab_smtp_password` |
+| keycloak | `keycloak_db_password`, `keycloak_admin_password`, `keycloak_tls_cert`, `keycloak_tls_key` |
+| mariadb | `mariadb_root_password`, `mariadb_password` |
+| mongodb | `mongodb_root_password`, `mongodb_password`, `mongodb_keyfile` |
+| openclaw | `openclaw_gateway_token` |
+| postgres | `postgres_password` |
+| redis | `redis_password` |
+| renovate | `renovate_token` |
+| superset | `superset_db_password`, `superset_redis_password`, `superset_secret_key`, `superset_admin_password`, `superset_oidc_client_secret` |
+| vaultwarden | `vaultwarden_postgres_password`, `vaultwarden_mysql_password`, `vaultwarden_admin_token`, `vaultwarden_smtp_password` |
+| zammad | `zammad_db_password`, `zammad_redis_password`, `zammad_elasticsearch_password` |
+
+Only the ones a release actually mounts matter — several are optional — and a
+chart installed under another release name was never exempt. So an application
+that installs the postgres chart as release `postgres` adds:
+
+```yaml
+- name: postgres
+  source:
+    # … as before
+  allow:
+    secrets: [postgres_password]
+```
+
+The controller says which entries each application needs. At startup it reads
+the recorded manifest of every release it installed and logs, once per
+application, a warning naming the entries missing, grouped by field:
+
+```
+level=WARN msg="releases of this application reference names its allowlist does not permit, and their next deploy will be refused until it does: add these entries to the application's allow in the app set" application=postgres releases=[postgres] allow.secrets=[postgres_password]
+```
+
+It refuses nothing and names only names. Add what it lists to the app set before
+the next deploy — or after, since a deploy that is refused leaves the release
+running as it was, naming the entry to add. `validate` cannot catch these: they
+depend on the charts, not the file.
 
 ## Restarting, and what survives one
 
