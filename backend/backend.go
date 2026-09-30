@@ -64,6 +64,7 @@ var (
 	_ capability.StackVolumeRemover  = (*Backend)(nil)
 	_ capability.NodeRoster          = (*Backend)(nil)
 	_ capability.ServiceLogReader    = (*Backend)(nil)
+	_ capability.AllowAuditor        = (*Backend)(nil)
 )
 
 // WithRegistryAuth returns a copy of the backend that authenticates its image

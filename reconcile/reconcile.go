@@ -179,9 +179,9 @@ type Reconciler struct {
 	// two — so cancelling Run retires every entry, which stops a sync the API
 	// started as well as the loop. It is nil until Run is called.
 	//
-	// wg tracks the live loop goroutines. It is not the whole drain, because a
-	// sync started through the API belongs to no goroutine it counts; the
-	// entries' leases are the other half. See drain.
+	// wg tracks the live loop goroutines and the startup allowlist audit. It is
+	// not the whole drain, because a sync started through the API belongs to no
+	// goroutine it counts; the entries' leases are the other half. See drain.
 	root context.Context
 	wg   sync.WaitGroup
 	// installing names, for each application whose apply is under way, the
@@ -250,6 +250,13 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	for _, name := range r.order {
 		r.startLoopLocked(r.apps[name])
 	}
+	// Beside the loops rather than before them: it only warns, and a slow daemon
+	// must not hold up the reconciles it is warning about.
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.auditAllowlists(ctx)
+	}()
 	r.mu.Unlock()
 
 	<-ctx.Done()
