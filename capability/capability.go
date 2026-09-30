@@ -298,6 +298,11 @@ type StackVolumeRemover interface {
 	RemoveStackVolume(ctx context.Context, v StackVolume) error
 }
 
+// ErrVolumeLeft is what RemoveStackVolume returns when the name no longer
+// answers with the stack's node-local volume and nothing was removed, so that a
+// purge neither fails on it nor reports it as deleted.
+var ErrVolumeLeft = errors.New("the volume's name no longer answers with the stack's node-local volume, so it was left in place")
+
 // StackVolume names one volume of one stack, as StackVolumes listed it.
 type StackVolume struct {
 	Stack string

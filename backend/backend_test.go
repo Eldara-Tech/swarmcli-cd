@@ -2888,8 +2888,12 @@ func TestAVolumeIsRemovedOnlyWhileItIsTheOneListed(t *testing.T) {
 		{"nothing of that name", &fakeAPI{}, "s", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := testBackend(t, tc.api, nil).RemoveStackVolume(t.Context(), capability.StackVolume{Stack: tc.stack, Name: "s_data"}); err != nil {
-				t.Fatalf("RemoveStackVolume = %v, want nil", err)
+			err := testBackend(t, tc.api, nil).RemoveStackVolume(t.Context(), capability.StackVolume{Stack: tc.stack, Name: "s_data"})
+			// Left in place is said, so a purge does not report it as deleted;
+			// gone already is not.
+			wantLeft := !tc.removed && len(tc.api.volumes)+len(tc.api.clusterVolumes) > 0
+			if got := errors.Is(err, capability.ErrVolumeLeft); got != wantLeft || (err != nil && !wantLeft) {
+				t.Fatalf("RemoveStackVolume = %v, want ErrVolumeLeft: %v", err, wantLeft)
 			}
 			if got := slices.Contains(tc.api.removed, "volume:s_data"); got != tc.removed {
 				t.Errorf("removed %v, want the volume removed: %v", tc.api.removed, tc.removed)
@@ -2901,6 +2905,33 @@ func TestAVolumeIsRemovedOnlyWhileItIsTheOneListed(t *testing.T) {
 	api := &fakeAPI{clusterVolumes: []volume.Volume{{Name: "s_data"}}}
 	if err := testBackend(t, api, nil).RemoveVolume(t.Context(), "s_data"); err != nil || len(api.removed) != 0 {
 		t.Errorf("RemoveVolume = %v, removed %v; want a cluster volume of that name left in place", err, api.removed)
+	}
+}
+
+// An inspect that fails answers nothing about the name, so nothing is removed on
+// the strength of it: the failure is returned, and the delete is not sent.
+func TestAVolumeIsNotRemovedWhenItCouldNotBeInspected(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remove func(*Backend, *fakeAPI) error
+	}{
+		{"RemoveVolume", func(b *Backend, _ *fakeAPI) error { return b.RemoveVolume(t.Context(), "s_data") }},
+		{"RemoveStackVolume", func(b *Backend, _ *fakeAPI) error {
+			return b.RemoveStackVolume(t.Context(), capability.StackVolume{Stack: "s", Name: "s_data"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeAPI{
+				volumes:          []volume.Volume{{Name: "s_data", Labels: map[string]string{convert.LabelNamespace: "s"}}},
+				volumeInspectErr: errors.New("daemon busy"),
+			}
+			if err := tc.remove(testBackend(t, api, nil), api); err == nil || !strings.Contains(err.Error(), "daemon busy") {
+				t.Errorf("err = %v, want the inspect failure", err)
+			}
+			if len(api.removed) != 0 {
+				t.Errorf("removed %v after an inspect that failed", api.removed)
+			}
+		})
 	}
 }
 

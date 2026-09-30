@@ -280,10 +280,13 @@ func purgeEveryNode(ctx context.Context, log *slog.Logger, backend charts.Backen
 		}
 		remove := volumeRemover(nb, release)
 		for _, name := range names {
-			if err := settle(ctx, func(ctx context.Context) error { return remove(ctx, name) }); err != nil {
+			gone, err := removeVolume(ctx, remove, name)
+			if err != nil {
 				return failed(fmt.Errorf("removing volume '%s' on node %s: %w", name, nodeName(node), err))
 			}
-			deleted = append(deleted, nodeName(node)+"/"+name)
+			if gone {
+				deleted = append(deleted, nodeName(node)+"/"+name)
+			}
 		}
 	}
 
@@ -409,9 +412,14 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 	}
 
 	remove := volumeRemover(backend, release)
+	removed := make([]string, 0, len(names))
 	for _, name := range names {
-		if err := settle(ctx, func(ctx context.Context) error { return remove(ctx, name) }); err != nil {
+		gone, err := removeVolume(ctx, remove, name)
+		if err != nil {
 			return fmt.Errorf("removing volume '%s': %w", name, err)
+		}
+		if gone {
+			removed = append(removed, name)
 		}
 	}
 
@@ -419,8 +427,8 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 		// Warn, like every other deletion here — this is data going — but only
 		// when there was some. A release that declared no volume has nothing to
 		// report, and on a one-node swarm an empty listing really does say so.
-		if len(names) > 0 {
-			log.Warn("deleted the release's volumes", "release", release, "volumes", names)
+		if len(removed) > 0 {
+			log.Warn("deleted the release's volumes", "release", release, "volumes", removed)
 		}
 		return nil
 	}
@@ -430,9 +438,25 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 	// purge is exactly the claim this must not make.
 	log.Warn("deleted only this node's volumes for the release: the daemon's volume list is node-local "+
 		"and this swarm has more than one node, so any volumes the release left on another node are still there",
-		"release", release, "volumes", names,
+		"release", release, "volumes", removed,
 		"remedy", "docker volume ls --filter label=com.docker.stack.namespace="+release+", on each node")
 	return nil
+}
+
+// removeVolume removes one volume with settle's retries, and reports whether it
+// is gone: a volume the backend left in place (capability.ErrVolumeLeft) is not
+// a failure, and not a deletion either.
+func removeVolume(ctx context.Context, remove func(context.Context, string) error, name string) (bool, error) {
+	left := false
+	err := settle(ctx, func(ctx context.Context) error {
+		err := remove(ctx, name)
+		if errors.Is(err, capability.ErrVolumeLeft) {
+			left = true
+			return nil
+		}
+		return err
+	})
+	return !left && err == nil, err
 }
 
 // volumeRemover is how a purge removes one of release's volumes from b: by stack

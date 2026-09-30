@@ -6,6 +6,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -439,13 +440,18 @@ func (b *Backend) SwarmNodes(ctx context.Context) (int, error) {
 // between them leaves the delete to that same fallback, and at a current API
 // version the daemon offers no node-local-only delete to close it.
 func (b *Backend) RemoveVolume(ctx context.Context, name string) error {
-	return b.removeLocalVolume(ctx, name, func(volume.Volume) bool { return true })
+	// Nothing of this name to remove is not an error to this contract, whatever
+	// the name answers with instead.
+	if err := b.removeLocalVolume(ctx, name, func(volume.Volume) bool { return true }); !errors.Is(err, capability.ErrVolumeLeft) {
+		return err
+	}
+	return nil
 }
 
 // RemoveStackVolume removes one of a stack's volumes while the name still
 // answers with it: RemoveVolume, and only if the node-local volume carries the
 // stack's namespace label. A volume of that name another stack has created since
-// it was listed is left in place.
+// it was listed is left in place, and capability.ErrVolumeLeft says so.
 func (b *Backend) RemoveStackVolume(ctx context.Context, v capability.StackVolume) error {
 	return b.removeLocalVolume(ctx, v.Name, func(cur volume.Volume) bool {
 		return cur.Labels[convert.LabelNamespace] == v.Stack
@@ -453,7 +459,8 @@ func (b *Backend) RemoveStackVolume(ctx context.Context, v capability.StackVolum
 }
 
 // removeLocalVolume removes the node-local volume name answers with, if ours
-// accepts it, and leaves anything else the name answers with in place.
+// accepts it, and leaves anything else the name answers with in place, returning
+// capability.ErrVolumeLeft.
 func (b *Backend) removeLocalVolume(ctx context.Context, name string, ours func(volume.Volume) bool) error {
 	cur, err := b.api.VolumeInspect(ctx, name)
 	switch {
@@ -464,7 +471,7 @@ func (b *Backend) removeLocalVolume(ctx context.Context, name string, ours func(
 	case cur.ClusterVolume != nil || !ours(cur):
 		b.log.Warn("left a volume in place: its name now answers with a cluster volume, or with another stack's, "+
 			"rather than the node-local volume that was listed", "volume", name)
-		return nil
+		return capability.ErrVolumeLeft
 	}
 	if err := b.api.VolumeRemove(ctx, name, false); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("removing volume '%s': %w", name, err)

@@ -163,9 +163,10 @@ type NodeReach interface {
 // app set — that the decision was made from.
 type NodeBackend interface {
 	// StackVolumes names the node's volumes labelled as belonging to a stack.
-	// The label has to be matched on what comes back, not left to the daemon's
-	// filter: on a manager a volume listing includes every CSI cluster volume
-	// whatever the filter.
+	// It must return node-local volumes only, excluding any with ClusterVolume
+	// set, and match the label on what comes back rather than leave it to the
+	// daemon's filter: on a manager a volume listing includes every CSI cluster
+	// volume whatever the filter.
 	StackVolumes(ctx context.Context, stack string) ([]string, error)
 	// RemoveVolume deletes one of them by name. A volume that is already gone
 	// is not an error: a caller retrying a partial sweep must not be failed by
