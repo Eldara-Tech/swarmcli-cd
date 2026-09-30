@@ -56,6 +56,9 @@ func (b *Backend) UnpermittedNames(ctx context.Context, req capability.AllowRequ
 			add(&need.Configs, req.Allow.Configs, mine.configs, name)
 		}
 		for _, m := range volumeSources(svc) {
+			if _, theirs := mine.volumes[m.Source]; theirs {
+				continue
+			}
 			if !createsVolume(m) {
 				add(&need.Volumes, req.Allow.Volumes, mine.volumes, m.Source)
 				continue

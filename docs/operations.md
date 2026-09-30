@@ -51,7 +51,7 @@ practice. `swarmcli-cd validate --file applications.yaml` run with the binary yo
 are moving *to* answers that before the deployment does — it needs neither a
 controller nor a swarm.
 
-**What a release may reach without `allow` has narrowed.** From v2.0.0:
+**What a release may reach without `allow` has narrowed.** From v1.5.0:
 
 - an `external:` reference — config, secret, volume or network — needs an
   [`allow`](configuration.md#allow-optional) entry whatever it is called,
@@ -106,7 +106,7 @@ level=WARN msg="releases of this application reference names its allowlist does 
 A name the release's own prefix used to hand it, but which is scoped under a
 release of another application or of nothing this controller installed —
 `web_a_db` read by release `web`, beside release `web_a` — gets a warning of its
-own. That is the reach v2.0.0 refuses, so review it. Permit one only if it is
+own. That is the reach v1.5.0 refuses, so review it. Permit one only if it is
 meant to be shared, and then as an `external:` reference: permitting a name the
 release *declares* hands the other release's object to this one, and the other
 is refused on its next deploy.
@@ -129,9 +129,12 @@ to add. `validate` cannot catch these: they depend on the charts, not the file.
 declaration that is not `external:` and names a volume outside the release — a
 `name:` not starting with `<release>_` — was deployed with an `allow.volumes`
 entry and is now refused. So is one held on the controller's node by a volume
-labelled for a release whose name it is scoped under too, which only a pair of
-releases like `web` and `web_a` can do. No entry helps, so the startup check
-warns of each instead, naming the release and the refusal:
+labelled for another stack whose name it is scoped under too — the other half of
+a pair like `web` and `web_a`, a stack deployed without the controller, or one
+that has gone and left the volume behind, since a volume's labels never change.
+Remove such a volume if its stack is gone; declaring it `external:` would adopt
+its data. No entry helps, so the startup check warns of each instead, naming the
+release and the refusal:
 
 ```
 level=WARN msg="a deploy of this release is refused whatever its application's allow says; the refusal says what would work" release=cache refusal="service 'app' mounts volume 'shared-cache', which this stack declares under a name outside this release. …"

@@ -3827,7 +3827,7 @@ func TestADeclaredVolumeHeldByAnotherStackIsNotTheReleasesOwn(t *testing.T) {
 				api := asController(&fakeAPI{volumes: holder.local, clusterVolumes: holder.cluster})
 				err := allowing(t, api, application.Allow{Volumes: []string{manifest.allow}}).DeployStack(t.Context(),
 					charts.DeployRequest{Name: holder.release, Manifest: declared, Resolve: ResolveNever})
-				want := []string{"service 'app'", "'web_a_site'", holder.refused, "external:"}
+				want := []string{"service 'app'", "'web_a_site'", holder.refused, "external:", "remove it, if that stack is gone"}
 				switch {
 				case holder.refused == "" && manifest.how == "with driver options and no entry":
 					want = []string{"driver_opts", "add 'web_a_site' to allow.volumes"}

@@ -170,17 +170,20 @@ volumes:
 // A declared volume no entry could grant — named outside the release, or held on
 // the controller's node for a stack whose purge would reach it — is not among
 // the names, since adding one would not help, and is warned about instead, with
-// the refusal a deploy of it meets. One with driver options too.
+// the refusal a deploy of it meets. One with driver options too. The
+// controller's own volume is neither: no entry reaches it, and the deploy
+// refuses it for being the controller's.
 func TestUnpermittedNamesWarnOfAVolumeNoEntryGrants(t *testing.T) {
 	const manifest = `
 services:
   app:
     image: busybox
-    volumes: ["borrowed:/borrowed", "a_site:/site", "own:/own"]
+    volumes: ["borrowed:/borrowed", "a_site:/site", "own:/own", "ctl:/ctl"]
 volumes:
   borrowed: {name: shared-plain}
   a_site: {driver_opts: {type: tmpfs, device: tmpfs}}
   own: {}
+  ctl: {name: swarmcli-cd_swarmcli-cd-data}
 `
 	var logged bytes.Buffer
 	api := asController(&fakeAPI{volumes: []volume.Volume{{Name: "web_a_site", Labels: map[string]string{convert.LabelNamespace: "web_a"}}}})
@@ -199,8 +202,12 @@ volumes:
 			t.Errorf("log %q does not mention %q", log, want)
 		}
 	}
-	if strings.Contains(log, "web_own") {
-		t.Errorf("log %q warns of the release's own volume", log)
+	// Nor of the controller's own volume, which a deploy refuses as the
+	// controller's before it asks whose else it is.
+	for _, not := range []string{"web_own", "swarmcli-cd_swarmcli-cd-data"} {
+		if strings.Contains(log, not) {
+			t.Errorf("log %q warns of %s", log, not)
+		}
 	}
 }
 

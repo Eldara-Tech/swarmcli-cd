@@ -787,8 +787,8 @@ func mountsHeldVolume(service, name, holder string) error {
 		"that name on this controller's node carries the namespace label of stack '%s', whose name it is scoped "+
 		"under too. A declared volume is used as found where it exists and created labelled as this release's "+
 		"where it does not, so each stack's purge would remove it where it carries that stack's label — declare "+
-		"it external: and add it to allow.volumes in the app set to share it, or give it a name of its own",
-		service, name, holder)
+		"it external: and add it to allow.volumes in the app set to share it, give it a name of its own, or "+
+		"remove it, if that stack is gone", service, name, holder)
 }
 
 func declaresUnpermitted(kind, name, field string) error {
