@@ -625,6 +625,9 @@ func TestAllowIsValidated(t *testing.T) {
 		{"a secret with a slash", "secrets: [team-b/creds]", "allow.secrets[0]"},
 		{"a config with a space", `configs: ["my config"]`, "allow.configs[0]"},
 		{"a volume starting with a dot", "volumes: [.hidden]", "allow.volumes[0]"},
+		{"a volume group naming nothing", `volumes: ["group:"]`, "allow.volumes[0]"},
+		{"a volume group with a slash", `volumes: ["group:a/b"]`, "allow.volumes[0]"},
+		{"a group anywhere but a volume", `configs: ["group:db"]`, "allow.configs[0]"},
 		{"an empty network name", `networks: [""]`, "allow.networks[0]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -637,6 +640,19 @@ func TestAllowIsValidated(t *testing.T) {
 				t.Errorf("error %q does not say what is wrong", err)
 			}
 		})
+	}
+}
+
+// A cluster mount may name a whole CSI volume group as "group:<name>", and an
+// operator permits it by writing that same string in allow.volumes.
+func TestAVolumeGroupIsAValidVolumeEntry(t *testing.T) {
+	f, err := Parse([]byte("applications:\n  - name: edge\n    source:\n      repoURL: https://x/y.git\n"+
+		"      revision: main\n      releaseFile: r.yaml\n    allow:\n      volumes: [\"group:db\"]\n"), "applications.yaml")
+	if err != nil {
+		t.Fatalf("Parse = %v, want a volume group permitted", err)
+	}
+	if got := f.Applications[0].Allow.Volumes; !reflect.DeepEqual(got, []string{"group:db"}) {
+		t.Errorf("allow.volumes = %v, want [group:db]", got)
 	}
 }
 

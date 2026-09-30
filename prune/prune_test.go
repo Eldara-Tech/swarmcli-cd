@@ -746,6 +746,135 @@ func TestASingleNodeSwarmReportsThePurgeAsComplete(t *testing.T) {
 	}
 }
 
+// stackVolumeBackend is a backend that can be asked for one of a stack's volumes
+// by stack, and records how it was asked.
+type stackVolumeBackend struct {
+	sizedBackend
+	asked []capability.StackVolume
+	// left names the volumes the backend reports left in place.
+	left []string
+}
+
+func (b *stackVolumeBackend) RemoveStackVolume(ctx context.Context, v capability.StackVolume) error {
+	b.asked = append(b.asked, v)
+	if slices.Contains(b.left, v.Name) {
+		return capability.ErrVolumeLeft
+	}
+	return b.RemoveVolume(ctx, v.Name)
+}
+
+// A backend that can check a volume is still the release's before removing it is
+// asked that way, with the release the volume was listed for, and not by name
+// alone.
+func TestAPurgeRemovesAVolumeByStackWhenTheBackendCan(t *testing.T) {
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	b := &stackVolumeBackend{sizedBackend: sizedBackend{
+		fakeBackend: &fakeBackend{volumes: map[string][]string{"api": {"api_data"}}},
+		nodes:       1,
+	}}
+
+	if _, err := prunerLogging(t, e, b, true, io.Discard).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+	if want := []capability.StackVolume{{Stack: "api", Name: "api_data"}}; !slices.Equal(b.asked, want) {
+		t.Errorf("asked %v, want %v", b.asked, want)
+	}
+	if !slices.Equal(b.removedVol, []string{"api_data"}) {
+		t.Errorf("removed volumes %v, want api_data", b.removedVol)
+	}
+}
+
+// stackAwareNodes is a reaching registry whose node backends can also be asked
+// for one of a stack's volumes by stack, and records how they were asked.
+type stackAwareNodes struct {
+	reachingSwarms
+	asked *[]capability.StackVolume
+	left  []string
+}
+
+func (r stackAwareNodes) NodeBackend(ctx context.Context, t swarms.Target, n swarms.Node) (swarms.NodeBackend, error) {
+	nb, err := r.reachingSwarms.NodeBackend(ctx, t, n)
+	if err != nil {
+		return nil, err
+	}
+	return stackVolumeNode{NodeBackend: nb, asked: r.asked, left: r.left}, nil
+}
+
+type stackVolumeNode struct {
+	swarms.NodeBackend
+	asked *[]capability.StackVolume
+	left  []string
+}
+
+func (n stackVolumeNode) RemoveStackVolume(ctx context.Context, v capability.StackVolume) error {
+	*n.asked = append(*n.asked, v)
+	if slices.Contains(n.left, v.Name) {
+		return capability.ErrVolumeLeft
+	}
+	return n.RemoveVolume(ctx, v.Name)
+}
+
+// The purge that reaches every node asks each node's backend the same way, and
+// does not report a volume a node left in place as deleted.
+func TestAPurgeOnEveryNodeRemovesByStackWhenTheNodeCan(t *testing.T) {
+	var buf bytes.Buffer
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	n1, b1 := node("worker-1", "api_data", "api_logs")
+	var asked []capability.StackVolume
+	reg := stackAwareNodes{
+		reachingSwarms: reachingSwarms{
+			fakeSwarms: fakeSwarms{backend: sizedBackend{fakeBackend: &fakeBackend{}, nodes: 1}},
+			nodes:      []swarms.Node{n1},
+			backends:   map[string]*fakeBackend{"worker-1": b1},
+		},
+		asked: &asked,
+		left:  []string{"api_logs"},
+	}
+	p := New(Options{
+		Swarms:       reg,
+		Engine:       func(charts.Backend) Engine { return e },
+		Volumes:      true,
+		ControllerID: testController,
+		Log:          slog.New(slog.NewTextHandler(&buf, nil)),
+	})
+
+	if _, err := p.Departed(t.Context(), []string{"kept"}, nil); err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+	want := []capability.StackVolume{{Stack: "api", Name: "api_data"}, {Stack: "api", Name: "api_logs"}}
+	if !slices.Equal(asked, want) {
+		t.Errorf("asked %v, want %v", asked, want)
+	}
+	if !slices.Equal(b1.removedVol, []string{"api_data"}) {
+		t.Errorf("removed volumes %v, want api_data", b1.removedVol)
+	}
+	if log := buf.String(); !strings.Contains(log, "worker-1/api_data") || strings.Contains(log, "api_logs") {
+		t.Errorf("log %q, want worker-1/api_data reported deleted and api_logs not", log)
+	}
+}
+
+// A volume the backend left in place, because its name no longer answered with
+// the release's own, is neither a failure nor reported as deleted.
+func TestAPurgeDoesNotReportAVolumeLeftInPlaceAsDeleted(t *testing.T) {
+	var buf bytes.Buffer
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	b := &stackVolumeBackend{sizedBackend: sizedBackend{
+		fakeBackend: &fakeBackend{volumes: map[string][]string{"api": {"api_data", "api_logs"}}},
+		nodes:       1,
+	}, left: []string{"api_logs"}}
+
+	if _, err := prunerLogging(t, e, b, true, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+		t.Fatalf("Departed = %v, want nil", err)
+	}
+	if !slices.Equal(b.removedVol, []string{"api_data"}) {
+		t.Errorf("removed volumes %v, want api_data", b.removedVol)
+	}
+	log := buf.String()
+	if !strings.Contains(log, "api_data") || strings.Contains(log, "api_logs") {
+		t.Errorf("log %q, want api_data reported deleted and api_logs not", log)
+	}
+}
+
 // A count that could not be read is not one node. Both shapes of "cannot
 // answer" have to land on the cautious side, because the alternative is
 // claiming a purge covered a swarm nothing checked.
