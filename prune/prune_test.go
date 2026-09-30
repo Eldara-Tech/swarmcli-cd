@@ -875,6 +875,57 @@ func TestAPurgeDoesNotReportAVolumeLeftInPlaceAsDeleted(t *testing.T) {
 	}
 }
 
+// A volume labelled as the release's under a name outside it is left in place
+// and named, on this node and on every node the registry reaches: the label says
+// the release's task created it there first, and a name outside the release may
+// be another stack's volume. "apiary_data" is not scoped under "api".
+func TestAPurgeLeavesAVolumeNamedOutsideTheRelease(t *testing.T) {
+	const want = "left volumes labelled as the release's out of the purge"
+	t.Run("this node", func(t *testing.T) {
+		var buf bytes.Buffer
+		e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+		b := sizedBackend{fakeBackend: &fakeBackend{volumes: map[string][]string{"api": {"api_data", "shared-data", "apiary_data"}}}, nodes: 1}
+
+		if _, err := prunerLogging(t, e, b, true, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+			t.Fatalf("Departed = %v, want nil", err)
+		}
+		if !slices.Equal(b.removedVol, []string{"api_data"}) {
+			t.Errorf("removed volumes %v, want api_data alone", b.removedVol)
+		}
+		if log := buf.String(); !strings.Contains(log, want) || !strings.Contains(log, "volumes=\"[shared-data apiary_data]\"") {
+			t.Errorf("log %q, want shared-data and apiary_data named as left", log)
+		}
+	})
+	t.Run("every node", func(t *testing.T) {
+		var buf bytes.Buffer
+		e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+		n1, b1 := node("worker-1", "api_data", "shared-data")
+		reg := reachingSwarms{nodes: []swarms.Node{n1}, backends: map[string]*fakeBackend{"worker-1": b1}}
+
+		if _, err := prunerReaching(t, e, sizedBackend{fakeBackend: &fakeBackend{}, nodes: 1}, reg, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+			t.Fatalf("Departed = %v, want nil", err)
+		}
+		if !slices.Equal(b1.removedVol, []string{"api_data"}) {
+			t.Errorf("removed volumes %v, want api_data alone", b1.removedVol)
+		}
+		if log := buf.String(); !strings.Contains(log, want) || !strings.Contains(log, "node=worker-1") || !strings.Contains(log, "volumes=[shared-data]") {
+			t.Errorf("log %q, want shared-data named as left on worker-1", log)
+		}
+	})
+	t.Run("nothing outside", func(t *testing.T) {
+		var buf bytes.Buffer
+		e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+		b := sizedBackend{fakeBackend: &fakeBackend{volumes: map[string][]string{"api": {"api_data"}}}, nodes: 1}
+
+		if _, err := prunerLogging(t, e, b, true, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+			t.Fatalf("Departed = %v, want nil", err)
+		}
+		if log := buf.String(); strings.Contains(log, want) {
+			t.Errorf("log %q, want no volume named as left", log)
+		}
+	})
+}
+
 // A count that could not be read is not one node. Both shapes of "cannot
 // answer" have to land on the cautious side, because the alternative is
 // claiming a purge covered a swarm nothing checked.

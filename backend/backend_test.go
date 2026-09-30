@@ -3748,6 +3748,94 @@ func TestDriverOptionsNeedAVolumeNamedWithinTheRelease(t *testing.T) {
 	}
 }
 
+// A volume the stack declares is created labelled as the release's on each node
+// that first mounts it, and a purge removes what carries that label, so one
+// named outside the release is refused whatever allow.volumes lists: another
+// stack's volume is shared by external:. A declaration beside an external: of
+// the same name is still a declaration, since its mount carries the label.
+func TestADeclaredVolumeNamedOutsideTheReleaseIsRefusedWhateverAllowSays(t *testing.T) {
+	for _, tc := range []struct{ name, manifest string }{
+		{"a plain declaration", mountsAVolume("shared-cache", false)},
+		{"beside an external: of the same name", mountsAVolume("shared-cache", false) +
+			"  ext:\n    external: true\n    name: shared-cache\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+			err := allowing(t, api, application.Allow{Volumes: []string{"shared-cache"}}).DeployStack(t.Context(),
+				charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever})
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the declaration refused")
+			}
+			for _, want := range []string{"service 'thief'", "'shared-cache'", "outside this release", "external:", "allow.volumes"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// A declared volume scoped under the release is its own only if the node-local
+// volume of that name on the controller's node carries no other stack's
+// namespace label: "web_a_site" is stack "web_a"'s as much as release "web"'s,
+// and whichever creates it first on a node labels it. Refused whatever
+// allow.volumes lists, since sharing it is what external: is for. A volume made
+// by hand carries no label, so no purge selects it and it is accepted, and a
+// cluster volume of the name is not what a volume mount uses.
+func TestADeclaredVolumeHeldByAnotherStackIsNotTheReleasesOwn(t *testing.T) {
+	held := func(owner string) volume.Volume {
+		v := volume.Volume{Name: "web_a_site"}
+		if owner != "" {
+			v.Labels = map[string]string{convert.LabelNamespace: owner}
+		}
+		return v
+	}
+	for _, holder := range []struct {
+		why     string
+		local   []volume.Volume
+		cluster []volume.Volume
+		refused string
+	}{
+		{"another stack's", []volume.Volume{held("web_a")}, nil, "'web_a'"},
+		{"another case", []volume.Volume{held("Web")}, nil, "'Web'"},
+		{"the release's own", []volume.Volume{held("web")}, nil, ""},
+		{"made by hand", []volume.Volume{held("")}, nil, ""},
+		{"a cluster volume only", nil, []volume.Volume{held("web_a")}, ""},
+		{"nothing", nil, nil, ""},
+	} {
+		for _, manifest := range []struct{ how, manifest string }{
+			{"by key", "services:\n  app:\n    image: busybox\n    volumes: [\"a_site:/data\"]\nvolumes:\n  a_site: {}\n"},
+			{"by name", declaresAVolume("    name: web_a_site\n")},
+		} {
+			t.Run(holder.why+"/"+manifest.how, func(t *testing.T) {
+				api := asController(&fakeAPI{volumes: holder.local, clusterVolumes: holder.cluster})
+				err := allowing(t, api, application.Allow{Volumes: []string{"web_a_site"}}).DeployStack(t.Context(),
+					charts.DeployRequest{Name: "web", Manifest: manifest.manifest, Resolve: ResolveNever})
+				if holder.refused == "" {
+					if err != nil {
+						t.Fatalf("DeployStack = %v, want the volume deployed as the release's own", err)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatal("DeployStack = nil, want the declaration refused")
+				}
+				for _, want := range []string{"service 'app'", "'web_a_site'", holder.refused, "external:"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not mention %q", err, want)
+					}
+				}
+				if len(api.created) != 0 || len(api.order) != 0 {
+					t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+				}
+			})
+		}
+	}
+}
+
 // What the rule leaves alone: a declaration naming the default driver and no
 // options is a plain named volume, and an anonymous one has no declaration at all
 // — its mount carries no VolumeOptions. None needs an entry.
@@ -4275,6 +4363,7 @@ func TestADeclaredNameThatCannotBeLookedUpRefusesTheDeploy(t *testing.T) {
 		{"config", shipsAConfig},
 		{"secret", declaresAndMounts},
 		{"network", "services:\n  app:\n    image: busybox\n"},
+		{"volume", declaresAVolume("    {}\n")},
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
 			api := &lookupErrAPI{fakeAPI: &fakeAPI{}, kind: tc.kind, err: errors.New("daemon busy")}
@@ -4290,8 +4379,8 @@ func TestADeclaredNameThatCannotBeLookedUpRefusesTheDeploy(t *testing.T) {
 }
 
 // lookupErrAPI fails the read ownDeclared makes for one kind: a config's or a
-// secret's inspect, or the listing of every network. applyNetworks lists by
-// label, so its read still answers.
+// secret's inspect, or the listing of every network — or a declared volume's
+// inspect. applyNetworks lists by label, so its read still answers.
 type lookupErrAPI struct {
 	*fakeAPI
 	kind string
@@ -4310,6 +4399,13 @@ func (a *lookupErrAPI) SecretInspectWithRaw(ctx context.Context, name string) (s
 		return swarm.Secret{}, nil, a.err
 	}
 	return a.fakeAPI.SecretInspectWithRaw(ctx, name)
+}
+
+func (a *lookupErrAPI) VolumeInspect(ctx context.Context, name string) (volume.Volume, error) {
+	if a.kind == "volume" {
+		return volume.Volume{}, a.err
+	}
+	return a.fakeAPI.VolumeInspect(ctx, name)
 }
 
 func (a *lookupErrAPI) NetworkList(ctx context.Context, o network.ListOptions) ([]network.Summary, error) {

@@ -69,10 +69,6 @@ type Stack struct {
 	// mounts it.
 	ExternalConfigs []swarm.Annotations
 	ExternalSecrets []swarm.Annotations
-	// ExternalVolumes names the volumes the manifest declares external:, by the
-	// name a service's mount of one carries. A mount's source alone does not say
-	// whether the stack declared the volume or only named one already there.
-	ExternalVolumes []string
 }
 
 // Service pairs the name the manifest used with the spec it produced.
@@ -203,22 +199,7 @@ func Convert(ctx context.Context, manifest, stack string, files map[string][]byt
 		ExternalNetworks: external,
 		ExternalConfigs:  externals(cfg.Configs),
 		ExternalSecrets:  externals(cfg.Secrets),
-		ExternalVolumes:  externalVolumes(cfg.Volumes),
 	}, nil
-}
-
-// externalVolumes is the volumes: entries declared external:, by the name the
-// loader resolved for each — its name:, the deprecated external.name, or else
-// its key — and sorted.
-func externalVolumes(section map[string]composetypes.VolumeConfig) []string {
-	var out []string
-	for _, v := range section {
-		if v.External.External {
-			out = append(out, v.Name)
-		}
-	}
-	slices.Sort(out)
-	return out
 }
 
 // externals is the entries of a configs: or secrets: section declared external:,

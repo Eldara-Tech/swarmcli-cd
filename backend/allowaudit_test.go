@@ -25,8 +25,8 @@ import (
 // the release's own, from every service, each once, sorted — and a volume of its
 // own with driver options. What the release declares as its own needs nothing;
 // nor does what the allowlist names, in each of its lists; nor what no entry
-// could grant: what belongs to the controller, or driver options on a volume
-// named outside the release.
+// could grant: what belongs to the controller, or a volume declared under a
+// name outside the release, with driver options or without.
 // A bind does not stop the manifest being read, since binds are not what this
 // reports.
 func TestUnpermittedNamesAreWhatADeployWouldBeRefusedFor(t *testing.T) {
@@ -47,6 +47,7 @@ services:
       - {type: cluster, source: scoped, target: /scoped}
       - optioned:/optioned
       - foreign:/foreign
+      - borrowed:/borrowed
   worker:
     image: busybox
     secrets: [key, db]
@@ -76,6 +77,7 @@ volumes:
   ctl: {external: true, name: swarmcli-cd_swarmcli-cd-data}
   optioned: {driver_opts: {type: tmpfs, device: tmpfs}}
   foreign: {name: shared-data, driver: vieux/sshfs}
+  borrowed: {name: shared-plain}
 `
 	got, err := testBackend(t, asController(&fakeAPI{}), nil).UnpermittedNames(t.Context(), capability.AllowRequest{
 		ManifestRequest: capability.ManifestRequest{Name: "web", Manifest: manifest, Files: decoyFiles},

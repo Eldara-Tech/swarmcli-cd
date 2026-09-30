@@ -233,9 +233,12 @@ const (
 // is called — the manifest has said it is not the release's — and a declared
 // name is the release's own only if it is scoped under the release and whatever
 // already holds that name carries exactly the release's namespace label
-// (ownDeclared). Which of two names like "web" and "web_a" may be installed at
-// all is asked before this: rejectRecordedCollision, and the reconciler's
-// claimInstalls for two installs at once.
+// (ownDeclared). A declared volume is held to the same, except that one carrying
+// no label at all is accepted, and only on the node this controller talks to,
+// the one whose volumes it can read (volumeHolder). Which of two names like "web"
+// and "web_a" may be installed at all is asked before this:
+// rejectRecordedCollision, and the reconciler's claimInstalls for two installs at
+// once.
 //
 // The direction matters more than the sets do. It is an allowlist because the
 // other way round leaves whatever nobody thought of permitted, and the family
@@ -367,19 +370,28 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			if _, forbidden := mine.volumes[name]; forbidden {
 				return mountsForbidden(svc.Name, "volume", name, whatControllerVolume)
 			}
-			// Before the unscoped check, so that a name outside the release is
-			// told what would work — external: — rather than to add an entry
-			// that would not.
-			if _, ok := driven[name]; ok {
-				if !scopedUnder(ns, name) {
-					return mountsForeignDriver(svc.Name, name)
-				}
+			if !createsVolume(m) {
 				if !permits(b.allow.Volumes, name) {
-					return mountsDriverUnpermitted(svc.Name, name)
+					return mountsUnpermitted(svc.Name, "volume", name, "allow.volumes")
 				}
+				continue
 			}
-			if !ownVolume(stack, m) && !permits(b.allow.Volumes, name) {
-				return mountsUnpermitted(svc.Name, "volume", name, "allow.volumes")
+			// A volume the stack declares is the release's own or it is refused,
+			// whatever allow.volumes says: a node creates it labelled as this
+			// release's, and a purge removes what carries that label. Sharing
+			// another stack's volume is what external: is for.
+			if !scopedUnder(ns, name) {
+				return mountsForeignVolume(svc.Name, name)
+			}
+			holder, err := b.volumeHolder(ctx, name)
+			if err != nil {
+				return err
+			}
+			if holder != "" && holder != ns {
+				return mountsHeldVolume(svc.Name, name, holder)
+			}
+			if _, ok := driven[name]; ok && !permits(b.allow.Volumes, name) {
+				return mountsDriverUnpermitted(svc.Name, name)
 			}
 		}
 	}
@@ -766,11 +778,20 @@ func mountsDriverUnpermitted(service, name string) error {
 		service, name, name)
 }
 
-func mountsForeignDriver(service, name string) error {
-	return fmt.Errorf("service '%s' mounts volume '%s', which this stack declares with a volume driver or "+
-		"driver_opts under a name outside this release. A volume another stack owns is shared by declaring "+
-		"it external:, which carries no options; driver options are accepted only on a volume named within "+
-		"this release, and allow.volumes does not change that", service, name)
+func mountsForeignVolume(service, name string) error {
+	return fmt.Errorf("service '%s' mounts volume '%s', which this stack declares under a name outside this "+
+		"release. A declared volume is created labelled as this release's on each node that first mounts it, and "+
+		"a purge of the release removes what carries that label, so a volume another stack owns is shared by "+
+		"declaring it external: and adding it to allow.volumes in the app set; an entry alone does not change "+
+		"this", service, name)
+}
+
+func mountsHeldVolume(service, name, holder string) error {
+	return fmt.Errorf("service '%s' mounts volume '%s', which this stack declares as its own, but the volume of "+
+		"that name on this controller's node carries the namespace label of stack '%s'. A declared volume is used as found "+
+		"where it exists and created labelled as this release's where it does not, so each stack's purge would "+
+		"remove it where it carries that stack's label — declare it external: and add it to allow.volumes in "+
+		"the app set to share it, or give it a name of its own", service, name, holder)
 }
 
 func declaresUnpermitted(kind, name, field string) error {
@@ -837,16 +858,42 @@ func externalRefs(stack *cdcompose.Stack, svc cdcompose.Service) (secrets, confi
 	return secrets, configs
 }
 
-// ownVolume reports whether a volume or cluster mount is the release's own.
+// createsVolume reports whether a mount names a volume the stack declares, as
+// against one it declares external: or a cluster mount, which it never creates.
 //
-// A volume the stack declares external: is not, however it is named, and nor is
-// a cluster mount: a stack never creates a CSI volume, so the one it names is
-// always somebody's already. One it declares is, if conversion scoped it under
-// the release; nothing on the swarm can say otherwise, because a volume lives on
-// whichever node first mounted it.
-func ownVolume(stack *cdcompose.Stack, m mount.Mount) bool {
-	return m.Type != mount.TypeCluster && !slices.Contains(stack.ExternalVolumes, m.Source) &&
-		scopedUnder(stack.Namespace.Name(), m.Source)
+// Read off the mount rather than the manifest's external: entries, because a
+// manifest can declare the same name both ways. Conversion puts the stack's
+// namespace label on a declared volume's mount and on nothing else
+// (convert.handleVolumeToMount), and that label is what a node creates the
+// volume with and what a purge selects it by.
+func createsVolume(m mount.Mount) bool {
+	return m.VolumeOptions != nil && m.VolumeOptions.Labels[convert.LabelNamespace] != ""
+}
+
+// volumeHolder returns the namespace label of the node-local volume name answers
+// with on the node this controller talks to, or "" when there is none or it
+// carries no label.
+//
+// That node only: a volume lives on whichever node first mounted it, and the
+// daemon's inspect answers from its own store. A purge removes only a volume
+// named within the release (prune.withinRelease) whose label it re-reads on that
+// node just before (RemoveStackVolume). What stays open is a name scoped under
+// two stacks whose names differ by a '_' suffix, on a node this does not see: a
+// pair rejectRecordedCollision warns of, or a stack deployed without this
+// controller. A cluster volume answering the name is none, since a volume mount
+// uses the node-local store. An unlabelled volume is accepted: a mount never
+// relabels one, and no purge selects it.
+func (b *Backend) volumeHolder(ctx context.Context, name string) (string, error) {
+	v, err := b.api.VolumeInspect(ctx, name)
+	switch {
+	case errdefs.IsNotFound(err):
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("inspecting volume '%s' to check whose it is: %w", name, err)
+	case v.ClusterVolume != nil:
+		return "", nil
+	}
+	return v.Labels[convert.LabelNamespace], nil
 }
 
 // volumeSources is the volume and cluster mounts one service makes, each naming
@@ -863,7 +910,7 @@ func ownVolume(stack *cdcompose.Stack, m mount.Mount) bool {
 //
 // A cluster mount is here too: it names an existing CSI volume, or a whole
 // volume group as "group:<name>", which the stack never creates, so it is
-// compared by name and is never the release's own (ownVolume).
+// compared by name and is never the release's own (createsVolume).
 //
 // Binds are not here. A bind names a path rather than a cluster-wide name, so
 // there is nothing for it to collide with, and the question it does raise — which
@@ -891,8 +938,8 @@ func volumeSources(svc cdcompose.Service) []mount.Mount {
 // Either decides what the node mounts when it first creates the volume, and the
 // local driver alone reaches host paths and devices through its options. So a
 // stack's own volume carrying them is held to allow.volumes like a volume it does
-// not own, and one declared under a name outside the release may not carry them
-// at all: another stack's volume is shared by external:, which has no options.
+// not own. A volume declared under a name outside the release is refused with or
+// without them (mountsForeignVolume): another stack's is shared by external:.
 // There is no attempt to tell one option set from another: a list of the safe
 // ones would be a guess about a driver this controller does not run.
 //
@@ -1422,9 +1469,10 @@ func (b *Backend) rejectRecordedCollision(ctx context.Context, release string) e
 	if shares != "" && own {
 		b.log.Warn("this release and another whose name is its own followed by '_', or the other way round, were both "+
 			"installed before such pairs were refused. It keeps deploying, but only this controller's checks on each "+
-			"deploy keep what the two declare apart: a config, secret or network the other holds is refused, and a "+
-			"volume is told apart by its name alone, so one scoped into the other's names is the other's. Give one "+
-			"of them a name of its own", "release", release, "collidesWith", shares)
+			"deploy keep what the two declare apart: a config, secret or network the other holds is refused, and so "+
+			"is a volume carrying the other's label on this controller's node. On any other node nothing tells a "+
+			"volume's two claimants apart: whichever creates it there first labels it, and that one's purge removes "+
+			"it. Give one of them a name of its own", "release", release, "collidesWith", shares)
 	}
 	if extends != "" && !own && !b.selfRelease {
 		return fmt.Errorf("refusing to install release '%s': release '%s' already has release records on this swarm, and "+
