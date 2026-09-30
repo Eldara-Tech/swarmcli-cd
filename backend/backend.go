@@ -357,19 +357,15 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 				return mountsUnpermitted(svc.Name, "config", name, "allow.configs")
 			}
 		}
-		for _, name := range volumeSources(svc) {
+		for _, m := range volumeSources(svc) {
+			name := m.Source
 			if b.ownMount(mine.volumes, name) {
 				continue
 			}
 			if _, forbidden := mine.volumes[name]; forbidden {
 				return mountsForbidden(svc.Name, "volume", name, whatControllerVolume)
 			}
-			// A volume the stack declares external: is not its own, however it is
-			// named. One it declares is, if conversion scoped it under the release;
-			// nothing on the swarm can say otherwise, because a volume lives on
-			// whichever node first mounted it.
-			own := !slices.Contains(stack.ExternalVolumes, name) && scopedUnder(ns, name)
-			if !own && !permits(b.allow.Volumes, name) {
+			if !ownVolume(stack, m) && !permits(b.allow.Volumes, name) {
 				return mountsUnpermitted(svc.Name, "volume", name, "allow.volumes")
 			}
 		}
@@ -456,6 +452,8 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 			return joinsUnpermitted(name)
 		}
 	}
+	// Listed once for all of them, and only if one gets that far.
+	var networks []network.Summary
 	for _, nw := range stack.Networks {
 		if inControllersStack(mine.namespace, nw.Name) {
 			if !b.selfRelease {
@@ -467,10 +465,12 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 		// so one already held by something that is not this release's cannot be
 		// its own whatever the allowlist says: the create would fail. Joining it
 		// is what external: is for.
-		held, found, err := b.networkLabels(ctx, nw.Name)
-		if err != nil {
-			return err
+		if networks == nil {
+			if networks, err = b.swarmNetworks(ctx); err != nil {
+				return err
+			}
 		}
+		held, found := heldNetwork(networks, nw.Name)
 		if found && held[convert.LabelNamespace] != ns {
 			return declaresHeldNetwork(nw.Name)
 		}
@@ -509,10 +509,7 @@ func ownDeclared(ctx context.Context, ns, name string, labels func(context.Conte
 }
 
 // secretLabels and configLabels answer ownDeclared for a secret and a config,
-// found by name without regard to case, as Swarm keeps names. networkLabels
-// answers the same for a network, among the swarm-scoped ones — a service can
-// join no other — listed and matched here, because a network listing filters by
-// name as a pattern and inspecting one by name fails when two share it.
+// found by name without regard to case, as Swarm keeps names.
 func (b *Backend) secretLabels(ctx context.Context, name string) (map[string]string, bool, error) {
 	s, _, err := b.api.SecretInspectWithRaw(ctx, name)
 	switch {
@@ -535,17 +532,33 @@ func (b *Backend) configLabels(ctx context.Context, name string) (map[string]str
 	return c.Spec.Labels, true, nil
 }
 
-func (b *Backend) networkLabels(ctx context.Context, name string) (map[string]string, bool, error) {
-	networks, err := b.api.NetworkList(ctx, network.ListOptions{})
+// swarmNetworks lists the swarm-scoped networks — a service can join no other —
+// never nil, so that a caller can tell a listing from none.
+func (b *Backend) swarmNetworks(ctx context.Context) ([]network.Summary, error) {
+	all, err := b.api.NetworkList(ctx, network.ListOptions{})
 	if err != nil {
-		return nil, false, fmt.Errorf("listing networks to check whose '%s' is: %w", name, err)
+		return nil, fmt.Errorf("listing networks to check whose each declared one is: %w", err)
 	}
-	for _, n := range networks {
-		if n.Scope == "swarm" && strings.EqualFold(n.Name, name) {
-			return n.Labels, true, nil
+	out := make([]network.Summary, 0, len(all))
+	for _, n := range all {
+		if n.Scope == "swarm" {
+			out = append(out, n)
 		}
 	}
-	return nil, false, nil
+	return out, nil
+}
+
+// heldNetwork returns the labels of the network holding name, found without
+// regard to case, as Swarm keeps names. Matched here rather than asked for,
+// because a network listing filters by name as a pattern and inspecting one by
+// name fails when two share it.
+func heldNetwork(networks []network.Summary, name string) (map[string]string, bool) {
+	for _, n := range networks {
+		if strings.EqualFold(n.Name, name) {
+			return n.Labels, true
+		}
+	}
+	return nil, false
 }
 
 // allowFor is the allowlist this deploy converts under: the application's own,
@@ -797,7 +810,20 @@ func externalRefs(stack *cdcompose.Stack, svc cdcompose.Service) (secrets, confi
 	return secrets, configs
 }
 
-// volumeSources names the volumes one service mounts.
+// ownVolume reports whether a volume or cluster mount is the release's own.
+//
+// A volume the stack declares external: is not, however it is named, and nor is
+// a cluster mount: a stack never creates a CSI volume, so the one it names is
+// always somebody's already. One it declares is, if conversion scoped it under
+// the release; nothing on the swarm can say otherwise, because a volume lives on
+// whichever node first mounted it.
+func ownVolume(stack *cdcompose.Stack, m mount.Mount) bool {
+	return m.Type != mount.TypeCluster && !slices.Contains(stack.ExternalVolumes, m.Source) &&
+		scopedUnder(stack.Namespace.Name(), m.Source)
+}
+
+// volumeSources is the volume and cluster mounts one service makes, each naming
+// what it mounts in Source.
 //
 // All of them, unlike externalRefs, which drops the ones the stack declares.
 // There is nothing to drop: a top-level `volumes:` entry creates nothing (Swarm
@@ -818,15 +844,15 @@ func externalRefs(stack *cdcompose.Stack, svc cdcompose.Service) (secrets, confi
 // earlier, in compose.checkBindSources, against the same allowlist; a Windows
 // named pipe is a path too, and is checked there with them. A tmpfs mount names
 // nothing, and an image mount names an image, which any service may run anyway.
-func volumeSources(svc cdcompose.Service) []string {
+func volumeSources(svc cdcompose.Service) []mount.Mount {
 	cs := svc.Spec.TaskTemplate.ContainerSpec
 	if cs == nil {
 		return nil
 	}
-	out := make([]string, 0, len(cs.Mounts))
+	out := make([]mount.Mount, 0, len(cs.Mounts))
 	for _, m := range cs.Mounts {
 		if (m.Type == mount.TypeVolume || m.Type == mount.TypeCluster) && m.Source != "" {
-			out = append(out, m.Source)
+			out = append(out, m)
 		}
 	}
 	return out
@@ -1325,6 +1351,12 @@ func (b *Backend) rejectRecordedCollision(ctx context.Context, release string) e
 		case application.ReleasesCollide(other, release) && (extends == "" || other < extends):
 			extends = other
 		}
+	}
+	if extends != "" && own {
+		b.log.Warn("this release and another whose name is its own followed by '_', or the other way round, were both "+
+			"installed before such pairs were refused; it keeps deploying, but a volume either declares is told apart "+
+			"from the other's by its name alone, so one scoped into the other's names mounts the other's data. "+
+			"Give one of them a name of its own", "release", release, "collidesWith", extends)
 	}
 	if extends != "" && !own && !b.selfRelease {
 		return fmt.Errorf("refusing to install release '%s': release '%s' already has release records on this swarm, and "+

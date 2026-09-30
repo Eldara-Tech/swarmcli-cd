@@ -3175,13 +3175,16 @@ func TestDeployStackRefusesInstallingAReleaseCollidingWithARecordedOne(t *testin
 		{"web_a", []string{"web"}, "'web'"},
 		{"web", []string{"WEB_a"}, "'WEB_a'"},
 		{"web", []string{"web", "web_a"}, ""},
+		{"web", []string{"web"}, ""},
 		{"web", []string{"webapp", "web-a"}, ""},
 	} {
 		api := asController(&fakeAPI{configs: nil})
 		for _, r := range tc.recorded {
 			api.configs = append(api.configs, record(r))
 		}
-		err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: tc.release, Manifest: trivialStack, Resolve: ResolveNever})
+		var logged bytes.Buffer
+		b := New(api, Options{Log: slog.New(slog.NewTextHandler(&logged, nil))})
+		err := b.DeployStack(t.Context(), charts.DeployRequest{Name: tc.release, Manifest: trivialStack, Resolve: ResolveNever})
 		switch {
 		case tc.refused == "" && err != nil:
 			t.Errorf("DeployStack(%s) beside %v = %v, want it deployed", tc.release, tc.recorded, err)
@@ -3189,6 +3192,12 @@ func TestDeployStackRefusesInstallingAReleaseCollidingWithARecordedOne(t *testin
 			t.Errorf("DeployStack(%s) beside %v = %v, want it refused naming %s", tc.release, tc.recorded, err, tc.refused)
 		case tc.refused != "" && (len(api.created) != 0 || len(api.order) != 0):
 			t.Errorf("DeployStack(%s) created %v and %d services, want nothing", tc.release, api.order, len(api.created))
+		}
+		// A pair installed together before this was refused keeps deploying, and
+		// says so, since its volumes are still told apart by name alone.
+		pair := slices.Contains(tc.recorded, tc.release) && len(tc.recorded) > 1 && tc.recorded[1] == "web_a"
+		if warned := strings.Contains(logged.String(), "collidesWith="); warned != pair || pair && !strings.Contains(logged.String(), "collidesWith=web_a") {
+			t.Errorf("DeployStack(%s) beside %v logged %q, want a warning %t", tc.release, tc.recorded, logged.String(), pair)
 		}
 	}
 
@@ -3254,6 +3263,32 @@ func TestAHolderThatAppearedAfterTheCheckIsNotAdopted(t *testing.T) {
 	}
 }
 
+// Every network a stack declares is looked up in one listing of the swarm's, not
+// one each.
+func TestDeclaredNetworksAreLookedUpInOneListing(t *testing.T) {
+	api := &countingNetworksAPI{fakeAPI: asController(&fakeAPI{})}
+	manifest := "services:\n  app:\n    image: busybox\n    networks: [a, b, c]\nnetworks:\n  a: {}\n  b: {}\n  c: {}\n"
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: manifest, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want nil", err)
+	}
+	if api.unfiltered != 1 {
+		t.Errorf("listed every network %d times for three declared ones, want once", api.unfiltered)
+	}
+}
+
+// countingNetworksAPI counts the network listings made with no filter at all.
+type countingNetworksAPI struct {
+	*fakeAPI
+	unfiltered int
+}
+
+func (a *countingNetworksAPI) NetworkList(ctx context.Context, o network.ListOptions) ([]network.Summary, error) {
+	if o.Filters.Len() == 0 {
+		a.unfiltered++
+	}
+	return a.fakeAPI.NetworkList(ctx, o)
+}
+
 // A service joins only a swarm-scoped network, so a node-local one of the same
 // name — a compose project's default network on the manager, say — is nobody's
 // claim on the release's own and does not refuse it.
@@ -3309,8 +3344,11 @@ func TestANamespaceInAnotherCaseIsNotTheReleasesOwn(t *testing.T) {
 
 // A cluster mount names an existing CSI volume, or a whole volume group, as a
 // volume mount names a volume, and passes the same guard: another stack's is
-// refused unless the app set permits the name, the controller's own is refused
-// outright, and the release's own needs nothing.
+// refused unless the app set permits the name, and the controller's own is
+// refused outright. None is the release's own, whatever it is called: a stack
+// never creates a cluster volume, so a name scoped under the release — its own
+// key, or one scoped into the names of a release called tenant_a — is somebody's
+// already, and needs the app set's permission like any other.
 func TestAClusterMountPassesTheVolumeGuard(t *testing.T) {
 	mounts := func(source, decl string) string {
 		return "services:\n  app:\n    image: busybox\n    volumes:\n" +
@@ -3326,7 +3364,9 @@ func TestAClusterMountPassesTheVolumeGuard(t *testing.T) {
 			"this controller's own volume", application.Allow{Volumes: []string{"swarmcli-cd_swarmcli-cd-data"}}},
 		{"permitted", mounts("shared-csi", "volumes:\n  shared-csi: {external: true}\n"), "", application.Allow{Volumes: []string{"shared-csi"}}},
 		{"a permitted volume group", mounts("group:db", ""), "", application.Allow{Volumes: []string{"group:db"}}},
-		{"the release's own", mounts("data", "volumes:\n  data: {}\n"), "", application.Allow{}},
+		{"a name scoped under the release", mounts("data", "volumes:\n  data: {}\n"), "allow.volumes", application.Allow{}},
+		{"a name scoped into another release's", mounts("a_data", "volumes:\n  a_data: {}\n"), "allow.volumes", application.Allow{}},
+		{"a permitted name scoped under the release", mounts("data", "volumes:\n  data: {}\n"), "", application.Allow{Volumes: []string{"tenant_data"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
