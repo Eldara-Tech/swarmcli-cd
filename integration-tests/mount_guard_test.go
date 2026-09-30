@@ -244,6 +244,79 @@ func TestAChartMayBindTheDockerSocketWhenPermitted(t *testing.T) {
 	}
 }
 
+// driverOptsChartFiles is a chart declaring a volume of its own whose driver_opts
+// have the local driver bind a node directory, and mounting it by name.
+func driverOptsChartFiles(release string) map[string]string {
+	files := chartFiles(release, 1)
+	files["charts/app/templates/stack.yaml"] = "" +
+		"version: \"3.9\"\n" +
+		"services:\n" +
+		"  app:\n" +
+		"    image: busybox:1.36\n" +
+		"    command: [\"sleep\", \"3600\"]\n" +
+		"    volumes:\n" +
+		"      - data:/data\n" +
+		"    deploy:\n" +
+		"      labels:\n" +
+		"        com.swarmcli.release: {{ .Release.Name }}\n" +
+		"volumes:\n" +
+		"  data:\n" +
+		"    driver: local\n" +
+		"    driver_opts:\n" +
+		"      type: none\n" +
+		"      o: bind\n" +
+		"      device: /tmp\n"
+	return files
+}
+
+// A chart's own volume carrying driver_opts is refused unless its application
+// names it in allow.volumes, through the whole chain: nothing upstream reads a
+// volume's driver options, so the refusal is the applier's, and it leaves nothing
+// running.
+func TestAVolumeWithDriverOptionsNeedsAllowVolumes(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-guard-driveropts"
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	rec := reconciler(t, releaseApp("driveropts", gitRepo(t, driverOptsChartFiles(release)), true))
+	err := rec.SyncNow(context.Background(), "driveropts")
+	if err == nil {
+		t.Fatal("SyncNow(driveropts) = nil, want the deploy refused for a volume with driver options")
+	}
+	if !strings.Contains(err.Error(), "driver_opts") || !strings.Contains(err.Error(), "allow.volumes") {
+		t.Fatalf("SyncNow(driveropts) = %v, want it refused for the volume's driver options", err)
+	}
+	if names := serviceNamesOf(t, cli, release); len(names) != 0 {
+		t.Errorf("services = %v, want none created by a refused deploy", names)
+	}
+}
+
+// And the same chart deploys once its application names the volume, with the
+// options reaching Swarm as the manifest wrote them. /tmp exists on every node, so
+// the volume the local driver creates from them converges.
+func TestAVolumeWithDriverOptionsDeploysWhenPermitted(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-gate-driveropts"
+	// Swarm leaves a stack's volumes behind, and this one binds a node path.
+	t.Cleanup(func() { removeStack(t, release); removeVolumes(t, cli, release) })
+
+	app := releaseApp("driveropts", gitRepo(t, driverOptsChartFiles(release)), true)
+	app.Allow = application.Allow{Volumes: []string{release + "_data"}}
+
+	rec := reconciler(t, app)
+	if err := rec.SyncNow(context.Background(), "driveropts"); err != nil {
+		t.Fatalf("SyncNow(driveropts) = %v, want the permitted volume deployed", err)
+	}
+	if names := serviceNamesOf(t, cli, release); len(names) != 1 {
+		t.Fatalf("services = %v, want the one the chart declares", names)
+	}
+	mounts := mountsOf(t, cli, release+"_app")
+	if len(mounts) != 1 || mounts[0].VolumeOptions == nil || mounts[0].VolumeOptions.DriverConfig == nil ||
+		mounts[0].VolumeOptions.DriverConfig.Options["device"] != "/tmp" {
+		t.Fatalf("mounts = %+v, want the volume with its driver options", mounts)
+	}
+}
+
 // mountsOf reads a service's mounts back off the daemon, which is the only place
 // that says what Swarm accepted rather than what was asked for.
 func mountsOf(t *testing.T, cli *dockerclient.Client, name string) []mount.Mount {

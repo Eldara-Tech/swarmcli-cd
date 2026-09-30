@@ -505,6 +505,19 @@ func TestAPermittedHostPathIsBound(t *testing.T) {
 	}
 }
 
+// A long-form volume entry with an empty type: is refused. The schema requires
+// the key but not a value, and conversion then produces a mount the daemon reads
+// as a bind of whatever source it names, which no guard here classifies — so it is
+// refused before one has to.
+func TestAnEmptyMountTypeIsRefused(t *testing.T) {
+	_, err := Convert(context.Background(),
+		"services:\n  app:\n    image: busybox\n    volumes:\n      - type: \"\"\n        source: data\n        target: /data\n"+
+			"volumes:\n  data: {}\n", "s", nil, fakeAPI{}, application.Allow{})
+	if err == nil || !strings.Contains(err.Error(), "service 'app'") || !strings.Contains(err.Error(), "type") {
+		t.Fatalf("Convert = %v, want an empty volume type refused", err)
+	}
+}
+
 // chartConfigs is a chart that ships its configs' content: the shapes a config's
 // file: may take, and the bytes the chart engine resolved them to.
 const chartConfigs = `

@@ -347,12 +347,24 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 				return mountsUnpermitted(svc.Name, "config", name, "allow.configs")
 			}
 		}
+		driven := driverBacked(svc)
 		for _, name := range volumeSources(svc) {
 			if b.ownMount(mine.volumes, name) {
 				continue
 			}
 			if _, forbidden := mine.volumes[name]; forbidden {
 				return mountsForbidden(svc.Name, "volume", name, whatControllerVolume)
+			}
+			// Before the unscoped check, so that a name outside the release is
+			// told what would work — external: — rather than to add an entry
+			// that would not.
+			if _, ok := driven[name]; ok {
+				if !scopedUnder(ns, name) {
+					return mountsForeignDriver(svc.Name, name)
+				}
+				if !permits(b.allow.Volumes, name) {
+					return mountsDriverUnpermitted(svc.Name, name)
+				}
 			}
 			if !scopedUnder(ns, name) && !permits(b.allow.Volumes, name) {
 				return mountsUnpermitted(svc.Name, "volume", name, "allow.volumes")
@@ -628,6 +640,20 @@ func mountsUnpermitted(service, kind, name, field string) error {
 		service, kind, name, kind, field)
 }
 
+func mountsDriverUnpermitted(service, name string) error {
+	return fmt.Errorf("service '%s' mounts volume '%s', which the manifest gives a volume driver or driver_opts. "+
+		"Those decide what the node mounts when it creates the volume, so a volume carrying them is one this "+
+		"application must be permitted — add '%s' to allow.volumes in the app set if that is what is meant",
+		service, name, name)
+}
+
+func mountsForeignDriver(service, name string) error {
+	return fmt.Errorf("service '%s' mounts volume '%s', which this stack declares with a volume driver or "+
+		"driver_opts under a name outside this release. A volume another stack owns is shared by declaring "+
+		"it external:, which carries no options; driver options are accepted only on a volume named within "+
+		"this release, and allow.volumes does not change that", service, name)
+}
+
 func declaresUnpermitted(kind, name, field string) error {
 	return fmt.Errorf("this stack declares %s '%s', which is not scoped to this release and which this "+
 		"application is not permitted to reference. A declaration carrying a name that already exists is "+
@@ -716,6 +742,39 @@ func volumeSources(svc cdcompose.Service) []string {
 	for _, m := range cs.Mounts {
 		if (m.Type == mount.TypeVolume || m.Type == mount.TypeCluster) && m.Source != "" {
 			out = append(out, m.Source)
+		}
+	}
+	return out
+}
+
+// driverBacked is the volumes a service mounts that the manifest gives a volume
+// driver other than the default one, or non-empty driver_opts.
+//
+// Either decides what the node mounts when it first creates the volume, and the
+// local driver alone reaches host paths and devices through its options. So a
+// stack's own volume carrying them is held to allow.volumes like a volume it does
+// not own, and one declared under a name outside the release may not carry them
+// at all: another stack's volume is shared by external:, which has no options.
+// There is no attempt to tell one option set from another: a list of the safe
+// ones would be a guess about a driver this controller does not run.
+//
+// Read off the converted mount, which is what the daemon is handed. Conversion
+// sets DriverConfig only for a declared, non-external volume that names a driver
+// or options (convert.handleVolumeToMount), so an external reference, a cluster
+// mount and a plain declaration are never here — nor is `driver: local` with no
+// options, which is the default spelled out.
+func driverBacked(svc cdcompose.Service) map[string]struct{} {
+	out := map[string]struct{}{}
+	cs := svc.Spec.TaskTemplate.ContainerSpec
+	if cs == nil {
+		return out
+	}
+	for _, m := range cs.Mounts {
+		if m.Type != mount.TypeVolume || m.VolumeOptions == nil || m.VolumeOptions.DriverConfig == nil {
+			continue
+		}
+		if d := m.VolumeOptions.DriverConfig; (d.Name != "" && d.Name != "local") || len(d.Options) > 0 {
+			out[m.Source] = struct{}{}
 		}
 	}
 	return out

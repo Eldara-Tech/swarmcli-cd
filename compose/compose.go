@@ -154,6 +154,9 @@ func Convert(ctx context.Context, manifest, stack string, files map[string][]byt
 	if err := checkSecretSources(cfg.Secrets); err != nil {
 		return nil, err
 	}
+	if err := checkMountTypes(cfg.Services); err != nil {
+		return nil, err
+	}
 
 	ns := convert.NewNamespace(stack)
 
@@ -453,8 +456,9 @@ func checkBindSources(dict map[string]any, allow application.Allow) error {
 // it" is not a guard. The other four name no host path: volume and cluster take a
 // volume name, image an image reference, and tmpfs no source at all.
 //
-// A long-form entry with no `type:` needs no case. The schema makes it required,
-// so loader.Load refuses one a few lines after this runs.
+// A long-form entry with no `type:` needs no case. The schema makes the key
+// required, so loader.Load refuses one a few lines after this runs; one whose
+// type: is empty passes the schema and is refused by checkMountTypes.
 func bindSource(v any) (string, bool) {
 	switch entry := v.(type) {
 	case string:
@@ -678,6 +682,27 @@ func checkSecretSources(secrets map[string]composetypes.SecretConfig) error {
 	for _, name := range slices.Sorted(maps.Keys(secrets)) {
 		if s := secrets[name]; !s.External.External && s.Driver == "" {
 			return secretRefused(name, "it is neither external: nor driver-backed")
+		}
+	}
+	return nil
+}
+
+// checkMountTypes refuses a service volume entry whose type: is empty.
+//
+// The schema requires the key and not a value, so a long-form `type: ""` loads.
+// Conversion then files it with the volumes and keeps the empty type, which the
+// daemon maps to its zero value — a bind — of whatever source the entry names.
+// That is a mount no check here classifies: checkBindSources reads bind and npipe,
+// and backend's volume guards read volume and cluster. The node refuses to run it,
+// but that is not a guard, so it is refused here, after the load, where every
+// short-form entry has been given its type and only a written empty one is left.
+func checkMountTypes(services []composetypes.ServiceConfig) error {
+	for _, svc := range services {
+		for _, v := range svc.Volumes {
+			if v.Type == "" {
+				return fmt.Errorf("service '%s': a volume entry's type: is empty; name one of volume, bind, "+
+					"tmpfs, npipe, image or cluster", svc.Name)
+			}
 		}
 	}
 	return nil
