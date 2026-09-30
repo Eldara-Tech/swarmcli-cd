@@ -239,12 +239,14 @@ mount is never the release's own, since a stack never creates a cluster volume.
 Any other volume is decided by its name alone, because it lives on whichever
 node first mounted it and there is no cluster-wide label to read.
 
-That leaves one thing open, and only between releases the rules above cannot
-keep apart: a pair whose names collide by `_` and which were installed together
-before this was refused, or a release beside a stack deployed without the
-controller. There, a volume one of them declares under a name scoped into the
-other's — release `a` declaring `b_data` beside release `a_b`'s `data` — is the
-same volume on a node that runs both. Give one of the pair a name of its own.
+Between releases, that leaves volume names open where the rules above cannot
+keep two releases apart: a pair whose names collide by `_` and which were
+installed together before this was refused (each of its deploys warns), a
+release beside a stack deployed without the controller, and a release beside the
+volumes an uninstalled one left behind, whose records are gone with it. There, a
+volume one declares under a name scoped into the other's — release `a` declaring
+`b_data` beside release `a_b`'s `data` — is the same volume on a node that runs
+both. Give one of the pair a name of its own.
 
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by

@@ -321,7 +321,7 @@ A `charts.Backend` is the smallest thing that can deploy a stack. Everything the
 reconciler and the sweep ask of a backend beyond that — read a `ServiceSpec`,
 list what a stored revision declared, scope an image pull to one application's
 credential, count the swarm's nodes — is an optional interface they type-assert
-for, and all twelve of them are named in
+for, and all of them are named in
 [`capability`](../capability/capability.go). A Phase 3 remote backend implements
 whichever it can answer; each one it leaves out costs that one feature and
 nothing else.
@@ -340,7 +340,7 @@ able to name them. Go interfaces are structural, so a backend in another module
 *can* satisfy an interface it cannot name — but it cannot be compile-checked
 against it, and since every one of these is an upgrade that falls back silently
 when the assertion fails, the first evidence of a changed signature would be a
-feature that had quietly stopped working. `backend.Backend` asserts all twelve at
+feature that had quietly stopped working. `backend.Backend` asserts every one at
 compile time for exactly that reason, so the OSS backend and a companion one are
 held to the contract the same way.
 

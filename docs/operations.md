@@ -51,15 +51,15 @@ practice. `swarmcli-cd validate --file applications.yaml` run with the binary yo
 are moving *to* answers that before the deployment does — it needs neither a
 controller nor a swarm.
 
-**What a release may reach without `allow` has narrowed.** From this version:
+**What a release may reach without `allow` has narrowed.** From v2.0.0:
 
 - an `external:` reference — config, secret, volume or network — needs an
   [`allow`](configuration.md#allow-optional) entry whatever it is called,
   including a name that starts with the release's own `<release>_`;
 - a `type: cluster` mount needs one whatever it is called, since a stack never
   creates a cluster volume;
-- a declared config or secret whose name something other than the release
-  already holds needs one too.
+- a declared config or secret named outside the release, or whose name
+  something other than the release already holds, needs one too.
 
 The common case is a chart that references a secret the operator creates, under
 a default name starting with the chart's own, installed under the chart's name.
@@ -91,18 +91,30 @@ that installs the postgres chart as release `postgres` adds:
     secrets: [postgres_password]
 ```
 
-The controller says which entries each application needs. At startup it reads
-the recorded manifest of every release it installed and logs, once per
-application, a warning naming the entries missing, grouped by field:
+The controller says which entries each application needs. At startup, and for an
+application that joins the set later, it reads the recorded manifest of every
+release it installed for that application and logs a warning naming the entries
+missing, grouped by field:
 
 ```
-level=WARN msg="releases of this application reference names its allowlist does not permit, and their next deploy will be refused until it does: add these entries to the application's allow in the app set" application=postgres releases=[postgres] allow.secrets=[postgres_password]
+level=WARN msg="releases of this application reference names its allowlist does not name, and a deploy of them is refused until it does: add these entries to the application's allow in the app set, or remove a release the application no longer declares" application=postgres releases=[postgres] allow.secrets=[postgres_password]
 ```
 
-It refuses nothing and names only names. Add what it lists to the app set before
-the next deploy — or after, since a deploy that is refused leaves the release
-running as it was, naming the entry to add. `validate` cannot catch these: they
-depend on the charts, not the file.
+A name scoped under another application's release — `web_a_db` read by release
+`web`, beside release `web_a` — gets a warning of its own. That is the reach
+v2.0.0 refuses, so review it, and grant it only if the sharing is meant:
+
+```
+level=WARN msg="releases of this application reference names scoped under another release on this swarm, which they reached before without an allow entry and are refused now: those are the other release's, so grant one only if it is meant to be shared" application=web releases=[web] allow.secrets=[web_a_db] scopedUnder=[web_a]
+```
+
+Each check ends with a line saying how many releases it read on each swarm, so a
+check that found nothing reads differently from one that did not run. It
+refuses nothing and names only names. A release the application no longer
+declares is read too, since its record is what there is: remove it rather than
+permit what it used. Add the entries before the next deploy — or after, since a
+deploy that is refused leaves the release running as it was, naming the entry
+to add. `validate` cannot catch these: they depend on the charts, not the file.
 
 ## Restarting, and what survives one
 
