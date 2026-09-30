@@ -548,7 +548,7 @@ What each grant is worth:
 |---|---|
 | `secrets` | the bytes. A Swarm secret is the shape a database password, a registry credential and a signing key all arrive in |
 | `configs` | the bytes, and they are readable — a config is not encrypted at rest the way a secret is |
-| `volumes` | another stack's data, read **and written**, on whichever node the task lands on. A `type: cluster` mount is held to the same list, by volume name or, for a whole CSI volume group, as `group:<name>`. So is a chart's **own** volume when it declares a `driver:` other than `local` or any non-empty `driver_opts:` — named as the swarm holds it, `<release>_<name>` — because those decide what the node mounts, host paths and devices included |
+| `volumes` | another stack's data, read **and written**, on whichever node the task lands on. A `type: cluster` mount is held to the same list, by volume name or, for a whole CSI volume group, as `group:<name>`. So is a chart's **own** volume when it declares a `driver:` other than `local` or any non-empty `driver_opts:` — named as the swarm holds it, `<release>_<key>` or the volume's `name:` — because those decide what the node mounts, host paths and devices included. The entry permits the volume whatever options the chart gives it later, so grant it as you would the paths those options can reach |
 | `networks` | everything already on that network. Joining `traefik-public` is being on it with every other stack that is |
 
 #### Why it lives here and not in the chart
