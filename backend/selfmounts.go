@@ -6,6 +6,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/containerd/errdefs"
@@ -221,6 +222,18 @@ func (b *Backend) readSelfMounts(ctx context.Context) (selfMounts, error) {
 			out.volumes[m.Source] = struct{}{}
 		case m.Type == mount.TypeBind && m.Source != "":
 			out.binds[m.Source] = struct{}{}
+		}
+		// Swarm resolves a "group:<name>" source to any volume in that group, so
+		// the group of a cluster volume mounted by name is the controller's too.
+		if m.Type == mount.TypeCluster && m.Source != "" && !strings.HasPrefix(m.Source, "group:") {
+			v, err := b.api.VolumeInspect(ctx, m.Source)
+			switch {
+			case errdefs.IsNotFound(err):
+			case err != nil:
+				return selfMounts{}, fmt.Errorf("inspecting this controller's cluster volume '%s': %w", m.Source, err)
+			case v.ClusterVolume != nil && v.ClusterVolume.Spec.Group != "":
+				out.volumes["group:"+v.ClusterVolume.Spec.Group] = struct{}{}
+			}
 		}
 	}
 	return out, nil

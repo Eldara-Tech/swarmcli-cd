@@ -61,6 +61,10 @@ type fakeAPI struct {
 	// volume listing whatever its filter (docker v28.5.2
 	// api/server/router/volume/volume_routes.go:41-51).
 	clusterVolumes []volume.Volume
+	// volumeInspectErr fails every volume inspect, and volumeInspects records
+	// the name of each.
+	volumeInspectErr error
+	volumeInspects   []string
 	// nodeErr fails the node listing, which is what a worker node answers: only
 	// a manager can enumerate the swarm.
 	nodeErr error
@@ -916,6 +920,10 @@ func (f *fakeAPI) VolumeList(_ context.Context, o volume.ListOptions) (volume.Li
 // VolumeInspect answers as the daemon does: a node-local volume of that name
 // first, and only when there is none, a cluster volume of that name.
 func (f *fakeAPI) VolumeInspect(_ context.Context, name string) (volume.Volume, error) {
+	f.volumeInspects = append(f.volumeInspects, name)
+	if f.volumeInspectErr != nil {
+		return volume.Volume{}, f.volumeInspectErr
+	}
 	for _, v := range f.volumes {
 		if v.Name == name {
 			return v, nil

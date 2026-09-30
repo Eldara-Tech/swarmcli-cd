@@ -3200,26 +3200,66 @@ func TestAClusterMountPassesTheVolumeGuard(t *testing.T) {
 // A controller that keeps its own state on a CSI cluster volume holds that name
 // as it holds a volume's: no app set permits another release to mount it, and
 // the self release may re-declare it.
+//
+// Swarm resolves a group source to any volume in that group, so the group of a
+// cluster volume the controller mounts by name is the controller's too.
 func TestTheControllersOwnClusterVolumeIsItsOwn(t *testing.T) {
-	const mountsIt = "services:\n  app:\n    image: busybox\n    volumes:\n" +
-		"      - {type: cluster, source: state, target: /state}\nvolumes:\n  state: {external: true, name: cd-csi}\n"
-	withCSI := func() *fakeAPI {
-		api := asController(&fakeAPI{})
+	const tenantMounts = "services:\n  app:\n    image: busybox\n    volumes:\n" +
+		"      - {type: cluster, source: %s, target: /state}\n%s"
+	withCSI := func(api *fakeAPI) *fakeAPI {
+		api = asController(api)
 		cs := api.selfSpec.TaskTemplate.ContainerSpec
 		cs.Mounts = append(cs.Mounts, mount.Mount{Type: mount.TypeCluster, Source: "cd-csi", Target: "/state"})
+		api.clusterVolumes = append(api.clusterVolumes, volume.Volume{Name: "cd-csi", ClusterVolume: &volume.ClusterVolume{
+			ID: "csi-cd", Spec: volume.ClusterVolumeSpec{Group: "cd-state"},
+		}})
 		return api
 	}
 
-	api := withCSI()
-	err := allowing(t, api, application.Allow{Volumes: []string{"cd-csi"}}).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsIt, Resolve: ResolveNever})
-	if err == nil || !strings.Contains(err.Error(), "this controller's own volume") {
-		t.Fatalf("DeployStack = %v, want the controller's cluster volume refused whatever the app set says", err)
+	for _, tc := range []struct{ name, source, decl string }{
+		{"by name", "state", "volumes:\n  state: {external: true, name: cd-csi}\n"},
+		{"by its group", "group:cd-state", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := withCSI(&fakeAPI{})
+			err := allowing(t, api, application.Allow{Volumes: []string{"cd-csi", "group:cd-state"}}).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "tenant", Manifest: fmt.Sprintf(tenantMounts, tc.source, tc.decl), Resolve: ResolveNever,
+			})
+			if err == nil || !strings.Contains(err.Error(), "this controller's own volume") {
+				t.Fatalf("DeployStack = %v, want the controller's cluster volume refused whatever the app set says", err)
+			}
+		})
 	}
 
-	self := testBackend(t, withCSI(), nil).WithSelfRelease(noDeferral)
-	if err := self.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: mountsIt, Resolve: ResolveNever}); err != nil &&
-		strings.Contains(err.Error(), "cd-csi") {
-		t.Errorf("DeployStack(self) = %v, want the controller's own cluster volume recognised as its own", err)
+	// A cluster volume whose group cannot be read is not taken for one without a
+	// group: the controller's own mounts are not known, so nothing is deployed.
+	api := withCSI(&fakeAPI{volumeInspectErr: errors.New("daemon busy")})
+	err := allowing(t, api, application.Allow{Volumes: []string{"group:cd-state"}}).DeployStack(t.Context(), charts.DeployRequest{
+		Name: "tenant", Manifest: fmt.Sprintf(tenantMounts, "group:cd-state", ""), Resolve: ResolveNever,
+	})
+	if err == nil || !strings.Contains(err.Error(), "daemon busy") {
+		t.Fatalf("DeployStack = %v, want the failed read of the controller's own volume surfaced", err)
+	}
+
+	// One that is gone has no group left to protect, and does not stop anybody
+	// else's deploy.
+	api = asController(&fakeAPI{})
+	cs := api.selfSpec.TaskTemplate.ContainerSpec
+	cs.Mounts = append(cs.Mounts, mount.Mount{Type: mount.TypeCluster, Source: "cd-csi", Target: "/state"})
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: trivialStack, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want a deploy unaffected by a controller volume that is gone", err)
+	}
+
+	// And the self release re-declares it: the controller's own stack, with the
+	// cluster mount beside everything else the controller runs with.
+	api = withCSI(selfAPI())
+	manifest := strings.Replace(selfStack, "      - swarmcli-cd-data:/var/lib/swarmcli-cd\n",
+		"      - swarmcli-cd-data:/var/lib/swarmcli-cd\n      - {type: cluster, source: state, target: /state}\n", 1) +
+		"  state: {external: true, name: cd-csi}\n"
+	if err := testBackend(t, api, nil).WithSelfRelease(noDeferral).DeployStack(t.Context(), charts.DeployRequest{
+		Name: "swarmcli-cd", Manifest: manifest, Resolve: ResolveNever,
+	}); err != nil {
+		t.Fatalf("DeployStack(self) = %v, want the controller's own cluster volume recognised as its own", err)
 	}
 }
 
