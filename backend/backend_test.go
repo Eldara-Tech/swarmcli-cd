@@ -3175,6 +3175,8 @@ func TestDeployStackRefusesInstallingAReleaseCollidingWithARecordedOne(t *testin
 		{"web_a", []string{"web"}, "'web'"},
 		{"web", []string{"WEB_a"}, "'WEB_a'"},
 		{"web", []string{"web", "web_a"}, ""},
+		{"web_a", []string{"web_a", "web"}, ""},
+		{"web", []string{"web", "WEB_a"}, ""},
 		{"web", []string{"web"}, ""},
 		{"web", []string{"webapp", "web-a"}, ""},
 	} {
@@ -3194,9 +3196,12 @@ func TestDeployStackRefusesInstallingAReleaseCollidingWithARecordedOne(t *testin
 			t.Errorf("DeployStack(%s) created %v and %d services, want nothing", tc.release, api.order, len(api.created))
 		}
 		// A pair installed together before this was refused keeps deploying, and
-		// says so, since its volumes are still told apart by name alone.
-		pair := slices.Contains(tc.recorded, tc.release) && len(tc.recorded) > 1 && tc.recorded[1] == "web_a"
-		if warned := strings.Contains(logged.String(), "collidesWith="); warned != pair || pair && !strings.Contains(logged.String(), "collidesWith=web_a") {
+		// warns, either half of it, since its volumes are still told apart by name
+		// alone. One whose names match only without regard to case shares no
+		// volume name, since those keep their case, and does not.
+		other := map[string]string{"web": "web_a", "web_a": "web"}[tc.release]
+		pair := slices.Contains(tc.recorded, tc.release) && slices.Contains(tc.recorded, other)
+		if warned := strings.Contains(logged.String(), "level=WARN"); warned != pair || pair && !strings.Contains(logged.String(), "collidesWith="+other) {
 			t.Errorf("DeployStack(%s) beside %v logged %q, want a warning %t", tc.release, tc.recorded, logged.String(), pair)
 		}
 	}

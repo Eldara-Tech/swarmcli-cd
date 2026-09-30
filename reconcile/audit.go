@@ -5,8 +5,10 @@ package reconcile
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
@@ -17,39 +19,78 @@ import (
 )
 
 // releaseLister is the part of the chart engine the audit reads: the current
-// revision of every release on a swarm. *charts.Engine implements it.
+// revision of every release on a swarm. Asserted here, because the audit reaches
+// it through a type assertion that would otherwise fall back silently.
 type releaseLister interface {
 	List(ctx context.Context) ([]charts.Release, error)
 }
 
-// auditAllowlists warns, for each application in the set, of the allow entries
-// the releases it has on the swarm need and its allowlist does not name — what
-// the next deploy of one of them would be refused for.
+var _ releaseLister = (*charts.Engine)(nil)
+
+// startAuditLocked runs auditAllowlists for specs beside the loops, counted in
+// wg as they are and guarded as startLoopLocked is: once Run's context is done,
+// drain may be waiting on wg, and nothing may be added to it. The caller holds mu.
+//
+// A panic is recovered and logged, as reconcile recovers one: the audit only
+// warns, and it reads every recorded manifest through the compose converter, so
+// one it cannot convert must not take the controller down on every start.
+func (r *Reconciler) startAuditLocked(specs []application.Spec) {
+	if r.root == nil || r.root.Err() != nil || len(specs) == 0 {
+		return
+	}
+	ctx := r.root
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		defer func() {
+			if p := recover(); p != nil {
+				r.log.Error("recovered a panic checking the applications' allowlists", "panic", p)
+			}
+		}()
+		r.auditAllowlists(ctx, specs)
+	}()
+}
+
+// auditAllowlists warns, for each application in specs, of the allow entries
+// the releases it has on the swarm need and its allowlist does not name — what a
+// deploy of one of them would be refused for.
 //
 // It is how an upgrade that narrowed what a release may reach without an entry
 // says so before the first refusal does: every release this controller installed
-// is read from its current record, with the manifest and files it was deployed
-// with, and asked of the backend (capability.AllowAuditor). Nothing is refused
-// and nothing is written. It reports names and never a value; the manifest is
-// not logged. A backend or engine that cannot answer is skipped, and a release
-// whose manifest cannot be read is said so and passed over.
-func (r *Reconciler) auditAllowlists(ctx context.Context) {
-	r.mu.RLock()
+// for one of them is read from its current record, with the manifest and files
+// it was deployed with, and asked of the backend (capability.AllowAuditor).
+// Nothing is refused and nothing is written; it reports names, and the manifest
+// is not logged.
+//
+// Two warnings, because the two call for different answers. A name scoped under
+// no release, or under one of the application's own, is one to add. A name
+// scoped under another application's release, or one this controller did not
+// install — "web_a_db" for release "web", beside release "web_a" — is that
+// release's, and reaching it without an entry is exactly what is refused now: it
+// is listed to review, and to grant only if the sharing is meant.
+//
+// A release the application no longer declares is read too, since its record is
+// what there is; a sweep, not an entry, is the answer to one of those. A backend
+// or engine that cannot answer is skipped, and a release that cannot be read is
+// said so and passed over.
+func (r *Reconciler) auditAllowlists(ctx context.Context, specs []application.Spec) {
 	bySwarm := map[string]map[string]application.Spec{}
-	for _, name := range r.order {
-		spec := r.apps[name].spec
+	for _, spec := range specs {
 		if bySwarm[spec.Destination.Swarm] == nil {
 			bySwarm[spec.Destination.Swarm] = map[string]application.Spec{}
 		}
-		bySwarm[spec.Destination.Swarm][name] = spec
+		bySwarm[spec.Destination.Swarm][spec.Name] = spec
 	}
-	r.mu.RUnlock()
 
 	for _, swarm := range slices.Sorted(maps.Keys(bySwarm)) {
+		if ctx.Err() != nil {
+			return
+		}
 		apps := bySwarm[swarm]
 		backend, err := r.swarms.Backend(ctx, swarms.Target{Swarm: swarm})
 		if err != nil {
-			continue // the application's own reconcile reports an unreachable destination
+			r.log.Warn("could not resolve a swarm to check the applications' allowlists", "swarm", swarm, "error", err)
+			continue
 		}
 		auditor, ok := backend.(capability.AllowAuditor)
 		if !ok {
@@ -61,61 +102,126 @@ func (r *Reconciler) auditAllowlists(ctx context.Context) {
 		}
 		releases, err := lister.List(ctx)
 		if err != nil {
-			r.log.Warn("could not list the swarm's releases to check the applications' allowlists", "error", err)
+			r.log.Warn("could not list the swarm's releases to check the applications' allowlists", "swarm", swarm, "error", err)
 			continue
 		}
-
-		need := map[string]*application.Allow{}
-		held := map[string][]string{}
+		names := make([]string, 0, len(releases))
+		appOf := make(map[string]string, len(releases))
 		for _, rel := range releases {
+			names = append(names, rel.Name)
 			// "" for a release no application of this controller installed.
-			app, _ := prune.Owner(rel, r.controller)
+			appOf[rel.Name], _ = prune.Owner(rel, r.controller)
+		}
+
+		need, others := map[string]*application.Allow{}, map[string]*application.Allow{}
+		held, owners := map[string]*[]string{}, map[string]*[]string{}
+		list := func(m map[string]*[]string, app string) *[]string {
+			if m[app] == nil {
+				m[app] = &[]string{}
+			}
+			return m[app]
+		}
+		checked := 0
+		for _, rel := range releases {
+			if ctx.Err() != nil {
+				return
+			}
+			app := appOf[rel.Name]
 			spec, inSet := apps[app]
 			if !inSet {
 				continue
 			}
-			names, err := auditor.UnpermittedNames(ctx, capability.AllowRequest{
+			checked++
+			got, err := unpermitted(ctx, auditor, capability.AllowRequest{
 				ManifestRequest: capability.ManifestRequest{Name: rel.Name, Manifest: rel.Manifest, Files: rel.Files},
 				Allow:           spec.Allow,
 			})
 			if err != nil {
-				r.log.Warn("could not read a release's recorded manifest to check its application's allowlist",
+				r.log.Warn("could not check a release against its application's allowlist",
 					"application", app, "release", rel.Name, "error", err)
 				continue
 			}
-			if len(names.Secrets)+len(names.Configs)+len(names.Volumes)+len(names.Networks) == 0 {
-				continue
+			for _, field := range allowFields(&got) {
+				for _, name := range *field.names {
+					into, owner := need, ownerOf(name, names)
+					if owner != "" && appOf[owner] != app {
+						into = others
+						merge(list(owners, app), []string{owner})
+					}
+					if into[app] == nil {
+						into[app] = &application.Allow{}
+					}
+					merge(field.of(into[app]), []string{name})
+					merge(list(held, app), []string{rel.Name})
+				}
 			}
-			if need[app] == nil {
-				need[app] = &application.Allow{}
-			}
-			merge(&need[app].Secrets, names.Secrets)
-			merge(&need[app].Configs, names.Configs)
-			merge(&need[app].Volumes, names.Volumes)
-			merge(&need[app].Networks, names.Networks)
-			held[app] = append(held[app], rel.Name)
 		}
 
 		for _, app := range slices.Sorted(maps.Keys(need)) {
-			attrs := []any{"application", app, "releases", held[app]}
-			for _, entry := range []struct {
-				field string
-				names []string
-			}{
-				{"allow.secrets", need[app].Secrets},
-				{"allow.configs", need[app].Configs},
-				{"allow.volumes", need[app].Volumes},
-				{"allow.networks", need[app].Networks},
-			} {
-				if len(entry.names) > 0 {
-					attrs = append(attrs, entry.field, entry.names)
-				}
-			}
-			r.log.Warn("releases of this application reference names its allowlist does not permit, and their next "+
-				"deploy will be refused until it does: add these entries to the application's allow in the app set",
-				attrs...)
+			r.log.Warn("releases of this application reference names its allowlist does not name, and a deploy of "+
+				"them is refused until it does: add these entries to the application's allow in the app set, or "+
+				"remove a release the application no longer declares", attrs(app, *held[app], need[app])...)
+		}
+		for _, app := range slices.Sorted(maps.Keys(others)) {
+			r.log.Warn("releases of this application reference names scoped under another release on this swarm, "+
+				"which they reached before without an allow entry and are refused now: those are the other "+
+				"release's, so grant one only if it is meant to be shared",
+				append(attrs(app, *held[app], others[app]), "scopedUnder", *owners[app])...)
+		}
+		r.log.Info("checked the applications' releases against their allowlists", "swarm", swarm, "releases", checked)
+	}
+}
+
+// unpermitted asks the backend, turning a panic into an error, so that one
+// release the converter cannot handle is reported like any other it cannot read.
+func unpermitted(ctx context.Context, auditor capability.AllowAuditor, req capability.AllowRequest) (names application.Allow, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic reading the recorded manifest: %v", p)
+		}
+	}()
+	return auditor.UnpermittedNames(ctx, req)
+}
+
+// ownerOf is the release a name is scoped under, among names: the longest whose
+// name followed by '_' begins it, compared without regard to case, or "".
+func ownerOf(name string, releases []string) string {
+	owner := ""
+	for _, rel := range releases {
+		if strings.HasPrefix(strings.ToLower(name), strings.ToLower(rel)+"_") && len(rel) > len(owner) {
+			owner = rel
 		}
 	}
+	return owner
+}
+
+// allowField is one of the name lists in an application.Allow, with the key a
+// warning names it by.
+type allowField struct {
+	key   string
+	names *[]string
+	of    func(*application.Allow) *[]string
+}
+
+func allowFields(a *application.Allow) []allowField {
+	return []allowField{
+		{"allow.secrets", &a.Secrets, func(x *application.Allow) *[]string { return &x.Secrets }},
+		{"allow.configs", &a.Configs, func(x *application.Allow) *[]string { return &x.Configs }},
+		{"allow.volumes", &a.Volumes, func(x *application.Allow) *[]string { return &x.Volumes }},
+		{"allow.networks", &a.Networks, func(x *application.Allow) *[]string { return &x.Networks }},
+	}
+}
+
+// attrs is a warning's attributes: the application, its releases read, and each
+// field with names in it.
+func attrs(app string, releases []string, names *application.Allow) []any {
+	out := []any{"application", app, "releases", releases}
+	for _, field := range allowFields(names) {
+		if len(*field.names) > 0 {
+			out = append(out, field.key, *field.names)
+		}
+	}
+	return out
 }
 
 // merge adds the names in from that into does not already hold, keeping it sorted.

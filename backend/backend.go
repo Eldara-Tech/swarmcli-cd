@@ -837,7 +837,7 @@ func ownVolume(stack *cdcompose.Stack, m mount.Mount) bool {
 //
 // A cluster mount is here too: it names an existing CSI volume, or a whole
 // volume group as "group:<name>", which the stack never creates, so it is
-// compared like any other volume name.
+// compared by name and is never the release's own (ownVolume).
 //
 // Binds are not here. A bind names a path rather than a cluster-wide name, so
 // there is nothing for it to collide with, and the question it does raise — which
@@ -1336,7 +1336,7 @@ func (b *Backend) rejectRecordedCollision(ctx context.Context, release string) e
 	if err != nil {
 		return fmt.Errorf("listing release records to check release '%s' against: %w", release, err)
 	}
-	own, extends := false, ""
+	own, extends, shares := false, "", ""
 	for _, c := range list {
 		if !isReleaseRecord(c.Spec.Labels) {
 			continue
@@ -1349,15 +1349,23 @@ func (b *Backend) rejectRecordedCollision(ctx context.Context, release string) e
 			return fmt.Errorf("refusing to deploy release '%s': release '%s' already has release records on this swarm, "+
 				"and Swarm compares config names without regard to case, so the two would need the same record names. "+
 				"Give the release a name of its own", release, other)
-		case application.ReleasesCollide(other, release) && (extends == "" || other < extends):
-			extends = other
+		case application.ReleasesCollide(other, release):
+			if extends == "" || other < extends {
+				extends = other
+			}
+			// Volume names keep their case, so only a pair whose names match as
+			// written can reach each other's.
+			if (strings.HasPrefix(other, release+"_") || strings.HasPrefix(release, other+"_")) && (shares == "" || other < shares) {
+				shares = other
+			}
 		}
 	}
-	if extends != "" && own {
+	if shares != "" && own {
 		b.log.Warn("this release and another whose name is its own followed by '_', or the other way round, were both "+
-			"installed before such pairs were refused; it keeps deploying, but a volume either declares is told apart "+
-			"from the other's by its name alone, so one scoped into the other's names mounts the other's data. "+
-			"Give one of them a name of its own", "release", release, "collidesWith", extends)
+			"installed before such pairs were refused. It keeps deploying, but only this controller's checks on each "+
+			"deploy keep what the two declare apart: a config, secret or network the other holds is refused, and a "+
+			"volume is told apart by its name alone, so one scoped into the other's names is the other's. Give one "+
+			"of them a name of its own", "release", release, "collidesWith", shares)
 	}
 	if extends != "" && !own && !b.selfRelease {
 		return fmt.Errorf("refusing to install release '%s': release '%s' already has release records on this swarm, and "+

@@ -15,14 +15,13 @@ import (
 // UnpermittedNames converts a manifest and returns the names in it that the
 // allowlist would have to name for rejectForbiddenResources to let a deploy of
 // it through: what its services reference external:, volumes and cluster mounts
-// that are not the release's own, and networks it joins or declares outside the
-// release. Each list is sorted, and names only.
+// that are not the release's own, networks it joins or declares outside the
+// release, and configs and secrets it declares that are not its own
+// (ownDeclared). Each list is sorted, and names only.
 //
-// What no allowlist can grant is left out — the controller's own secrets,
-// configs, volumes and networks — because naming it would not help, and for the
-// self release it is its own. So is a declared config, secret or network whose
-// name something else holds: after a deploy that succeeded, what holds a name
-// the release declares is the release's, and asking is a read per name.
+// What no allowlist can grant is left out, because naming it would not help: the
+// controller's own secrets, configs, volumes and networks (for the self release
+// they are its own), and a name in the space of the release records.
 func (b *Backend) UnpermittedNames(ctx context.Context, req capability.AllowRequest) (application.Allow, error) {
 	// Conversion reads an allowlist for one thing, a bind's source, which is not
 	// what this reports; permitting every path keeps a bind from failing it.
@@ -35,6 +34,7 @@ func (b *Backend) UnpermittedNames(ctx context.Context, req capability.AllowRequ
 	if err != nil {
 		return application.Allow{}, err
 	}
+	ns := stack.Namespace.Name()
 
 	var need application.Allow
 	add := func(list *[]string, allowed []string, controllers map[string]struct{}, name string) {
@@ -57,13 +57,37 @@ func (b *Backend) UnpermittedNames(ctx context.Context, req capability.AllowRequ
 			}
 		}
 	}
+	for _, spec := range stack.Secrets {
+		if namedLikeARecord(spec.Name) || permits(req.Allow.Secrets, spec.Name) {
+			continue
+		}
+		own, err := ownDeclared(ctx, ns, spec.Name, b.secretLabels)
+		if err != nil {
+			return application.Allow{}, err
+		}
+		if !own {
+			add(&need.Secrets, req.Allow.Secrets, mine.secrets, spec.Name)
+		}
+	}
+	for _, spec := range stack.Configs {
+		if namedLikeARecord(spec.Name) || permits(req.Allow.Configs, spec.Name) {
+			continue
+		}
+		own, err := ownDeclared(ctx, ns, spec.Name, b.configLabels)
+		if err != nil {
+			return application.Allow{}, err
+		}
+		if !own {
+			add(&need.Configs, req.Allow.Configs, mine.configs, spec.Name)
+		}
+	}
 	for _, name := range stack.ExternalNetworks {
 		if !inControllersStack(mine.namespace, name) {
 			add(&need.Networks, req.Allow.Networks, nil, name)
 		}
 	}
 	for _, nw := range stack.Networks {
-		if !inControllersStack(mine.namespace, nw.Name) && !scopedUnder(stack.Namespace.Name(), nw.Name) {
+		if !inControllersStack(mine.namespace, nw.Name) && !scopedUnder(ns, nw.Name) {
 			add(&need.Networks, req.Allow.Networks, nil, nw.Name)
 		}
 	}

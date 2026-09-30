@@ -247,16 +247,14 @@ func New(apps []application.Spec, o Options) *Reconciler {
 func (r *Reconciler) Run(ctx context.Context) error {
 	r.mu.Lock()
 	r.root = ctx
+	specs := make([]application.Spec, 0, len(r.order))
 	for _, name := range r.order {
 		r.startLoopLocked(r.apps[name])
+		specs = append(specs, r.apps[name].spec)
 	}
 	// Beside the loops rather than before them: it only warns, and a slow daemon
 	// must not hold up the reconciles it is warning about.
-	r.wg.Add(1)
-	go func() {
-		defer r.wg.Done()
-		r.auditAllowlists(ctx)
-	}()
+	r.startAuditLocked(specs)
 	r.mu.Unlock()
 
 	<-ctx.Done()
@@ -363,6 +361,9 @@ func (r *Reconciler) Add(spec application.Spec) error {
 	r.apps[spec.Name] = e
 	r.order = append(r.order, spec.Name)
 	r.startLoopLocked(e)
+	// An application arriving once the set is running — including every one, when
+	// the set could not be read at startup — is checked as it arrives.
+	r.startAuditLocked([]application.Spec{spec})
 	return nil
 }
 
