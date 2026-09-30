@@ -33,7 +33,7 @@ interrupted either — Swarm is the thing performing it, including any
 `app sync --wait` running at that moment reports a failure it cannot distinguish
 from the real thing.
 
-Two things do change with the binary, and both are worth reading the release
+Some things do change with the binary, and all are worth reading the release
 notes for.
 
 **The chart engine version** is stamped into each build from the swarmcli
@@ -50,6 +50,80 @@ introduced is *refused* by an older one, which is what a downgrade means in
 practice. `swarmcli-cd validate --file applications.yaml` run with the binary you
 are moving *to* answers that before the deployment does — it needs neither a
 controller nor a swarm.
+
+**What a release may reach without `allow` has narrowed.** From v2.0.0:
+
+- an `external:` reference — config, secret, volume or network — needs an
+  [`allow`](configuration.md#allow-optional) entry whatever it is called,
+  including a name that starts with the release's own `<release>_`;
+- a `type: cluster` mount needs one whatever it is called, since a stack never
+  creates a cluster volume;
+- a declared config or secret named outside the release, or whose name
+  something other than the release already holds, needs one too;
+- so does a volume of the release's own given a `driver:` other than `local` or
+  any non-empty `driver_opts:`, named `<release>_<key>` (see
+  [`volumes`](configuration.md#secrets-configs-volumes-and-networks)).
+
+The common case is a chart that references a secret the operator creates, under
+a default name starting with the chart's own, installed under the chart's name.
+In [swarmcli-charts](https://github.com/Eldara-Tech/swarmcli-charts), eleven do:
+
+| chart | default external secrets |
+|---|---|
+| gitlab | `gitlab_root_password`, `gitlab_smtp_password` |
+| keycloak | `keycloak_db_password`, `keycloak_admin_password`, `keycloak_tls_cert`, `keycloak_tls_key` |
+| mariadb | `mariadb_root_password`, `mariadb_password` |
+| mongodb | `mongodb_root_password`, `mongodb_password`, `mongodb_keyfile` |
+| openclaw | `openclaw_gateway_token` |
+| postgres | `postgres_password` |
+| redis | `redis_password` |
+| renovate | `renovate_token` |
+| superset | `superset_db_password`, `superset_redis_password`, `superset_secret_key`, `superset_admin_password`, `superset_oidc_client_secret` |
+| vaultwarden | `vaultwarden_postgres_password`, `vaultwarden_mysql_password`, `vaultwarden_admin_token`, `vaultwarden_smtp_password` |
+| zammad | `zammad_db_password`, `zammad_redis_password`, `zammad_elasticsearch_password` |
+
+Only the ones a release actually mounts matter — several are optional — and a
+chart installed under another release name was never exempt. So an application
+that installs the postgres chart as release `postgres` adds:
+
+```yaml
+- name: postgres
+  source:
+    # … as before
+  allow:
+    secrets: [postgres_password]
+```
+
+The controller says which entries each application needs. At startup, and for an
+application that joins the set later, it reads the recorded manifest of every
+release it installed for that application and logs a warning naming the entries
+missing, grouped by field:
+
+```
+level=WARN msg="releases of this application reference names its allowlist does not name, and a deploy of them is refused until it does: add these entries to the application's allow in the app set, or remove a release the application no longer declares" application=postgres releases=[postgres] allow.secrets=[postgres_password]
+```
+
+A name the release's own prefix used to hand it, but which is scoped under a
+release of another application or of nothing this controller installed —
+`web_a_db` read by release `web`, beside release `web_a` — gets a warning of its
+own. That is the reach v2.0.0 refuses, so review it. Permit one only if it is
+meant to be shared, and then as an `external:` reference: permitting a name the
+release *declares* hands the other release's object to this one, and the other
+is refused on its next deploy.
+
+```
+level=WARN msg="releases of this application reference names scoped under another release on this swarm, which they reached before without an allow entry and are refused now: those are the other release's. Permit one only if it is meant to be shared, and then as an external: reference — permitting one the release declares hands the other release's object to this one" application=web releases=[web] allow.secrets=[web_a_db] scopedUnder=[web_a]
+```
+
+Each check ends with a line saying how many releases it read on each swarm, so a
+check that found nothing reads differently from one that did not run. Only
+releases with a record count: a stack deployed without the controller is not
+read, and its names are not told apart from the release's own. It
+refuses nothing and names only names. A release the application no longer
+declares is read too, since its record is what there is: remove it rather than
+permit what it used. Add the entries before the next deploy — or after, since a
+deploy that is refused leaves the release running as it was, naming the entry
+to add. `validate` cannot catch these: they depend on the charts, not the file.
 
 ## Restarting, and what survives one
 

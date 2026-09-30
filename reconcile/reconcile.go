@@ -179,11 +179,14 @@ type Reconciler struct {
 	// two — so cancelling Run retires every entry, which stops a sync the API
 	// started as well as the loop. It is nil until Run is called.
 	//
-	// wg tracks the live loop goroutines. It is not the whole drain, because a
-	// sync started through the API belongs to no goroutine it counts; the
-	// entries' leases are the other half. See drain.
+	// wg tracks the live loop goroutines and the startup allowlist audit. It is
+	// not the whole drain, because a sync started through the API belongs to no
+	// goroutine it counts; the entries' leases are the other half. See drain.
 	root context.Context
 	wg   sync.WaitGroup
+	// installing names, for each application whose apply is under way, the
+	// releases that apply installs. Guarded by mu; see claimInstalls.
+	installing map[*appEntry][]string
 }
 
 // New returns a Reconciler for the given applications.
@@ -219,9 +222,10 @@ func New(apps []application.Spec, o Options) *Reconciler {
 		controller: o.ControllerID,
 		// Copied, not adopted: the map is written to as the set changes, and the
 		// caller's copy — built once at startup — is not ours to mutate.
-		regAuth: make(map[string]regauth.Resolver, len(o.RegistryAuth)),
-		apps:    make(map[string]*appEntry, len(apps)),
-		order:   make([]string, 0, len(apps)),
+		regAuth:    make(map[string]regauth.Resolver, len(o.RegistryAuth)),
+		apps:       make(map[string]*appEntry, len(apps)),
+		order:      make([]string, 0, len(apps)),
+		installing: map[*appEntry][]string{},
 	}
 	maps.Copy(r.regAuth, o.RegistryAuth)
 	for _, spec := range apps {
@@ -243,9 +247,14 @@ func New(apps []application.Spec, o Options) *Reconciler {
 func (r *Reconciler) Run(ctx context.Context) error {
 	r.mu.Lock()
 	r.root = ctx
+	specs := make([]application.Spec, 0, len(r.order))
 	for _, name := range r.order {
 		r.startLoopLocked(r.apps[name])
+		specs = append(specs, r.apps[name].spec)
 	}
+	// Beside the loops rather than before them: it only warns, and a slow daemon
+	// must not hold up the reconciles it is warning about.
+	r.startAuditLocked(specs)
 	r.mu.Unlock()
 
 	<-ctx.Done()
@@ -352,6 +361,9 @@ func (r *Reconciler) Add(spec application.Spec) error {
 	r.apps[spec.Name] = e
 	r.order = append(r.order, spec.Name)
 	r.startLoopLocked(e)
+	// An application arriving once the set is running — including every one, when
+	// the set could not be read at startup — is checked as it arrives.
+	r.startAuditLocked([]application.Spec{spec})
 	return nil
 }
 
@@ -1963,6 +1975,11 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	if err := checkCompat(plan); err != nil {
 		return err
 	}
+	release, err := r.claimInstalls(e, plan)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := r.apply(ctx, e, spec, backend, engine, plan, built, checkout, live, doomed); err != nil {
 		return err
 	}
@@ -1997,6 +2014,59 @@ func checkCompat(plan *charts.Plan) error {
 		return nil
 	}
 	return fmt.Errorf("refusing to apply: %s", strings.Join(refused, "; "))
+}
+
+// claimInstalls marks the releases a plan installs as being installed by e, and
+// returns the call that clears the mark. It refuses the plan while another
+// application is installing a release whose name collides with one of them
+// (application.ReleasesCollide).
+//
+// The backend refuses an install that collides with a release that has records
+// (rejectRecordedCollision), but the chart engine writes those only after
+// DeployStack returns, and applications deploy in their own goroutines: two
+// colliding installs at once would both find none. So the mark is taken and
+// compared under one lock, and held until the apply is over — by when the
+// release that got there first has records, and the other is refused by those.
+// An apply that deployed and then failed to write the record leaves none behind,
+// which lets the other install in, and the first is then refused by its records.
+// Only what is being installed marks and is compared: a release another
+// application declares and has not installed holds nothing, so declaring a name
+// is not a way to hold one, and a release already installed keeps deploying.
+//
+// Keyed by entry rather than by name, so that a retired entry still finishing
+// its apply and its successor under the same name each clear only their own. An
+// entry's own marks are never there to compare against: it holds its lease, and
+// its last apply cleared them.
+func (r *Reconciler) claimInstalls(e *appEntry, plan *charts.Plan) (func(), error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var mine []string
+	for _, rp := range plan.Releases {
+		if rp.Action != charts.ActionInstall {
+			continue
+		}
+		var held []string
+		for _, names := range r.installing {
+			for _, name := range names {
+				if application.ReleasesCollide(rp.Name, name) {
+					held = append(held, name)
+				}
+			}
+		}
+		if len(held) > 0 {
+			return nil, fmt.Errorf("refusing to install release '%s' while release '%s' is being installed: Swarm "+
+				"cannot keep apart what the two scope — names differing only in case are one name to it, and a "+
+				"name followed by '_' is the other's prefix — so only one of them may be installed. Give the "+
+				"release a name of its own", rp.Name, slices.Min(held))
+		}
+		mine = append(mine, rp.Name)
+	}
+	r.installing[e] = mine
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		delete(r.installing, e)
+	}, nil
 }
 
 // unsettled names the releases a plan would still change, in plan order.

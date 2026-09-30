@@ -53,6 +53,11 @@ secrets:
     name: s_apikey
 `
 
+// oneOfEachAllowed permits what oneOfEach references. An external: reference
+// needs the app set's permission whatever it is called — the manifest has said it
+// is not the release's — so names scoped under the release are no exception.
+var oneOfEachAllowed = application.Allow{Configs: []string{"s_site"}, Secrets: []string{"s_apikey"}}
+
 // A service can reference a network, config or secret, so each has to exist
 // before the service does. Getting the order wrong produces a create that fails
 // on a reference the next call would have satisfied.
@@ -62,7 +67,7 @@ func TestDeployStackCreatesReferencesBeforeServices(t *testing.T) {
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	}
 
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
+	if err := allowing(t, api, oneOfEachAllowed).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 
@@ -256,9 +261,8 @@ func TestRejectForbiddenSecretMounts(t *testing.T) {
 	}
 	forbidden := map[string]struct{}{"swarmcli-cd-token": {}}
 	// Permitted by the application, so that the only thing that can refuse these
-	// is the forbidden set this test is about. "s_apikey" needs no entry: it is
-	// scoped to the release being deployed, which is nobody's permission to give.
-	permitted := application.Allow{Secrets: []string{"swarmcli-cd-token"}}
+	// is the forbidden set this test is about.
+	permitted := application.Allow{Secrets: []string{"swarmcli-cd-token", "s_apikey"}}
 
 	for name, tc := range map[string]struct {
 		forbidden map[string]struct{}
@@ -2496,15 +2500,16 @@ func TestAStackDeclaringItsOwnSecretIsAllowed(t *testing.T) {
 }
 
 // An external reference is the ordinary way to share a config an operator
-// created, and refusing those would make the guard unusable. Only the
-// controller's own and the engine's own are off limits.
+// created, and refusing those would make the guard unusable. One the app set
+// permits deploys; only the controller's own and the engine's own are off limits
+// whatever it permits.
 func TestDeployStackAllowsAnOrdinaryExternalConfig(t *testing.T) {
 	api := asController(&fakeAPI{
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	})
 
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
+	if err := allowing(t, api, oneOfEachAllowed).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 }
@@ -2517,8 +2522,9 @@ func TestDeployStackAllowsAnOrdinaryExternalConfig(t *testing.T) {
 // a release name is compared against the controller's own namespace whatever the
 // manifest declares (#102). It costs one pair of round trips for the life of the
 // process, which is what TestTheControllersOwnMountsAreReadOnce pins. So is the
-// read of this release's own records by name prefix (rejectRecordedInAnotherCase),
-// which is bounded by the release's own history rather than by every release's.
+// read of the records by name prefix (rejectRecordedCollision), which is bounded
+// by this release's own history and those of the releases its name collides with,
+// rather than by every release's.
 func TestAStackThatReachesForNothingCostsNoReleaseLookup(t *testing.T) {
 	const selfContained = `
 services:
@@ -2550,7 +2556,7 @@ func TestTheControllersOwnMountsAreReadOnce(t *testing.T) {
 	// services. A real DeployStack writes a release record on the way through;
 	// the fake does not, so stand one in or the ownership guard refuses (#102).
 	installed(api, "s")
-	b := testBackend(t, api, nil)
+	b := testBackend(t, api, nil).WithAllowedReferences(oneOfEachAllowed).(*Backend)
 
 	for range 3 {
 		if err := b.WithRegistryAuth(nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
@@ -2571,7 +2577,7 @@ func TestAFailedSelfReadRefusesTheDeployAndIsRetried(t *testing.T) {
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	}
-	b := testBackend(t, api, nil)
+	b := allowing(t, api, oneOfEachAllowed)
 
 	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err == nil {
 		t.Fatal("DeployStack = nil, want the deploy refused rather than run unguarded")
@@ -2618,7 +2624,7 @@ func TestAnUnreachableDaemonRefusesTheDeployAndIsRetried(t *testing.T) {
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	})
-	b := testBackend(t, api, nil)
+	b := allowing(t, api, oneOfEachAllowed)
 
 	err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever})
 	if err == nil {
@@ -2704,7 +2710,7 @@ func TestOutsideASwarmThereIsNothingOfOursToProtect(t *testing.T) {
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
 		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
 	}
-	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
+	if err := allowing(t, api, oneOfEachAllowed).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want nil", err)
 	}
 }
@@ -2724,7 +2730,7 @@ func TestAContainerThisDaemonDoesNotKnowIsAnAnswer(t *testing.T) {
 	// services. A real DeployStack writes a release record on the way through;
 	// the fake does not, so stand one in or the ownership guard refuses (#102).
 	installed(api, "s")
-	b := testBackend(t, api, nil)
+	b := allowing(t, api, oneOfEachAllowed)
 
 	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
 		t.Fatalf("DeployStack = %v, want a controller that is not a swarm task to deploy", err)
@@ -2763,9 +2769,10 @@ func TestCreatedConfigsAndSecretsCarryTheCreationMarker(t *testing.T) {
 }
 
 // The pre-seed pattern, which is the whole of issue #108's fourth item: an
-// operator ran `docker secret create s_apikey`, and a chart then declared it.
-// The apply adopts it — relabels it into the stack's namespace, which is what
-// makes it a sweep candidate — and must not claim to have created it.
+// operator ran `docker secret create s_apikey`, permitted it in the app set, and
+// a chart then declared it. The apply adopts it — relabels it into the stack's
+// namespace, which is what makes it a sweep candidate — and must not claim to
+// have created it.
 func TestAnAdoptedConfigOrSecretNeverGainsTheCreationMarker(t *testing.T) {
 	api := &fakeAPI{
 		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{
@@ -2776,6 +2783,7 @@ func TestAnAdoptedConfigOrSecretNeverGainsTheCreationMarker(t *testing.T) {
 		}}},
 	}
 	b := testBackend(t, api, nil)
+	b.allow = application.Allow{Configs: []string{"s_site"}, Secrets: []string{"s_apikey"}}
 	ctx := context.Background()
 
 	if err := b.applyConfigs(ctx, []swarm.ConfigSpec{{
@@ -3145,6 +3153,157 @@ func TestDeployStackRefusesAReleaseDifferingOnlyInCaseFromARecordedOne(t *testin
 	}
 }
 
+// A release whose name is another's followed by '_', or which that other's name
+// extends, scopes names that collide with it, so it is not installed while the
+// other has records — whichever of the two it is, and however the case differs.
+// A release that has records of its own keeps deploying beside such a one, which
+// is a pair installed before this was refused; and a name merely starting with
+// another's collides with nothing. The records are asked for by name prefix, the
+// shorter names' included.
+func TestDeployStackRefusesInstallingAReleaseCollidingWithARecordedOne(t *testing.T) {
+	record := func(release string) swarm.Config {
+		return swarm.Config{ID: "rec-" + release, Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{
+			Name:   "swarmcli.release." + release + ".v1",
+			Labels: map[string]string{charts.LabelType: charts.TypeRelease, charts.LabelRelease: release},
+		}}}
+	}
+	for _, tc := range []struct {
+		release  string
+		recorded []string
+		refused  string
+	}{
+		{"web_a", []string{"web"}, "'web'"},
+		{"web", []string{"WEB_a"}, "'WEB_a'"},
+		{"web", []string{"web", "web_a"}, ""},
+		{"web_a", []string{"web_a", "web"}, ""},
+		{"web", []string{"web", "WEB_a"}, ""},
+		{"web", []string{"web"}, ""},
+		{"web", []string{"webapp", "web-a"}, ""},
+	} {
+		api := asController(&fakeAPI{configs: nil})
+		for _, r := range tc.recorded {
+			api.configs = append(api.configs, record(r))
+		}
+		var logged bytes.Buffer
+		b := New(api, Options{Log: slog.New(slog.NewTextHandler(&logged, nil))})
+		err := b.DeployStack(t.Context(), charts.DeployRequest{Name: tc.release, Manifest: trivialStack, Resolve: ResolveNever})
+		switch {
+		case tc.refused == "" && err != nil:
+			t.Errorf("DeployStack(%s) beside %v = %v, want it deployed", tc.release, tc.recorded, err)
+		case tc.refused != "" && (err == nil || !strings.Contains(err.Error(), tc.refused) || !strings.Contains(err.Error(), "'_'")):
+			t.Errorf("DeployStack(%s) beside %v = %v, want it refused naming %s", tc.release, tc.recorded, err, tc.refused)
+		case tc.refused != "" && (len(api.created) != 0 || len(api.order) != 0):
+			t.Errorf("DeployStack(%s) created %v and %d services, want nothing", tc.release, api.order, len(api.created))
+		}
+		// A pair installed together before this was refused keeps deploying, and
+		// warns, either half of it, since its volumes are still told apart by name
+		// alone. One whose names match only without regard to case shares no
+		// volume name, since those keep their case, and does not.
+		other := map[string]string{"web": "web_a", "web_a": "web"}[tc.release]
+		pair := slices.Contains(tc.recorded, tc.release) && slices.Contains(tc.recorded, other)
+		if warned := strings.Contains(logged.String(), "level=WARN"); warned != pair || pair && !strings.Contains(logged.String(), "collidesWith="+other) {
+			t.Errorf("DeployStack(%s) beside %v logged %q, want a warning %t", tc.release, tc.recorded, logged.String(), pair)
+		}
+	}
+
+	// Beside two, the refusal names the first in order, whatever order the
+	// daemon lists them in.
+	for _, listed := range [][]string{{"web_b", "web_a"}, {"web_a", "web_b"}} {
+		api := asController(&fakeAPI{configs: []swarm.Config{record(listed[0]), record(listed[1])}})
+		err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: trivialStack, Resolve: ResolveNever})
+		if err == nil || !strings.Contains(err.Error(), "'web_a'") {
+			t.Errorf("DeployStack(web) beside %v = %v, want it refused naming 'web_a'", listed, err)
+		}
+	}
+
+	// The self release adopts the stack this controller already runs as, so a
+	// recorded release whose name extends it does not refuse it.
+	self := selfAPI()
+	self.configs = append(self.configs, record("swarmcli-cd_x"))
+	if err := testBackend(t, self, nil).WithSelfRelease(noDeferral).DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: selfStack, Resolve: ResolveNever}); err != nil {
+		t.Errorf("DeployStack(self) beside a recorded 'swarmcli-cd_x' = %v, want the self release adopted", err)
+	}
+
+	api := asController(&fakeAPI{})
+	_ = testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "a_b_c", Manifest: trivialStack, Resolve: ResolveNever})
+	for _, want := range []string{"swarmcli.release.a_b_c.", "swarmcli.release.a_b_c_", "swarmcli.release.a.", "swarmcli.release.a_b."} {
+		if !slices.Contains(api.configNameFilters, want) {
+			t.Errorf("config name filters = %q, want %q among them", api.configNameFilters, want)
+		}
+	}
+}
+
+// Where the adoption happens, the same rule as the guard: a config or secret that
+// has come to hold a declared name since the guard looked, labelled as another
+// stack's or as nobody's, is not relabelled into this one unless the app set
+// permits the name. One already labelled as this stack's is.
+func TestAHolderThatAppearedAfterTheCheckIsNotAdopted(t *testing.T) {
+	for _, holder := range []map[string]string{{convert.LabelNamespace: "web_a"}, nil} {
+		api := &fakeAPI{
+			configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "web_a_site", Labels: holder}, Data: []byte("same")}}},
+			secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "web_a_site", Labels: holder}}}},
+		}
+		labels := map[string]string{convert.LabelNamespace: "web"}
+		configs := []swarm.ConfigSpec{{Annotations: swarm.Annotations{Name: "web_a_site", Labels: labels}, Data: []byte("same")}}
+		secrets := []swarm.SecretSpec{{Annotations: swarm.Annotations{Name: "web_a_site", Labels: labels}}}
+
+		b := testBackend(t, api, nil)
+		if err := b.applyConfigs(t.Context(), configs); err == nil || !strings.Contains(err.Error(), "allow.configs") {
+			t.Errorf("applyConfigs over %v = %v, want the adoption refused", holder, err)
+		}
+		if err := b.applySecrets(t.Context(), secrets); err == nil || !strings.Contains(err.Error(), "allow.secrets") {
+			t.Errorf("applySecrets over %v = %v, want the adoption refused", holder, err)
+		}
+		if len(api.updatedConfigs)+len(api.updatedSecrets) != 0 {
+			t.Errorf("relabelled %v and %v, want nothing", api.updatedConfigs, api.updatedSecrets)
+		}
+
+		b.allow = application.Allow{Configs: []string{"web_a_site"}, Secrets: []string{"web_a_site"}}
+		if err := b.applyConfigs(t.Context(), configs); err != nil {
+			t.Errorf("applyConfigs over %v = %v, want a permitted name adopted", holder, err)
+		}
+		if err := b.applySecrets(t.Context(), secrets); err != nil {
+			t.Errorf("applySecrets over %v = %v, want a permitted name adopted", holder, err)
+		}
+	}
+}
+
+// Every network a stack declares is looked up in one listing of the swarm's, not
+// one each.
+func TestDeclaredNetworksAreLookedUpInOneListing(t *testing.T) {
+	api := &countingNetworksAPI{fakeAPI: asController(&fakeAPI{})}
+	manifest := "services:\n  app:\n    image: busybox\n    networks: [a, b, c]\nnetworks:\n  a: {}\n  b: {}\n  c: {}\n"
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: manifest, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want nil", err)
+	}
+	if api.unfiltered != 1 {
+		t.Errorf("listed every network %d times for three declared ones, want once", api.unfiltered)
+	}
+}
+
+// countingNetworksAPI counts the network listings made with no filter at all.
+type countingNetworksAPI struct {
+	*fakeAPI
+	unfiltered int
+}
+
+func (a *countingNetworksAPI) NetworkList(ctx context.Context, o network.ListOptions) ([]network.Summary, error) {
+	if o.Filters.Len() == 0 {
+		a.unfiltered++
+	}
+	return a.fakeAPI.NetworkList(ctx, o)
+}
+
+// A service joins only a swarm-scoped network, so a node-local one of the same
+// name — a compose project's default network on the manager, say — is nobody's
+// claim on the release's own and does not refuse it.
+func TestALocalNetworkOfTheSameNameIsNotTheHolder(t *testing.T) {
+	api := asController(&fakeAPI{networks: []network.Summary{{ID: "l", Name: "web_default", Scope: "local"}}})
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: trivialStack, Resolve: ResolveNever}); err != nil {
+		t.Errorf("DeployStack = %v, want the release's own network created beside a local one", err)
+	}
+}
+
 // Removing it is not refused. RemoveStack and StackVolumes select by the
 // namespace label, whose value Swarm compares exactly, so they reach only what
 // carries that spelling — never the controller's — and refusing would leave such
@@ -3190,8 +3349,11 @@ func TestANamespaceInAnotherCaseIsNotTheReleasesOwn(t *testing.T) {
 
 // A cluster mount names an existing CSI volume, or a whole volume group, as a
 // volume mount names a volume, and passes the same guard: another stack's is
-// refused unless the app set permits the name, the controller's own is refused
-// outright, and the release's own needs nothing.
+// refused unless the app set permits the name, and the controller's own is
+// refused outright. None is the release's own, whatever it is called: a stack
+// never creates a cluster volume, so a name scoped under the release — its own
+// key, or one scoped into the names of a release called tenant_a — is somebody's
+// already, and needs the app set's permission like any other.
 func TestAClusterMountPassesTheVolumeGuard(t *testing.T) {
 	mounts := func(source, decl string) string {
 		return "services:\n  app:\n    image: busybox\n    volumes:\n" +
@@ -3207,7 +3369,9 @@ func TestAClusterMountPassesTheVolumeGuard(t *testing.T) {
 			"this controller's own volume", application.Allow{Volumes: []string{"swarmcli-cd_swarmcli-cd-data"}}},
 		{"permitted", mounts("shared-csi", "volumes:\n  shared-csi: {external: true}\n"), "", application.Allow{Volumes: []string{"shared-csi"}}},
 		{"a permitted volume group", mounts("group:db", ""), "", application.Allow{Volumes: []string{"group:db"}}},
-		{"the release's own", mounts("data", "volumes:\n  data: {}\n"), "", application.Allow{}},
+		{"a name scoped under the release", mounts("data", "volumes:\n  data: {}\n"), "allow.volumes", application.Allow{}},
+		{"a name scoped into another release's", mounts("a_data", "volumes:\n  a_data: {}\n"), "allow.volumes", application.Allow{}},
+		{"a permitted name scoped under the release", mounts("data", "volumes:\n  data: {}\n"), "", application.Allow{Volumes: []string{"tenant_data"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
@@ -3220,6 +3384,46 @@ func TestAClusterMountPassesTheVolumeGuard(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("DeployStack = %v, want the cluster mount refused (%s)", err, tc.want)
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// The cluster rule and the driver-options rule hold together in one service: a
+// cluster mount scoped under the release needs its entry, a volume of the
+// release's own with driver options needs its own, and each entry answers for
+// its own mount and not the other's. A volume named outside the release with
+// driver options is refused whatever the app set permits.
+func TestClusterMountsAndDriverOptionsAreHeldApart(t *testing.T) {
+	const manifest = "services:\n  app:\n    image: busybox\n    volumes:\n" +
+		"      - {type: cluster, source: csi, target: /csi}\n      - opts:/opts\n" +
+		"volumes:\n  csi: {}\n  opts: {driver_opts: {type: none, o: bind, device: /srv}}\n"
+	const foreign = "services:\n  app:\n    image: busybox\n    volumes: [\"opts:/opts\"]\n" +
+		"volumes:\n  opts: {name: shared-data, driver_opts: {type: none, o: bind, device: /srv}}\n"
+	for _, tc := range []struct {
+		name, manifest, want string
+		allow                application.Allow
+	}{
+		{"neither permitted", manifest, "'web_csi'", application.Allow{}},
+		{"only the cluster mount", manifest, "driver_opts", application.Allow{Volumes: []string{"web_csi"}}},
+		{"only the volume with options", manifest, "'web_csi'", application.Allow{Volumes: []string{"web_opts"}}},
+		{"both", manifest, "", application.Allow{Volumes: []string{"web_csi", "web_opts"}}},
+		{"options outside the release", foreign, "external:", application.Allow{Volumes: []string{"shared-data"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+			err := allowing(t, api, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: tc.manifest, Resolve: ResolveNever})
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("DeployStack = %v, want it deployed", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("DeployStack = %v, want it refused mentioning %s", err, tc.want)
 			}
 			if len(api.created) != 0 || len(api.order) != 0 {
 				t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
@@ -3433,19 +3637,23 @@ func TestAStackMayNotMountAVolumeItsApplicationDoesNotPermit(t *testing.T) {
 		{"permitted it as a secret", application.Allow{Secrets: []string{"shared-cache"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			api := asController(&fakeAPI{})
+			// Both forms: an external: one, and one the stack declares under a
+			// name: outside the release, which is its own volume in name only.
+			for _, external := range []bool{true, false} {
+				api := asController(&fakeAPI{})
 
-			err := allowing(t, api, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsAVolume("shared-cache", true), Resolve: ResolveNever})
-			if err == nil {
-				t.Fatal("DeployStack = nil, want the volume refused")
-			}
-			for _, want := range []string{"thief", "shared-cache", "allow.volumes"} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("error %q does not mention %q", err, want)
+				err := allowing(t, api, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: mountsAVolume("shared-cache", external), Resolve: ResolveNever})
+				if err == nil {
+					t.Fatalf("DeployStack (external %t) = nil, want the volume refused", external)
 				}
-			}
-			if len(api.created) != 0 || len(api.order) != 0 {
-				t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+				for _, want := range []string{"thief", "shared-cache", "allow.volumes"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("error %q does not mention %q", err, want)
+					}
+				}
+				if len(api.created) != 0 || len(api.order) != 0 {
+					t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+				}
 			}
 		})
 	}
@@ -3895,22 +4103,220 @@ func TestAStackMayReferenceOnlyWhatItsApplicationPermits(t *testing.T) {
 	}
 }
 
-// What the release owns needs no entry at all, which is what keeps the gate from
-// being a per-chart inventory: conversion scopes everything a stack declares to
-// "<release>_<name>", so a chart's own secrets, configs, volumes and networks are
-// nobody else's and nobody's to permit.
-//
-// The external references here are scoped names too — the shape oneOfEach uses —
-// because a reference to something inside your own release is still your own.
-func TestAStackNeedsNoPermissionForWhatItOwns(t *testing.T) {
-	api := asController(&fakeAPI{
-		configs: []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: "s_site"}}}},
-		secrets: []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: "s_apikey"}}}},
-	})
+// ownsOneOfEach declares a network, a config, a secret and a volume and uses
+// each, so every name it reaches for is one conversion scoped under the release.
+const ownsOneOfEach = `
+services:
+  web:
+    image: nginx
+    networks: [front]
+    configs: [site]
+    secrets: [apikey]
+    volumes: ["data:/data"]
+networks:
+  front: {}
+configs:
+  site:
+    file: files/decoy.conf
+secrets:
+  apikey:
+    driver: vault
+volumes:
+  data: {}
+`
 
-	if err := allowing(t, api, application.Allow{}).DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: oneOfEach, Resolve: ResolveNever}); err != nil {
-		t.Fatalf("DeployStack = %v, want a release's own resources to need no permission", err)
+// What the release owns needs no entry at all, which is what keeps the gate from
+// being a per-chart inventory: conversion scopes what a stack declares to
+// "<release>_<name>", so a chart's own secrets, configs, volumes and networks
+// need nobody's permission — on the first deploy, when nothing holds those names
+// yet, and on every later one, when what holds them carries the release's label.
+// The network is there from the start, labelled as the release's.
+func TestAStackNeedsNoPermissionForWhatItOwns(t *testing.T) {
+	front := stackNetwork("n", "s_front", "s")
+	front.Scope = "swarm"
+	api := installed(asController(&fakeAPI{networks: []network.Summary{front}}), "s")
+	b := allowing(t, api, application.Allow{})
+
+	for i := range 2 {
+		if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "s", Manifest: ownsOneOfEach, Resolve: ResolveNever, Files: decoyFiles}); err != nil {
+			t.Fatalf("deploy %d = %v, want a release's own resources to need no permission", i+1, err)
+		}
 	}
+	if len(api.createdConfigs) != 1 || len(api.createdSecrets) != 1 || len(api.createdNets) != 0 {
+		t.Errorf("created configs %d, secrets %d, networks %d; want the first deploy to create its own config and secret once",
+			len(api.createdConfigs), len(api.createdSecrets), len(api.createdNets))
+	}
+}
+
+// An external: reference is not the release's own whatever it is called: the
+// manifest has said the thing is somebody else's, and a name scoped under the
+// release is no exception. "web_a_site" is the shape that matters — a release
+// name may contain '_', so it is stack "web_a"'s site as much as anything of
+// release "web"'s — and "web_site" labelled as the release's own needs the entry
+// too, because an external reference is not where a release reaches its own.
+func TestAnExternalReferenceNeedsPermissionWhateverItsName(t *testing.T) {
+	for _, name := range []struct{ name, owner string }{{"web_a_site", "web_a"}, {"web_site", "web"}} {
+		for _, tc := range []struct {
+			kind, manifest, field string
+			permit                application.Allow
+		}{
+			{"config", mountsAConfig(name.name), "allow.configs", application.Allow{Configs: []string{name.name}}},
+			{"secret", mountsASecret(name.name), "allow.secrets", application.Allow{Secrets: []string{name.name}}},
+			{"volume", mountsAVolume(name.name, true), "allow.volumes", application.Allow{Volumes: []string{name.name}}},
+			{"network", joinsANetwork(name.name, true), "allow.networks", application.Allow{Networks: []string{name.name}}},
+		} {
+			t.Run(tc.kind+" "+name.name, func(t *testing.T) {
+				api := func() *fakeAPI {
+					return asController(&fakeAPI{
+						configs:  []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: stackScoped(name.name, name.owner)}}},
+						secrets:  []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: stackScoped(name.name, name.owner)}}},
+						networks: []network.Summary{stackNetwork("n", name.name, name.owner)},
+					})
+				}
+
+				refused := api()
+				err := allowing(t, refused, application.Allow{}).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: tc.manifest, Resolve: ResolveNever})
+				if err == nil || !strings.Contains(err.Error(), tc.field) {
+					t.Fatalf("DeployStack = %v, want the reference refused as not permitted", err)
+				}
+				if len(refused.created) != 0 || len(refused.order) != 0 {
+					t.Errorf("resources were created despite the refusal: order=%v created=%d", refused.order, len(refused.created))
+				}
+
+				if err := allowing(t, api(), tc.permit).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: tc.manifest, Resolve: ResolveNever}); err != nil {
+					t.Errorf("DeployStack = %v, want the reference deployed once the app set permits it", err)
+				}
+			})
+		}
+	}
+}
+
+// A declared name is the release's own only if whatever already holds it carries
+// exactly the release's namespace label. Declaring a config or secret that exists
+// hands it to the stack's services and relabels it as the stack's, and joining a
+// declared network that exists is joining it, so each of these reaches something
+// the release does not own although its name is scoped under the release: a key
+// with '_' in it, or a name:, lands on stack "web_a"'s; one made by hand carries
+// no label at all; and one labelled "Web" is another stack's, since the label is
+// compared as written. The network is held under another case, which Swarm's
+// name index folds, so the lookup has to as well.
+//
+// A config or secret the app set permits is adopted. A network is not adopted
+// but created, and Swarm keeps network names unique, so one already held is
+// refused whatever the app set permits — joining it is what external: is for.
+func TestADeclaredNameHeldByAnotherStackIsNotTheReleasesOwn(t *testing.T) {
+	declaresKey := func(kind, key string) string {
+		source := map[string]string{"configs": "    file: files/decoy.conf\n", "secrets": "    driver: vault\n", "networks": "    driver: overlay\n"}[kind]
+		return "services:\n  app:\n    image: busybox\n    " + kind + ": [" + key + "]\n" + kind + ":\n  " + key + ":\n" + source
+	}
+	for _, holder := range []struct{ why, owner, name string }{
+		{"another stack's", "web_a", "web_a_site"},
+		{"made by hand", "", "web_a_site"},
+		{"another case", "Web", "web_a_site"},
+		// Held under another case of the name, which the daemon's lookup folds:
+		// the permitted half is left out, since Swarm refuses the relabel a
+		// different spelling would ask for.
+		{"another stack's, held in another case", "web_a", "WEB_A_site"},
+	} {
+		labels := func() map[string]string {
+			if holder.owner == "" {
+				return nil
+			}
+			return map[string]string{convert.LabelNamespace: holder.owner}
+		}
+		for _, tc := range []struct {
+			kind, manifest, field string
+			permit                application.Allow
+			held                  bool
+		}{
+			{"config by key", declaresKey("configs", "a_site"), "allow.configs", application.Allow{Configs: []string{"web_a_site"}}, false},
+			{"config by name", stealsByDeclaring("configs", "web_a_site", true), "allow.configs", application.Allow{Configs: []string{"web_a_site"}}, false},
+			{"secret by key", declaresKey("secrets", "a_site"), "allow.secrets", application.Allow{Secrets: []string{"web_a_site"}}, false},
+			{"network by key", declaresKey("networks", "a_site"), "allow.networks", application.Allow{Networks: []string{"web_a_site"}}, true},
+			{"network by name", joinsANetwork("web_a_site", false), "allow.networks", application.Allow{Networks: []string{"web_a_site"}}, true},
+		} {
+			t.Run(holder.why+"/"+tc.kind, func(t *testing.T) {
+				api := func() *fakeAPI {
+					return asController(&fakeAPI{
+						configs:  []swarm.Config{{ID: "c", Spec: swarm.ConfigSpec{Annotations: swarm.Annotations{Name: holder.name, Labels: labels()}, Data: decoyFiles["files/decoy.conf"]}}},
+						secrets:  []swarm.Secret{{ID: "s", Spec: swarm.SecretSpec{Annotations: swarm.Annotations{Name: holder.name, Labels: labels()}}}},
+						networks: []network.Summary{{ID: "n", Name: "WEB_A_site", Scope: "swarm", Labels: labels()}},
+					})
+				}
+
+				refused := api()
+				err := allowing(t, refused, application.Allow{}).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: tc.manifest, Resolve: ResolveNever, Files: decoyFiles})
+				if err == nil || !strings.Contains(err.Error(), tc.field) || !strings.Contains(err.Error(), "web_a_site") {
+					t.Fatalf("DeployStack = %v, want the declaration refused as not permitted", err)
+				}
+				if len(refused.created) != 0 || len(refused.order) != 0 || len(refused.updatedConfigs)+len(refused.updatedSecrets) != 0 {
+					t.Errorf("resources were created or relabelled despite the refusal: order=%v created=%d", refused.order, len(refused.created))
+				}
+
+				if holder.name != "web_a_site" {
+					return
+				}
+				err = allowing(t, api(), tc.permit).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: tc.manifest, Resolve: ResolveNever, Files: decoyFiles})
+				switch {
+				case tc.held && (err == nil || !strings.Contains(err.Error(), "already exists")):
+					t.Errorf("DeployStack = %v, want a held network refused whatever the app set permits", err)
+				case !tc.held && err != nil:
+					t.Errorf("DeployStack = %v, want the declaration deployed once the app set permits it", err)
+				}
+			})
+		}
+	}
+}
+
+// Looking up what holds a declared name is a daemon read, and a daemon that
+// could not answer is not the news that nothing holds it: the deploy fails.
+func TestADeclaredNameThatCannotBeLookedUpRefusesTheDeploy(t *testing.T) {
+	for _, tc := range []struct{ kind, manifest string }{
+		{"config", shipsAConfig},
+		{"secret", declaresAndMounts},
+		{"network", "services:\n  app:\n    image: busybox\n"},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			api := &lookupErrAPI{fakeAPI: &fakeAPI{}, kind: tc.kind, err: errors.New("daemon busy")}
+			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: tc.manifest, Resolve: ResolveNever, Files: map[string][]byte{"files/nginx.conf": []byte("x")}})
+			if err == nil || !strings.Contains(err.Error(), "daemon busy") {
+				t.Fatalf("DeployStack = %v, want the lookup's failure", err)
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("resources were created despite the failure: order=%v created=%d", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// lookupErrAPI fails the read ownDeclared makes for one kind: a config's or a
+// secret's inspect, or the listing of every network. applyNetworks lists by
+// label, so its read still answers.
+type lookupErrAPI struct {
+	*fakeAPI
+	kind string
+	err  error
+}
+
+func (a *lookupErrAPI) ConfigInspectWithRaw(ctx context.Context, name string) (swarm.Config, []byte, error) {
+	if a.kind == "config" {
+		return swarm.Config{}, nil, a.err
+	}
+	return a.fakeAPI.ConfigInspectWithRaw(ctx, name)
+}
+
+func (a *lookupErrAPI) SecretInspectWithRaw(ctx context.Context, name string) (swarm.Secret, []byte, error) {
+	if a.kind == "secret" {
+		return swarm.Secret{}, nil, a.err
+	}
+	return a.fakeAPI.SecretInspectWithRaw(ctx, name)
+}
+
+func (a *lookupErrAPI) NetworkList(ctx context.Context, o network.ListOptions) ([]network.Summary, error) {
+	if a.kind == "network" && labelOf(o.Filters) == "" {
+		return nil, a.err
+	}
+	return a.fakeAPI.NetworkList(ctx, o)
 }
 
 // The invariant that makes the whole design hold: an allowlist cannot reach the

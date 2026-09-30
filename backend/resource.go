@@ -182,6 +182,9 @@ func (b *Backend) applySecrets(ctx context.Context, secrets []swarm.SecretSpec) 
 			// somebody else created is relabelled into the stack's namespace
 			// here. It does not gain a creation marker, and that is what keeps
 			// the sweep off it.
+			if !b.adoptable(cur.Spec.Labels, spec.Labels, b.allow.Secrets, spec.Name) {
+				return declaresUnpermitted("secret", spec.Name, "allow.secrets")
+			}
 			spec.Data = nil
 			spec.Labels = keepCreated(spec.Labels, cur.Spec.Labels)
 			if err := b.api.SecretUpdate(ctx, cur.ID, cur.Version, spec); err != nil {
@@ -219,6 +222,9 @@ func (b *Backend) applyConfigs(ctx context.Context, configs []swarm.ConfigSpec) 
 			// name that already carries exactly this content is relabelled into
 			// the stack's namespace rather than refused. It does not gain a
 			// creation marker either.
+			if !b.adoptable(cur.Spec.Labels, spec.Labels, b.allow.Configs, spec.Name) {
+				return declaresUnpermitted("config", spec.Name, "allow.configs")
+			}
 			data := spec.Data
 			spec.Data = nil
 			spec.Labels = keepCreated(spec.Labels, cur.Spec.Labels)
@@ -229,6 +235,17 @@ func (b *Backend) applyConfigs(ctx context.Context, configs []swarm.ConfigSpec) 
 		}
 	}
 	return nil
+}
+
+// adoptable reports whether a config or secret already on the swarm may be
+// relabelled into the stack a spec of the same name belongs to: it carries that
+// stack's namespace label already, or the application permits the name.
+//
+// rejectForbiddenResources refused everything else before anything was created
+// (ownDeclared). This is the same rule where the adoption happens, for what came
+// to hold the name in between — another deploy that created it after the check.
+func (b *Backend) adoptable(current, labels map[string]string, allowed []string, name string) bool {
+	return current[convert.LabelNamespace] == labels[convert.LabelNamespace] || permits(allowed, name)
 }
 
 // --- the release engine's own config store ---

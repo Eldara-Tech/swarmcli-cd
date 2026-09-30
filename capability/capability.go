@@ -248,6 +248,24 @@ type ManifestRequest struct {
 	Files map[string][]byte
 }
 
+// AllowAuditor is the optional interface a backend implements to say which
+// allowlist entries a rendered manifest needs that an allowlist does not name —
+// the entries a deploy of it would be refused for want of.
+//
+// Advisory: nothing refuses on its answer. It is how a controller warns at
+// startup about releases already on the swarm that a deploy under its rules
+// would refuse, before the first deploy does. The answer holds names only, and
+// never what can be granted by no allowlist.
+type AllowAuditor interface {
+	UnpermittedNames(ctx context.Context, req AllowRequest) (application.Allow, error)
+}
+
+// AllowRequest is one rendered manifest and the allowlist it is deployed under.
+type AllowRequest struct {
+	ManifestRequest
+	Allow application.Allow
+}
+
 // ResourceLister is the optional interface a backend implements to read the
 // other three kinds a manifest declares, by scoped name.
 //

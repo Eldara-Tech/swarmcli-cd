@@ -41,9 +41,10 @@ applications:
       releaseFile: swarm/prod/swarmcli-release.yaml  # path within the repo
     # allow is what this application's charts may reach OUTSIDE the releases they
     # install. It is an allowlist: omit it and a chart can declare and mount its
-    # own resources and nothing else, because everything a release owns is scoped
-    # to `<release>_<name>` and needs no entry — except a volume of its own given a
-    # driver: other than local or any driver_opts:, which needs one in volumes:.
+    # own resources and nothing else. What a release declares is scoped to
+    # `<release>_<name>` and needs no entry — except a volume of its own given a
+    # driver: other than local or any driver_opts:, which needs one in volumes: —
+    # and an `external:` reference needs one whatever it is called.
     #
     # It lives here and nowhere a chart author can write, so that being able to
     # change an app's chart is not the same permission as being able to add an

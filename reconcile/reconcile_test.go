@@ -1678,6 +1678,190 @@ func TestAnApplicationDoesNotProtectAReleaseFromItself(t *testing.T) {
 	}
 }
 
+// installing is a plan installing each named release.
+func installing(releases ...string) *charts.Plan {
+	plan := &charts.Plan{}
+	for _, name := range releases {
+		plan.Releases = append(plan.Releases, charts.ReleasePlan{Name: name, Ref: "repo/" + name, Action: charts.ActionInstall, ToVersion: "0.1.0"})
+	}
+	return plan
+}
+
+// While one application is installing a release, another may not install one
+// whose name collides with it: one differing only in case, or one that is the
+// other followed by '_', in either direction. The same name is not a collision,
+// nor is an upgrade, nor a name that merely starts with the other's; and once
+// the first install is over the mark is gone — by then the release has records,
+// and the backend refuses by those.
+func TestAnInstallIsRefusedWhileACollidingOneIsBeingInstalled(t *testing.T) {
+	r := newTest(t, []application.Spec{spec("one", true), spec("two", true)}, &fakeEngine{}, nil)
+	one, two := r.apps["one"], r.apps["two"]
+	done, err := r.claimInstalls(one, installing("web"))
+	if err != nil {
+		t.Fatalf("claimInstalls(one) = %v, want the first install marked", err)
+	}
+
+	for _, name := range []string{"Web", "web_a", "WEB_a"} {
+		if _, err := r.claimInstalls(two, installing(name)); err == nil || !strings.Contains(err.Error(), "'web'") {
+			t.Errorf("claimInstalls(two, %s) = %v, want it refused naming the release being installed", name, err)
+		}
+	}
+	for _, plan := range []*charts.Plan{outOfSyncRelease("Web"), installing("webapp"), installing("web-a"), installing("web")} {
+		release, err := r.claimInstalls(two, plan)
+		if err != nil {
+			t.Errorf("claimInstalls(two, %s %s) = %v, want nil", plan.Releases[0].Action, plan.Releases[0].Name, err)
+			continue
+		}
+		release()
+	}
+	// Neither another application installing the same name, nor that one's
+	// clearing its mark, clears this one's.
+	if _, err := r.claimInstalls(two, installing("WEB")); err == nil {
+		t.Error("claimInstalls(two, WEB) = nil, want the first install still marked")
+	}
+	done()
+	release, err := r.claimInstalls(two, installing("Web"))
+	if err != nil {
+		t.Fatalf("claimInstalls(two, Web) after the first install = %v, want the mark gone", err)
+	}
+	release()
+
+	// Colliding with two at once, it names the same one every time.
+	three := newEntry(spec("three", true))
+	for _, claim := range []struct {
+		e    *appEntry
+		name string
+	}{{one, "a_c"}, {three, "a_b"}} {
+		if _, err := r.claimInstalls(claim.e, installing(claim.name)); err != nil {
+			t.Fatalf("claimInstalls(%s) = %v, want it marked", claim.name, err)
+		}
+	}
+	if _, err := r.claimInstalls(two, installing("a")); err == nil || !strings.Contains(err.Error(), "'a_b' is being installed") {
+		t.Errorf("claimInstalls(two, a) = %v, want it refused naming 'a_b', the first of the two in order", err)
+	}
+}
+
+// Declaring a release holds no name. A chart application that has not installed
+// its release — refused, failing, or not yet reconciled — does not keep another
+// application from installing a release whose name collides with it; whichever
+// installs first holds the name, and the backend refuses the other by its
+// records.
+func TestADeclaredReleaseThatIsNotBeingInstalledHoldsNoName(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{installing("web"), declaring("web")}}
+	r := newTest(t, []application.Spec{spec("edge", true), chartApp("acme", "Web"), chartApp("shop", "web_a")}, engine, nil)
+
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want the install applied", err)
+	}
+	if engine.applyCount() != 1 {
+		t.Errorf("applied %d times, want 1", engine.applyCount())
+	}
+}
+
+// outOfSyncRelease is outOfSync for a named release.
+func outOfSyncRelease(name string) *charts.Plan {
+	plan := outOfSync()
+	plan.Releases[0].Name = name
+	return plan
+}
+
+// racingEngine installs one release per application and holds every Apply until
+// the test lets it go, so that one application's install is still in flight
+// when the other's reaches claimInstalls. Its first plans are held too, until
+// both applications have planned.
+type racingEngine struct {
+	*fakeEngine
+	releases map[string]string // application → the release it installs
+	planned  chan string
+	plan     chan struct{}
+	applying chan string
+	apply    chan struct{}
+
+	mu    sync.Mutex
+	plans map[string]int
+}
+
+func (e *racingEngine) PlanApply(_ context.Context, _ *charts.ReleaseFile, _ charts.ChartSource, opts charts.PlanOptions) (*charts.Plan, error) {
+	app := opts.Owner[strings.LastIndex(opts.Owner, "/")+1:]
+	e.mu.Lock()
+	e.plans[app]++
+	first := e.plans[app] == 1
+	e.mu.Unlock()
+	if !first {
+		return declaring(e.releases[app]), nil
+	}
+	e.planned <- app
+	<-e.plan
+	return installing(e.releases[app]), nil
+}
+
+func (e *racingEngine) Apply(ctx context.Context, plan *charts.Plan, opts charts.InstallOptions) ([]charts.ApplyResult, error) {
+	e.applying <- plan.Releases[0].Name
+	<-e.apply
+	return e.fakeEngine.Apply(ctx, plan, opts)
+}
+
+// Two applications installing releases that differ only in case, at once: the
+// one that reaches the check first is deployed, and the other is refused naming
+// it while the first is still being installed.
+func TestOfTwoCollidingInstallsAtOnceTheFirstIsDeployed(t *testing.T) {
+	engine := &racingEngine{
+		fakeEngine: &fakeEngine{},
+		releases:   map[string]string{"one": "web", "two": "Web"},
+		planned:    make(chan string, 2),
+		plan:       make(chan struct{}),
+		applying:   make(chan string, 2),
+		apply:      make(chan struct{}),
+		plans:      map[string]int{},
+	}
+	r := newTest(t, []application.Spec{spec("one", true), spec("two", true)}, engine, nil)
+
+	errs := make(chan error, 2)
+	for _, app := range []string{"one", "two"} {
+		go func() { errs <- r.Sync(t.Context(), app) }()
+	}
+	timeout := time.After(10 * time.Second)
+	for range 2 {
+		select {
+		case <-engine.planned:
+		case <-timeout:
+			t.Fatal("both applications did not plan")
+		}
+	}
+	close(engine.plan)
+
+	var first string
+	select {
+	case first = <-engine.applying:
+	case <-timeout:
+		t.Fatal("neither install reached the apply")
+	}
+	select {
+	case err := <-errs:
+		other := map[string]string{"web": "'Web'", "Web": "'web'"}[first]
+		if err == nil || !strings.Contains(err.Error(), "'"+first+"'") || !strings.Contains(err.Error(), other) {
+			t.Errorf("Sync = %v, want the second install refused naming '%s'", err, first)
+		}
+	case name := <-engine.applying:
+		t.Fatalf("both installs reached the apply: %s and %s", first, name)
+	case <-timeout:
+		t.Fatal("the second install was neither refused nor applied")
+	}
+	close(engine.apply)
+	if err := <-errs; err != nil {
+		t.Errorf("Sync = %v, want the first install applied", err)
+	}
+	if applied := engine.applyCount(); applied != 1 {
+		t.Errorf("applied %d times, want 1", applied)
+	}
+	// And the mark goes with the apply: nothing is being installed any more.
+	release, err := r.claimInstalls(r.apps["two"], installing(first+"_x"))
+	if err != nil {
+		t.Fatalf("claimInstalls after both syncs = %v, want the first install's mark gone", err)
+	}
+	release()
+}
+
 // The D-e default. An orphan is reported and left running unless the
 // application's own sync policy asks for it to go.
 func TestOrphansSurviveWhenPruneIsOff(t *testing.T) {

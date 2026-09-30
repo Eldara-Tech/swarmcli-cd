@@ -123,12 +123,18 @@ they cannot select its version, which is why a `ref` carries its own `version`.
 **The release name is the stack name.** A release name *is* the Swarm stack
 namespace, so `release` — not the application's `name` — is what `docker stack
 ls` shows. Omit it and the application's own name is used, which is Argo CD's
-default for `source.helm.releaseName` and the one choice that cannot collide:
-application names are unique within an app set, so a file that never writes a
-release name down can never have two applications claiming one stack. Write one
+default for `source.helm.releaseName` and the one choice that cannot share a
+stack: application names are unique within an app set, so a file that never
+writes a release name down can never have two applications claiming one. Write one
 down to install under a different name; two applications that write the same one
 are refused at load, and so are two whose names differ only in case, because
-Swarm compares the names a stack creates without regard to case.
+Swarm compares the names a stack creates without regard to case. Nor is a
+release *installed* beside one whose name differs from it only in case, or where
+one name is the other followed by `_` (`web` and `web_a`, either way round):
+release `web` declaring `a_site` and release `web_a` declaring `site` would both
+be `web_a_site`. Whichever installs first keeps deploying, and the other is
+refused, naming it — so on a fresh swarm a set holding such a pair installs one
+of the two, and a `_` pair already installed together keeps deploying.
 
 The two are separate fields rather than one because a `releaseFile` application
 installs several releases under a single application name, so the application
@@ -220,7 +226,14 @@ handed the real one — and its labels rewritten into the stack's namespace, whe
 uninstalling that release would delete it. Declared names are therefore checked
 against the same sets as referenced ones, whether or not any service mounts them
 (swarmcli-cd#86). A chart's own config or secret is unaffected: its name is
-namespace-scoped to `<release>_<name>`, so it is nobody else's.
+namespace-scoped to `<release>_<name>`, and on every later deploy what holds that
+name carries the release's namespace label. A declared config or secret that
+something else already holds — another stack's, or one created by hand — needs
+the app set's permission like any other, even when it starts with `<release>_`: a
+release name may contain `_`, so the prefix alone does not say whose a name is. A
+declared network already held that way is refused whatever the app set says,
+because a declared network is created and Swarm keeps network names unique; to
+join one, declare it `external:` and permit it.
 
 Five things are off limits **whatever the app set says**. They are not a
 permission an operator withholds and could grant; permitting one would not be
@@ -286,11 +299,12 @@ mounted": only an answer is.
 Everything else a chart reaches outside its own release for — an operator's
 shared config, secret, volume or network, and any path on a node — is refused
 unless the application's [`allow`](#allow-optional) names it. A chart declaring
-and mounting its own is unaffected, and needs no entry: its name is
-namespace-scoped to `<release>_<name>`, so it is nobody else's and nobody's to
-permit. The one exception is a volume of its own given a `driver:` other than
-`local` or any non-empty `driver_opts:`, which is held to `allow.volumes` — see
-[`allow`](#allow-optional).
+and mounting its own is unaffected, and needs no entry: what it declares is
+namespace-scoped to `<release>_<name>`. The one exception is a volume of its own
+given a `driver:` other than `local` or any non-empty `driver_opts:`, which is
+held to `allow.volumes` — see [`allow`](#allow-optional). An `external:`
+reference is never its own, whatever it is called — a name starting with
+`<release>_` included — because the chart has said the thing is not its own.
 
 **Content comes from the chart, never from the controller's filesystem.** A
 rendered manifest is a string, not a file in a checkout, so the only filesystem a
@@ -480,6 +494,7 @@ can install a chart that declares and mounts its own resources, and nothing else
 A chart's own are namespace-scoped to `<release>_<name>` and need no entry,
 except a volume of its own given a `driver:` other than `local` or any non-empty
 `driver_opts:`, which [`volumes`](#secrets-configs-volumes-and-networks) covers.
+An `external:` reference needs one whatever its name.
 
 #### Deploying Traefik, Portainer or an autoheal sidecar
 
@@ -548,7 +563,7 @@ What each grant is worth:
 |---|---|
 | `secrets` | the bytes. A Swarm secret is the shape a database password, a registry credential and a signing key all arrive in |
 | `configs` | the bytes, and they are readable — a config is not encrypted at rest the way a secret is |
-| `volumes` | another stack's data, read **and written**, on whichever node the task lands on. A `type: cluster` mount is held to the same list, by volume name or, for a whole CSI volume group, as `group:<name>`. So is a chart's **own** volume when it declares a `driver:` other than `local` or any non-empty `driver_opts:` — named as the swarm holds it, `<release>_<key>` or a `name:` within the release — because those decide what the node mounts, host paths and devices included. The entry permits the volume whatever options the chart gives it later, so grant it as you would the paths those options can reach. A declaration naming a volume outside the release may not carry them at all, entry or not: another stack's volume is shared by declaring it `external:` |
+| `volumes` | another stack's data, read **and written**, on whichever node the task lands on. A `type: cluster` mount is held to the same list whatever it is called — a stack never creates a cluster volume, so none is a release's own — by volume name or, for a whole CSI volume group, as `group:<name>`. So is a chart's **own** volume when it declares a `driver:` other than `local` or any non-empty `driver_opts:` — named as the swarm holds it, `<release>_<key>` or a `name:` within the release — because those decide what the node mounts, host paths and devices included. The entry permits the volume whatever options the chart gives it later, so grant it as you would the paths those options can reach. A declaration naming a volume outside the release may not carry them at all, entry or not: another stack's volume is shared by declaring it `external:` |
 | `networks` | everything already on that network. Joining `traefik-public` is being on it with every other stack that is |
 
 #### Why it lives here and not in the chart
@@ -1522,7 +1537,7 @@ reading those logs wants. It quotes any value containing a space, and escapes
 any quote inside it so that the value stays one field:
 
 ```
-time=2026-08-02T08:46:57.840Z level=ERROR msg="reconcile failed" application=eldara-zammad failures=1 error="applying: release 'zammad': this stack joins network 'shared-services', which is not scoped to this release"
+time=2026-08-02T08:46:57.840Z level=ERROR msg="reconcile failed" application=eldara-zammad failures=1 error="applying: release 'zammad': this stack joins network 'shared-services', which is not this release's own"
 ```
 
 Messages the controller writes name things in single quotes for that reason —
