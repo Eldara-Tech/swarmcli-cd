@@ -125,6 +125,24 @@ permit what it used. Add the entries before the next deploy — or after, since 
 deploy that is refused leaves the release running as it was, naming the entry
 to add. `validate` cannot catch these: they depend on the charts, not the file.
 
+**A volume a release declares has to be its own, whatever `allow` says.** A
+declaration that is not `external:` and names a volume outside the release — a
+`name:` not starting with `<release>_` — was deployed with an `allow.volumes`
+entry and is now refused, as is one whose name a volume labelled for another
+stack holds on the controller's node. The startup check does not list these,
+since no entry helps. Declare a volume another stack owns `external: true` and
+keep its entry; the volume and its data are left as they are:
+
+```yaml
+volumes:
+  cache:
+    external: true      # was: a declaration with name: shared-cache
+    name: shared-cache
+```
+
+A purge now leaves a volume labelled for the release under a name outside it in
+place, and names it in the log.
+
 ## Restarting, and what survives one
 
 A restart is cheap and is the documented remedy for two things — a
