@@ -143,10 +143,15 @@ func newAuditing(swarm string, asked *[]capability.AllowRequest) auditingBackend
 
 // One warning per application whose releases need entries its allowlist does
 // not name, merged across its releases and grouped by field; nothing for one
-// that needs none, and no field with nothing in it. A name scoped under another
-// application's release on the swarm — web_a_db for release web beside release
-// Web_a, compared without regard to case — is that release's, and is warned
-// about apart, to review rather than to add. Each release is asked with its own
+// that needs none, and no field with nothing in it. A name the release's own
+// prefix used to hand it that is scoped under another application's release —
+// web_a_db for release web beside release Web_a, compared without regard to case
+// — is that release's, and is warned about apart, to review rather than to add,
+// naming only the releases behind it. One scoped under another application's
+// release but not under the reading release — tidy_token read by api — needed an
+// entry before as well, and is one to add; so is one scoped under another of
+// the application's own releases — web_b_db read by web, beside edge's web_b.
+// Only releases actually read are counted. Each release is asked with its own
 // manifest, files and application's allowlist; one that is not the set's, or is
 // another controller's, is not asked; one that cannot be read, or panics, is said
 // so and the rest are still read; and the manifest is never logged.
@@ -156,8 +161,8 @@ func TestTheAuditWarnsOfTheAllowEntriesEachApplicationNeeds(t *testing.T) {
 	clean.Allow = application.Allow{Secrets: []string{"tidy_key"}}
 	var asked []capability.AllowRequest
 	backend := newAuditing("", &asked)
-	backend.needs["web"] = application.Allow{Secrets: []string{"web_a_db", "web_db"}, Networks: []string{"web_public"}}
-	backend.needs["api"] = application.Allow{Secrets: []string{"web_db"}, Configs: []string{"api_site"}, Volumes: []string{"api_data"}}
+	backend.needs["web"] = application.Allow{Secrets: []string{"web_a_db", "web_b_db", "web_db"}, Networks: []string{"web_public"}}
+	backend.needs["api"] = application.Allow{Secrets: []string{"web_db", "tidy_token"}, Configs: []string{"api_site"}, Volumes: []string{"api_data"}}
 	backend.errs["broken"] = errors.New("parsing the manifest: bad")
 	backend.panics["crashing"] = true
 	files := map[string][]byte{"files/site.conf": []byte("x")}
@@ -166,7 +171,7 @@ func TestTheAuditWarnsOfTheAllowEntriesEachApplicationNeeds(t *testing.T) {
 	theirs := owned("edge", "theirs", "theirs manifest")
 	theirs.Owner = charts.OwnerRef{ID: application.OwnerID("other", "edge"), Kind: charts.OwnerKindRelease, Name: "theirs"}.String()
 	engine := &listingEngine{fakeEngine: &fakeEngine{}, releases: []charts.Release{
-		web, owned("edge", "api", "api manifest"),
+		web, owned("edge", "api", "api manifest"), owned("edge", "web_b", "web_b manifest"),
 		owned("clean", "tidy", "tidy manifest"), owned("clean", "broken", "broken manifest"),
 		owned("clean", "crashing", "crashing manifest"), owned("gone", "Web_a", "Web_a manifest"),
 		theirs, {Name: "handmade", Manifest: "handmade manifest"},
@@ -179,14 +184,14 @@ func TestTheAuditWarnsOfTheAllowEntriesEachApplicationNeeds(t *testing.T) {
 	if len(adds) != 1 {
 		t.Fatalf("warned %d times of entries to add, want once, for edge alone:\n%s", len(adds), logged.String())
 	}
-	for _, want := range []string{"application=edge", `releases="[api web]"`, `allow.secrets=[web_db]`,
+	for _, want := range []string{"application=edge", `releases="[api web]"`, `allow.secrets="[tidy_token web_b_db web_db]"`,
 		"allow.configs=[api_site]", "allow.volumes=[api_data]", "allow.networks=[web_public]"} {
 		if !strings.Contains(adds[0], want) {
 			t.Errorf("warning %q does not carry %s", adds[0], want)
 		}
 	}
 	reviews := logged.lines("level=WARN", "scoped under another release")
-	if len(reviews) != 1 || !strings.Contains(reviews[0], "allow.secrets=[web_a_db]") ||
+	if len(reviews) != 1 || !strings.Contains(reviews[0], "allow.secrets=[web_a_db]") || !strings.Contains(reviews[0], "releases=[web]") ||
 		!strings.Contains(reviews[0], "scopedUnder=[Web_a]") || strings.Contains(adds[0], "web_a_db") ||
 		strings.Contains(reviews[0], "allow.configs") {
 		t.Errorf("warnings %q and %q, want web_a_db kept apart as web_a's", adds, reviews)
@@ -194,7 +199,7 @@ func TestTheAuditWarnsOfTheAllowEntriesEachApplicationNeeds(t *testing.T) {
 	for _, want := range [][]string{
 		{"level=WARN", "application=clean", "release=broken", "parsing the manifest"},
 		{"level=WARN", "application=clean", "release=crashing", "panic"},
-		{"level=INFO", "releases=5"},
+		{"level=INFO", "releases=4"},
 	} {
 		if len(logged.lines(want...)) != 1 {
 			t.Errorf("log does not carry one line with %v:\n%s", want, logged.String())
@@ -214,7 +219,7 @@ func TestTheAuditWarnsOfTheAllowEntriesEachApplicationNeeds(t *testing.T) {
 			t.Errorf("asked about web with %+v, want its own manifest and files", req)
 		}
 	}
-	if want := []string{"web", "api", "tidy", "broken", "crashing"}; !reflect.DeepEqual(names, want) {
+	if want := []string{"web", "api", "web_b", "tidy", "broken", "crashing"}; !reflect.DeepEqual(names, want) {
 		t.Errorf("asked about %v, want the set's releases %v", names, want)
 	}
 	if !reflect.DeepEqual(allows["web"], edge.Allow) || !reflect.DeepEqual(allows["tidy"], clean.Allow) {

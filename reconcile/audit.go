@@ -62,12 +62,12 @@ func (r *Reconciler) startAuditLocked(specs []application.Spec) {
 // Nothing is refused and nothing is written; it reports names, and the manifest
 // is not logged.
 //
-// Two warnings, because the two call for different answers. A name scoped under
-// no release, or under one of the application's own, is one to add. A name
-// scoped under another application's release, or one this controller did not
-// install — "web_a_db" for release "web", beside release "web_a" — is that
-// release's, and reaching it without an entry is exactly what is refused now: it
-// is listed to review, and to grant only if the sharing is meant.
+// Two warnings, because the two call for different answers. A name that the
+// release's own prefix used to hand it, and that is scoped under another
+// application's release or one this controller did not install — "web_a_db" for
+// release "web", beside release "web_a" — is that release's: reaching it without
+// an entry is exactly what is refused now, so it is listed to review, and to
+// grant only as a shared external: reference. Every other name is one to add.
 //
 // A release the application no longer declares is read too, since its record is
 // what there is; a sweep, not an entry, is the answer to one of those. A backend
@@ -114,7 +114,7 @@ func (r *Reconciler) auditAllowlists(ctx context.Context, specs []application.Sp
 		}
 
 		need, others := map[string]*application.Allow{}, map[string]*application.Allow{}
-		held, owners := map[string]*[]string{}, map[string]*[]string{}
+		held, heldOthers, owners := map[string]*[]string{}, map[string]*[]string{}, map[string]*[]string{}
 		list := func(m map[string]*[]string, app string) *[]string {
 			if m[app] == nil {
 				m[app] = &[]string{}
@@ -131,7 +131,6 @@ func (r *Reconciler) auditAllowlists(ctx context.Context, specs []application.Sp
 			if !inSet {
 				continue
 			}
-			checked++
 			got, err := unpermitted(ctx, auditor, capability.AllowRequest{
 				ManifestRequest: capability.ManifestRequest{Name: rel.Name, Manifest: rel.Manifest, Files: rel.Files},
 				Allow:           spec.Allow,
@@ -141,18 +140,21 @@ func (r *Reconciler) auditAllowlists(ctx context.Context, specs []application.Sp
 					"application", app, "release", rel.Name, "error", err)
 				continue
 			}
+			checked++
 			for _, field := range allowFields(&got) {
 				for _, name := range *field.names {
-					into, owner := need, ownerOf(name, names)
-					if owner != "" && appOf[owner] != app {
-						into = others
+					// Another's only if the prefix rule used to hand it to this
+					// release: scoped under this release's name as well.
+					into, releases, owner := need, held, ownerOf(name, names)
+					if owner != "" && appOf[owner] != app && strings.HasPrefix(strings.ToLower(name), strings.ToLower(rel.Name)+"_") {
+						into, releases = others, heldOthers
 						merge(list(owners, app), []string{owner})
 					}
 					if into[app] == nil {
 						into[app] = &application.Allow{}
 					}
 					merge(field.of(into[app]), []string{name})
-					merge(list(held, app), []string{rel.Name})
+					merge(list(releases, app), []string{rel.Name})
 				}
 			}
 		}
@@ -165,8 +167,9 @@ func (r *Reconciler) auditAllowlists(ctx context.Context, specs []application.Sp
 		for _, app := range slices.Sorted(maps.Keys(others)) {
 			r.log.Warn("releases of this application reference names scoped under another release on this swarm, "+
 				"which they reached before without an allow entry and are refused now: those are the other "+
-				"release's, so grant one only if it is meant to be shared",
-				append(attrs(app, *held[app], others[app]), "scopedUnder", *owners[app])...)
+				"release's. Permit one only if it is meant to be shared, and then as an external: reference — "+
+				"permitting one the release declares hands the other release's object to this one",
+				append(attrs(app, *heldOthers[app], others[app]), "scopedUnder", *owners[app])...)
 		}
 		r.log.Info("checked the applications' releases against their allowlists", "swarm", swarm, "releases", checked)
 	}

@@ -100,16 +100,22 @@ missing, grouped by field:
 level=WARN msg="releases of this application reference names its allowlist does not name, and a deploy of them is refused until it does: add these entries to the application's allow in the app set, or remove a release the application no longer declares" application=postgres releases=[postgres] allow.secrets=[postgres_password]
 ```
 
-A name scoped under another application's release — `web_a_db` read by release
-`web`, beside release `web_a` — gets a warning of its own. That is the reach
-v2.0.0 refuses, so review it, and grant it only if the sharing is meant:
+A name the release's own prefix used to hand it, but which is scoped under a
+release of another application or of nothing this controller installed —
+`web_a_db` read by release `web`, beside release `web_a` — gets a warning of its
+own. That is the reach v2.0.0 refuses, so review it. Permit one only if it is
+meant to be shared, and then as an `external:` reference: permitting a name the
+release *declares* hands the other release's object to this one, and the other
+is refused on its next deploy.
 
 ```
-level=WARN msg="releases of this application reference names scoped under another release on this swarm, which they reached before without an allow entry and are refused now: those are the other release's, so grant one only if it is meant to be shared" application=web releases=[web] allow.secrets=[web_a_db] scopedUnder=[web_a]
+level=WARN msg="releases of this application reference names scoped under another release on this swarm, which they reached before without an allow entry and are refused now: those are the other release's. Permit one only if it is meant to be shared, and then as an external: reference — permitting one the release declares hands the other release's object to this one" application=web releases=[web] allow.secrets=[web_a_db] scopedUnder=[web_a]
 ```
 
 Each check ends with a line saying how many releases it read on each swarm, so a
-check that found nothing reads differently from one that did not run. It
+check that found nothing reads differently from one that did not run. Only
+releases with a record count: a stack deployed without the controller is not
+read, and its names are not told apart from the release's own. It
 refuses nothing and names only names. A release the application no longer
 declares is read too, since its record is what there is: remove it rather than
 permit what it used. Add the entries before the next deploy — or after, since a
