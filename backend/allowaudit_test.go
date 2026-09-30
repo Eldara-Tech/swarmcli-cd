@@ -22,9 +22,11 @@ import (
 // reference, every volume or cluster mount that is not the release's own —
 // including a cluster mount scoped under the release — every network joined or
 // declared outside the release, and every declared config or secret that is not
-// the release's own, from every service, each once, sorted. What the release
-// declares as its own needs nothing; nor does what the allowlist names, in each
-// of its lists; nor what belongs to the controller, which no entry could grant.
+// the release's own, from every service, each once, sorted — and a volume of its
+// own with driver options. What the release declares as its own needs nothing;
+// nor does what the allowlist names, in each of its lists; nor what no entry
+// could grant: what belongs to the controller, or driver options on a volume
+// named outside the release.
 // A bind does not stop the manifest being read, since binds are not what this
 // reports.
 func TestUnpermittedNamesAreWhatADeployWouldBeRefusedFor(t *testing.T) {
@@ -43,6 +45,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - {type: cluster, source: "group:db", target: /csi}
       - {type: cluster, source: scoped, target: /scoped}
+      - optioned:/optioned
+      - foreign:/foreign
   worker:
     image: busybox
     secrets: [key, db]
@@ -70,6 +74,8 @@ volumes:
   shared: {external: true, name: web_shared}
   ok: {external: true, name: web_ok}
   ctl: {external: true, name: swarmcli-cd_swarmcli-cd-data}
+  optioned: {driver_opts: {type: tmpfs, device: tmpfs}}
+  foreign: {name: shared-data, driver: vieux/sshfs}
 `
 	got, err := testBackend(t, asController(&fakeAPI{}), nil).UnpermittedNames(t.Context(), capability.AllowRequest{
 		ManifestRequest: capability.ManifestRequest{Name: "web", Manifest: manifest, Files: decoyFiles},
@@ -84,7 +90,7 @@ volumes:
 	want := application.Allow{
 		Secrets:  []string{"shared-token", "web_db"},
 		Configs:  []string{"shared-conf", "web_site"},
-		Volumes:  []string{"group:db", "web_scoped", "web_shared"},
+		Volumes:  []string{"group:db", "web_optioned", "web_scoped", "web_shared"},
 		Networks: []string{"shared-net", "web_public"},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -104,7 +110,7 @@ services:
     secrets: [db]
     configs: [site, held]
     networks: [public]
-    volumes: ["shared:/shared", {type: cluster, source: scoped, target: /scoped}]
+    volumes: ["shared:/shared", "optioned:/optioned", {type: cluster, source: scoped, target: /scoped}]
 secrets:
   db: {external: true, name: web_db}
 configs:
@@ -114,6 +120,7 @@ networks:
   public: {external: true, name: web_public}
 volumes:
   scoped: {}
+  optioned: {driver_opts: {type: tmpfs, device: tmpfs}}
   shared: {external: true, name: web_shared}
 `
 	api := func() *fakeAPI {
@@ -149,8 +156,8 @@ volumes:
 			}
 		}
 	}
-	if n := len(need.Secrets) + len(need.Configs) + len(need.Volumes) + len(need.Networks); n != 6 {
-		t.Errorf("UnpermittedNames = %+v, want six names", need)
+	if n := len(need.Secrets) + len(need.Configs) + len(need.Volumes) + len(need.Networks); n != 7 {
+		t.Errorf("UnpermittedNames = %+v, want seven names", need)
 	}
 }
 

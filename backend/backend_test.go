@@ -3392,6 +3392,46 @@ func TestAClusterMountPassesTheVolumeGuard(t *testing.T) {
 	}
 }
 
+// The cluster rule and the driver-options rule hold together in one service: a
+// cluster mount scoped under the release needs its entry, a volume of the
+// release's own with driver options needs its own, and each entry answers for
+// its own mount and not the other's. A volume named outside the release with
+// driver options is refused whatever the app set permits.
+func TestClusterMountsAndDriverOptionsAreHeldApart(t *testing.T) {
+	const manifest = "services:\n  app:\n    image: busybox\n    volumes:\n" +
+		"      - {type: cluster, source: csi, target: /csi}\n      - opts:/opts\n" +
+		"volumes:\n  csi: {}\n  opts: {driver_opts: {type: none, o: bind, device: /srv}}\n"
+	const foreign = "services:\n  app:\n    image: busybox\n    volumes: [\"opts:/opts\"]\n" +
+		"volumes:\n  opts: {name: shared-data, driver_opts: {type: none, o: bind, device: /srv}}\n"
+	for _, tc := range []struct {
+		name, manifest, want string
+		allow                application.Allow
+	}{
+		{"neither permitted", manifest, "'web_csi'", application.Allow{}},
+		{"only the cluster mount", manifest, "driver_opts", application.Allow{Volumes: []string{"web_csi"}}},
+		{"only the volume with options", manifest, "'web_csi'", application.Allow{Volumes: []string{"web_opts"}}},
+		{"both", manifest, "", application.Allow{Volumes: []string{"web_csi", "web_opts"}}},
+		{"options outside the release", foreign, "external:", application.Allow{Volumes: []string{"shared-data"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+			err := allowing(t, api, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: tc.manifest, Resolve: ResolveNever})
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("DeployStack = %v, want it deployed", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("DeployStack = %v, want it refused mentioning %s", err, tc.want)
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
+			}
+		})
+	}
+}
+
 // A controller that keeps its own state on a CSI cluster volume holds that name
 // as it holds a volume's: no app set permits another release to mount it, and
 // the self release may re-declare it.

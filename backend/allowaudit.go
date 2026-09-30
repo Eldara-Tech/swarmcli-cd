@@ -15,13 +15,15 @@ import (
 // UnpermittedNames converts a manifest and returns the names in it that the
 // allowlist would have to name for rejectForbiddenResources to let a deploy of
 // it through: what its services reference external:, volumes and cluster mounts
-// that are not the release's own, networks it joins or declares outside the
-// release, and configs and secrets it declares that are not its own
-// (ownDeclared). Each list is sorted, and names only.
+// that are not the release's own, a volume of its own with driver options
+// (driverBacked), networks it joins or declares outside the release, and
+// configs and secrets it declares that are not its own (ownDeclared). Each list
+// is sorted, and names only.
 //
 // What no allowlist can grant is left out, because naming it would not help: the
 // controller's own secrets, configs, volumes and networks (for the self release
-// they are its own), and a name in the space of the release records.
+// they are its own), a name in the space of the release records, and driver
+// options on a volume named outside the release (mountsForeignDriver).
 func (b *Backend) UnpermittedNames(ctx context.Context, req capability.AllowRequest) (application.Allow, error) {
 	// Conversion reads an allowlist for one thing, a bind's source, which is not
 	// what this reports; permitting every path keeps a bind from failing it.
@@ -44,6 +46,7 @@ func (b *Backend) UnpermittedNames(ctx context.Context, req capability.AllowRequ
 		*list = append(*list, name)
 	}
 	for _, svc := range stack.Services {
+		driven := driverBacked(svc)
 		secrets, configs := externalRefs(stack, svc)
 		for _, name := range secrets {
 			add(&need.Secrets, req.Allow.Secrets, mine.secrets, name)
@@ -52,7 +55,10 @@ func (b *Backend) UnpermittedNames(ctx context.Context, req capability.AllowRequ
 			add(&need.Configs, req.Allow.Configs, mine.configs, name)
 		}
 		for _, m := range volumeSources(svc) {
-			if !ownVolume(stack, m) {
+			_, withOptions := driven[m.Source]
+			switch {
+			case withOptions && !scopedUnder(ns, m.Source):
+			case withOptions || !ownVolume(stack, m):
 				add(&need.Volumes, req.Allow.Volumes, mine.volumes, m.Source)
 			}
 		}
