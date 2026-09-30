@@ -211,7 +211,8 @@ type Allow struct {
 	Secrets []string `json:"secrets,omitempty" yaml:"secrets,omitempty"`
 	// Configs are the Docker configs a chart may reference without declaring.
 	Configs []string `json:"configs,omitempty" yaml:"configs,omitempty"`
-	// Volumes are the named volumes a chart may mount that are not its own.
+	// Volumes are the named volumes a chart may mount that are not its own, and
+	// those of its own it gives a volume driver or driver_opts.
 	Volumes []string `json:"volumes,omitempty" yaml:"volumes,omitempty"`
 	// Networks are the networks a chart may join that it does not create.
 	Networks []string `json:"networks,omitempty" yaml:"networks,omitempty"`

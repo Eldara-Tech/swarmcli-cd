@@ -3451,6 +3451,103 @@ func TestAStackMayNotMountAVolumeItsApplicationDoesNotPermit(t *testing.T) {
 	}
 }
 
+// declaresAVolume is a chart declaring a volume of its own, data, with the given
+// block, and mounting it. Scoped to the release, so nothing but the block can make
+// it need an allow.volumes entry.
+func declaresAVolume(block string) string {
+	return "services:\n  app:\n    image: busybox\n    volumes: [\"data:/data\"]\nvolumes:\n  data:\n" + block
+}
+
+// driverBackedVolumes are declarations whose driver or driver_opts decide what the
+// node mounts when it creates the volume. Every one is held to allow.volumes, with
+// no attempt to tell one option set from another.
+var driverBackedVolumes = []struct{ name, block string }{
+	{"a local bind", "    driver: local\n    driver_opts:\n      type: none\n      o: bind\n      device: /srv/data\n"},
+	{"driver_opts with the driver left to default", "    driver_opts:\n      type: none\n      o: bind\n      device: /srv/data\n"},
+	{"overlay", "    driver: local\n    driver_opts:\n      type: overlay\n      device: overlay\n      o: \"lowerdir=/srv/a,upperdir=/srv/u,workdir=/srv/w\"\n"},
+	{"tmpfs", "    driver: local\n    driver_opts:\n      type: tmpfs\n      device: tmpfs\n      o: size=100m\n"},
+	{"nfs", "    driver: local\n    driver_opts:\n      type: nfs\n      o: \"addr=10.0.0.1,rw\"\n      device: \":/export\"\n"},
+	{"a plugin driver", "    driver: example/volume-plugin\n"},
+}
+
+// A stack's own volume given a driver or driver_opts needs an allow.volumes entry
+// like a volume it does not own, and a refusal creates nothing.
+func TestAVolumeWithDriverOptionsNeedsAllowVolumes(t *testing.T) {
+	for _, tc := range driverBackedVolumes {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+			err := allowing(t, api, application.Allow{}).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "tenant", Manifest: declaresAVolume(tc.block), Resolve: ResolveNever})
+			if err == nil {
+				t.Fatal("DeployStack = nil, want the volume refused")
+			}
+			for _, want := range []string{"service 'app'", "tenant_data", "allow.volumes"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("resources were created despite the refusal: order=%v created=%d", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// And each deploys once the application names it.
+func TestAVolumeWithDriverOptionsDeploysWhenPermitted(t *testing.T) {
+	for _, tc := range driverBackedVolumes {
+		t.Run(tc.name, func(t *testing.T) {
+			err := allowing(t, asController(&fakeAPI{}), application.Allow{Volumes: []string{"tenant_data"}}).DeployStack(t.Context(),
+				charts.DeployRequest{Name: "tenant", Manifest: declaresAVolume(tc.block), Resolve: ResolveNever})
+			if err != nil {
+				t.Fatalf("DeployStack = %v, want the permitted volume deployed", err)
+			}
+		})
+	}
+}
+
+// What the rule leaves alone: a declaration naming the default driver and no
+// options is a plain named volume, and needs no entry.
+func TestAVolumeWithoutDriverOptionsNeedsNoEntry(t *testing.T) {
+	for _, tc := range []struct{ name, block string }{
+		{"a plain declaration", "    {}\n"},
+		{"the local driver named", "    driver: local\n"},
+		{"empty driver_opts", "    driver_opts: {}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := allowing(t, asController(&fakeAPI{}), application.Allow{}).DeployStack(t.Context(),
+				charts.DeployRequest{Name: "tenant", Manifest: declaresAVolume(tc.block), Resolve: ResolveNever}); err != nil {
+				t.Fatalf("DeployStack = %v, want the volume deployed", err)
+			}
+		})
+	}
+}
+
+// The self release redeclares the volume the controller already runs with, and a
+// deployment that gave it driver options keeps deploying without an entry: it is
+// recognised as the controller's own before the options are looked at.
+func TestASelfReleaseKeepsItsOwnVolumeWithDriverOptions(t *testing.T) {
+	const manifest = `
+services:
+  controller:
+    image: eldaratech/swarmcli-cd:1.2.0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - swarmcli-cd-data:/var/lib/swarmcli-cd
+volumes:
+  swarmcli-cd-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=10.0.0.1,rw"
+      device: ":/export"
+`
+	b := testBackend(t, selfAPI(), nil).WithSelfRelease(noDeferral)
+	if err := b.DeployStack(t.Context(), charts.DeployRequest{Name: "swarmcli-cd", Manifest: manifest, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want the controller's own volume kept", err)
+	}
+}
+
 // joinsANetwork is the network shape of the same two forms.
 func joinsANetwork(name string, external bool) string {
 	entry := "networks:\n  inside:\n    name: " + name + "\n"
