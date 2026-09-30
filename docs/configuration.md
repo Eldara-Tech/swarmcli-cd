@@ -304,7 +304,9 @@ namespace-scoped to `<release>_<name>`. The one exception is a volume of its own
 given a `driver:` other than `local` or any non-empty `driver_opts:`, which is
 held to `allow.volumes` — see [`allow`](#allow-optional). An `external:`
 reference is never its own, whatever it is called — a name starting with
-`<release>_` included — because the chart has said the thing is not its own.
+`<release>_` included — because the chart has said the thing is not its own. And
+a volume the chart declares is its own or it is refused, whatever `allow` says:
+see [`volumes`](#secrets-configs-volumes-and-networks).
 
 **Content comes from the chart, never from the controller's filesystem.** A
 rendered manifest is a string, not a file in a checkout, so the only filesystem a
@@ -494,7 +496,8 @@ can install a chart that declares and mounts its own resources, and nothing else
 A chart's own are namespace-scoped to `<release>_<name>` and need no entry,
 except a volume of its own given a `driver:` other than `local` or any non-empty
 `driver_opts:`, which [`volumes`](#secrets-configs-volumes-and-networks) covers.
-An `external:` reference needs one whatever its name.
+An `external:` reference needs one whatever its name, and is the only way to
+share another stack's volume.
 
 #### Deploying Traefik, Portainer or an autoheal sidecar
 
@@ -563,7 +566,7 @@ What each grant is worth:
 |---|---|
 | `secrets` | the bytes. A Swarm secret is the shape a database password, a registry credential and a signing key all arrive in |
 | `configs` | the bytes, and they are readable — a config is not encrypted at rest the way a secret is |
-| `volumes` | another stack's data, read **and written**, on whichever node the task lands on. A `type: cluster` mount is held to the same list whatever it is called — a stack never creates a cluster volume, so none is a release's own — by volume name or, for a whole CSI volume group, as `group:<name>`. So is a chart's **own** volume when it declares a `driver:` other than `local` or any non-empty `driver_opts:` — named as the swarm holds it, `<release>_<key>` or a `name:` within the release — because those decide what the node mounts, host paths and devices included. The entry permits the volume whatever options the chart gives it later, so grant it as you would the paths those options can reach. A declaration naming a volume outside the release may not carry them at all, entry or not: another stack's volume is shared by declaring it `external:` |
+| `volumes` | another stack's data, read **and written**, on whichever node the task lands on. A `type: cluster` mount is held to the same list whatever it is called — a stack never creates a cluster volume, so none is a release's own — by volume name or, for a whole CSI volume group, as `group:<name>`. So is a chart's **own** volume when it declares a `driver:` other than `local` or any non-empty `driver_opts:` — named as the swarm holds it, `<release>_<key>` or a `name:` within the release — because those decide what the node mounts, host paths and devices included. The entry permits the volume whatever options the chart gives it later, so grant it as you would the paths those options can reach. A volume the chart **declares** — not `external:` — has to be its own, entry or not, because a node creates it labelled as the release's: one named outside the release is refused, and so is one held on the controller's node by a volume labelled for another stack whose name it is scoped under too — `web_a_site` labelled `web_a`, declared by release `web` — since that stack's purge would remove it. The controller reads that label on its own node only; a volume lives on whichever node first mounted it. Another stack's volume is shared by declaring it `external:` and listing it here |
 | `networks` | everything already on that network. Joining `traefik-public` is being on it with every other stack that is |
 
 #### Why it lives here and not in the chart
@@ -1090,12 +1093,18 @@ volume answers to, and inspects each volume just before removing it. That
 narrows the case rather than closing it: the inspect and the removal are two
 calls, and nothing the daemon offers makes them one.
 
+A purge also leaves out a volume labelled as the release's under a name outside
+`<release>_`, and names it in the log. A declaration naming a volume outside the
+release was accepted with an `allow.volumes` entry before such declarations were
+refused, and the node labelled the volume for whichever stack created it first,
+so another stack may be using it. Remove one by hand once nothing does.
+
 The controller does not pretend otherwise. On a multi-node swarm every purge
 logs what it actually removed and says the listing was node-local, with the
 filter that finds the rest:
 
 ```
-docker volume ls --filter label=com.docker.stack.namespace=<release>
+docker volume ls --filter label=com.docker.stack.namespace=<release> --filter 'name=^<release>_'
 ```
 
 run on each node. It does **not** stop and it does not hold the release records

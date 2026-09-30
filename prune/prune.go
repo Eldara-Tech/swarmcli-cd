@@ -102,7 +102,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
@@ -278,6 +280,7 @@ func purgeEveryNode(ctx context.Context, log *slog.Logger, backend charts.Backen
 		if err != nil {
 			return failed(fmt.Errorf("listing the release's volumes on node %s: %w", nodeName(node), err))
 		}
+		names = withinRelease(log, release, names, "node", nodeName(node))
 		remove := volumeRemover(nb, release)
 		for _, name := range names {
 			gone, err := removeVolume(ctx, remove, name)
@@ -311,7 +314,7 @@ func purgeEveryNode(ctx context.Context, log *slog.Logger, backend charts.Backen
 	log.Warn("deleted the release's volumes on the nodes the registry could reach, which could not be shown to be "+
 		"all of them; any volumes the release left on a node this did not cover are still there",
 		"release", release, "nodes", nodeNames(nodes), "volumes", deleted,
-		"remedy", "docker volume ls --filter label=com.docker.stack.namespace="+release+", on each node")
+		"remedy", remedy(release))
 	return nil
 }
 
@@ -410,6 +413,7 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 	if err != nil {
 		return fmt.Errorf("listing the stack's volumes: %w", err)
 	}
+	names = withinRelease(log, release, names)
 
 	remove := volumeRemover(backend, release)
 	removed := make([]string, 0, len(names))
@@ -439,8 +443,41 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 	log.Warn("deleted only this node's volumes for the release: the daemon's volume list is node-local "+
 		"and this swarm has more than one node, so any volumes the release left on another node are still there",
 		"release", release, "volumes", removed,
-		"remedy", "docker volume ls --filter label=com.docker.stack.namespace="+release+", on each node")
+		"remedy", remedy(release))
 	return nil
+}
+
+// remedy is the listing that finds, on a node, what a purge of release would
+// have removed there: its label, and a name within the release (withinRelease),
+// as a regular expression the daemon's name filter matches.
+func remedy(release string) string {
+	return "docker volume ls --filter label=com.docker.stack.namespace=" + release +
+		" --filter 'name=^" + regexp.QuoteMeta(release) + "_', on each node"
+}
+
+// withinRelease is what a purge may remove of the volumes StackVolumes listed:
+// those named within the release, "<release>_<name>". The rest are named in a
+// warning, with attrs, and left in place.
+//
+// The label says only that the release's task created the volume on that node
+// first. A declaration naming a volume outside the release was accepted with an
+// allow.volumes entry before the backend refused one, so such a volume may be
+// another stack's, and removing it would delete that stack's data.
+func withinRelease(log *slog.Logger, release string, names []string, attrs ...any) []string {
+	var own, left []string
+	for _, name := range names {
+		if strings.HasPrefix(name, release+"_") {
+			own = append(own, name)
+		} else {
+			left = append(left, name)
+		}
+	}
+	if len(left) > 0 {
+		log.Warn("left volumes labelled as the release's out of the purge: they are named outside the release, "+
+			"so another stack may be using them; remove them by hand once nothing does",
+			append([]any{"release", release, "volumes", left}, attrs...)...)
+	}
+	return own
 }
 
 // removeVolume removes one volume with settle's retries, and reports whether it

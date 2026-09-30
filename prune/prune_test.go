@@ -705,7 +705,7 @@ func TestAMultiNodeSwarmDoesNotClaimToHavePrunedVolumesItCannotSee(t *testing.T)
 	if !strings.Contains(log, "node-local") {
 		t.Errorf("log %q does not say the listing was node-local", log)
 	}
-	if !strings.Contains(log, "label=com.docker.stack.namespace=api") {
+	if !strings.Contains(log, "label=com.docker.stack.namespace=api --filter 'name=^api_'") {
 		t.Errorf("log %q does not hand over the filter that finds what is left", log)
 	}
 	if strings.Contains(log, "deleted the release's volumes") {
@@ -872,6 +872,65 @@ func TestAPurgeDoesNotReportAVolumeLeftInPlaceAsDeleted(t *testing.T) {
 	log := buf.String()
 	if !strings.Contains(log, "api_data") || strings.Contains(log, "api_logs") {
 		t.Errorf("log %q, want api_data reported deleted and api_logs not", log)
+	}
+}
+
+// A volume labelled as the release's under a name outside it is left in place
+// and named, on this node and on every node the registry reaches: the label says
+// the release's task created it there first, and a name outside the release may
+// be another stack's volume. "apiary_data" is not scoped under "api".
+func TestAPurgeLeavesAVolumeNamedOutsideTheRelease(t *testing.T) {
+	const want = "left volumes labelled as the release's out of the purge"
+	t.Run("this node", func(t *testing.T) {
+		var buf bytes.Buffer
+		e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+		b := sizedBackend{fakeBackend: &fakeBackend{volumes: map[string][]string{"api": {"api_data", "shared-data", "apiary_data"}}}, nodes: 1}
+
+		if _, err := prunerLogging(t, e, b, true, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+			t.Fatalf("Departed = %v, want nil", err)
+		}
+		if !slices.Equal(b.removedVol, []string{"api_data"}) {
+			t.Errorf("removed volumes %v, want api_data alone", b.removedVol)
+		}
+		if log := buf.String(); !strings.Contains(log, want) || !strings.Contains(log, "volumes=\"[shared-data apiary_data]\"") {
+			t.Errorf("log %q, want shared-data and apiary_data named as left", log)
+		}
+	})
+	t.Run("every node", func(t *testing.T) {
+		var buf bytes.Buffer
+		e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+		n1, b1 := node("worker-1", "api_data", "shared-data")
+		reg := reachingSwarms{nodes: []swarms.Node{n1}, backends: map[string]*fakeBackend{"worker-1": b1}}
+
+		if _, err := prunerReaching(t, e, sizedBackend{fakeBackend: &fakeBackend{}, nodes: 1}, reg, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+			t.Fatalf("Departed = %v, want nil", err)
+		}
+		if !slices.Equal(b1.removedVol, []string{"api_data"}) {
+			t.Errorf("removed volumes %v, want api_data alone", b1.removedVol)
+		}
+		if log := buf.String(); !strings.Contains(log, want) || !strings.Contains(log, "node=worker-1") || !strings.Contains(log, "volumes=[shared-data]") {
+			t.Errorf("log %q, want shared-data named as left on worker-1", log)
+		}
+	})
+	t.Run("nothing outside", func(t *testing.T) {
+		var buf bytes.Buffer
+		e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+		b := sizedBackend{fakeBackend: &fakeBackend{volumes: map[string][]string{"api": {"api_data"}}}, nodes: 1}
+
+		if _, err := prunerLogging(t, e, b, true, &buf).Departed(t.Context(), []string{"kept"}, nil); err != nil {
+			t.Fatalf("Departed = %v, want nil", err)
+		}
+		if log := buf.String(); strings.Contains(log, want) {
+			t.Errorf("log %q, want no volume named as left", log)
+		}
+	})
+}
+
+// The remedy's name filter is a regular expression, so a '.' in a release name
+// is quoted: unquoted, "my.app" would also list "myXapp_data".
+func TestTheRemedyListsOnlyNamesWithinTheRelease(t *testing.T) {
+	if got, want := remedy("my.app"), `docker volume ls --filter label=com.docker.stack.namespace=my.app --filter 'name=^my\.app_', on each node`; got != want {
+		t.Errorf("remedy = %q, want %q", got, want)
 	}
 }
 
@@ -1227,7 +1286,7 @@ func TestAPurgeThatCouldNotCoverEveryNodeDoesNotClaimItDid(t *testing.T) {
 			if !strings.Contains(log, "worker-1") || !strings.Contains(log, "worker-2") {
 				t.Errorf("log %q does not name the nodes that were covered", log)
 			}
-			if !strings.Contains(log, "label=com.docker.stack.namespace=api") {
+			if !strings.Contains(log, "label=com.docker.stack.namespace=api --filter 'name=^api_'") {
 				t.Errorf("log %q does not hand over the filter that finds what is left", log)
 			}
 		})

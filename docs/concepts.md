@@ -227,8 +227,8 @@ moment — the records are written only after a deploy, and applications
 reconcile in parallel. Whichever installs first keeps deploying; a release that
 is only declared holds no name. A pair installed together before this rule keeps
 deploying too, with a warning on each of its deploys, because the rules in the
-next paragraph are then all that keeps the two apart, and they do not cover
-volumes.
+next paragraph are then all that keeps the two apart, and they cover volumes on
+the controller's node only.
 
 What a release scopes is its own only as far as the swarm can say so: an
 `external:` reference needs the app set's permission whatever it is called —
@@ -236,17 +236,26 @@ the `self: true` release aside, for what the controller itself holds — and a d
 config, secret or network is the release's only if nothing holds its name yet or
 what does carries exactly the release's namespace label. A `type: cluster`
 mount is never the release's own, since a stack never creates a cluster volume.
-Any other volume is decided by its name alone, because it lives on whichever
-node first mounted it and there is no cluster-wide label to read.
+A purge removes a volume only if it carries the release's label and is named
+within the release, and it re-reads the label on the node first. So a declared
+volume is the release's only if it is named within the release and the volume of
+that name on the controller's node, if there is one, is not labelled for another
+stack whose name it is scoped under too — whose purge would remove it. One named
+outside the release is refused whatever the app set permits, because a node
+creates it labelled as this release's, and another stack's volume would carry
+that label — share it `external:` instead. Only the controller's node is read,
+because a volume lives on whichever node first mounted it and there is no
+cluster-wide label to read.
 
-Between releases, that leaves volume names open where the rules above cannot
-keep two releases apart: a pair whose names collide by `_` and which were
-installed together before this was refused (each of its deploys warns), a
-release beside a stack deployed without the controller, and a release beside the
-volumes an uninstalled one left behind, whose records are gone with it. There, a
-volume one declares under a name scoped into the other's — release `a` declaring
-`b_data` beside release `a_b`'s `data` — is the same volume on a node that runs
-both. Give one of the pair a name of its own.
+Between releases, that leaves volume names open on the other nodes where the
+rules above cannot keep two releases apart: a pair whose names collide by `_`
+and which were installed together before this was refused (each of its deploys
+warns), a release beside a stack deployed without the controller, and a release
+beside the volumes an uninstalled one left behind, whose records are gone with
+it. There, a volume one declares under a name scoped into the other's — release
+`a` declaring `b_data` beside release `a_b`'s `data` — is the same volume on a
+node that runs both, and whichever created it there first labels it. Give one of
+the pair a name of its own.
 
 This is the same ownership mechanism CE's `charts apply` uses, with one
 consequence worth stating plainly: when your release file is consumed by

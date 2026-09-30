@@ -4,13 +4,17 @@
 package backend
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/docker/cli/cli/compose/convert"
 	"github.com/docker/docker/api/types/swarm"
+	"github.com/docker/docker/api/types/volume"
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
@@ -25,8 +29,8 @@ import (
 // the release's own, from every service, each once, sorted — and a volume of its
 // own with driver options. What the release declares as its own needs nothing;
 // nor does what the allowlist names, in each of its lists; nor what no entry
-// could grant: what belongs to the controller, or driver options on a volume
-// named outside the release.
+// could grant: what belongs to the controller, or a volume declared under a
+// name outside the release, with driver options or without.
 // A bind does not stop the manifest being read, since binds are not what this
 // reports.
 func TestUnpermittedNamesAreWhatADeployWouldBeRefusedFor(t *testing.T) {
@@ -47,6 +51,7 @@ services:
       - {type: cluster, source: scoped, target: /scoped}
       - optioned:/optioned
       - foreign:/foreign
+      - borrowed:/borrowed
   worker:
     image: busybox
     secrets: [key, db]
@@ -76,6 +81,7 @@ volumes:
   ctl: {external: true, name: swarmcli-cd_swarmcli-cd-data}
   optioned: {driver_opts: {type: tmpfs, device: tmpfs}}
   foreign: {name: shared-data, driver: vieux/sshfs}
+  borrowed: {name: shared-plain}
 `
 	got, err := testBackend(t, asController(&fakeAPI{}), nil).UnpermittedNames(t.Context(), capability.AllowRequest{
 		ManifestRequest: capability.ManifestRequest{Name: "web", Manifest: manifest, Files: decoyFiles},
@@ -161,6 +167,50 @@ volumes:
 	}
 }
 
+// A declared volume no entry could grant — named outside the release, or held on
+// the controller's node for a stack whose purge would reach it — is not among
+// the names, since adding one would not help, and is warned about instead, with
+// the refusal a deploy of it meets. One with driver options too. The
+// controller's own volume is neither: no entry reaches it, and the deploy
+// refuses it for being the controller's.
+func TestUnpermittedNamesWarnOfAVolumeNoEntryGrants(t *testing.T) {
+	const manifest = `
+services:
+  app:
+    image: busybox
+    volumes: ["borrowed:/borrowed", "a_site:/site", "own:/own", "ctl:/ctl"]
+volumes:
+  borrowed: {name: shared-plain}
+  a_site: {driver_opts: {type: tmpfs, device: tmpfs}}
+  own: {}
+  ctl: {name: swarmcli-cd_swarmcli-cd-data}
+`
+	var logged bytes.Buffer
+	api := asController(&fakeAPI{volumes: []volume.Volume{{Name: "web_a_site", Labels: map[string]string{convert.LabelNamespace: "web_a"}}}})
+	got, err := New(api, Options{Log: slog.New(slog.NewTextHandler(&logged, nil))}).UnpermittedNames(t.Context(), capability.AllowRequest{
+		ManifestRequest: capability.ManifestRequest{Name: "web", Manifest: manifest},
+	})
+	if err != nil {
+		t.Fatalf("UnpermittedNames = %v, want the manifest read", err)
+	}
+	if len(got.Volumes) != 0 {
+		t.Errorf("UnpermittedNames volumes = %v, want none", got.Volumes)
+	}
+	log := logged.String()
+	for _, want := range []string{"release=web", "'shared-plain'", "outside this release", "'web_a_site'", "stack 'web_a'"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log %q does not mention %q", log, want)
+		}
+	}
+	// Nor of the controller's own volume, which a deploy refuses as the
+	// controller's before it asks whose else it is.
+	for _, not := range []string{"web_own", "swarmcli-cd_swarmcli-cd-data"} {
+		if strings.Contains(log, not) {
+			t.Errorf("log %q warns of %s", log, not)
+		}
+	}
+}
+
 // A manifest that does not convert, or a daemon that cannot say what the
 // controller holds or whose a declared name is, is the caller's to report — not
 // an empty answer.
@@ -173,6 +223,7 @@ func TestUnpermittedNamesThatCannotBeWorkedOutAreAnError(t *testing.T) {
 		{"unreadable controller", "services:\n  app:\n    image: busybox\n", testBackend(t, asController(&fakeAPI{selfErr: errors.New("daemon busy")}), nil)},
 		{"unreadable secret", declaresAndMounts, testBackend(t, &lookupErrAPI{fakeAPI: &fakeAPI{}, kind: "secret", err: errors.New("daemon busy")}, nil)},
 		{"unreadable config", shipsAConfig, testBackend(t, &lookupErrAPI{fakeAPI: &fakeAPI{}, kind: "config", err: errors.New("daemon busy")}, nil)},
+		{"unreadable volume", declaresAVolume("    {}\n"), testBackend(t, &lookupErrAPI{fakeAPI: &fakeAPI{}, kind: "volume", err: errors.New("daemon busy")}, nil)},
 	} {
 		if _, err := tc.api.UnpermittedNames(t.Context(), capability.AllowRequest{
 			ManifestRequest: capability.ManifestRequest{Name: "web", Manifest: tc.manifest, Files: map[string][]byte{"files/nginx.conf": []byte("x")}},
