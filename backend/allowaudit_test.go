@@ -4,13 +4,17 @@
 package backend
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/docker/cli/cli/compose/convert"
 	"github.com/docker/docker/api/types/swarm"
+	"github.com/docker/docker/api/types/volume"
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
@@ -163,6 +167,43 @@ volumes:
 	}
 }
 
+// A declared volume no entry could grant — named outside the release, or held on
+// the controller's node for a stack whose purge would reach it — is not among
+// the names, since adding one would not help, and is warned about instead, with
+// the refusal a deploy of it meets. One with driver options too.
+func TestUnpermittedNamesWarnOfAVolumeNoEntryGrants(t *testing.T) {
+	const manifest = `
+services:
+  app:
+    image: busybox
+    volumes: ["borrowed:/borrowed", "a_site:/site", "own:/own"]
+volumes:
+  borrowed: {name: shared-plain}
+  a_site: {driver_opts: {type: tmpfs, device: tmpfs}}
+  own: {}
+`
+	var logged bytes.Buffer
+	api := asController(&fakeAPI{volumes: []volume.Volume{{Name: "web_a_site", Labels: map[string]string{convert.LabelNamespace: "web_a"}}}})
+	got, err := New(api, Options{Log: slog.New(slog.NewTextHandler(&logged, nil))}).UnpermittedNames(t.Context(), capability.AllowRequest{
+		ManifestRequest: capability.ManifestRequest{Name: "web", Manifest: manifest},
+	})
+	if err != nil {
+		t.Fatalf("UnpermittedNames = %v, want the manifest read", err)
+	}
+	if len(got.Volumes) != 0 {
+		t.Errorf("UnpermittedNames volumes = %v, want none", got.Volumes)
+	}
+	log := logged.String()
+	for _, want := range []string{"release=web", "'shared-plain'", "outside this release", "'web_a_site'", "stack 'web_a'"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log %q does not mention %q", log, want)
+		}
+	}
+	if strings.Contains(log, "web_own") {
+		t.Errorf("log %q warns of the release's own volume", log)
+	}
+}
+
 // A manifest that does not convert, or a daemon that cannot say what the
 // controller holds or whose a declared name is, is the caller's to report — not
 // an empty answer.
@@ -175,6 +216,7 @@ func TestUnpermittedNamesThatCannotBeWorkedOutAreAnError(t *testing.T) {
 		{"unreadable controller", "services:\n  app:\n    image: busybox\n", testBackend(t, asController(&fakeAPI{selfErr: errors.New("daemon busy")}), nil)},
 		{"unreadable secret", declaresAndMounts, testBackend(t, &lookupErrAPI{fakeAPI: &fakeAPI{}, kind: "secret", err: errors.New("daemon busy")}, nil)},
 		{"unreadable config", shipsAConfig, testBackend(t, &lookupErrAPI{fakeAPI: &fakeAPI{}, kind: "config", err: errors.New("daemon busy")}, nil)},
+		{"unreadable volume", declaresAVolume("    {}\n"), testBackend(t, &lookupErrAPI{fakeAPI: &fakeAPI{}, kind: "volume", err: errors.New("daemon busy")}, nil)},
 	} {
 		if _, err := tc.api.UnpermittedNames(t.Context(), capability.AllowRequest{
 			ManifestRequest: capability.ManifestRequest{Name: "web", Manifest: tc.manifest, Files: map[string][]byte{"files/nginx.conf": []byte("x")}},

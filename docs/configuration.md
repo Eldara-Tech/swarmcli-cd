@@ -566,7 +566,7 @@ What each grant is worth:
 |---|---|
 | `secrets` | the bytes. A Swarm secret is the shape a database password, a registry credential and a signing key all arrive in |
 | `configs` | the bytes, and they are readable — a config is not encrypted at rest the way a secret is |
-| `volumes` | another stack's data, read **and written**, on whichever node the task lands on. A `type: cluster` mount is held to the same list whatever it is called — a stack never creates a cluster volume, so none is a release's own — by volume name or, for a whole CSI volume group, as `group:<name>`. So is a chart's **own** volume when it declares a `driver:` other than `local` or any non-empty `driver_opts:` — named as the swarm holds it, `<release>_<key>` or a `name:` within the release — because those decide what the node mounts, host paths and devices included. The entry permits the volume whatever options the chart gives it later, so grant it as you would the paths those options can reach. A volume the chart **declares** — not `external:` — has to be its own, entry or not: one named outside the release is refused, and so is one whose name a volume carrying another stack's namespace label holds on the controller's node, because a node creates a declared volume labelled as the release's and a purge removes what carries that label. The controller reads that label on its own node only; a volume lives on whichever node first mounted it. Another stack's volume is shared by declaring it `external:` and listing it here |
+| `volumes` | another stack's data, read **and written**, on whichever node the task lands on. A `type: cluster` mount is held to the same list whatever it is called — a stack never creates a cluster volume, so none is a release's own — by volume name or, for a whole CSI volume group, as `group:<name>`. So is a chart's **own** volume when it declares a `driver:` other than `local` or any non-empty `driver_opts:` — named as the swarm holds it, `<release>_<key>` or a `name:` within the release — because those decide what the node mounts, host paths and devices included. The entry permits the volume whatever options the chart gives it later, so grant it as you would the paths those options can reach. A volume the chart **declares** — not `external:` — has to be its own, entry or not, because a node creates it labelled as the release's: one named outside the release is refused, and so is one held on the controller's node by a volume labelled for another stack whose name it is scoped under too — `web_a_site` labelled `web_a`, declared by release `web` — since that stack's purge would remove it. The controller reads that label on its own node only; a volume lives on whichever node first mounted it. Another stack's volume is shared by declaring it `external:` and listing it here |
 | `networks` | everything already on that network. Joining `traefik-public` is being on it with every other stack that is |
 
 #### Why it lives here and not in the chart
@@ -1104,7 +1104,7 @@ logs what it actually removed and says the listing was node-local, with the
 filter that finds the rest:
 
 ```
-docker volume ls --filter label=com.docker.stack.namespace=<release>
+docker volume ls --filter label=com.docker.stack.namespace=<release> --filter 'name=^<release>_'
 ```
 
 run on each node. It does **not** stop and it does not hold the release records

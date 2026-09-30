@@ -102,6 +102,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -313,7 +314,7 @@ func purgeEveryNode(ctx context.Context, log *slog.Logger, backend charts.Backen
 	log.Warn("deleted the release's volumes on the nodes the registry could reach, which could not be shown to be "+
 		"all of them; any volumes the release left on a node this did not cover are still there",
 		"release", release, "nodes", nodeNames(nodes), "volumes", deleted,
-		"remedy", "docker volume ls --filter label=com.docker.stack.namespace="+release+", on each node")
+		"remedy", remedy(release))
 	return nil
 }
 
@@ -442,8 +443,16 @@ func purgeThisNode(ctx context.Context, log *slog.Logger, backend charts.Backend
 	log.Warn("deleted only this node's volumes for the release: the daemon's volume list is node-local "+
 		"and this swarm has more than one node, so any volumes the release left on another node are still there",
 		"release", release, "volumes", removed,
-		"remedy", "docker volume ls --filter label=com.docker.stack.namespace="+release+", on each node")
+		"remedy", remedy(release))
 	return nil
+}
+
+// remedy is the listing that finds, on a node, what a purge of release would
+// have removed there: its label, and a name within the release (withinRelease),
+// as a regular expression the daemon's name filter matches.
+func remedy(release string) string {
+	return "docker volume ls --filter label=com.docker.stack.namespace=" + release +
+		" --filter 'name=^" + regexp.QuoteMeta(release) + "_', on each node"
 }
 
 // withinRelease is what a purge may remove of the volumes StackVolumes listed:

@@ -128,10 +128,17 @@ to add. `validate` cannot catch these: they depend on the charts, not the file.
 **A volume a release declares has to be its own, whatever `allow` says.** A
 declaration that is not `external:` and names a volume outside the release — a
 `name:` not starting with `<release>_` — was deployed with an `allow.volumes`
-entry and is now refused, as is one whose name a volume labelled for another
-stack holds on the controller's node. The startup check does not list these,
-since no entry helps. Declare a volume another stack owns `external: true` and
-keep its entry; the volume and its data are left as they are:
+entry and is now refused. So is one held on the controller's node by a volume
+labelled for a release whose name it is scoped under too, which only a pair of
+releases like `web` and `web_a` can do. No entry helps, so the startup check
+warns of each instead, naming the release and the refusal:
+
+```
+level=WARN msg="a deploy of this release is refused whatever its application's allow says; the refusal says what would work" release=cache refusal="service 'app' mounts volume 'shared-cache', which this stack declares under a name outside this release. …"
+```
+
+Declare a volume another stack owns `external: true` and keep its entry; the
+volume and its data are left as they are:
 
 ```yaml
 volumes:

@@ -233,9 +233,8 @@ const (
 // is called — the manifest has said it is not the release's — and a declared
 // name is the release's own only if it is scoped under the release and whatever
 // already holds that name carries exactly the release's namespace label
-// (ownDeclared). A declared volume is held to the same, except that one carrying
-// no label at all is accepted, and only on the node this controller talks to,
-// the one whose volumes it can read (volumeHolder). Which of two names like "web"
+// (ownDeclared). A declared volume is held to what a purge would do instead,
+// and on the node this controller talks to only (notOwnVolume). Which of two names like "web"
 // and "web_a" may be installed at all is asked before this:
 // rejectRecordedCollision, and the reconciler's claimInstalls for two installs at
 // once.
@@ -377,18 +376,15 @@ func (b *Backend) rejectForbiddenResources(ctx context.Context, stack *cdcompose
 				continue
 			}
 			// A volume the stack declares is the release's own or it is refused,
-			// whatever allow.volumes says: a node creates it labelled as this
-			// release's, and a purge removes what carries that label. Sharing
-			// another stack's volume is what external: is for.
-			if !scopedUnder(ns, name) {
-				return mountsForeignVolume(svc.Name, name)
-			}
-			holder, err := b.volumeHolder(ctx, name)
+			// whatever allow.volumes says — and before the entry driver options
+			// need, so that a volume that cannot be this release's is told what
+			// would work rather than to add an entry that would not.
+			refusal, err := b.notOwnVolume(ctx, ns, svc.Name, name)
 			if err != nil {
 				return err
 			}
-			if holder != "" && holder != ns {
-				return mountsHeldVolume(svc.Name, name, holder)
+			if refusal != nil {
+				return refusal
 			}
 			if _, ok := driven[name]; ok && !permits(b.allow.Volumes, name) {
 				return mountsDriverUnpermitted(svc.Name, name)
@@ -780,18 +776,19 @@ func mountsDriverUnpermitted(service, name string) error {
 
 func mountsForeignVolume(service, name string) error {
 	return fmt.Errorf("service '%s' mounts volume '%s', which this stack declares under a name outside this "+
-		"release. A declared volume is created labelled as this release's on each node that first mounts it, and "+
-		"a purge of the release removes what carries that label, so a volume another stack owns is shared by "+
-		"declaring it external: and adding it to allow.volumes in the app set; an entry alone does not change "+
-		"this", service, name)
+		"release. A declared volume is created, labelled as this release's and with its options, on each node "+
+		"that first mounts it, so another stack's volume would carry this release's label wherever this release "+
+		"got there first. It is shared by declaring it external: and adding it to allow.volumes in the app set; "+
+		"an entry alone does not change this", service, name)
 }
 
 func mountsHeldVolume(service, name, holder string) error {
 	return fmt.Errorf("service '%s' mounts volume '%s', which this stack declares as its own, but the volume of "+
-		"that name on this controller's node carries the namespace label of stack '%s'. A declared volume is used as found "+
-		"where it exists and created labelled as this release's where it does not, so each stack's purge would "+
-		"remove it where it carries that stack's label — declare it external: and add it to allow.volumes in "+
-		"the app set to share it, or give it a name of its own", service, name, holder)
+		"that name on this controller's node carries the namespace label of stack '%s', whose name it is scoped "+
+		"under too. A declared volume is used as found where it exists and created labelled as this release's "+
+		"where it does not, so each stack's purge would remove it where it carries that stack's label — declare "+
+		"it external: and add it to allow.volumes in the app set to share it, or give it a name of its own",
+		service, name, holder)
 }
 
 func declaresUnpermitted(kind, name, field string) error {
@@ -870,6 +867,32 @@ func createsVolume(m mount.Mount) bool {
 	return m.VolumeOptions != nil && m.VolumeOptions.Labels[convert.LabelNamespace] != ""
 }
 
+// notOwnVolume returns why a volume the stack declares is not the release's own,
+// or nil when it is; err is a daemon read that failed.
+//
+// It is the release's own when it is named within the release and no other
+// stack's purge would reach it. A purge removes a volume only when it carries
+// the stack's label and is named within that stack (prune.withinRelease), so
+// what refuses is a volume on the controller's node labelled for another stack
+// whose name it is scoped under too: "web_a_site" labelled "web_a", declared by
+// release "web", or labelled "web", declared by release "web_a". A label no
+// purge could pair with the name holds nothing back — none, one in another
+// case, or that of a stack which only borrowed the name — and refusing on it
+// would refuse the name's owner for good, since a volume's labels never change.
+func (b *Backend) notOwnVolume(ctx context.Context, ns, service, name string) (refusal, err error) {
+	if !scopedUnder(ns, name) {
+		return mountsForeignVolume(service, name), nil
+	}
+	holder, err := b.volumeHolder(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if holder != ns && scopedUnder(holder, name) {
+		return mountsHeldVolume(service, name, holder), nil
+	}
+	return nil, nil
+}
+
 // volumeHolder returns the namespace label of the node-local volume name answers
 // with on the node this controller talks to, or "" when there is none or it
 // carries no label.
@@ -878,11 +901,14 @@ func createsVolume(m mount.Mount) bool {
 // daemon's inspect answers from its own store. A purge removes only a volume
 // named within the release (prune.withinRelease) whose label it re-reads on that
 // node just before (RemoveStackVolume). What stays open is a name scoped under
-// two stacks whose names differ by a '_' suffix, on a node this does not see: a
+// two stacks whose names differ by a '_' suffix, on a node this does not see — a
 // pair rejectRecordedCollision warns of, or a stack deployed without this
-// controller. A cluster volume answering the name is none, since a volume mount
-// uses the node-local store. An unlabelled volume is accepted: a mount never
-// relabels one, and no purge selects it.
+// controller — and a release taking the exact name of a stack that has gone,
+// whose leftover volumes carry that name's label. So does a volume a global-scope
+// driver keeps across nodes, which another node's store registers with the
+// labels of the first mount it sees there; such a driver needs allow.volumes.
+// A cluster volume answering the name is none, since a volume mount uses the
+// node-local store.
 func (b *Backend) volumeHolder(ctx context.Context, name string) (string, error) {
 	v, err := b.api.VolumeInspect(ctx, name)
 	switch {

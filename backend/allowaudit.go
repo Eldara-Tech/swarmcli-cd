@@ -21,10 +21,10 @@ import (
 //
 // What no allowlist can grant is left out, because naming it would not help: the
 // controller's own secrets, configs, volumes and networks (for the self release
-// they are its own), a name in the space of the release records, and a volume
-// declared under a name outside the release (mountsForeignVolume). So is a
-// declared volume another stack's label is on (mountsHeldVolume), which this
-// does not look up: it is refused whatever the entry.
+// they are its own), a name in the space of the release records, and a declared
+// volume that is not the release's own (notOwnVolume). That last is warned about
+// instead, with the refusal a deploy meets, since the release may be running
+// unchanged until the next one.
 func (b *Backend) UnpermittedNames(ctx context.Context, req capability.AllowRequest) (application.Allow, error) {
 	// Conversion reads an allowlist for one thing, a bind's source, which is not
 	// what this reports; permitting every path keeps a bind from failing it.
@@ -56,8 +56,20 @@ func (b *Backend) UnpermittedNames(ctx context.Context, req capability.AllowRequ
 			add(&need.Configs, req.Allow.Configs, mine.configs, name)
 		}
 		for _, m := range volumeSources(svc) {
-			_, withOptions := driven[m.Source]
-			if !createsVolume(m) || withOptions && scopedUnder(ns, m.Source) {
+			if !createsVolume(m) {
+				add(&need.Volumes, req.Allow.Volumes, mine.volumes, m.Source)
+				continue
+			}
+			refusal, err := b.notOwnVolume(ctx, ns, svc.Name, m.Source)
+			if err != nil {
+				return application.Allow{}, err
+			}
+			if refusal != nil {
+				b.log.Warn("a deploy of this release is refused whatever its application's allow says; the refusal "+
+					"says what would work", "release", req.Name, "refusal", refusal.Error())
+				continue
+			}
+			if _, withOptions := driven[m.Source]; withOptions {
 				add(&need.Volumes, req.Allow.Volumes, mine.volumes, m.Source)
 			}
 		}

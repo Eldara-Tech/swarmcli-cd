@@ -705,7 +705,7 @@ func TestAMultiNodeSwarmDoesNotClaimToHavePrunedVolumesItCannotSee(t *testing.T)
 	if !strings.Contains(log, "node-local") {
 		t.Errorf("log %q does not say the listing was node-local", log)
 	}
-	if !strings.Contains(log, "label=com.docker.stack.namespace=api") {
+	if !strings.Contains(log, "label=com.docker.stack.namespace=api --filter 'name=^api_'") {
 		t.Errorf("log %q does not hand over the filter that finds what is left", log)
 	}
 	if strings.Contains(log, "deleted the release's volumes") {
@@ -924,6 +924,14 @@ func TestAPurgeLeavesAVolumeNamedOutsideTheRelease(t *testing.T) {
 			t.Errorf("log %q, want no volume named as left", log)
 		}
 	})
+}
+
+// The remedy's name filter is a regular expression, so a '.' in a release name
+// is quoted: unquoted, "my.app" would also list "myXapp_data".
+func TestTheRemedyListsOnlyNamesWithinTheRelease(t *testing.T) {
+	if got, want := remedy("my.app"), `docker volume ls --filter label=com.docker.stack.namespace=my.app --filter 'name=^my\.app_', on each node`; got != want {
+		t.Errorf("remedy = %q, want %q", got, want)
+	}
 }
 
 // A count that could not be read is not one node. Both shapes of "cannot
@@ -1278,7 +1286,7 @@ func TestAPurgeThatCouldNotCoverEveryNodeDoesNotClaimItDid(t *testing.T) {
 			if !strings.Contains(log, "worker-1") || !strings.Contains(log, "worker-2") {
 				t.Errorf("log %q does not name the nodes that were covered", log)
 			}
-			if !strings.Contains(log, "label=com.docker.stack.namespace=api") {
+			if !strings.Contains(log, "label=com.docker.stack.namespace=api --filter 'name=^api_'") {
 				t.Errorf("log %q does not hand over the filter that finds what is left", log)
 			}
 		})

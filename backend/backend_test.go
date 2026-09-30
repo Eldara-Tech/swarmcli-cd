@@ -3749,19 +3749,21 @@ func TestDriverOptionsNeedAVolumeNamedWithinTheRelease(t *testing.T) {
 }
 
 // A volume the stack declares is created labelled as the release's on each node
-// that first mounts it, and a purge removes what carries that label, so one
-// named outside the release is refused whatever allow.volumes lists: another
-// stack's volume is shared by external:. A declaration beside an external: of
-// the same name is still a declaration, since its mount carries the label.
+// that first mounts it, so one named outside the release is refused whatever
+// allow.volumes lists: another stack's volume is shared by external:. A
+// declaration beside an external: of the same name is still a declaration, since
+// its mount carries the label; and one with driver options and no entry is told
+// the same, not to add an entry that would not help.
 func TestADeclaredVolumeNamedOutsideTheReleaseIsRefusedWhateverAllowSays(t *testing.T) {
-	for _, tc := range []struct{ name, manifest string }{
-		{"a plain declaration", mountsAVolume("shared-cache", false)},
+	for _, tc := range []struct{ name, manifest, allow string }{
+		{"a plain declaration", mountsAVolume("shared-cache", false), "shared-cache"},
 		{"beside an external: of the same name", mountsAVolume("shared-cache", false) +
-			"  ext:\n    external: true\n    name: shared-cache\n"},
+			"  ext:\n    external: true\n    name: shared-cache\n", "shared-cache"},
+		{"with driver options and no entry", mountsAVolume("shared-cache", false) + "    driver: example/volume-plugin\n", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := asController(&fakeAPI{})
-			err := allowing(t, api, application.Allow{Volumes: []string{"shared-cache"}}).DeployStack(t.Context(),
+			err := allowing(t, api, application.Allow{Volumes: []string{tc.allow}}).DeployStack(t.Context(),
 				charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever})
 			if err == nil {
 				t.Fatal("DeployStack = nil, want the declaration refused")
@@ -3778,14 +3780,18 @@ func TestADeclaredVolumeNamedOutsideTheReleaseIsRefusedWhateverAllowSays(t *test
 	}
 }
 
-// A declared volume scoped under the release is its own only if the node-local
-// volume of that name on the controller's node carries no other stack's
-// namespace label: "web_a_site" is stack "web_a"'s as much as release "web"'s,
-// and whichever creates it first on a node labels it. Refused whatever
-// allow.volumes lists, since sharing it is what external: is for. A volume made
-// by hand carries no label, so no purge selects it and it is accepted, and a
-// cluster volume of the name is not what a volume mount uses.
+// A declared volume scoped under the release is its own unless the node-local
+// volume of that name on the controller's node is labelled for another stack
+// whose purge would reach it: one the name is scoped under, since a purge removes
+// only a volume named within its release. "web_a_site" is stack "web_a"'s as much
+// as release "web"'s, and the other way round, so either label refuses the other
+// release whatever allow.volumes lists — with driver options too, and before the
+// entry they need, so the refusal names what would work. A label whose purge
+// cannot reach the name holds nothing back: one made by hand carries none, one in
+// another case or of a stack that only borrowed the name is never purged with
+// it, and a cluster volume of the name is not what a volume mount uses.
 func TestADeclaredVolumeHeldByAnotherStackIsNotTheReleasesOwn(t *testing.T) {
+	const opts = "    driver_opts:\n      type: nfs\n      o: \"addr=10.0.0.1,rw\"\n      device: \":/export\"\n"
 	held := func(owner string) volume.Volume {
 		v := volume.Volume{Name: "web_a_site"}
 		if owner != "" {
@@ -3794,27 +3800,38 @@ func TestADeclaredVolumeHeldByAnotherStackIsNotTheReleasesOwn(t *testing.T) {
 		return v
 	}
 	for _, holder := range []struct {
-		why     string
-		local   []volume.Volume
-		cluster []volume.Volume
-		refused string
+		why, release, key string
+		local, cluster    []volume.Volume
+		refused           string
 	}{
-		{"another stack's", []volume.Volume{held("web_a")}, nil, "'web_a'"},
-		{"another case", []volume.Volume{held("Web")}, nil, "'Web'"},
-		{"the release's own", []volume.Volume{held("web")}, nil, ""},
-		{"made by hand", []volume.Volume{held("")}, nil, ""},
-		{"a cluster volume only", nil, []volume.Volume{held("web_a")}, ""},
-		{"nothing", nil, nil, ""},
+		{"another stack's", "web", "a_site", []volume.Volume{held("web_a")}, nil, "'web_a'"},
+		{"the shorter name's", "web_a", "site", []volume.Volume{held("web")}, nil, "'web'"},
+		{"another case", "web", "a_site", []volume.Volume{held("Web")}, nil, ""},
+		{"a borrower's", "web", "a_site", []volume.Volume{held("tenant")}, nil, ""},
+		{"the release's own", "web", "a_site", []volume.Volume{held("web")}, nil, ""},
+		{"made by hand", "web", "a_site", []volume.Volume{held("")}, nil, ""},
+		{"a cluster volume only", "web", "a_site", nil, []volume.Volume{held("web_a")}, ""},
+		{"nothing", "web", "a_site", nil, nil, ""},
 	} {
-		for _, manifest := range []struct{ how, manifest string }{
-			{"by key", "services:\n  app:\n    image: busybox\n    volumes: [\"a_site:/data\"]\nvolumes:\n  a_site: {}\n"},
-			{"by name", declaresAVolume("    name: web_a_site\n")},
+		for _, manifest := range []struct{ how, block, allow string }{
+			{"by key", "    {}\n", ""},
+			{"by name", "    name: web_a_site\n", ""},
+			{"with driver options", opts, "web_a_site"},
+			{"with driver options and no entry", opts, ""},
 		} {
 			t.Run(holder.why+"/"+manifest.how, func(t *testing.T) {
+				declared := "services:\n  app:\n    image: busybox\n    volumes: [\"" + holder.key + ":/data\"]\nvolumes:\n  " + holder.key + ":\n" + manifest.block
+				if manifest.how == "by name" {
+					declared = declaresAVolume(manifest.block)
+				}
 				api := asController(&fakeAPI{volumes: holder.local, clusterVolumes: holder.cluster})
-				err := allowing(t, api, application.Allow{Volumes: []string{"web_a_site"}}).DeployStack(t.Context(),
-					charts.DeployRequest{Name: "web", Manifest: manifest.manifest, Resolve: ResolveNever})
-				if holder.refused == "" {
+				err := allowing(t, api, application.Allow{Volumes: []string{manifest.allow}}).DeployStack(t.Context(),
+					charts.DeployRequest{Name: holder.release, Manifest: declared, Resolve: ResolveNever})
+				want := []string{"service 'app'", "'web_a_site'", holder.refused, "external:"}
+				switch {
+				case holder.refused == "" && manifest.how == "with driver options and no entry":
+					want = []string{"driver_opts", "add 'web_a_site' to allow.volumes"}
+				case holder.refused == "":
 					if err != nil {
 						t.Fatalf("DeployStack = %v, want the volume deployed as the release's own", err)
 					}
@@ -3823,9 +3840,9 @@ func TestADeclaredVolumeHeldByAnotherStackIsNotTheReleasesOwn(t *testing.T) {
 				if err == nil {
 					t.Fatal("DeployStack = nil, want the declaration refused")
 				}
-				for _, want := range []string{"service 'app'", "'web_a_site'", holder.refused, "external:"} {
-					if !strings.Contains(err.Error(), want) {
-						t.Errorf("error %q does not mention %q", err, want)
+				for _, w := range want {
+					if !strings.Contains(err.Error(), w) {
+						t.Errorf("error %q does not mention %q", err, w)
 					}
 				}
 				if len(api.created) != 0 || len(api.order) != 0 {
@@ -4368,8 +4385,8 @@ func TestADeclaredNameThatCannotBeLookedUpRefusesTheDeploy(t *testing.T) {
 		t.Run(tc.kind, func(t *testing.T) {
 			api := &lookupErrAPI{fakeAPI: &fakeAPI{}, kind: tc.kind, err: errors.New("daemon busy")}
 			err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "web", Manifest: tc.manifest, Resolve: ResolveNever, Files: map[string][]byte{"files/nginx.conf": []byte("x")}})
-			if err == nil || !strings.Contains(err.Error(), "daemon busy") {
-				t.Fatalf("DeployStack = %v, want the lookup's failure", err)
+			if !errors.Is(err, api.err) {
+				t.Fatalf("DeployStack = %v, want the lookup's failure wrapped", err)
 			}
 			if len(api.created) != 0 || len(api.order) != 0 {
 				t.Errorf("resources were created despite the failure: order=%v created=%d", api.order, len(api.created))

@@ -236,14 +236,16 @@ the `self: true` release aside, for what the controller itself holds — and a d
 config, secret or network is the release's only if nothing holds its name yet or
 what does carries exactly the release's namespace label. A `type: cluster`
 mount is never the release's own, since a stack never creates a cluster volume.
-A declared volume is the release's only if it is named within the release and
-the volume of that name on the controller's node, if there is one, carries no
-other stack's namespace label; one named outside the release is refused whatever
-the app set permits, because a node creates it labelled as this release's and a
-purge removes what carries that label — share it `external:` instead. Only the
-controller's node is read, because a volume lives on whichever node first
-mounted it and there is no cluster-wide label to read. A purge removes only a
-volume named within the release, and re-reads its label on the node first.
+A purge removes a volume only if it carries the release's label and is named
+within the release, and it re-reads the label on the node first. So a declared
+volume is the release's only if it is named within the release and the volume of
+that name on the controller's node, if there is one, is not labelled for another
+stack whose name it is scoped under too — whose purge would remove it. One named
+outside the release is refused whatever the app set permits, because a node
+creates it labelled as this release's, and another stack's volume would carry
+that label — share it `external:` instead. Only the controller's node is read,
+because a volume lives on whichever node first mounted it and there is no
+cluster-wide label to read.
 
 Between releases, that leaves volume names open on the other nodes where the
 rules above cannot keep two releases apart: a pair whose names collide by `_`
