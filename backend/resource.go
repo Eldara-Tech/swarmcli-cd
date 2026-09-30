@@ -6,9 +6,12 @@ package backend
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -19,6 +22,8 @@ import (
 	"github.com/docker/docker/api/types/volume"
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
+
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
@@ -344,6 +349,24 @@ func (b *Backend) DeleteConfig(ctx context.Context, name string) error {
 // release named for the controller's stack would name the volume holding every
 // application's git clone and chart cache, so the refusal has to be on the read
 // that produces the list rather than only on the removal that precedes it (#102).
+//
+// The label is checked here as well as sent as a filter, because on a manager
+// the daemon applies the filter only to the node-local volumes: it appends every
+// cluster volume unfiltered (volume_routes.go:41-51 and
+// daemon/cluster/volumes.go:37, which sends an empty ListVolumesRequest). Only a
+// node-local volume carrying this stack's namespace is returned. A cluster volume
+// never is, labelled or not: a stack deploy neither creates nor labels one
+// (docker/cli's convert gives a cluster mount empty ClusterOptions), so one was
+// provisioned outside the release, and removing it deletes its storage.
+//
+// A node-local volume whose name a cluster volume in the same listing also
+// answers to is left out as well. Removal is by name, and if the node-local one
+// is gone by then the daemon resolves the name in the swarm store instead — by a
+// cluster volume's name, without regard to case, or as a prefix of its ID
+// (daemon/cluster/helpers.go:248-270) — where a delete of an idle volume marks it
+// for deletion for good. A declared cluster mount is named <stack>_<volume>
+// exactly as a node-local volume is, so the two can share a name. A cluster
+// volume created after this listing is not seen here.
 func (b *Backend) StackVolumes(ctx context.Context, name string) ([]string, error) {
 	if err := b.rejectOwnNamespace(ctx, name); err != nil {
 		return nil, err
@@ -352,8 +375,25 @@ func (b *Backend) StackVolumes(ctx context.Context, name string) ([]string, erro
 	if err != nil {
 		return nil, fmt.Errorf("listing the stack's volumes: %w", err)
 	}
+	var clusters []*volume.ClusterVolume
+	var clusterNames []string
+	for _, v := range resp.Volumes {
+		if v.ClusterVolume != nil {
+			clusters = append(clusters, v.ClusterVolume)
+			clusterNames = append(clusterNames, strings.ToLower(v.Name))
+		}
+	}
 	out := make([]string, 0, len(resp.Volumes))
 	for _, v := range resp.Volumes {
+		if v.ClusterVolume != nil || v.Labels[convert.LabelNamespace] != name {
+			continue
+		}
+		if slices.Contains(clusterNames, strings.ToLower(v.Name)) ||
+			slices.ContainsFunc(clusters, func(c *volume.ClusterVolume) bool { return strings.HasPrefix(c.ID, v.Name) }) {
+			b.log.Warn("left a volume out of the purge: a cluster volume answers to the same name, and a removal "+
+				"by name would reach it once the node-local volume is gone", "stack", name, "volume", v.Name)
+			continue
+		}
 		out = append(out, v.Name)
 	}
 	sort.Strings(out)
@@ -390,7 +430,49 @@ func (b *Backend) SwarmNodes(ctx context.Context) (int, error) {
 // missing volume is answered by the local volume store, or on a manager by
 // getVolume, and both wrap in a not-found the client recognises
 // (daemon/cluster/helpers.go:274).
+//
+// Node-local only, as StackVolumes is. A name reaches a cluster volume when no
+// node-local volume answers it — the daemon's delete and inspect both fall back
+// to swarm (volume_routes.go:157-181 and :68-81), and the delete does so for
+// any force=true request too, which is why force stays false — so the volume
+// is inspected first and removed only if that answer is node-local. The inspect
+// and the delete are two calls: a node-local volume removed by something else
+// between them leaves the delete to that same fallback, and at a current API
+// version the daemon offers no node-local-only delete to close it.
 func (b *Backend) RemoveVolume(ctx context.Context, name string) error {
+	// Nothing of this name to remove is not an error to this contract, whatever
+	// the name answers with instead.
+	if err := b.removeLocalVolume(ctx, name, func(volume.Volume) bool { return true }); !errors.Is(err, capability.ErrVolumeLeft) {
+		return err
+	}
+	return nil
+}
+
+// RemoveStackVolume removes one of a stack's volumes while the name still
+// answers with it: RemoveVolume, and only if the node-local volume carries the
+// stack's namespace label. A volume of that name another stack has created since
+// it was listed is left in place, and capability.ErrVolumeLeft says so.
+func (b *Backend) RemoveStackVolume(ctx context.Context, v capability.StackVolume) error {
+	return b.removeLocalVolume(ctx, v.Name, func(cur volume.Volume) bool {
+		return cur.Labels[convert.LabelNamespace] == v.Stack
+	})
+}
+
+// removeLocalVolume removes the node-local volume name answers with, if ours
+// accepts it, and leaves anything else the name answers with in place, returning
+// capability.ErrVolumeLeft.
+func (b *Backend) removeLocalVolume(ctx context.Context, name string, ours func(volume.Volume) bool) error {
+	cur, err := b.api.VolumeInspect(ctx, name)
+	switch {
+	case errdefs.IsNotFound(err):
+		return nil
+	case err != nil:
+		return fmt.Errorf("inspecting volume '%s': %w", name, err)
+	case cur.ClusterVolume != nil || !ours(cur):
+		b.log.Warn("left a volume in place: its name now answers with a cluster volume, or with another stack's, "+
+			"rather than the node-local volume that was listed", "volume", name)
+		return capability.ErrVolumeLeft
+	}
 	if err := b.api.VolumeRemove(ctx, name, false); err != nil && !errdefs.IsNotFound(err) {
 		return fmt.Errorf("removing volume '%s': %w", name, err)
 	}

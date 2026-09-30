@@ -57,6 +57,14 @@ type fakeAPI struct {
 	nodes      []swarm.Node
 	tasks      []swarm.Task
 	networkErr error
+	// clusterVolumes are CSI cluster volumes, which a manager appends to every
+	// volume listing whatever its filter (docker v28.5.2
+	// api/server/router/volume/volume_routes.go:41-51).
+	clusterVolumes []volume.Volume
+	// volumeInspectErr fails every volume inspect, and volumeInspects records
+	// the name of each.
+	volumeInspectErr error
+	volumeInspects   []string
 	// nodeErr fails the node listing, which is what a worker node answers: only
 	// a manager can enumerate the swarm.
 	nodeErr error
@@ -903,13 +911,51 @@ func (f *fakeAPI) VolumeList(_ context.Context, o volume.ListOptions) (volume.Li
 			out = append(out, &f.volumes[i])
 		}
 	}
+	for _, v := range f.clusterVolumes {
+		out = append(out, asCluster(v))
+	}
 	return volume.ListResponse{Volumes: out}, nil
+}
+
+// VolumeInspect answers as the daemon does: a node-local volume of that name
+// first, and only when there is none, a cluster volume of that name.
+func (f *fakeAPI) VolumeInspect(_ context.Context, name string) (volume.Volume, error) {
+	f.volumeInspects = append(f.volumeInspects, name)
+	if f.volumeInspectErr != nil {
+		return volume.Volume{}, f.volumeInspectErr
+	}
+	for _, v := range f.volumes {
+		if v.Name == name {
+			return v, nil
+		}
+	}
+	for _, v := range f.clusterVolumes {
+		if v.Name == name {
+			return *asCluster(v), nil
+		}
+	}
+	return volume.Volume{}, errdefs.ErrNotFound
+}
+
+// asCluster is a cluster volume as the daemon reports one: with its ClusterVolume
+// set, which a node-local volume never has.
+func asCluster(v volume.Volume) *volume.Volume {
+	v.Scope = "global"
+	if v.ClusterVolume == nil {
+		v.ClusterVolume = &volume.ClusterVolume{ID: "csi-" + v.Name}
+	}
+	return &v
 }
 
 // VolumeRemove honours removeErr as the other removals do, so that a volume
 // that went between the list and the delete can be modelled at all.
-func (f *fakeAPI) VolumeRemove(_ context.Context, name string, _ bool) error {
+// A forced removal is recorded under its own key: the daemon also tries the
+// cluster store for one (volume_routes.go:170-180), so no caller here may send it.
+func (f *fakeAPI) VolumeRemove(_ context.Context, name string, force bool) error {
 	key := "volume:" + name
+	if force {
+		key = "volume(force):" + name
+	}
 	f.removed = append(f.removed, key)
 	return f.removeErr[key]
 }

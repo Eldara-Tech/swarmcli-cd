@@ -30,6 +30,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/capability"
 	cdcompose "github.com/Eldara-Tech/swarmcli-cd/compose"
 )
 
@@ -679,6 +680,103 @@ func TestStackVolumesAreScopedAndSorted(t *testing.T) {
 	}
 }
 
+// On a manager the daemon appends every CSI cluster volume to a volume listing
+// without applying its filter, so what comes back is not only the stack's. What
+// StackVolumes returns is what a purge removes, so it keeps only the node-local
+// volumes carrying this stack's namespace. A cluster volume is never one of
+// them, even labelled with it: a stack deploy neither creates nor labels one, so
+// it was provisioned outside the release, and removing it deletes its storage.
+func TestStackVolumesKeepOnlyTheStacksOwn(t *testing.T) {
+	ns := func(stack string) map[string]string { return map[string]string{convert.LabelNamespace: stack} }
+	api := &fakeAPI{
+		volumes: []volume.Volume{{Name: "s_data", Labels: map[string]string{convert.LabelNamespace: "s", "tier": "db"}}},
+		clusterVolumes: []volume.Volume{
+			{Name: "shared-csi"},
+			{Name: "other_db", Labels: ns("other")},
+			{Name: "s_csi", Labels: ns("s")},
+			{Name: "S_csi", Labels: ns("S")},
+			{Name: "s-staging_db", Labels: ns("s-staging")},
+			{Name: "s_orphan"},
+		},
+	}
+
+	var logged bytes.Buffer
+	b := New(api, Options{Log: slog.New(slog.NewTextHandler(&logged, nil))})
+	got, err := b.StackVolumes(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("StackVolumes = %v, want nil", err)
+	}
+	if want := []string{"s_data"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("volumes = %v, want %v", got, want)
+	}
+	// A cluster volume is simply not a candidate; it is not a node-local volume
+	// left out for sharing a name, and is not reported as one.
+	if strings.Contains(logged.String(), "left a volume out") {
+		t.Errorf("log %q reports a cluster volume as a node-local one left out", logged.String())
+	}
+}
+
+// A volume is removed by name, and when the node-local volume of that name is
+// gone by the time it is removed the daemon resolves the name in the swarm store
+// instead: by a cluster volume's name, without regard to case, or as a prefix of
+// its ID. So a node-local name a cluster volume in the same listing also answers
+// to is left out of the purge.
+func TestStackVolumesLeaveOutANameACLusterVolumeAlsoAnswers(t *testing.T) {
+	ns := map[string]string{convert.LabelNamespace: "s"}
+	api := &fakeAPI{
+		volumes: []volume.Volume{
+			{Name: "s_data", Labels: ns},
+			{Name: "s_logs", Labels: ns},
+			{Name: "abc", Labels: ns},
+		},
+		clusterVolumes: []volume.Volume{
+			{Name: "S_DATA"},
+			{Name: "other", ClusterVolume: &volume.ClusterVolume{ID: "abcdef0123456789"}},
+		},
+	}
+
+	got, err := testBackend(t, api, nil).StackVolumes(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("StackVolumes = %v, want nil", err)
+	}
+	if want := []string{"s_logs"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("volumes = %v, want %v", got, want)
+	}
+}
+
+// unfilteredVolumes hands back extra node-local volumes whatever the listing's
+// filter, so that the label StackVolumes checks is what keeps them out.
+type unfilteredVolumes struct {
+	*fakeAPI
+	extra []volume.Volume
+}
+
+func (u unfilteredVolumes) VolumeList(ctx context.Context, o volume.ListOptions) (volume.ListResponse, error) {
+	resp, err := u.fakeAPI.VolumeList(ctx, o)
+	for i := range u.extra {
+		resp.Volumes = append(resp.Volumes, &u.extra[i])
+	}
+	return resp, err
+}
+
+// The label is checked on what comes back, for node-local volumes too: a listing
+// that returned another stack's, or an unlabelled one, does not put it in a purge.
+func TestStackVolumesCheckTheLabelOfEveryVolume(t *testing.T) {
+	api := unfilteredVolumes{fakeAPI: &fakeAPI{}, extra: []volume.Volume{
+		{Name: "s_data", Labels: map[string]string{convert.LabelNamespace: "s"}},
+		{Name: "t_data", Labels: map[string]string{convert.LabelNamespace: "t"}},
+		{Name: "loose"},
+	}}
+
+	got, err := testBackend(t, api, nil).StackVolumes(context.Background(), "s")
+	if err != nil {
+		t.Fatalf("StackVolumes = %v, want nil", err)
+	}
+	if want := []string{"s_data"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("volumes = %v, want %v", got, want)
+	}
+}
+
 func TestNetworkScopesAndSecretNames(t *testing.T) {
 	api := &fakeAPI{
 		networks: []network.Summary{{Name: "traefik-public", Scope: "swarm"}, {Name: "bridge", Scope: "local"}},
@@ -806,7 +904,7 @@ func TestConfigRoundTrip(t *testing.T) {
 }
 
 func TestRemoveVolume(t *testing.T) {
-	api := &fakeAPI{}
+	api := &fakeAPI{volumes: []volume.Volume{{Name: "s_data"}}}
 	if err := testBackend(t, api, nil).RemoveVolume(context.Background(), "s_data"); err != nil {
 		t.Fatalf("RemoveVolume = %v, want nil", err)
 	}
@@ -961,6 +1059,10 @@ func (e *errAPI) VolumeList(context.Context, volume.ListOptions) (volume.ListRes
 }
 
 func (e *errAPI) VolumeRemove(context.Context, string, bool) error { return e.err }
+
+func (e *errAPI) VolumeInspect(context.Context, string) (volume.Volume, error) {
+	return volume.Volume{}, e.err
+}
 
 func (e *errAPI) NodeList(context.Context, swarm.NodeListOptions) ([]swarm.Node, error) {
 	return nil, e.err
@@ -2758,15 +2860,83 @@ func TestStampingTheCreationMarkerDoesNotMutateTheCallersLabels(t *testing.T) {
 // and the caller retries — so the loss was the whole settle budget spent on a
 // volume that had already gone, and then a prune failed naming "still in use".
 func TestRemoveVolumeToleratesOneAlreadyGone(t *testing.T) {
-	api := &fakeAPI{removeErr: map[string]error{"volume:s_data": errdefs.ErrNotFound}}
+	api := &fakeAPI{volumes: []volume.Volume{{Name: "s_data"}}, removeErr: map[string]error{"volume:s_data": errdefs.ErrNotFound}}
 
 	if err := testBackend(t, api, nil).RemoveVolume(context.Background(), "s_data"); err != nil {
 		t.Errorf("RemoveVolume = %v, want nil for one already gone", err)
 	}
 }
 
+// A volume is removed by name, and the daemon falls back to a cluster volume of
+// that name when no node-local one answers it. So a removal inspects first and
+// acts only on a node-local volume — and, asked for one of a stack's volumes,
+// only on one still carrying that stack's namespace. Anything else the name now
+// answers with is left in place.
+func TestAVolumeIsRemovedOnlyWhileItIsTheOneListed(t *testing.T) {
+	ns := func(stack string) map[string]string { return map[string]string{convert.LabelNamespace: stack} }
+	for _, tc := range []struct {
+		name    string
+		api     *fakeAPI
+		stack   string
+		removed bool
+	}{
+		{"the stack's node-local volume", &fakeAPI{volumes: []volume.Volume{{Name: "s_data", Labels: ns("s")}}}, "s", true},
+		{"a node-local volume of another stack", &fakeAPI{volumes: []volume.Volume{{Name: "s_data", Labels: ns("t")}}}, "s", false},
+		{"a node-local volume of a stack named in another case", &fakeAPI{volumes: []volume.Volume{{Name: "s_data", Labels: ns("S")}}}, "s", false},
+		{"a node-local volume of a stack sharing the prefix", &fakeAPI{volumes: []volume.Volume{{Name: "s_data", Labels: ns("s-staging")}}}, "s", false},
+		{"only a cluster volume of that name", &fakeAPI{clusterVolumes: []volume.Volume{{Name: "s_data", Labels: ns("s")}}}, "s", false},
+		{"nothing of that name", &fakeAPI{}, "s", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := testBackend(t, tc.api, nil).RemoveStackVolume(t.Context(), capability.StackVolume{Stack: tc.stack, Name: "s_data"})
+			// Left in place is said, so a purge does not report it as deleted;
+			// gone already is not.
+			wantLeft := !tc.removed && len(tc.api.volumes)+len(tc.api.clusterVolumes) > 0
+			if got := errors.Is(err, capability.ErrVolumeLeft); got != wantLeft || (err != nil && !wantLeft) {
+				t.Fatalf("RemoveStackVolume = %v, want ErrVolumeLeft: %v", err, wantLeft)
+			}
+			if got := slices.Contains(tc.api.removed, "volume:s_data"); got != tc.removed {
+				t.Errorf("removed %v, want the volume removed: %v", tc.api.removed, tc.removed)
+			}
+		})
+	}
+
+	// RemoveVolume, which carries no stack, still acts only on a node-local one.
+	api := &fakeAPI{clusterVolumes: []volume.Volume{{Name: "s_data"}}}
+	if err := testBackend(t, api, nil).RemoveVolume(t.Context(), "s_data"); err != nil || len(api.removed) != 0 {
+		t.Errorf("RemoveVolume = %v, removed %v; want a cluster volume of that name left in place", err, api.removed)
+	}
+}
+
+// An inspect that fails answers nothing about the name, so nothing is removed on
+// the strength of it: the failure is returned, and the delete is not sent.
+func TestAVolumeIsNotRemovedWhenItCouldNotBeInspected(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remove func(*Backend, *fakeAPI) error
+	}{
+		{"RemoveVolume", func(b *Backend, _ *fakeAPI) error { return b.RemoveVolume(t.Context(), "s_data") }},
+		{"RemoveStackVolume", func(b *Backend, _ *fakeAPI) error {
+			return b.RemoveStackVolume(t.Context(), capability.StackVolume{Stack: "s", Name: "s_data"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeAPI{
+				volumes:          []volume.Volume{{Name: "s_data", Labels: map[string]string{convert.LabelNamespace: "s"}}},
+				volumeInspectErr: errors.New("daemon busy"),
+			}
+			if err := tc.remove(testBackend(t, api, nil), api); err == nil || !strings.Contains(err.Error(), "daemon busy") {
+				t.Errorf("err = %v, want the inspect failure", err)
+			}
+			if len(api.removed) != 0 {
+				t.Errorf("removed %v after an inspect that failed", api.removed)
+			}
+		})
+	}
+}
+
 func TestRemoveVolumeSurfacesARefusal(t *testing.T) {
-	api := &fakeAPI{removeErr: map[string]error{"volume:s_data": errors.New("volume is in use")}}
+	api := &fakeAPI{volumes: []volume.Volume{{Name: "s_data"}}, removeErr: map[string]error{"volume:s_data": errors.New("volume is in use")}}
 
 	err := testBackend(t, api, nil).RemoveVolume(context.Background(), "s_data")
 	if err == nil || !strings.Contains(err.Error(), "in use") {
@@ -3015,6 +3185,112 @@ func TestANamespaceInAnotherCaseIsNotTheReleasesOwn(t *testing.T) {
 	}
 	if len(api.created) != 0 {
 		t.Errorf("created %d services, want none", len(api.created))
+	}
+}
+
+// A cluster mount names an existing CSI volume, or a whole volume group, as a
+// volume mount names a volume, and passes the same guard: another stack's is
+// refused unless the app set permits the name, the controller's own is refused
+// outright, and the release's own needs nothing.
+func TestAClusterMountPassesTheVolumeGuard(t *testing.T) {
+	mounts := func(source, decl string) string {
+		return "services:\n  app:\n    image: busybox\n    volumes:\n" +
+			"      - {type: cluster, source: " + source + ", target: /data}\n" + decl
+	}
+	for _, tc := range []struct {
+		name, manifest, want string
+		allow                application.Allow
+	}{
+		{"another stack's volume", mounts("shared-csi", "volumes:\n  shared-csi: {external: true}\n"), "allow.volumes", application.Allow{}},
+		{"a volume group", mounts("group:db", ""), "allow.volumes", application.Allow{}},
+		{"the controller's own volume", mounts("data", "volumes:\n  data: {external: true, name: swarmcli-cd_swarmcli-cd-data}\n"),
+			"this controller's own volume", application.Allow{Volumes: []string{"swarmcli-cd_swarmcli-cd-data"}}},
+		{"permitted", mounts("shared-csi", "volumes:\n  shared-csi: {external: true}\n"), "", application.Allow{Volumes: []string{"shared-csi"}}},
+		{"a permitted volume group", mounts("group:db", ""), "", application.Allow{Volumes: []string{"group:db"}}},
+		{"the release's own", mounts("data", "volumes:\n  data: {}\n"), "", application.Allow{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := asController(&fakeAPI{})
+			err := allowing(t, api, tc.allow).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: tc.manifest, Resolve: ResolveNever})
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("DeployStack = %v, want the cluster mount deployed", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("DeployStack = %v, want the cluster mount refused (%s)", err, tc.want)
+			}
+			if len(api.created) != 0 || len(api.order) != 0 {
+				t.Errorf("created %v and %d services, want nothing", api.order, len(api.created))
+			}
+		})
+	}
+}
+
+// A controller that keeps its own state on a CSI cluster volume holds that name
+// as it holds a volume's: no app set permits another release to mount it, and
+// the self release may re-declare it.
+//
+// Swarm resolves a group source to any volume in that group, so the group of a
+// cluster volume the controller mounts by name is the controller's too.
+func TestTheControllersOwnClusterVolumeIsItsOwn(t *testing.T) {
+	const tenantMounts = "services:\n  app:\n    image: busybox\n    volumes:\n" +
+		"      - {type: cluster, source: %s, target: /state}\n%s"
+	withCSI := func(api *fakeAPI) *fakeAPI {
+		api = asController(api)
+		cs := api.selfSpec.TaskTemplate.ContainerSpec
+		cs.Mounts = append(cs.Mounts, mount.Mount{Type: mount.TypeCluster, Source: "cd-csi", Target: "/state"})
+		api.clusterVolumes = append(api.clusterVolumes, volume.Volume{Name: "cd-csi", ClusterVolume: &volume.ClusterVolume{
+			ID: "csi-cd", Spec: volume.ClusterVolumeSpec{Group: "cd-state"},
+		}})
+		return api
+	}
+
+	for _, tc := range []struct{ name, source, decl string }{
+		{"by name", "state", "volumes:\n  state: {external: true, name: cd-csi}\n"},
+		{"by its group", "group:cd-state", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := withCSI(&fakeAPI{})
+			err := allowing(t, api, application.Allow{Volumes: []string{"cd-csi", "group:cd-state"}}).DeployStack(t.Context(), charts.DeployRequest{
+				Name: "tenant", Manifest: fmt.Sprintf(tenantMounts, tc.source, tc.decl), Resolve: ResolveNever,
+			})
+			if err == nil || !strings.Contains(err.Error(), "this controller's own volume") {
+				t.Fatalf("DeployStack = %v, want the controller's cluster volume refused whatever the app set says", err)
+			}
+		})
+	}
+
+	// A cluster volume whose group cannot be read is not taken for one without a
+	// group: the controller's own mounts are not known, so nothing is deployed.
+	api := withCSI(&fakeAPI{volumeInspectErr: errors.New("daemon busy")})
+	err := allowing(t, api, application.Allow{Volumes: []string{"group:cd-state"}}).DeployStack(t.Context(), charts.DeployRequest{
+		Name: "tenant", Manifest: fmt.Sprintf(tenantMounts, "group:cd-state", ""), Resolve: ResolveNever,
+	})
+	if err == nil || !strings.Contains(err.Error(), "daemon busy") {
+		t.Fatalf("DeployStack = %v, want the failed read of the controller's own volume surfaced", err)
+	}
+
+	// One that is gone has no group left to protect, and does not stop anybody
+	// else's deploy.
+	api = asController(&fakeAPI{})
+	cs := api.selfSpec.TaskTemplate.ContainerSpec
+	cs.Mounts = append(cs.Mounts, mount.Mount{Type: mount.TypeCluster, Source: "cd-csi", Target: "/state"})
+	if err := testBackend(t, api, nil).DeployStack(t.Context(), charts.DeployRequest{Name: "tenant", Manifest: trivialStack, Resolve: ResolveNever}); err != nil {
+		t.Fatalf("DeployStack = %v, want a deploy unaffected by a controller volume that is gone", err)
+	}
+
+	// And the self release re-declares it: the controller's own stack, with the
+	// cluster mount beside everything else the controller runs with.
+	api = withCSI(selfAPI())
+	manifest := strings.Replace(selfStack, "      - swarmcli-cd-data:/var/lib/swarmcli-cd\n",
+		"      - swarmcli-cd-data:/var/lib/swarmcli-cd\n      - {type: cluster, source: state, target: /state}\n", 1) +
+		"  state: {external: true, name: cd-csi}\n"
+	if err := testBackend(t, api, nil).WithSelfRelease(noDeferral).DeployStack(t.Context(), charts.DeployRequest{
+		Name: "swarmcli-cd", Manifest: manifest, Resolve: ResolveNever,
+	}); err != nil {
+		t.Fatalf("DeployStack(self) = %v, want the controller's own cluster volume recognised as its own", err)
 	}
 }
 

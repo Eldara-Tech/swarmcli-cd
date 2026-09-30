@@ -60,6 +60,7 @@ var (
 	_ capability.ResourceLister      = (*Backend)(nil)
 	_ capability.ResourceRemover     = (*Backend)(nil)
 	_ capability.SwarmSizer          = (*Backend)(nil)
+	_ capability.StackVolumeRemover  = (*Backend)(nil)
 	_ capability.NodeRoster          = (*Backend)(nil)
 	_ capability.ServiceLogReader    = (*Backend)(nil)
 )
@@ -696,10 +697,16 @@ func externalRefs(stack *cdcompose.Stack, svc cdcompose.Service) (secrets, confi
 // what the node will address, so it is the whole of what is worth comparing, and
 // a declaration no service mounts reaches nothing.
 //
+// A cluster mount is here too: it names an existing CSI volume, or a whole
+// volume group as "group:<name>", which the stack never creates, so it is
+// compared like any other volume name.
+//
 // Binds are not here. A bind names a path rather than a cluster-wide name, so
 // there is nothing for it to collide with, and the question it does raise — which
 // paths on a node this application may reach at all — is answered one step
-// earlier, in compose.checkBindSources, against the same allowlist.
+// earlier, in compose.checkBindSources, against the same allowlist; a Windows
+// named pipe is a path too, and is checked there with them. A tmpfs mount names
+// nothing, and an image mount names an image, which any service may run anyway.
 func volumeSources(svc cdcompose.Service) []string {
 	cs := svc.Spec.TaskTemplate.ContainerSpec
 	if cs == nil {
@@ -707,7 +714,7 @@ func volumeSources(svc cdcompose.Service) []string {
 	}
 	out := make([]string, 0, len(cs.Mounts))
 	for _, m := range cs.Mounts {
-		if m.Type == mount.TypeVolume && m.Source != "" {
+		if (m.Type == mount.TypeVolume || m.Type == mount.TypeCluster) && m.Source != "" {
 			out = append(out, m.Source)
 		}
 	}
