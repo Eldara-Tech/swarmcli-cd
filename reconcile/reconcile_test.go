@@ -1178,6 +1178,116 @@ func TestReleasesReportTheRevisionTheirHistoryEndsAt(t *testing.T) {
 	}
 }
 
+// countingLister is a listingEngine that counts its reads and whose answer a
+// test can move, so it can say both whether the records were read and which
+// reading the status carries.
+type countingLister struct {
+	*fakeEngine
+	mu       sync.Mutex
+	revision int
+	reads    int
+}
+
+func (e *countingLister) List(context.Context) ([]charts.Release, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reads++
+	return []charts.Release{{Name: "whoami", Revision: e.revision}}, nil
+}
+
+func (e *countingLister) set(revision int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.revision = revision
+}
+
+func (e *countingLister) count() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.reads
+}
+
+func revisionOf(t *testing.T, r *Reconciler) int {
+	t.Helper()
+	view, _ := r.View("edge")
+	if len(view.Status.Releases) != 1 {
+		t.Fatalf("releases = %+v, want one", view.Status.Releases)
+	}
+	return view.Status.Releases[0].Revision
+}
+
+// The first pass reads the records and a pass whose plan is unchanged reuses
+// that reading: a steady-state controller reads them no more than it did before
+// it reported revisions at all. An upgrade nobody planned stays unseen until the
+// next pass that is not in sync, which is the staleness the field documents.
+func TestAnUnchangedPassReusesTheRevisions(t *testing.T) {
+	engine := &countingLister{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced()}}, revision: 4}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if engine.count() != 1 || revisionOf(t, r) != 4 {
+		t.Fatalf("read %d times, revision %d; want one read on the first pass, revision 4", engine.count(), revisionOf(t, r))
+	}
+
+	engine.set(5)
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if engine.count() != 1 || revisionOf(t, r) != 4 {
+		t.Errorf("read %d times, revision %d; want no read on an unchanged pass and revision 4 kept", engine.count(), revisionOf(t, r))
+	}
+}
+
+// A pass whose plan is not in sync reads again: something moved the release, or
+// is about to, and the cached reading may be the one it moved from.
+func TestAPassOutOfSyncRereadsTheRevisions(t *testing.T) {
+	engine := &countingLister{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced(), outOfSync()}}, revision: 4}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	engine.set(5)
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if engine.count() != 2 || revisionOf(t, r) != 5 {
+		t.Errorf("read %d times, revision %d; want a second read and revision 5", engine.count(), revisionOf(t, r))
+	}
+}
+
+// An apply writes revisions, so the status after it reads them again even though
+// the confirming plan is unchanged — and so does the pass after an apply that
+// failed, which may have written some of them.
+func TestAnApplyRereadsTheRevisions(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		engine := &countingLister{fakeEngine: &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}}, revision: 4}
+		engine.onApply = func() { engine.set(5) }
+		if failed {
+			engine.applyErr = errors.New("swarm said no")
+		}
+		r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+		err := r.Sync(t.Context(), "edge")
+		if failed {
+			if err == nil {
+				t.Fatal("Sync = nil, want the apply failure")
+			}
+			engine.applyErr = nil
+			if err := r.Sync(t.Context(), "edge"); err != nil {
+				t.Fatalf("Sync after the failure = %v, want nil", err)
+			}
+		} else if err != nil {
+			t.Fatalf("Sync = %v, want nil", err)
+		}
+		if revisionOf(t, r) != 5 {
+			t.Errorf("failed apply %v: revision %d, want 5, read after the apply", failed, revisionOf(t, r))
+		}
+	}
+}
+
 // Release records that cannot be read leave the revision at 0 and fail nothing:
 // the sync, the health and everything else the status reports stand.
 func TestUnreadableReleaseRecordsLeaveTheRevisionZero(t *testing.T) {

@@ -137,6 +137,15 @@ type appEntry struct {
 	// holding the resource.
 	pruneFailures map[string]int
 
+	// revisions is the revision each release on the swarm was at when record
+	// last read the release records, so that a pass with nothing to move one
+	// reuses it rather than listing the whole swarm again. Nil until the first
+	// read, after a read that failed, and from the moment an apply starts.
+	//
+	// Guarded by the lease rather than by Reconciler.mu: only the lease holder
+	// reconciles, and the read it caches is made outside the lock.
+	revisions map[string]int
+
 	// done is closed when this application's loop goroutine has returned. It is
 	// nil until the loop is started — before Run, or for an application added to
 	// a not-yet-running reconciler — and starting is what it gates on, since

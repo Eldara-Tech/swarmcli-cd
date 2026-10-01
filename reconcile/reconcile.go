@@ -2176,6 +2176,9 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 		}
 	}
 
+	// Whatever it writes, including a part of a plan that then fails, moves a
+	// revision the status has cached.
+	e.revisions = nil
 	results, applyErr := engine.Apply(ctx, plan, charts.InstallOptions{
 		// From the plan, not recomputed: apply must stamp the same owner it
 		// classified against, or a release is installed under one id and the
@@ -3057,12 +3060,14 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 		r.log.Warn("reading the swarm failed; publishing this application's releases as unread",
 			"application", e.name, "error", readErr)
 	}
-	revisions := r.currentRevisions(ctx, e.name, engine)
+	if e.revisions == nil || sync.Summary.Install+sync.Summary.Upgrade > 0 {
+		e.revisions = r.currentRevisions(ctx, e.name, engine)
+	}
 
 	for i := range releases {
 		rel := &releases[i]
 		// Absent, and so 0, for a release that has never been installed.
-		rel.Revision = revisions[rel.Name]
+		rel.Revision = e.revisions[rel.Name]
 		rel.Health, rel.Services = health.Release(health.Input{
 			States: states[rel.Name],
 			// A release the plan would install is declared and not deployed.
@@ -3118,8 +3123,11 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 // currentRevisions reads the revision every release on the swarm is at, keyed by
 // name: the newest its history records, which is the top row History serves.
 //
-// One read answers every release, rather than a History each. Records that cannot
-// be read leave every revision at 0 and fail nothing, as an unread stack does not.
+// One read answers every release, rather than a History each, and record makes it
+// only when a revision can have moved — the first pass, after an apply, and on a
+// pass whose plan is not in sync — because it lists every release record on the
+// swarm, as the plan has just done. Records that cannot be read leave every
+// revision at 0 and fail nothing, as an unread stack does not.
 func (r *Reconciler) currentRevisions(ctx context.Context, app string, engine Engine) map[string]int {
 	lister, ok := engine.(releaseLister)
 	if !ok {
