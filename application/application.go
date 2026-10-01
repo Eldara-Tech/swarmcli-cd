@@ -481,7 +481,7 @@ type ReleaseStatus struct {
 	Name     string          `json:"name"`
 	Chart    string          `json:"chart"`
 	Version  string          `json:"version"`
-	Revision int             `json:"revision"` // charts revision number; 0 when never installed
+	Revision int             `json:"revision"` // charts revision number; 0 when never installed or unread; see docs/api.md
 	Action   SyncAction      `json:"action"`
 	Sync     SyncState       `json:"sync"`
 	Health   Health          `json:"health"`

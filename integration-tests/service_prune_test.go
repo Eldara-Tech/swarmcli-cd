@@ -69,7 +69,13 @@ func TestAServiceDroppedFromATemplateIsPruned(t *testing.T) {
 		t.Fatalf("History = %v, want nil", err)
 	}
 	if len(history.Releases) != 1 || len(history.Releases[0].Revisions) != 2 {
-		t.Errorf("history = %+v, want one release at two revisions", history.Releases)
+		t.Fatalf("history = %+v, want one release at two revisions", history.Releases)
+	}
+	// And the status names the revision that history ends at — the real engine's
+	// List agreeing with its History, which the unit tests can only assume.
+	view, _ := rec.View("edge")
+	if len(view.Status.Releases) != 1 || view.Status.Releases[0].Revision != history.Releases[0].Revisions[0].Revision {
+		t.Errorf("status releases = %+v, want revision %d", view.Status.Releases, history.Releases[0].Revisions[0].Revision)
 	}
 }
 

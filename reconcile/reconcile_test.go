@@ -1138,6 +1138,291 @@ func TestHistoryIsNewestFirstAndCoversEveryRelease(t *testing.T) {
 	}
 }
 
+// A release reports the revision it is at: the newest its history records, which
+// is the top row `app history` shows. One the plan would install reports 0. Every
+// release used to report 0, because the plan carries no revision and nothing
+// filled it in.
+func TestReleasesReportTheRevisionTheirHistoryEndsAt(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "whoami", Action: charts.ActionUnchanged},
+		{Name: "redis", Action: charts.ActionInstall},
+	}}
+	history := map[string][]charts.Release{"whoami": {
+		{Name: "whoami", Revision: 1, Status: "superseded"},
+		{Name: "whoami", Revision: 2, Status: "deployed"},
+	}}
+	engine := &listingEngine{
+		fakeEngine: &fakeEngine{plans: []*charts.Plan{plan}, history: history},
+		// The engine's List: the newest revision of every release on the swarm,
+		// another application's included.
+		releases: []charts.Release{{Name: "other", Revision: 7}, history["whoami"][1]},
+	}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	hist, err := r.History(t.Context(), "edge")
+	if err != nil {
+		t.Fatalf("History = %v, want nil", err)
+	}
+	view, _ := r.View("edge")
+	if len(view.Status.Releases) != 2 || len(hist.Releases) != 2 || len(hist.Releases[0].Revisions) == 0 {
+		t.Fatalf("releases = %+v, history = %+v, want both releases", view.Status.Releases, hist.Releases)
+	}
+	if got, want := view.Status.Releases[0].Revision, hist.Releases[0].Revisions[0].Revision; got != want || got != 2 {
+		t.Errorf("whoami revision = %d, want %d, the newest in its history", got, want)
+	}
+	if got := view.Status.Releases[1].Revision; got != 0 {
+		t.Errorf("redis revision = %d, want 0 for a release never installed", got)
+	}
+}
+
+// countingLister is a listingEngine that counts its reads and whose answer a
+// test can move, so it can say both whether the records were read and which
+// reading the status carries.
+type countingLister struct {
+	*fakeEngine
+	mu       sync.Mutex
+	revision int
+	reads    int
+}
+
+func (e *countingLister) List(context.Context) ([]charts.Release, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.reads++
+	return []charts.Release{{Name: "whoami", Revision: e.revision}}, nil
+}
+
+func (e *countingLister) set(revision int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.revision = revision
+}
+
+func (e *countingLister) count() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.reads
+}
+
+func revisionOf(t *testing.T, r *Reconciler) int {
+	t.Helper()
+	view, _ := r.View("edge")
+	if len(view.Status.Releases) != 1 {
+		t.Fatalf("releases = %+v, want one", view.Status.Releases)
+	}
+	return view.Status.Releases[0].Revision
+}
+
+// The first pass reads the records and a pass whose plan is unchanged reuses
+// that reading: a steady-state controller reads them no more than it did before
+// it reported revisions at all. An upgrade nobody planned stays unseen until the
+// next pass that is not in sync, which is the staleness the field documents.
+func TestAnUnchangedPassReusesTheRevisions(t *testing.T) {
+	engine := &countingLister{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced()}}, revision: 4}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if engine.count() != 1 || revisionOf(t, r) != 4 {
+		t.Fatalf("read %d times, revision %d; want one read on the first pass, revision 4", engine.count(), revisionOf(t, r))
+	}
+
+	engine.set(5)
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if engine.count() != 1 || revisionOf(t, r) != 4 {
+		t.Errorf("read %d times, revision %d; want no read on an unchanged pass and revision 4 kept", engine.count(), revisionOf(t, r))
+	}
+}
+
+// An application that stays out of sync — a manual policy, by design — does not
+// read the records on every pass: only when what is deployed has moved.
+func TestAnApplicationThatStaysOutOfSyncReadsOnlyWhenTheDeployedSideMoves(t *testing.T) {
+	moved := outOfSync()
+	moved.Releases[0].CurrentManifest = "replicas: 2\n"
+	plans := []*charts.Plan{outOfSync(), outOfSync(), outOfSync(), moved, moved}
+	engine := &countingLister{fakeEngine: &fakeEngine{plans: plans}, revision: 4}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	for pass, want := range []int{1, 1, 1, 2, 2} {
+		if err := r.Sync(t.Context(), "edge"); err != nil {
+			t.Fatalf("pass %d: Sync = %v, want nil", pass, err)
+		}
+		if got := engine.count(); got != want {
+			t.Fatalf("pass %d: %d reads, want %d", pass, got, want)
+		}
+	}
+}
+
+// A release that is removed out of band reads as one the plan would install, and
+// its revision goes with it rather than staying at the cached reading.
+func TestAReleaseRemovedOutOfBandReportsZero(t *testing.T) {
+	install := synced()
+	install.Releases[0].Action = charts.ActionInstall
+	engine := &countingLister{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced(), install}}, revision: 4}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	engine.set(0) // the records are gone; countingLister then reports revision 0
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := revisionOf(t, r); got != 0 {
+		t.Errorf("revision = %d, want 0 for a release the plan would install", got)
+	}
+}
+
+// A destination that moves to another swarm reads that swarm's records rather
+// than keeping the old one's.
+func TestADestinationChangeRereadsTheRevisions(t *testing.T) {
+	engine := &countingLister{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced()}}, revision: 4}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	moved := spec("edge", false)
+	moved.Destination.Swarm = "eu"
+	if err := r.Replace(moved); err != nil {
+		t.Fatalf("Replace = %v", err)
+	}
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if got := engine.count(); got != 2 {
+		t.Errorf("%d reads, want a second for the new swarm", got)
+	}
+}
+
+// What counts as the deployed side having moved.
+func TestDeployedMoved(t *testing.T) {
+	base := func() *charts.Plan {
+		return &charts.Plan{Releases: []charts.ReleasePlan{{
+			Name: "whoami", Action: charts.ActionUpgrade, FromVersion: "0.1.7", ToVersion: "0.1.8",
+			CurrentManifest: "replicas: 1\n", Manifest: "replicas: 3\n",
+		}}}
+	}
+	for name, tc := range map[string]struct {
+		edit func(*charts.Plan)
+		prev bool // whether there is a previous plan at all
+		want bool
+	}{
+		"no previous plan":      {func(*charts.Plan) {}, false, true},
+		"identical":             {func(*charts.Plan) {}, true, false},
+		"action":                {func(p *charts.Plan) { p.Releases[0].Action = charts.ActionUnchanged }, true, true},
+		"deployed version":      {func(p *charts.Plan) { p.Releases[0].FromVersion = "0.1.6" }, true, true},
+		"deployed manifest":     {func(p *charts.Plan) { p.Releases[0].CurrentManifest = "replicas: 2\n" }, true, true},
+		"a release added":       {func(p *charts.Plan) { p.Releases = append(p.Releases, charts.ReleasePlan{Name: "redis"}) }, true, true},
+		"a release removed":     {func(p *charts.Plan) { p.Releases = nil }, true, false},
+		"the desired side only": {func(p *charts.Plan) { p.Releases[0].Manifest, p.Releases[0].ToVersion = "replicas: 5\n", "0.1.9" }, true, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var prev *charts.Plan
+			if tc.prev {
+				prev = base()
+			}
+			next := base()
+			tc.edit(next)
+			if got := deployedMoved(prev, next); got != tc.want {
+				t.Errorf("deployedMoved = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A pass whose plan is not in sync reads again: something moved the release, or
+// is about to, and the cached reading may be the one it moved from.
+func TestAPassOutOfSyncRereadsTheRevisions(t *testing.T) {
+	engine := &countingLister{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced(), outOfSync()}}, revision: 4}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	engine.set(5)
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if engine.count() != 2 || revisionOf(t, r) != 5 {
+		t.Errorf("read %d times, revision %d; want a second read and revision 5", engine.count(), revisionOf(t, r))
+	}
+}
+
+// An apply writes revisions, so the status after it reads them again even though
+// the confirming plan is unchanged — and so does the pass after an apply that
+// failed, which may have written some of them.
+func TestAnApplyRereadsTheRevisions(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		engine := &countingLister{fakeEngine: &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}}, revision: 4}
+		engine.onApply = func() { engine.set(5) }
+		if failed {
+			engine.applyErr = errors.New("swarm said no")
+		}
+		r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+		err := r.Sync(t.Context(), "edge")
+		if failed {
+			if err == nil {
+				t.Fatal("Sync = nil, want the apply failure")
+			}
+			engine.applyErr = nil
+			if err := r.Sync(t.Context(), "edge"); err != nil {
+				t.Fatalf("Sync after the failure = %v, want nil", err)
+			}
+		} else if err != nil {
+			t.Fatalf("Sync = %v, want nil", err)
+		}
+		if revisionOf(t, r) != 5 {
+			t.Errorf("failed apply %v: revision %d, want 5, read after the apply", failed, revisionOf(t, r))
+		}
+	}
+}
+
+// Release records that cannot be read leave the revision at 0 and fail nothing:
+// the sync, the health and everything else the status reports stand.
+func TestUnreadableReleaseRecordsLeaveTheRevisionZero(t *testing.T) {
+	engine := &listingEngine{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced()}}, err: errors.New("daemon busy")}
+	logged := &syncBuffer{}
+	r := New([]application.Spec{spec("edge", false)}, Options{
+		Fetcher:   &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{},
+		NewEngine: func(charts.Backend) Engine { return engine },
+		Log:       slog.New(slog.NewTextHandler(logged, nil)),
+	})
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if len(logged.lines("level=WARN", "application=edge", "daemon busy")) != 1 {
+		t.Errorf("log %q, want one warning naming the application and the reason", logged.String())
+	}
+
+	view, _ := r.View("edge")
+	if len(view.Status.Releases) != 1 || view.Status.Releases[0].Revision != 0 {
+		t.Errorf("releases = %+v, want one at revision 0", view.Status.Releases)
+	}
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q, want synced", view.Status.Sync.State)
+	}
+
+	// And a failed read is not remembered as an answer: the next pass reads again.
+	engine.err = nil
+	engine.releases = []charts.Release{{Name: "whoami", Revision: 3}}
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if view, _ := r.View("edge"); len(view.Status.Releases) != 1 || view.Status.Releases[0].Revision != 3 {
+		t.Errorf("releases = %+v, want revision 3 once the records can be read", view.Status.Releases)
+	}
+}
+
 // A release the plan would install has no history, and the engine says so with
 // an error. That is the one case where an error is the expected answer.
 func TestHistoryOfAnUninstalledReleaseIsEmpty(t *testing.T) {
