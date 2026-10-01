@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,15 +49,18 @@ func (b auditingBackend) UnpermittedNames(_ context.Context, req capability.Allo
 }
 
 // listingEngine is a fakeEngine that also lists the swarm's releases.
+//
+// panics is atomic because a test flips it while the loops run, and every sync
+// lists the releases to report their revisions.
 type listingEngine struct {
 	*fakeEngine
 	releases []charts.Release
 	err      error
-	panics   bool
+	panics   atomic.Bool
 }
 
 func (e *listingEngine) List(context.Context) ([]charts.Release, error) {
-	if e.panics {
+	if e.panics.Load() {
 		panic("decoding")
 	}
 	return e.releases, e.err
@@ -338,7 +342,7 @@ func TestRunAuditsTheSetAndWhatJoinsIt(t *testing.T) {
 	if !waitFor("application=late", "allow.secrets=[late_db]") {
 		t.Errorf("log %q, want the application added later audited", logged.String())
 	}
-	engine.panics = true
+	engine.panics.Store(true)
 	_ = r.Add(spec("third", false))
 	if !waitFor("level=ERROR", "recovered a panic checking") {
 		t.Errorf("log %q, want the panic recovered and logged", logged.String())

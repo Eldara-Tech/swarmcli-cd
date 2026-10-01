@@ -1138,6 +1138,74 @@ func TestHistoryIsNewestFirstAndCoversEveryRelease(t *testing.T) {
 	}
 }
 
+// A release reports the revision it is at: the newest its history records, which
+// is the top row `app history` shows. One the plan would install reports 0. Every
+// release used to report 0, because the plan carries no revision and nothing
+// filled it in.
+func TestReleasesReportTheRevisionTheirHistoryEndsAt(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "whoami", Action: charts.ActionUnchanged},
+		{Name: "redis", Action: charts.ActionInstall},
+	}}
+	history := map[string][]charts.Release{"whoami": {
+		{Name: "whoami", Revision: 1, Status: "superseded"},
+		{Name: "whoami", Revision: 2, Status: "deployed"},
+	}}
+	engine := &listingEngine{
+		fakeEngine: &fakeEngine{plans: []*charts.Plan{plan}, history: history},
+		// The engine's List: the newest revision of every release on the swarm,
+		// another application's included.
+		releases: []charts.Release{{Name: "other", Revision: 7}, history["whoami"][1]},
+	}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+
+	hist, err := r.History(t.Context(), "edge")
+	if err != nil {
+		t.Fatalf("History = %v, want nil", err)
+	}
+	view, _ := r.View("edge")
+	if len(view.Status.Releases) != 2 || len(hist.Releases) != 2 || len(hist.Releases[0].Revisions) == 0 {
+		t.Fatalf("releases = %+v, history = %+v, want both releases", view.Status.Releases, hist.Releases)
+	}
+	if got, want := view.Status.Releases[0].Revision, hist.Releases[0].Revisions[0].Revision; got != want || got != 2 {
+		t.Errorf("whoami revision = %d, want %d, the newest in its history", got, want)
+	}
+	if got := view.Status.Releases[1].Revision; got != 0 {
+		t.Errorf("redis revision = %d, want 0 for a release never installed", got)
+	}
+}
+
+// Release records that cannot be read leave the revision at 0 and fail nothing:
+// the sync, the health and everything else the status reports stand.
+func TestUnreadableReleaseRecordsLeaveTheRevisionZero(t *testing.T) {
+	engine := &listingEngine{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced()}}, err: errors.New("daemon busy")}
+	logged := &syncBuffer{}
+	r := New([]application.Spec{spec("edge", false)}, Options{
+		Fetcher:   &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{},
+		NewEngine: func(charts.Backend) Engine { return engine },
+		Log:       slog.New(slog.NewTextHandler(logged, nil)),
+	})
+	if err := r.Sync(t.Context(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	if len(logged.lines("level=WARN", "application=edge", "daemon busy")) != 1 {
+		t.Errorf("log %q, want one warning naming the application and the reason", logged.String())
+	}
+
+	view, _ := r.View("edge")
+	if len(view.Status.Releases) != 1 || view.Status.Releases[0].Revision != 0 {
+		t.Errorf("releases = %+v, want one at revision 0", view.Status.Releases)
+	}
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q, want synced", view.Status.Sync.State)
+	}
+}
+
 // A release the plan would install has no history, and the engine says so with
 // an error. That is the one case where an error is the expected answer.
 func TestHistoryOfAnUninstalledReleaseIsEmpty(t *testing.T) {

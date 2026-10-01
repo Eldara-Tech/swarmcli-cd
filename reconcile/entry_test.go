@@ -250,6 +250,55 @@ func TestRecordDoesNotHoldTheGlobalLockAcrossTheSwarmRead(t *testing.T) {
 	<-inflight
 }
 
+// The same for the other read record makes: the release records, which fill in
+// each release's revision. It is a whole-swarm config listing, so it must not be
+// made under the lock either.
+func TestRecordDoesNotHoldTheGlobalLockAcrossTheReleaseRead(t *testing.T) {
+	engine := &blockingLister{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced()}},
+		entered: make(chan struct{}, 1), release: make(chan struct{})}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	inflight := syncing(t, r, "edge")
+
+	select {
+	case <-engine.entered:
+	case <-time.After(respond):
+		t.Fatal("record never reached the release read")
+	}
+
+	answered := make(chan struct{})
+	go func() {
+		defer close(answered)
+		r.Views()
+		r.View("edge")
+	}()
+
+	select {
+	case <-answered:
+	case <-time.After(respond):
+		t.Fatal("a status read blocked behind the release read record was doing")
+	}
+
+	close(engine.release)
+	<-inflight
+}
+
+// blockingLister holds the release listing until the test lets it out.
+type blockingLister struct {
+	*fakeEngine
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (e *blockingLister) List(context.Context) ([]charts.Release, error) {
+	select {
+	case e.entered <- struct{}{}:
+	default:
+	}
+	<-e.release
+	return nil, nil
+}
+
 // TestAPanicFailsOneApplicationRatherThanTheProcess is #105's remaining half.
 //
 // recover() appeared nowhere in this repository, so a panic in one application's

@@ -1920,7 +1920,7 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	// would never look like a transition.
 	was := r.syncState(e)
 	wasLive := r.driftState(e)
-	r.record(ctx, e, backend, plan, checkout.Revision, nil, live)
+	r.record(ctx, e, backend, engine, plan, checkout.Revision, nil, live)
 
 	// Both notifications come before the gate below, because something found and
 	// not correctable is exactly the case an operator has to be told about: the
@@ -2300,7 +2300,7 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 	// reading is cheap in the case that matters — a sweep that worked leaves no
 	// candidates, so no history is read at all.
 	afterLive, _ := r.observe(ctx, e, spec, backend, engine, after)
-	r.record(ctx, e, backend, after, checkout.Revision, result, afterLive)
+	r.record(ctx, e, backend, engine, after, checkout.Revision, result, afterLive)
 	return nil
 }
 
@@ -3021,7 +3021,7 @@ func (r *Reconciler) currentSpec(e *appEntry) application.Spec {
 // none of it and kept answering, so nothing restarted the container. Reading
 // first is safe because the caller holds the application's lease: no other sync
 // for it can be writing the fields this reads.
-func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Backend, plan *charts.Plan, revision string, result *application.SyncResult, live map[string]*application.ReleaseDrift) {
+func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Backend, engine Engine, plan *charts.Plan, revision string, result *application.SyncResult, live map[string]*application.ReleaseDrift) {
 	sync, releases := drift.FromPlan(plan)
 	sync.Revision = revision
 
@@ -3057,9 +3057,12 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 		r.log.Warn("reading the swarm failed; publishing this application's releases as unread",
 			"application", e.name, "error", readErr)
 	}
+	revisions := r.currentRevisions(ctx, e.name, engine)
 
 	for i := range releases {
 		rel := &releases[i]
+		// Absent, and so 0, for a release that has never been installed.
+		rel.Revision = revisions[rel.Name]
 		rel.Health, rel.Services = health.Release(health.Input{
 			States: states[rel.Name],
 			// A release the plan would install is declared and not deployed.
@@ -3110,6 +3113,29 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 	}
 	e.status = status
 	e.plan = plan
+}
+
+// currentRevisions reads the revision every release on the swarm is at, keyed by
+// name: the newest its history records, which is the top row History serves.
+//
+// One read answers every release, rather than a History each. Records that cannot
+// be read leave every revision at 0 and fail nothing, as an unread stack does not.
+func (r *Reconciler) currentRevisions(ctx context.Context, app string, engine Engine) map[string]int {
+	lister, ok := engine.(releaseLister)
+	if !ok {
+		return nil
+	}
+	releases, err := lister.List(ctx)
+	if err != nil {
+		r.log.Warn("reading the release records failed; publishing this application's releases without a revision",
+			"application", app, "error", err)
+		return nil
+	}
+	out := make(map[string]int, len(releases))
+	for _, rel := range releases {
+		out[rel.Name] = rel.Revision
+	}
+	return out
 }
 
 // driftState reports the live-drift state last observed for an application.

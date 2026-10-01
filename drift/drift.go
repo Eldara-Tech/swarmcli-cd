@@ -35,8 +35,8 @@ import (
 //
 // The returned Sync carries no Revision and no LastSync: a plan does not know
 // which commit produced it, or what happened the last time one was applied.
-// The reconciler fills both. ReleaseStatus.Revision is likewise left zero —
-// the chart revision number lives in the release records, not in the plan.
+// The reconciler fills both. ReleaseStatus.Revision is likewise left for it to
+// fill — the chart revision number lives in the release records, not in the plan.
 //
 // Plan.Orphaned and Plan.Unmanaged are deliberately not surfaced. They now
 // classify against this controller's own owner id rather than the command

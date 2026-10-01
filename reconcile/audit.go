@@ -18,9 +18,9 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
 )
 
-// releaseLister is the part of the chart engine the audit reads: the current
-// revision of every release on a swarm. Asserted here, because the audit reaches
-// it through a type assertion that would otherwise fall back silently.
+// releaseLister is the part of the chart engine the audit and the status read:
+// the current revision of every release on a swarm. Asserted here, because both
+// reach it through a type assertion that would otherwise fall back silently.
 type releaseLister interface {
 	List(ctx context.Context) ([]charts.Release, error)
 }
