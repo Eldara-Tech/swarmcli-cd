@@ -577,6 +577,25 @@ func New(o Options) *Pruner {
 	}
 }
 
+// Departing names the applications Departed would remove for the same desired
+// and declared sets, and removes nothing. The app-set loop asks it on the pass
+// it holds an empty set's sweep, so that what is held can be named.
+func (p *Pruner) Departing(ctx context.Context, desired, declared []string) ([]string, error) {
+	backend, err := p.swarms.Backend(ctx, swarms.Target{})
+	if err != nil {
+		return nil, fmt.Errorf("resolving the local swarm: %w", err)
+	}
+	releases, err := p.engine(backend).List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing the swarm's releases: %w", err)
+	}
+	var names []string
+	for _, app := range departed(releases, desired, declared, p.controller) {
+		names = append(names, app.name)
+	}
+	return names, nil
+}
+
 // Departed deletes the releases of every application this controller owns that
 // is absent from desired, and returns the applications it emptied.
 //

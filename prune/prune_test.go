@@ -298,6 +298,29 @@ func TestAnEmptyDesiredSetPrunesEveryDepartedApplication(t *testing.T) {
 	}
 }
 
+// Departing is Departed's answer without the deletion: the same applications,
+// nothing uninstalled, and a read failure returned rather than an empty list.
+func TestDepartingNamesWhatASweepWouldRemoveAndRemovesNothing(t *testing.T) {
+	e := &fakeEngine{releases: []charts.Release{
+		owned("api", "gone"),
+		owned("web", "kept"),
+		owned("db", "spared"),
+	}}
+
+	got, err := testPruner(t, e, false).Departing(t.Context(), []string{"kept"}, []string{"db"})
+	if err != nil {
+		t.Fatalf("Departing = %v, want nil", err)
+	}
+	if want := []string{"gone"}; !reflect.DeepEqual(got, want) || len(e.calls) != 0 {
+		t.Errorf("departing = %v and uninstalled %v, want %v and nothing", got, e.pruned(), want)
+	}
+
+	e.listErr = errors.New("daemon busy")
+	if _, err := testPruner(t, e, false).Departing(t.Context(), nil, nil); err == nil {
+		t.Error("Departing = nil error, want the list failure")
+	}
+}
+
 func TestVolumesAreOnlyPurgedWhenAsked(t *testing.T) {
 	for _, volumes := range []bool{false, true} {
 		e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
@@ -511,6 +534,9 @@ func TestUnresolvableSwarmIsReported(t *testing.T) {
 
 	if _, err := p.Departed(t.Context(), []string{"kept"}, nil); !errors.Is(err, boom) {
 		t.Fatalf("Departed = %v, want it to carry %v", err, boom)
+	}
+	if _, err := p.Departing(t.Context(), []string{"kept"}, nil); !errors.Is(err, boom) {
+		t.Fatalf("Departing = %v, want it to carry %v", err, boom)
 	}
 }
 

@@ -221,6 +221,10 @@ silence as a departure. This is the field that distinguishes "prune is enabled
 and correctly doing nothing" from "prune is broken", and it is what a rename
 looks like for the first pass or two (see
 [configuration § renaming an application](configuration.md#renaming-an-application)).
+With `applications` at zero the set is empty, and the field names what the sweep
+will remove instead: a sweep against an empty set is held for one pass and runs
+when the next pass loads an empty set too (see
+[configuration § prune](configuration.md#prune)).
 
 `applications` counts what is actually being reconciled, which is not always what
 the last loaded file declares.

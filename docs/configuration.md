@@ -1133,7 +1133,18 @@ applications: []
 ```
 
 The controller loads it, stops reconciling the application, and with prune on
-removes its stacks, as for any application that leaves the set. Emptying the
+removes its stacks, as for any application that leaves the set — but on the
+second pass that loads an empty set, not the first. The first holds the sweep
+and names what it will remove:
+
+```
+Prune held    confirming removal of edge
+```
+
+A set that is empty for one pass only, such as a force-push that briefly showed
+`[]`, therefore removes nothing, and an upgrade onto an `[]` committed while
+older controllers still refused it removes nothing until the next pass reads it
+again. The hold is kept in memory, so a restart holds once more. Emptying the
 file instead, or leaving `applications:` with nothing after it, is refused and
 the last set keeps running; see [what prune will not do](#what-prune-will-not-do).
 
@@ -1386,7 +1397,7 @@ a swarm over a transient failure:
   file without the `applications` key, a null or blank list are refused at load,
   because a truncated file looks exactly like them. To remove every
   application, write `applications: []` as the file's only document — that is
-  not ambiguous, so it loads and is swept like any other set.
+  not ambiguous, so it loads, and is swept once a second pass has loaded it too.
 
 A controller that has never successfully loaded a set therefore prunes nothing,
 indefinitely — which is the correct reading of "I have no idea what should be

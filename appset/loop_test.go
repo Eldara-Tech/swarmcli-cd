@@ -768,6 +768,16 @@ type fakePruner struct {
 	declared [][]string
 	returns  []string
 	err      error
+	// departing is what Departing answers; asked counts the calls.
+	departing []string
+	asked     int
+}
+
+func (p *fakePruner) Departing(context.Context, []string, []string) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.asked++
+	return p.departing, p.err
 }
 
 func (p *fakePruner) Departed(_ context.Context, desired, declared []string) ([]string, error) {
@@ -840,10 +850,11 @@ func TestPrunedApplicationLeavesOrphanedAndJoinsPruned(t *testing.T) {
 }
 
 // Removing the last application. A list left null is refused like any other
-// truncation and changes nothing; `applications: []` removes every application
-// and sweeps against an empty desired set.
-func TestAnExplicitlyEmptySetRemovesAndPrunesEveryApplication(t *testing.T) {
-	p := &fakePruner{returns: []string{"core", "edge"}}
+// truncation and changes nothing. `applications: []` stops every application at
+// once, but the sweep that would delete them all is held for one pass, naming
+// what it would remove, and runs only when the next pass loads an empty set too.
+func TestAnExplicitlyEmptySetIsSweptOnTheSecondPass(t *testing.T) {
+	p := &fakePruner{returns: []string{"core", "edge"}, departing: []string{"core", "edge"}}
 	loop, rec, publish := newPruningLoop(t, twoApps, p,
 		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
 
@@ -862,15 +873,62 @@ func TestAnExplicitlyEmptySetRemovesAndPrunesEveryApplication(t *testing.T) {
 	if got := rec.names(); len(got) != 0 {
 		t.Errorf("running = %v, want none", got)
 	}
+	got := loop.Status().AppSet
+	if p.called() != 0 || !slices.Equal(got.PruneHeldBy, []string{"core", "edge"}) {
+		t.Fatalf("swept %d times, held by %v; want the first empty pass held, naming core and edge", p.called(), got.PruneHeldBy)
+	}
+
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
 	if p.called() != 1 || len(p.lastDesired()) != 0 {
 		t.Errorf("swept %d times against %v, want once against nothing", p.called(), p.lastDesired())
 	}
-	got := loop.Status().AppSet
+	got = loop.Status().AppSet
 	if want := []string{"core", "edge"}; !slices.Equal(got.Pruned, want) {
 		t.Errorf("pruned = %v, want %v", got.Pruned, want)
 	}
-	if got.Error != "" || got.Stale {
-		t.Errorf("error = %q, stale = %v, want a clean pass", got.Error, got.Stale)
+	if len(got.PruneHeldBy) != 0 || got.Error != "" || got.Stale {
+		t.Errorf("held by %v, error = %q, stale = %v, want a clean pass", got.PruneHeldBy, got.Error, got.Stale)
+	}
+}
+
+// A set that is empty for one pass and then is not — a force-push that briefly
+// showed `[]` — sweeps nothing against the empty set, and a later empty set is
+// held afresh rather than counted as its second pass.
+func TestANonEmptySetResetsTheEmptySetHold(t *testing.T) {
+	p := &fakePruner{departing: []string{"core", "edge"}}
+	loop, _, publish := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+
+	for i, set := range []string{"applications: []\n", twoApps, "applications: []\n"} {
+		publish(set)
+		if err := loop.Once(t.Context()); err != nil {
+			t.Fatalf("pass %d: Once = %v, want nil", i, err)
+		}
+	}
+	for i, desired := range p.calls {
+		if len(desired) == 0 {
+			t.Errorf("sweep %d ran against an empty set that was never loaded twice running", i)
+		}
+	}
+	if got := loop.Status().AppSet.PruneHeldBy; !slices.Equal(got, []string{"core", "edge"}) {
+		t.Errorf("held by %v, want the second empty set held again", got)
+	}
+}
+
+// What the held sweep would remove is read from the swarm, and a failure to read
+// it fails the pass as a failed sweep would, rather than holding silently.
+func TestAnEmptySetHoldThatCannotReadTheSwarmFailsThePass(t *testing.T) {
+	p := &fakePruner{err: errors.New("daemon busy")}
+	loop, _, publish := newPruningLoop(t, oneApp, p, spec("edge", "releases/edge.yaml"))
+
+	publish("applications: []\n")
+	if err := loop.Once(t.Context()); err == nil || !strings.Contains(err.Error(), "daemon busy") {
+		t.Errorf("Once = %v, want the read failure", err)
+	}
+	if p.called() != 0 {
+		t.Errorf("swept %d times, want none", p.called())
 	}
 }
 

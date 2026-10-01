@@ -84,6 +84,8 @@ type LoopOptions struct {
 // assert that it was never called.
 type Pruner interface {
 	Departed(ctx context.Context, desired, declared []string) ([]string, error)
+	// Departing names what Departed would remove, removing nothing.
+	Departing(ctx context.Context, desired, declared []string) ([]string, error)
 }
 
 // Reclaimer deletes the on-disk caches of applications absent from the set it
@@ -133,8 +135,13 @@ type Loop struct {
 	// again within the same pass, so the two lists are disjoint by construction.
 	pruned []string
 	// pruneHeldBy names the applications whose first reconcile the last sweep
-	// waited on. Nil once a sweep has run.
+	// waited on, or the ones an empty set would remove. Nil once a sweep has run.
 	pruneHeldBy []string
+
+	// emptyBefore is whether the last pass that reached the sweep loaded an empty
+	// set. Only Once touches it. In memory, as reclaim's absent set is: a restart
+	// holds an empty set for one more pass, which is the safe direction.
+	emptyBefore bool
 }
 
 // NewLoop returns a Loop driving rec from src.
@@ -286,6 +293,11 @@ func (l *Loop) pruneDeparted(ctx context.Context, desired []application.Spec) er
 		return nil
 	}
 
+	// Counted before the gates below, so that a non-empty set resets it on a
+	// pass that holds for another reason too.
+	confirmed := l.emptyBefore
+	l.emptyBefore = len(desired) == 0
+
 	// One snapshot for both questions below, so the set the gate clears is the
 	// same set the releases are read from.
 	views := l.rec.Views()
@@ -312,12 +324,27 @@ func (l *Loop) pruneDeparted(ctx context.Context, desired []application.Spec) er
 			"applications", held)
 		return nil
 	}
-	l.recordPruneHeld(nil)
 
 	names := make([]string, 0, len(desired))
 	for _, spec := range desired {
 		names = append(names, spec.Name)
 	}
+
+	// A sweep against an empty set removes every application this controller
+	// installed, so it waits for a second pass that loads one too. One empty
+	// read is what a force-push that briefly showed `[]` looks like, and what an
+	// upgrade onto a `[]` committed while it was still refused looks like.
+	if len(desired) == 0 && !confirmed {
+		departing, err := l.pruner.Departing(ctx, names, declared(views))
+		if err != nil {
+			return fmt.Errorf("pruning departed applications: %w", err)
+		}
+		l.recordPruneHeld(departing)
+		l.log.Warn("prune held: the app set declares no applications, so what this controller installed is removed only if the next pass loads an empty set too",
+			"applications", departing)
+		return nil
+	}
+	l.recordPruneHeld(nil)
 
 	pruned, err := l.pruner.Departed(ctx, names, declared(views))
 	l.recordPruned(pruned)
