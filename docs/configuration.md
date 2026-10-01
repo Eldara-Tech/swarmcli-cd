@@ -40,6 +40,13 @@ applications:
 Unknown keys are an error. A misspelled key that was quietly ignored would leave
 a setting you believe you configured silently doing nothing.
 
+`applications` is required even when it lists nothing. A set that runs no
+applications says so with `applications: []`, as the file's only document.
+Anything else that comes out empty — an empty file, a file without the key,
+`applications:` with nothing after it, a list of blank entries — is refused,
+because that is what a truncated or emptied file looks like, and loading one
+would stop every application.
+
 ### `name` (required)
 
 The application's identity. It becomes a URL path segment and the last part of
@@ -972,9 +979,9 @@ valid YAML is indistinguishable from a set you meant to shrink.
 
 In every mode the controller parses and **fully validates** before it swaps
 anything in: apiVersion, unknown keys, duplicate names, every per-application
-rule. On any failure — an unreachable repository, a missing file, malformed
-YAML, a duplicate name — the last set that validated keeps running and the
-reason is reported. The set is never partially applied.
+rule. On any failure — an unreachable repository, a missing or emptied file,
+malformed YAML, a duplicate name — the last set that validated keeps running
+and the reason is reported. The set is never partially applied.
 
 `swarmcli-cd status` is where you see it:
 
@@ -1116,6 +1123,30 @@ best-effort convenience and the log line as the real inventory.**
 
 **With prune on, removing an application from the app set is an outage, not a
 pause.** Deleting the entry to "park" something deletes the deployment.
+
+That includes the last one. Delete its entry and leave the list written down as
+empty, so the file still says what it means:
+
+```yaml
+apiVersion: v1
+applications: []
+```
+
+The controller loads it, stops reconciling the application, and with prune on
+removes its stacks, as for any application that leaves the set — but on the
+second pass that loads an empty set, not the first. The first holds the sweep
+and names what it will remove:
+
+```
+Prune held    confirming removal of edge
+```
+
+A set that is empty for one pass only, such as a force-push that briefly showed
+`[]`, therefore removes nothing, and an upgrade onto an `[]` committed while
+older controllers still refused it removes nothing until the next pass reads it
+again. The hold is kept in memory, so a restart holds once more. Emptying the
+file instead, or leaving `applications:` with nothing after it, is refused and
+the last set keeps running; see [what prune will not do](#what-prune-will-not-do).
 
 #### Renaming an application
 
@@ -1362,9 +1393,11 @@ a swarm over a transient failure:
   running and no departure is inferred from a file nobody could read;
 - a pass whose apply failed prunes nothing, because the running state is not yet
   the declared one;
-- an app set that declares **no applications at all** prunes nothing. An empty
-  set and a truncated one are indistinguishable from here. To remove every
-  application, remove them one commit at a time.
+- an app set that does not say what it declares prunes nothing: an empty file, a
+  file without the `applications` key, a null or blank list are refused at load,
+  because a truncated file looks exactly like them. To remove every
+  application, write `applications: []` as the file's only document — that is
+  not ambiguous, so it loads, and is swept once a second pass has loaded it too.
 
 A controller that has never successfully loaded a set therefore prunes nothing,
 indefinitely — which is the correct reading of "I have no idea what should be

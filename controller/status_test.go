@@ -105,6 +105,23 @@ func TestStatusReportsWhatIsHoldingPrune(t *testing.T) {
 	}
 }
 
+// The empty set's one-pass hold names what the next pass would remove, and says
+// so rather than reading as an application that has not reconciled.
+func TestStatusReportsAnEmptySetHoldAsAConfirmation(t *testing.T) {
+	s := healthyStatus()
+	s.AppSet.PruneHeldBy = []string{"core", "edge"}
+	s.Applications = 0
+	server := startStatus(t, s)
+
+	code, stdout, stderr := cli(t, server, "status")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "confirming removal of core, edge") || strings.Contains(stdout, "waiting for") {
+		t.Errorf("stdout = %q, want the hold reported as a confirmation", stdout)
+	}
+}
+
 // A stale app set is a state, not a failure of the command: the controller
 // answered. `healthcheck` is the one command whose exit code is a verdict.
 func TestStatusExitsZeroWhenTheAppSetIsStale(t *testing.T) {

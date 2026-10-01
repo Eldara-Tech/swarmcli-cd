@@ -119,7 +119,14 @@ func renderStatus(out io.Writer, s application.ControllerStatus) {
 	// startup and a problem if it persists, and the line reads the same either
 	// way — which is the point. Without it, "prune is enabled and nothing has
 	// been pruned" has no visible explanation at all.
+	//
+	// With no applications in the set nothing is left to reconcile, so a held
+	// sweep is one against the empty set and the names are what it will remove.
 	if len(s.AppSet.PruneHeldBy) > 0 {
-		row("Prune held", "waiting for "+strings.Join(s.AppSet.PruneHeldBy, ", "))
+		reason := "waiting for "
+		if s.Applications == 0 {
+			reason = "confirming removal of "
+		}
+		row("Prune held", reason+strings.Join(s.AppSet.PruneHeldBy, ", "))
 	}
 }

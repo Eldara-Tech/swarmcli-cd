@@ -60,8 +60,8 @@ const renamedApp = `applications:
       releaseFile: releases/edge.yaml
 `
 
-// invalidSets are the four ways a commit breaks the set, one per rule the
-// loader is required to enforce before swapping anything in.
+// invalidSets are the ways a commit breaks the set, one per rule the loader is
+// required to enforce before swapping anything in.
 var invalidSets = map[string]string{
 	"unknown key": `applications:
   - name: edge
@@ -85,9 +85,13 @@ var invalidSets = map[string]string{
       revision: main
       releaseFile: releases/edge.yaml
 `,
-	// An operator removing the last application. It is a validation error, so
-	// the running set is kept rather than every application being stopped.
-	"no applications": "applications: []\n",
+	// A file emptied, or cut short of its list, without saying so — what a
+	// truncation looks like. Each is a validation error, so the running set is
+	// kept rather than every application being stopped; `applications: []` is
+	// how to declare none.
+	"file emptied":          "",
+	"applications key lost": "apiVersion: v1\n",
+	"applications null":     "applications:\n",
 }
 
 // mode is one source implementation under test: a loader, and the ability to
@@ -278,6 +282,31 @@ func TestLoadPicksUpANewSet(t *testing.T) {
 			}
 			if m.loader.Current() != file {
 				t.Error("Current did not swap to the set Load returned")
+			}
+		})
+	}
+}
+
+// An explicitly empty set is a set: it loads and swaps in, in both modes, so the
+// last application can be removed by a commit.
+func TestAnExplicitlyEmptySetLoads(t *testing.T) {
+	for name, newMode := range modes(oneApp) {
+		t.Run(name, func(t *testing.T) {
+			m := newMode(t)
+			if _, _, err := m.loader.Load(context.Background()); err != nil {
+				t.Fatalf("Load = %v, want nil", err)
+			}
+
+			m.publish("applications: []\n")
+			file, changed, err := m.loader.Load(context.Background())
+			if err != nil {
+				t.Fatalf("Load = %v, want nil", err)
+			}
+			if !changed || len(file.Applications) != 0 {
+				t.Errorf("changed=%v, applications=%v, want an empty set swapped in", changed, names(t, file.Applications))
+			}
+			if m.loader.Current() != file {
+				t.Error("Current did not swap to the empty set")
 			}
 		})
 	}
@@ -491,6 +520,9 @@ func TestPathTornReadKeepsTheLastGood(t *testing.T) {
 	for name, torn := range map[string]string{
 		"emptied by the truncate": "",
 		"half a line":             "applications:\n  - name: edge\n    source:\n      repoURL: https://example.com/infra.git\n      revis",
+		// Valid YAML whose one entry is blank, which the decoder drops: it must
+		// not read as `applications: []`.
+		"cut after the dash": "applications:\n  - ",
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := pathMode(t, oneApp)

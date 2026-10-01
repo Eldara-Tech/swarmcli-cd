@@ -323,7 +323,13 @@ func TestValidationErrors(t *testing.T) {
 
 	for name, tc := range map[string]struct{ src, want string }{
 		"empty file":         {"", "no applications"},
-		"no applications":    {"applications: []\n", "no applications"},
+		"only a comment":     {"# applications: []\n", "no applications"},
+		"missing key":        {"apiVersion: v1\n", "no applications"},
+		"null applications":  {"applications:\n", "no applications"},
+		"explicit null":      {"applications: null\n", "no applications"},
+		"null entry":         {"applications: [~]\n", "no applications"},
+		"cut at a dash":      {"applications:\n  - \n", "no applications"},
+		"empty, then a set":  {"applications: []\n---\n" + base("      releaseFile: r.yaml\n"), "no applications"},
 		"bad apiVersion":     {"apiVersion: v2\napplications: []\n", "apiVersion"},
 		"missing name":       {"applications:\n  - source:\n      repoURL: https://x/y.git\n      revision: main\n      releaseFile: r.yaml\n", "name is required"},
 		"bad name":           {"applications:\n  - name: Edge Prod\n    source:\n      repoURL: https://x/y.git\n      revision: main\n      releaseFile: r.yaml\n", "invalid name"},
@@ -368,6 +374,30 @@ func TestValidationErrors(t *testing.T) {
 				t.Errorf("error %q does not name the file", err)
 			}
 		})
+	}
+}
+
+// The one way to declare no applications is to say so. A file that is empty,
+// lost its applications key or left the list null is what a truncation looks
+// like, and those stay refused; an explicit empty list is not ambiguous.
+func TestAnExplicitlyEmptySetIsAccepted(t *testing.T) {
+	for _, src := range []string{"applications: []\n", "apiVersion: v1\napplications: []\n", "---\n# decommissioned\napplications: [ ]\n"} {
+		f, err := Parse([]byte(src), "applications.yaml")
+		if err != nil {
+			t.Fatalf("Parse(%q) = %v, want nil", src, err)
+		}
+		if len(f.Applications) != 0 {
+			t.Errorf("Parse(%q) applications = %+v, want none", src, f.Applications)
+		}
+	}
+}
+
+// The refusal names the way out, since removing the last application is the
+// usual way to meet it.
+func TestAnUndeclaredSetSaysHowToDeclareNone(t *testing.T) {
+	_, err := Parse([]byte("applications:\n"), "applications.yaml")
+	if err == nil || !strings.Contains(err.Error(), "applications: []") {
+		t.Errorf("Parse = %v, want an error naming 'applications: []'", err)
 	}
 }
 

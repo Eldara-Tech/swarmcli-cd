@@ -254,7 +254,9 @@ swarmcli-cd status -o json | jq -e '.appSet.stale == false' >/dev/null \
   || echo "swarmcli-cd: the running app set is stale"
 
 # Nothing has ever loaded — a permanently wrong --appset-repo looks like this.
-swarmcli-cd status -o json | jq -e '.applications > 0' >/dev/null \
+# So does a set none of whose applications would start. A set emptied on
+# purpose (`applications: []`) loaded with no error, so it passes.
+swarmcli-cd status -o json | jq -e '.applications > 0 or ((.appSet.error // "") == "" and (.appSet.loadedAt | startswith("0001-") | not))' >/dev/null \
   || echo "swarmcli-cd: no applications are being reconciled"
 ```
 

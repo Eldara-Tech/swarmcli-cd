@@ -107,6 +107,13 @@ func Parse(data []byte, path string) (*File, error) {
 	if err := dec.Decode(&f); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	// The decoder drops a null entry, so a list of blank entries — `[~]`, or
+	// one cut off after its first dash — comes out as empty as `[]`, and it
+	// reads only the first document. Neither is a declaration of none, so an
+	// empty list is kept only when declaresNone says the file is one.
+	if f.Applications != nil && len(f.Applications) == 0 && !declaresNone(data) {
+		f.Applications = nil
+	}
 
 	f.Path = path
 	f.applyDefaults()
@@ -114,6 +121,19 @@ func Parse(data []byte, path string) (*File, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &f, nil
+}
+
+// declaresNone reports whether data, which has already decoded to an empty list
+// of applications, is a single document whose list has no entries at all.
+func declaresNone(data []byte) bool {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var doc struct {
+		Applications yaml.Node `yaml:"applications"`
+	}
+	if err := dec.Decode(&doc); err != nil || len(doc.Applications.Content) != 0 {
+		return false
+	}
+	return errors.Is(dec.Decode(&yaml.Node{}), io.EOF)
 }
 
 func (f *File) applyDefaults() {
@@ -154,8 +174,13 @@ func (f *File) validate() error {
 	if f.APIVersion != "" && f.APIVersion != "v1" {
 		return fmt.Errorf("unsupported apiVersion '%s', want v1", f.APIVersion)
 	}
-	if len(f.Applications) == 0 {
-		return errors.New("no applications declared")
+	// Nil, not empty. An empty file, one with no applications key and one whose
+	// list is null all leave the slice nil, and they are what a truncated or
+	// emptied file looks like — loading one would stop every application, and
+	// with prune delete them. `applications: []` decodes to an empty slice and
+	// says "none" on purpose, so it loads.
+	if f.Applications == nil {
+		return errors.New("no applications declared; write 'applications: []' to run none")
 	}
 
 	seen := make(map[string]bool, len(f.Applications))

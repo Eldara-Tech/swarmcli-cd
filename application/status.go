@@ -85,10 +85,14 @@ type AppSetStatus struct {
 	// process's own deletions, not an audit log.
 	Pruned []string `json:"pruned,omitempty"`
 
-	// PruneHeldBy names the applications that have not reconciled yet and are
-	// therefore holding the sweep back. Empty whenever prune is disabled, and
-	// on any controller whose applications have all planned at least once —
-	// which after a settled startup is every controller.
+	// PruneHeldBy names the applications the sweep is holding for. Usually they
+	// have not reconciled yet. With Applications at zero the set is empty, and
+	// they are what the sweep will remove: a sweep against an empty set waits
+	// for a second pass that loads one too, so a set that is empty only briefly,
+	// or one already committed when the controller is upgraded, removes nothing
+	// before it has been read twice. Empty whenever prune is disabled, and on
+	// any controller whose applications have all planned at least once — which
+	// after a settled startup is every controller.
 	//
 	// The sweep deletes what no application declares, so it cannot run while an
 	// application has not said what it declares; it would read that silence as
