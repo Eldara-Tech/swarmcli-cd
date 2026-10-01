@@ -58,8 +58,8 @@ var errStillSyncing = errors.New("still syncing")
 // successor. Remove documented a guarantee that spanned all four and waited on
 // one of them.
 //
-// Every field except name, ctx, cancel and the lease channels is guarded by
-// Reconciler.mu.
+// Every field except name, ctx, cancel, the lease channels and the revision
+// cache is guarded by Reconciler.mu; the cache is guarded by the lease.
 type appEntry struct {
 	// name is the application this entry is, fixed for its whole life: a
 	// Replace keys on the name and cannot change it, and a change of name is a
@@ -140,11 +140,13 @@ type appEntry struct {
 	// revisions is the revision each release on the swarm was at when record
 	// last read the release records, so that a pass with nothing to move one
 	// reuses it rather than listing the whole swarm again. Nil until the first
-	// read, after a read that failed, and from the moment an apply starts.
+	// read, after a read that failed, from the moment an apply starts, and when
+	// the destination moves off revisionsSwarm, the swarm it was read from.
 	//
 	// Guarded by the lease rather than by Reconciler.mu: only the lease holder
 	// reconciles, and the read it caches is made outside the lock.
-	revisions map[string]int
+	revisions      map[string]int
+	revisionsSwarm string
 
 	// done is closed when this application's loop goroutine has returned. It is
 	// nil until the loop is started — before Run, or for an application added to

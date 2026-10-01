@@ -1878,6 +1878,11 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	if err != nil {
 		return fmt.Errorf("resolving destination: %w", err)
 	}
+	// The cached revisions are one swarm's records, and a Replace may have moved
+	// the destination since they were read.
+	if e.revisionsSwarm != spec.Destination.Swarm {
+		e.revisions, e.revisionsSwarm = nil, spec.Destination.Swarm
+	}
 	backend = withRegistryAuth(backend, r.registryAuth(spec.Name))
 	backend = withForbiddenSecrets(backend, r.forbidden)
 	backend = withAllowedReferences(backend, spec.Allow)
@@ -3031,6 +3036,7 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 	r.mu.RLock()
 	present := r.currentLocked(e)
 	sync.LastSync = e.status.Sync.LastSync
+	last := e.plan
 	r.mu.RUnlock()
 	if !present {
 		return
@@ -3060,7 +3066,7 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 		r.log.Warn("reading the swarm failed; publishing this application's releases as unread",
 			"application", e.name, "error", readErr)
 	}
-	if e.revisions == nil || sync.Summary.Install+sync.Summary.Upgrade > 0 {
+	if e.revisions == nil || deployedMoved(last, plan) {
 		e.revisions = r.currentRevisions(ctx, e.name, engine)
 	}
 
@@ -3124,10 +3130,11 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 // name: the newest its history records, which is the top row History serves.
 //
 // One read answers every release, rather than a History each, and record makes it
-// only when a revision can have moved — the first pass, after an apply, and on a
-// pass whose plan is not in sync — because it lists every release record on the
-// swarm, as the plan has just done. Records that cannot be read leave every
-// revision at 0 and fail nothing, as an unread stack does not.
+// only when a revision can have moved — the first pass, after an apply, after a
+// change of swarm, and when the deployed side of the plan has moved — because it
+// lists every release record on the swarm, as the plan has just done. Records
+// that cannot be read leave every revision at 0 and fail nothing, as an unread
+// stack does not.
 func (r *Reconciler) currentRevisions(ctx context.Context, app string, engine Engine) map[string]int {
 	lister, ok := engine.(releaseLister)
 	if !ok {
@@ -3144,6 +3151,28 @@ func (r *Reconciler) currentRevisions(ctx context.Context, app string, engine En
 		out[rel.Name] = rel.Revision
 	}
 	return out
+}
+
+// deployedMoved reports whether the deployed side of plan differs from last's: a
+// release last did not plan, or one whose action, deployed version or deployed
+// manifest has changed. What the repository asks for is the other side, and
+// moving it moves no revision; an application held out of sync therefore reads
+// the records once rather than on every pass.
+func deployedMoved(last, plan *charts.Plan) bool {
+	if last == nil {
+		return true
+	}
+	was := make(map[string]charts.ReleasePlan, len(last.Releases))
+	for _, rp := range last.Releases {
+		was[rp.Name] = rp
+	}
+	for _, rp := range plan.Releases {
+		prev, ok := was[rp.Name]
+		if !ok || prev.Action != rp.Action || prev.FromVersion != rp.FromVersion || prev.CurrentManifest != rp.CurrentManifest {
+			return true
+		}
+	}
+	return false
 }
 
 // driftState reports the live-drift state last observed for an application.

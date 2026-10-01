@@ -269,9 +269,11 @@ here rather than "none" — the engine rejects a release file declaring none.
 A release's `revision` is the chart engine's revision number, the newest row of
 its [history](#history--get-apiv1applicationsapphistory): 0 when it has never
 been installed, or when the release records could not be read. It is read on the
-first pass after the controller starts, after every apply, and on any pass whose
-plan is not in sync, and reused in between, so an upgrade made outside this
-controller that leaves the manifest unchanged shows here on the next change.
+first pass after the controller starts, after every apply, when the destination
+moves to another swarm, and when what the plan found deployed has changed — a
+release's action, deployed version or deployed manifest — and reused in between,
+so an upgrade made outside this controller that leaves the manifest unchanged
+shows here on the next change.
 
 ### Diff — `GET /api/v1/applications/{app}/diff`
 
