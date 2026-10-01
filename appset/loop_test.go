@@ -839,6 +839,41 @@ func TestPrunedApplicationLeavesOrphanedAndJoinsPruned(t *testing.T) {
 	}
 }
 
+// Removing the last application. A list left null is refused like any other
+// truncation and changes nothing; `applications: []` removes every application
+// and sweeps against an empty desired set.
+func TestAnExplicitlyEmptySetRemovesAndPrunesEveryApplication(t *testing.T) {
+	p := &fakePruner{returns: []string{"core", "edge"}}
+	loop, rec, publish := newPruningLoop(t, twoApps, p,
+		spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+
+	publish("applications:\n")
+	if err := loop.Once(t.Context()); err == nil {
+		t.Fatal("Once = nil, want the load failure")
+	}
+	if len(rec.removes()) != 0 || p.called() != 0 {
+		t.Fatalf("removed %v and swept %d times after a refused set, want neither", rec.removes(), p.called())
+	}
+
+	publish("applications: []\n")
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want nil", err)
+	}
+	if got := rec.names(); len(got) != 0 {
+		t.Errorf("running = %v, want none", got)
+	}
+	if p.called() != 1 || len(p.lastDesired()) != 0 {
+		t.Errorf("swept %d times against %v, want once against nothing", p.called(), p.lastDesired())
+	}
+	got := loop.Status().AppSet
+	if want := []string{"core", "edge"}; !slices.Equal(got.Pruned, want) {
+		t.Errorf("pruned = %v, want %v", got.Pruned, want)
+	}
+	if got.Error != "" || got.Stale {
+		t.Errorf("error = %q, stale = %v, want a clean pass", got.Error, got.Stale)
+	}
+}
+
 // The D-e default: with no pruner the departure is reported and the stack is
 // left running.
 func TestWithoutAPrunerOrphansAreOnlyReported(t *testing.T) {

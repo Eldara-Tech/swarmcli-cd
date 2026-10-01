@@ -57,6 +57,23 @@ applications:
 	}
 }
 
+// An explicitly empty set is valid, so the pre-commit check passes the commit
+// that removes the last application.
+func TestValidateAcceptsAnExplicitlyEmptySet(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "applications.yaml")
+	if err := os.WriteFile(file, []byte("applications: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"validate", "--file", file}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run(validate) = %d, want 0 (stderr: %q)", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "(0 applications)") {
+		t.Errorf("stdout = %q, want the application count", stdout.String())
+	}
+}
+
 func TestValidateFailure(t *testing.T) {
 	const broken = `
 applications:

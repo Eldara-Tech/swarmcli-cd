@@ -275,17 +275,26 @@ func TestOnlyTheStillDeclaredReleaseOfADepartedApplicationSurvives(t *testing.T)
 	}
 }
 
-// The guard that stops a controller from emptying a swarm because the app set
-// momentarily parsed to nothing.
-func TestEmptyDesiredSetPrunesNothing(t *testing.T) {
-	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+// An empty desired set is a set that declared `applications: []` — config
+// refuses every other way of declaring none, and the loop sweeps only behind a
+// load that succeeded — so every departed application goes, and nothing that was
+// never this controller's does.
+func TestAnEmptyDesiredSetPrunesEveryDepartedApplication(t *testing.T) {
+	e := &fakeEngine{releases: []charts.Release{
+		owned("api", "gone"),
+		owned("web", "last"),
+		stamped("cli", "apply/prod:release/cli"),
+	}}
 
-	got, err := testPruner(t, e, false).Departed(t.Context(), nil, nil)
+	got, err := testPruner(t, e, false).Departed(t.Context(), []string{}, nil)
 	if err != nil {
 		t.Fatalf("Departed = %v, want nil", err)
 	}
-	if len(got) != 0 || len(e.calls) != 0 {
-		t.Errorf("pruned %v / uninstalled %v, want nothing on an empty desired set", got, e.pruned())
+	if want := []string{"gone", "last"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("pruned applications = %v, want %v", got, want)
+	}
+	if want := []string{"api", "web"}; !reflect.DeepEqual(e.pruned(), want) {
+		t.Errorf("uninstalled releases = %v, want %v", e.pruned(), want)
 	}
 }
 

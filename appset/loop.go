@@ -256,7 +256,9 @@ func (l *Loop) Once(ctx context.Context) (err error) {
 // Two of the three guards against a controller mistaking a broken app set for
 // an empty one are in where this is called from: a pass that failed to load
 // returns before reaching it, and a pass whose apply failed skips it. The third
-// is the pruner's own refusal to act on a set that declares no applications.
+// is config's: a set declares no applications only by writing
+// `applications: []`, and an empty file, a missing key or a null list is a
+// failed load.
 //
 // The fourth guard is here, and it is about a different mistake: an application
 // that has joined the set but not yet reconciled has not told the controller

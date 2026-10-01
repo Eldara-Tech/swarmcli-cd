@@ -583,7 +583,10 @@ func New(o Options) *Pruner {
 // desired must be an app set that has actually loaded. The caller vouches for
 // that: this cannot tell "the set declares nothing" apart from "the set could
 // not be read", and the two want opposite things done. See appset.Loop, which
-// only calls this after a load and an apply have both succeeded.
+// only calls this after a load and an apply have both succeeded. An empty one
+// is therefore a set that declared `applications: []` — config refuses every
+// other way of declaring none, because a truncated file looks like them — and
+// every departed application is swept.
 //
 // declared names the releases the applications still in the set hold, and no
 // release named in it is ever deleted whatever its stamp says. That is what
@@ -600,16 +603,6 @@ func New(o Options) *Pruner {
 // rediscovers whatever is still stamped on the swarm, a failure costs a
 // reconcile interval rather than an orphan nobody looks at again.
 func (p *Pruner) Departed(ctx context.Context, desired, declared []string) ([]string, error) {
-	// An app set that declares nothing is indistinguishable from one somebody
-	// truncated, and acting on it would delete every managed stack on the
-	// swarm. Refusing costs the ability to empty the set in one commit, which
-	// an operator can still do one application at a time.
-	if len(desired) == 0 {
-		p.log.Warn("the app set declares no applications; pruning nothing, " +
-			"because an empty set and a truncated one look the same from here")
-		return nil, nil
-	}
-
 	backend, err := p.swarms.Backend(ctx, swarms.Target{})
 	if err != nil {
 		return nil, fmt.Errorf("resolving the local swarm: %w", err)

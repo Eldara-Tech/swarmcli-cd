@@ -209,6 +209,24 @@ func TestServeCreatesSeparateCloneAndChartDirectories(t *testing.T) {
 	}
 }
 
+// A static set that declares no applications on purpose starts a controller
+// reconciling none, rather than refusing to start.
+func TestServeStartsWithAnExplicitlyEmptyStaticSet(t *testing.T) {
+	swapAuthorizer(t, readyAuthorizer{})
+	path := filepath.Join(t.TempDir(), "applications.yaml")
+	if err := os.WriteFile(path, []byte("applications: []\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Already cancelled, as above: as far as this can go without a daemon.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := serve(ctx, staticOptions(path, t.TempDir()), discardLog()); err != nil {
+		t.Fatalf("serve = %v, want nil", err)
+	}
+}
+
 // Which selector was given decides the mode; nothing states it twice.
 func TestAppSetModeFollowsTheSelectors(t *testing.T) {
 	for _, tc := range []struct {
@@ -826,8 +844,8 @@ func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 // writeOfflineConfig is writeConfig for a test that lets the controller run
 // rather than cancelling it at once: the source is a path on this machine, so
 // the reconcile that fires at startup fails locally and instantly instead of
-// reaching for a repository on the internet. A set with no applications is not
-// the alternative — the static loader refuses one.
+// reaching for a repository on the internet. A set declaring `applications: []`
+// would also reach nothing, but it would reconcile nothing either.
 func writeOfflineConfig(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -928,8 +946,10 @@ func TestTheListenerIsDrainedBeforeTheReconcilerStops(t *testing.T) {
 				Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 			})
 
+			// A set the loader refuses, so the loop leaves the reconciler's one
+			// application running: `applications: []` would remove it.
 			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, defaultAppSetFile), []byte("applications: []\n"), 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, defaultAppSetFile), []byte(""), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			loop := appset.NewLoop(appset.NewPath(appset.PathConfig{Dir: dir, Path: defaultAppSetFile}), rec,
