@@ -38,6 +38,11 @@ import (
 // iteration.
 var _ charts.Backend = (*Backend)(nil)
 
+// The chart engine checks for this one itself, by the same silent type assertion:
+// without it, a stack whose services carry com.swarmcli.rollout: sequential (the
+// mariadb-galera chart's peers do) is deployed all at once instead of one at a time.
+var _ charts.OmittedServicesPreserver = (*Backend)(nil)
+
 // And every optional capability its callers look for, asserted here rather than
 // discovered at run time.
 //
@@ -1535,6 +1540,13 @@ func (b *Backend) releaseConfigNames(ctx context.Context) (map[string]struct{}, 
 	}
 	return out, nil
 }
+
+// PreservesOmittedServices reports true: DeployStack creates and updates what the
+// manifest declares and removes nothing it leaves out (see ApplyServices). Deleting
+// a service is the reconciler's sweep, which goes by the release's whole declared
+// manifest and this controller's revision records, so the partial manifests a
+// sequential rollout deploys never make it remove the services held back.
+func (b *Backend) PreservesOmittedServices() bool { return true }
 
 // DeployStack converges the swarm to a rendered manifest.
 //
