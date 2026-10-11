@@ -121,6 +121,18 @@ SWARMCLI_CD_ADMIN_TOKEN=x ./swarmcli-cd controller --config applications.yaml &
 curl -s localhost:8080/ | grep -q 'id="root"' || echo "this archive has no UI"
 ```
 
+Or statically, without starting anything. The "built without its web UI" text is
+compiled into **every** binary, a good one included, so finding it proves
+nothing; what only a built bundle contains is Vite's hashed entry chunk. This
+must print a name:
+
+```bash
+LC_ALL=C grep -a -o 'assets/index-[A-Za-z0-9_-]*\.js' swarmcli-cd | sort -u
+```
+
+`-a` matters: without it grep handles the file as binary and never prints the
+name, so a good release reads exactly like a broken one.
+
 A binary out of an archive prints the same release **without** the leading `v`:
 GoReleaser stamps `{{.Version}}`, which is the tag with its `v` stripped, while
 the image is built with `github.ref_name` verbatim. So `swarmcli-cd version`

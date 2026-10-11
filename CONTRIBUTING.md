@@ -27,6 +27,10 @@ golangci-lint run ./...
 ./scripts/check-spdx.sh
 ```
 
+In CI, `test` needs `fmt`, `lint` and `vet`, so a red lint leaves the Go suite
+skipped rather than run — `gofmt` and `go vet` passing locally say nothing about
+`lint`.
+
 The integration tests are behind a build tag and need a Docker daemon that is a
 swarm manager. They deploy real stacks, so point them at a swarm you do not mind
 being written to:
@@ -50,6 +54,16 @@ npm --prefix web/ui run dev     # the development loop; proxies to a controller 
 `npm --prefix web/ui run lint`, `typecheck` and `test` are what CI runs beside
 the build. `./scripts/check-npm-licences.sh`, `check-npm-scripts.sh` and
 `check-node-pins.sh` are the rest of the UI's gates.
+
+The UI is built and tested on **Node 26**: the Dockerfile and every workflow pin
+it, and `check-node-pins.sh` keeps them equal. Run `npm --prefix web/ui ci`
+again after switching Node, because a tree installed under another version can
+be partial in a way that looks like a repository defect: lint, typecheck and
+test pass, and only the build fails, with
+`[postcss] ENOENT: no such file or directory, open '@fontsource/plus-jakarta-sans/latin-600.css'`.
+The `@fontsource` packages are in the lockfile; the fresh install restores
+them, so do not vendor the fonts — the bundled third-party notices and
+`check-npm-licences.sh` both read the installed tree.
 
 ## Two ways a test passes without reaching the code
 
