@@ -63,6 +63,28 @@ npm --prefix web/ui run build
 - **Push via `originToken`**, never `origin` (SSH, broken). Commit as
   `eldara-cruncher <hello@eldara.io>`, matching the other code repos.
 - `gofmt` is the only formatter; import grouping is not linted.
+- **A Go bump moves these together, in one PR:**
+  - `go.mod` — the `go` and `toolchain` lines. Every workflow takes its Go from
+    here (`setup-go` prefers `toolchain`).
+  - `Dockerfile` — `FROM golang:X.Y-alpine AS build`, the compiler of the
+    published image. Dependabot bumps it on its own; pair that PR with the
+    `go.mod` bump, or CI keeps testing a compiler the shipped binary does not
+    use. A Dockerfile-only diff tests nothing: ci.yml's `code` filter leaves
+    the Dockerfile out, so `fmt`, `lint`, `vet`, `test` and smoke.yml's `smoke`
+    are all skipped and an image that builds is the only evidence. The `go.mod`
+    bump is what makes them run.
+  - `.devcontainer/Dockerfile` — `mcr.microsoft.com/devcontainers/go:dev-X.Y`,
+    once MCR publishes that tag, which can lag the `golang` image.
+- **There is no global `box-sizing` reset**, so every box is `content-box` and a
+  rule combining `height`/`width: 100%` with padding or a border overflows its
+  parent by exactly those. A clipping parent overlaps what follows (#291's
+  cards); a scrolling one gains scroll range and mis-centres its content (the
+  terminal's empty state). #295 fixed both per rule rather than globally,
+  because a reset changes the geometry of 23 other rules — so give any new such
+  rule its own `box-sizing: border-box`. Neither test layer sees layout (jsdom
+  has none, and the Playwright suite needs a real controller), but the Chromium
+  in `web/ui/node_modules` can measure it out of tree: render the markup with
+  the built `web/dist/assets/index-*.css` and compare `getBoundingClientRect()`s.
 
 ## Logging
 
@@ -203,7 +225,7 @@ reconciler, the API — is top-level here too.
 
 ## Design constraints worth not rediscovering
 
-Both are established, with reproductions, in issue #1:
+The first two are established, with reproductions, in issue #1:
 
 - **`docker stack deploy` cannot be the applier.** Its `--prune` removes services
   only and swallows its own list error, networks are silently never updated,
@@ -214,6 +236,19 @@ Both are established, with reproductions, in issue #1:
   ServiceSpec` is lossy and one-way, so diffing against
   `docker.ReconstructStackCompose` manufactures differences that do not exist.
   That function is for human-readable display only.
+- **A wrong health verdict is usually CE's.** `health/` takes every service
+  judgement from `charts.ServiceState.Convergence()` (its package doc says why),
+  so grep CE for the operator-visible reason first — `charts/release.go` holds
+  them — find the commit that changed it, `git fetch --tags` and
+  `git tag --contains <sha>`, and compare with `go.mod`'s pin before reading
+  code here. #290 was entirely CE's swarmcli#649, already fixed in `v2.0.1`
+  while `go.mod` pinned `v2.0.0`. A fix on CE `main` that is not yet tagged can
+  be pinned as a pseudo-version (see [RELEASING.md](RELEASING.md)). The
+  regression test is a `charts.ServiceState` literal through `health.Release` —
+  no daemon — which fails at the old pin and passes at the new one. What this
+  repo does own is presentation: the UI does its own replica arithmetic from
+  the API's counts, so a CE display fix does not reach it (#290 needed a second
+  fix here, for a finished one-shot reading `0/1`).
 
 ## Open-core seams
 
