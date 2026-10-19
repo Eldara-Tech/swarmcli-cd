@@ -127,7 +127,7 @@ func TestRemoveWaitsForASyncItDidNotStart(t *testing.T) {
 	go func() { removed <- r.Remove("edge") }()
 
 	select {
-	case <-removed:
+	case _ = <-removed:
 		t.Fatal("Remove returned while a sync it did not start was still running")
 	case <-time.After(settle):
 	}
@@ -142,7 +142,7 @@ func TestRemoveWaitsForASyncItDidNotStart(t *testing.T) {
 	case <-time.After(respond):
 		t.Fatal("Remove did not return once the sync finished")
 	}
-	<-inflight
+	_ = <-inflight
 }
 
 // TestRemoveCancelsASyncItDidNotStart is the other half. Waiting is only
@@ -164,8 +164,8 @@ func TestRemoveCancelsASyncItDidNotStart(t *testing.T) {
 	case <-time.After(respond):
 		t.Fatal("Remove did not cancel the context of a sync started through the API")
 	}
-	<-inflight
-	<-removed
+	_ = <-inflight
+	_ = <-removed
 }
 
 // TestALateWriteDoesNotLandOnTheSuccessorOfItsName is the identity check.
@@ -192,8 +192,8 @@ func TestALateWriteDoesNotLandOnTheSuccessorOfItsName(t *testing.T) {
 	waitFor(t, "the name to return to the set", func() bool { return r.Add(successor) == nil })
 
 	gate.let()
-	<-departing
-	<-removed
+	_ = <-departing
+	_ = <-removed
 
 	view, ok := r.View("edge")
 	if !ok {
@@ -247,7 +247,7 @@ func TestRecordDoesNotHoldTheGlobalLockAcrossTheSwarmRead(t *testing.T) {
 	}
 
 	close(backend.release)
-	<-inflight
+	_ = <-inflight
 }
 
 // The same for the other read record makes: the release records, which fill in
@@ -280,7 +280,7 @@ func TestRecordDoesNotHoldTheGlobalLockAcrossTheReleaseRead(t *testing.T) {
 	}
 
 	close(engine.release)
-	<-inflight
+	_ = <-inflight
 }
 
 // blockingLister holds the release listing until the test lets it out.
@@ -359,8 +359,8 @@ func TestManualSyncsCollapseOntoTheOneAlreadyQueued(t *testing.T) {
 	}
 
 	gate.let()
-	<-running
-	<-queued
+	_ = <-running
+	_ = <-queued
 }
 
 // TestDrainingHoldsUntilADepartedApplicationStops is what makes the bounded wait
@@ -384,7 +384,7 @@ func TestDrainingHoldsUntilADepartedApplicationStops(t *testing.T) {
 	}
 
 	gate.let()
-	<-inflight
+	_ = <-inflight
 
 	waitFor(t, "the departed application to stop", func() bool { return len(r.Draining()) == 0 })
 }
@@ -611,7 +611,7 @@ func TestTheDaemonReadRunsUnderTheSyncsContext(t *testing.T) {
 	case <-time.After(respond):
 		t.Fatal("cancelling the sync did not reach the context the swarm read runs under")
 	}
-	<-done
+	_ = <-done
 }
 
 // ctxCapturingBackend hands back the context its swarm read was given.

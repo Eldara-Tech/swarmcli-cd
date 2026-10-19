@@ -348,5 +348,5 @@ func TestRunAuditsTheSetAndWhatJoinsIt(t *testing.T) {
 		t.Errorf("log %q, want the panic recovered and logged", logged.String())
 	}
 	cancel()
-	<-done
+	_ = <-done
 }

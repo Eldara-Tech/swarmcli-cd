@@ -456,7 +456,7 @@ func TestFetchSerialisesOneApplicationsWorkingTree(t *testing.T) {
 	}()
 
 	select {
-	case <-same:
+	case _ = <-same:
 		t.Fatal("a second Fetch for one application ran while its working tree was being rewritten")
 	case <-time.After(100 * time.Millisecond):
 	}
