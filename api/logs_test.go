@@ -419,7 +419,7 @@ func TestWithdrawingAccessEndsAnAttachedStream(t *testing.T) {
 		done <- err
 	}()
 	select {
-	case <-done:
+	case _ = <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the stream outlived the authorisation that opened it")
 	}
