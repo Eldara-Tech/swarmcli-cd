@@ -364,7 +364,10 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 	}
 	_, _ = fmt.Fprintf(out, "  Destination  %s\n", destination(view.Spec.Destination))
 	_, _ = fmt.Fprintf(out, "  Sync         %s%s\n", state(view.Status.Sync.State), revisionSuffix(view.Status.Sync.Revision))
-	_, _ = fmt.Fprintf(out, "  Health       %s (%s services)\n", state(view.Status.Health.State), services(view.Status.Health.Services))
+	if s := view.Status.Sync.Subject; s != "" {
+		_, _ = fmt.Fprintf(out, "               %s\n", s)
+	}
+	_, _ = fmt.Fprintf(out, "  Health     %s (%s services)\n", state(view.Status.Health.State), services(view.Status.Health.Services))
 	if msg := view.Status.Health.Message; msg != "" {
 		_, _ = fmt.Fprintf(out, "  Message      %s\n", msg)
 	}
@@ -374,6 +377,11 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 	if last := view.Status.Sync.LastSync; last != nil {
 		_, _ = fmt.Fprintf(out, "  Last sync    %s at %s%s\n",
 			outcome(last.Succeeded), last.FinishedAt.Format(time.RFC3339), revisionSuffix(last.Revision))
+		// Only for a commit other than the one above, whose subject is already
+		// printed: the same line twice would read as two commits.
+		if last.Subject != "" && last.Revision != view.Status.Sync.Revision {
+			_, _ = fmt.Fprintf(out, "               %s\n", last.Subject)
+		}
 		if last.Error != "" {
 			_, _ = fmt.Fprintf(out, "               %s\n", last.Error)
 		}

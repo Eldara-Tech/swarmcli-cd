@@ -89,10 +89,11 @@ func TestFetchResolvesBranchTagAndCommit(t *testing.T) {
 	for name, tc := range map[string]struct {
 		revision string
 		want     plumbing.Hash
+		subject  string
 	}{
-		"branch":      {branch.Name().Short(), second},
-		"tag":         {"v1.0.0", first},
-		"commit hash": {first.String(), first},
+		"branch":      {branch.Name().Short(), second, "add b.txt"},
+		"tag":         {"v1.0.0", first, "add a.txt"},
+		"commit hash": {first.String(), first, "add a.txt"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got, err := s.Fetch(context.Background(), "edge", f.source(tc.revision))
@@ -104,6 +105,32 @@ func TestFetchResolvesBranchTagAndCommit(t *testing.T) {
 			}
 			if len(got.Revision) != 40 {
 				t.Errorf("revision %q is not a full hash", got.Revision)
+			}
+			if got.Subject != tc.subject {
+				t.Errorf("subject %q, want the resolved commit's %q", got.Subject, tc.subject)
+			}
+		})
+	}
+}
+
+func TestSubjectIsOneSafeBoundedLine(t *testing.T) {
+	long := strings.Repeat("é", subjectMax+10)
+	for name, tc := range map[string]struct {
+		message, want string
+	}{
+		"first line only":        {"Fix the chart\n\nBecause it was broken.\n", "Fix the chart"},
+		"crlf":                   {"Fix the chart\r\nbody", "Fix the chart"},
+		"leading blank lines":    {"\n\n  Fix the chart\n", "Fix the chart"},
+		"escape sequence":        {"\x1b[2J\x1b[31mred\x1b[0m", "[2J [31mred [0m"},
+		"tab and c1":             {"a\tb\u009bc", "a b c"},
+		"empty":                  {"", ""},
+		"bounded in runes":       {long, strings.Repeat("é", subjectMax-1) + "…"},
+		"exactly at the bound":   {long[:subjectMax*2], long[:subjectMax*2]},
+		"invalid utf-8 replaced": {"bad \xff byte", "bad � byte"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := subject(tc.message); got != tc.want {
+				t.Errorf("subject(%q) = %q, want %q", tc.message, got, tc.want)
 			}
 		})
 	}

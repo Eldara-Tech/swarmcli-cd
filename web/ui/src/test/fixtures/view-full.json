@@ -60,6 +60,7 @@
     "sync": {
       "state": "out-of-sync",
       "revision": "revision",
+      "subject": "subject",
       "summary": {
         "install": 1,
         "upgrade": 1,
@@ -68,6 +69,7 @@
       },
       "lastSync": {
         "revision": "revision",
+        "subject": "subject",
         "startedAt": "2026-07-22T09:41:10Z",
         "finishedAt": "2026-07-22T09:41:10Z",
         "succeeded": true,

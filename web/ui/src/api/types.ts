@@ -167,6 +167,8 @@ export interface Sync {
   state: SyncState
   /** The resolved SHA the assessment was made against, never a branch name. */
   revision?: string
+  /** The first line of that commit's message, made safe to print. */
+  subject?: string
   summary: SyncSummary
   lastSync?: SyncResult
 }
@@ -185,6 +187,8 @@ export interface SyncSummary {
 
 export interface SyncResult {
   revision: string
+  /** The first line of that commit's message, made safe to print. */
+  subject?: string
   startedAt: Timestamp
   finishedAt: Timestamp
   succeeded: boolean
