@@ -86,6 +86,7 @@ describe('the fleet overview', () => {
     await openOverview()
 
     expect(screen.getByText('all systems nominal')).toBeDefined()
+    expect(document.title).toBe('Overview · SwarmCLI CD')
     // The numbers, not the labels. Asserting "In sync" and "Healthy" asserted
     // two string literals in the JSX: both counters could render a hard-coded 0
     // and this suite stayed green.

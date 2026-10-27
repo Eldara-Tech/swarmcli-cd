@@ -105,6 +105,7 @@ describe('the monitor', () => {
     // Not "waiting": a converged controller raises nothing, so a terminal that
     // implied something was pending read as a broken screen (#292).
     expect(screen.getByText(/No controller events/)).toBeDefined()
+    expect(document.title).toBe('Monitor · SwarmCLI CD')
 
     await deliver(() => {
       stream.push({

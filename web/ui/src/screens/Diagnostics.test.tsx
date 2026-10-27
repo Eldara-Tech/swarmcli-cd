@@ -103,6 +103,7 @@ describe('the diagnostics screen', () => {
     await openDiagnostics()
 
     expect(screen.getByLabelText('Integrity score 50 out of 100')).toBeDefined()
+    expect(document.title).toBe('Diagnostics · SwarmCLI CD')
     expect(screen.getByRole('heading', { name: 'ingress', level: 3 })).toBeDefined()
     expect(screen.getByText('Health is degraded')).toBeDefined()
     expect(screen.getByText('swarm-mgr-1')).toBeDefined()

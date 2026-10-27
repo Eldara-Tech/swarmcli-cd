@@ -11,6 +11,7 @@ import type { ApplicationList } from '../api/types'
 import { ServiceLogViewer } from '../components/ServiceLogViewer'
 import { Empty } from '../components/StateBlock'
 import { TerminalStream } from '../components/TerminalStream'
+import { PageTitle } from '../components/PageTitle'
 import { useLive } from '../live'
 
 /**
@@ -57,6 +58,7 @@ export function Monitor() {
 
   return (
     <section className="screen monitor-screen">
+      <PageTitle page="Monitor" />
       <header className="screen-header">
         <div>
           <h1>Monitor</h1>

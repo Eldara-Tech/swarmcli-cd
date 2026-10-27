@@ -67,6 +67,7 @@ describe('the three app-set failure shapes', () => {
     render(<App />)
 
     expect(await screen.findByText('The running application set is stale')).toBeDefined()
+    expect(document.title).toBe('Controller · SwarmCLI CD')
     expect(notice().className).toContain('notice-stale')
     expect(within(notice()).getByText(/duplicate application name/)).toBeDefined()
   })

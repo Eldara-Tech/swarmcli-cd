@@ -117,6 +117,7 @@ describe('the header', () => {
     render(<App />)
 
     const title = await screen.findByRole('heading', { name: 'edge', level: 1 })
+    expect(document.title).toBe('edge · SwarmCLI CD')
     const header = within(ancestor(title, 'header'))
     expect(header.getByText('out-of-sync')).toBeDefined()
     expect(header.getByText('degraded')).toBeDefined()

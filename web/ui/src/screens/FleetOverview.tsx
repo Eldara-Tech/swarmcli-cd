@@ -11,6 +11,7 @@ import type { ApplicationList, ControllerStatus, View } from '../api/types'
 import { StatCard } from '../components/StatCard'
 import { ErrorState, Loading } from '../components/StateBlock'
 import { TerminalStream } from '../components/TerminalStream'
+import { PageTitle } from '../components/PageTitle'
 import { isUnset, formatInstant, serviceCounts } from '../format'
 import { useLive } from '../live'
 
@@ -56,6 +57,7 @@ export function FleetOverview() {
 
   return (
     <section className="screen">
+      <PageTitle page="Overview" />
       <header className="screen-header">
         <h1>Overview</h1>
         <p className="header-chips">
