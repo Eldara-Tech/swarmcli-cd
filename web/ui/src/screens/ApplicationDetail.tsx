@@ -294,6 +294,9 @@ export function ApplicationOverview() {
                     ) : (
                       <code title={status.sync.revision}>{shortRevision(status.sync.revision)}</code>
                     )}
+                    {status.sync.subject !== undefined && status.sync.subject !== '' && (
+                      <div className="muted">{status.sync.subject}</div>
+                    )}
                   </dd>
                 </div>
               </dl>
@@ -335,6 +338,14 @@ export function ApplicationOverview() {
                         {status.sync.lastSync.succeeded ? 'succeeded' : 'failed'} at{' '}
                         <Instant at={status.sync.lastSync.finishedAt} />{' '}
                         <code title={status.sync.lastSync.revision}>{shortRevision(status.sync.lastSync.revision)}</code>
+                        {/* Only for a commit other than the Revision card's, which
+                            already names it: the same line twice reads as two
+                            commits. Mirrors `app get`. */}
+                        {status.sync.lastSync.subject !== undefined &&
+                          status.sync.lastSync.subject !== '' &&
+                          status.sync.lastSync.revision !== status.sync.revision && (
+                            <div className="muted">{status.sync.lastSync.subject}</div>
+                          )}
                         {status.sync.lastSync.error !== undefined && status.sync.lastSync.error !== '' && (
                           <span className="error wrap"> {status.sync.lastSync.error}</span>
                         )}

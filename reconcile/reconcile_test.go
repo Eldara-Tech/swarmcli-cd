@@ -35,9 +35,13 @@ import (
 
 // ---------------------------------------------------------------- fakes
 
+// fetchedSubject is the commit subject newTest's default fetcher reports.
+const fetchedSubject = "Bump whoami to 0.1.8"
+
 type fakeFetcher struct {
 	mu       sync.Mutex
 	revision string
+	subject  string
 	err      error
 	calls    int
 }
@@ -49,7 +53,7 @@ func (f *fakeFetcher) Fetch(_ context.Context, app string, _ application.Source)
 	if f.err != nil {
 		return git.Checkout{}, f.err
 	}
-	return git.Checkout{Dir: "/tmp/" + app, Revision: f.revision}, nil
+	return git.Checkout{Dir: "/tmp/" + app, Revision: f.revision, Subject: f.subject}, nil
 }
 
 func (f *fakeFetcher) count() int {
@@ -330,7 +334,7 @@ func newTest(t *testing.T, apps []application.Spec, engine Engine, fetcher Fetch
 func newTestWith(t *testing.T, apps []application.Spec, engine Engine, fetcher Fetcher, swarms swarms.Registry) *Reconciler {
 	t.Helper()
 	if fetcher == nil {
-		fetcher = &fakeFetcher{revision: strings.Repeat("a", 40)}
+		fetcher = &fakeFetcher{revision: strings.Repeat("a", 40), subject: fetchedSubject}
 	}
 	return New(apps, Options{
 		Fetcher:   fetcher,
@@ -361,6 +365,9 @@ func TestSyncedApplicationDeploysNothing(t *testing.T) {
 	}
 	if view.Status.Sync.Revision != strings.Repeat("a", 40) {
 		t.Errorf("revision = %q, want the fetched commit", view.Status.Sync.Revision)
+	}
+	if view.Status.Sync.Subject != fetchedSubject {
+		t.Errorf("subject = %q, want the fetched commit's", view.Status.Sync.Subject)
 	}
 }
 
@@ -436,6 +443,8 @@ func TestAutomatedApplicationAppliesAndConfirms(t *testing.T) {
 	}
 	if view.Status.Sync.LastSync == nil || !view.Status.Sync.LastSync.Succeeded {
 		t.Errorf("lastSync = %+v, want a successful result", view.Status.Sync.LastSync)
+	} else if view.Status.Sync.LastSync.Subject != fetchedSubject {
+		t.Errorf("lastSync.Subject = %q, want the deployed commit's", view.Status.Sync.LastSync.Subject)
 	}
 	want := []notify.EventType{notify.DriftDetected, notify.SyncStarted, notify.SyncSucceeded}
 	if got := rec.types(); !equal(got, want) {
@@ -550,6 +559,8 @@ func TestFailedApplyRecordsTheResultAndTheError(t *testing.T) {
 	view, _ := r.View("edge")
 	if view.Status.Sync.LastSync == nil || view.Status.Sync.LastSync.Succeeded {
 		t.Errorf("lastSync = %+v, want a failed result", view.Status.Sync.LastSync)
+	} else if view.Status.Sync.LastSync.Subject != fetchedSubject {
+		t.Errorf("lastSync.Subject = %q, want the commit that failed to deploy", view.Status.Sync.LastSync.Subject)
 	}
 	if view.Status.Error == "" {
 		t.Error("status carries no error")
@@ -2330,6 +2341,8 @@ func TestPruneFirstFailureIsReportedAsAFailedSync(t *testing.T) {
 		t.Errorf("lastSync = %+v, want a failure — none of what the repository declares was deployed", last)
 	case !strings.Contains(last.Error, "network still attached"):
 		t.Errorf("lastSync.Error = %q, want the sweep failure named", last.Error)
+	case last.Subject != fetchedSubject:
+		t.Errorf("lastSync.Subject = %q, want the commit the sweep was for", last.Subject)
 	}
 	want := []notify.EventType{notify.DriftDetected, notify.SyncStarted, notify.PruneFailed, notify.SyncFailed}
 	if got := rec.types(); !equal(got, want) {

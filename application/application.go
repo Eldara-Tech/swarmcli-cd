@@ -425,9 +425,13 @@ type Status struct {
 // what was actually deployed. When the two differ there is a newer commit that
 // has not been applied, which is a different condition from being OutOfSync,
 // and a UI shows both.
+//
+// Subject is Revision's commit subject, and LastSync.Subject its own commit's:
+// what a short SHA cannot tell an operator about either (#329).
 type Sync struct {
 	State    SyncState   `json:"state"`
 	Revision string      `json:"revision,omitempty"` // resolved SHA, never a branch name
+	Subject  string      `json:"subject,omitempty"`
 	Summary  SyncSummary `json:"summary"`
 	LastSync *SyncResult `json:"lastSync,omitempty"`
 }
@@ -454,6 +458,7 @@ type SyncSummary struct {
 // SyncResult records the outcome of the last sync that was actually attempted.
 type SyncResult struct {
 	Revision   string    `json:"revision"`
+	Subject    string    `json:"subject,omitempty"`
 	StartedAt  time.Time `json:"startedAt"`
 	FinishedAt time.Time `json:"finishedAt"`
 	Succeeded  bool      `json:"succeeded"`

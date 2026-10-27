@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode"
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -37,6 +38,9 @@ type Checkout struct {
 	// or tag it was reached through. The status records what was actually
 	// deployed, so a moving ref would make it a guess.
 	Revision string
+	// Subject is the first line of the commit's message, made safe to print;
+	// see subject.
+	Subject string
 }
 
 // Sourcer fetches repositories into a cache directory, one clone per
@@ -144,8 +148,37 @@ func (s *Sourcer) Fetch(ctx context.Context, app string, src application.Source)
 	if err := tree.Clean(&gogit.CleanOptions{Dir: true}); err != nil {
 		return Checkout{}, fmt.Errorf("cleaning working tree: %w", err)
 	}
+	// Read under the same lock as the checkout, so the subject is the
+	// revision's own and not a later fetch's.
+	commit, err := repo.CommitObject(hash)
+	if err != nil {
+		return Checkout{}, fmt.Errorf("reading commit %s: %w", hash, err)
+	}
 
-	return Checkout{Dir: dir, Revision: hash.String()}, nil
+	return Checkout{Dir: dir, Revision: hash.String(), Subject: subject(commit.Message)}, nil
+}
+
+// subjectMax bounds a subject in runes. Git's own convention is under 72; the
+// bound is for the message that ignores it, which every list row would carry.
+const subjectMax = 200
+
+// subject reduces a commit message to its first line, fit for a status.
+//
+// Anyone who can push writes this text, and `app get` prints it to a terminal,
+// so control characters — an escape sequence above all — become spaces rather
+// than reaching the operator's screen.
+func subject(message string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(message), "\n")
+	line = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, line))
+	if runes := []rune(line); len(runes) > subjectMax {
+		line = string(runes[:subjectMax-1]) + "…"
+	}
+	return line
 }
 
 // open returns the application's clone, creating it if it is absent and

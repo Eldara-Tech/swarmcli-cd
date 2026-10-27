@@ -1925,7 +1925,7 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	// would never look like a transition.
 	was := r.syncState(e)
 	wasLive := r.driftState(e)
-	r.record(ctx, e, backend, engine, plan, checkout.Revision, nil, live)
+	r.record(ctx, e, backend, engine, plan, checkout, nil, live)
 
 	// Both notifications come before the gate below, because something found and
 	// not correctable is exactly the case an operator has to be told about: the
@@ -2176,7 +2176,7 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 			// stream and a status still showing the *previous* sync's result —
 			// so the one ordering that guarantees nothing is running was also the
 			// one that reported the last time something was (#107).
-			r.failSync(ctx, e, spec, checkout.Revision, started, err)
+			r.failSync(ctx, e, spec, checkout, started, err)
 			return err
 		}
 	}
@@ -2220,6 +2220,7 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 
 	result := &application.SyncResult{
 		Revision:   checkout.Revision,
+		Subject:    checkout.Subject,
 		StartedAt:  started,
 		FinishedAt: r.now(),
 		Succeeded:  applyErr == nil,
@@ -2308,7 +2309,7 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 	// reading is cheap in the case that matters — a sweep that worked leaves no
 	// candidates, so no history is read at all.
 	afterLive, _ := r.observe(ctx, e, spec, backend, engine, after)
-	r.record(ctx, e, backend, engine, after, checkout.Revision, result, afterLive)
+	r.record(ctx, e, backend, engine, after, checkout, result, afterLive)
 	return nil
 }
 
@@ -2324,13 +2325,14 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 // A cancelled context is not a failure and gets neither event nor result, for
 // the reason apply gives: a shutdown caught mid-sweep is the controller
 // stopping, not the sweep failing.
-func (r *Reconciler) failSync(ctx context.Context, e *appEntry, spec application.Spec, revision string, started time.Time, err error) {
+func (r *Reconciler) failSync(ctx context.Context, e *appEntry, spec application.Spec, checkout git.Checkout, started time.Time, err error) {
 	if cancelled(err) {
 		return
 	}
 
 	result := &application.SyncResult{
-		Revision:   revision,
+		Revision:   checkout.Revision,
+		Subject:    checkout.Subject,
 		StartedAt:  started,
 		FinishedAt: r.now(),
 		Succeeded:  false,
@@ -2338,7 +2340,7 @@ func (r *Reconciler) failSync(ctx context.Context, e *appEntry, spec application
 	}
 	dispatch(ctx, spec, notify.Event{
 		Type:     notify.SyncFailed,
-		Revision: revision,
+		Revision: checkout.Revision,
 		At:       result.FinishedAt,
 		Message:  err.Error(),
 	})
@@ -3029,9 +3031,9 @@ func (r *Reconciler) currentSpec(e *appEntry) application.Spec {
 // none of it and kept answering, so nothing restarted the container. Reading
 // first is safe because the caller holds the application's lease: no other sync
 // for it can be writing the fields this reads.
-func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Backend, engine Engine, plan *charts.Plan, revision string, result *application.SyncResult, live map[string]*application.ReleaseDrift) {
+func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Backend, engine Engine, plan *charts.Plan, checkout git.Checkout, result *application.SyncResult, live map[string]*application.ReleaseDrift) {
 	sync, releases := drift.FromPlan(plan)
-	sync.Revision = revision
+	sync.Revision, sync.Subject = checkout.Revision, checkout.Subject
 
 	r.mu.RLock()
 	present := r.currentLocked(e)

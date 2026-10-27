@@ -140,6 +140,36 @@ func TestAppGet(t *testing.T) {
 	}
 }
 
+// Each commit is named by its subject under its SHA (#329), and a deployed
+// commit that is the assessed one is not named twice.
+func TestAppGetNamesEachCommitBySubject(t *testing.T) {
+	for name, tc := range map[string]struct {
+		deployed string
+		want     int
+	}{
+		"behind":     {"0f26181aa", 1},
+		"up to date": {"8b65cf951c7e", 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			view := syncedView()
+			view.Status.Sync.Subject = "Bump web to 0.1.1"
+			view.Status.Sync.LastSync = &application.SyncResult{Revision: tc.deployed, Subject: "Fix edge's healthcheck", Succeeded: true}
+			server := start(t, &stubReconciler{view: view})
+
+			code, stdout, stderr := cli(t, server, "app", "get", "edge")
+			if code != 0 {
+				t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+			}
+			if got := strings.Count(stdout, "\n               Bump web to 0.1.1\n"); got != 1 {
+				t.Errorf("assessed subject printed %d times, want once:\n%s", got, stdout)
+			}
+			if got := strings.Count(stdout, "Fix edge's healthcheck"); got != tc.want {
+				t.Errorf("deployed subject printed %d times, want %d:\n%s", got, tc.want, stdout)
+			}
+		})
+	}
+}
+
 // A flag after the application name is the way people actually type it, and the
 // flag package stops parsing at the first positional.
 func TestFlagsMayFollowTheApplicationName(t *testing.T) {

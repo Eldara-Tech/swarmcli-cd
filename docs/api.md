@@ -248,9 +248,9 @@ added beside it:
     {
       "spec":   { "name": "edge", "source": { ... }, "syncPolicy": { ... } },
       "status": {
-        "sync":   { "state": "out-of-sync", "revision": "9f3c1ab",
+        "sync":   { "state": "out-of-sync", "revision": "9f3c1ab", "subject": "Bump edge to 2.4",
                     "summary": { "install": 0, "upgrade": 1, "unchanged": 3 },
-                    "lastSync": { "revision": "4b7e02d", "succeeded": true, ... } },
+                    "lastSync": { "revision": "4b7e02d", "subject": "Pin traefik", "succeeded": true, ... } },
         "health": { "state": "healthy", "services": { "healthy": 7, "total": 7 } },
         "observedAt": "2026-07-22T09:41:10Z"
       }

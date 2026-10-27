@@ -103,6 +103,14 @@ is a different condition from being out-of-sync against the commit you are on,
 and a UI shows both. A manual application that has drifted, and an automated one
 mid-way between its interval ticks, are both this case.
 
+Each also carries its commit's `subject`: the first line of the message, with
+control characters turned into spaces and at most 200 characters, because anyone
+who can push writes it and `app get` prints it to a terminal. In a repository
+holding several applications, the two revisions often differ only by commits to
+the others, which the subjects make visible. Both are held in memory with the
+rest of the status: after a restart the assessed one returns on the first pass,
+and the deployed one with the next sync.
+
 ## Automated versus manual
 
 `syncPolicy.automated` is the difference between a controller that deploys for

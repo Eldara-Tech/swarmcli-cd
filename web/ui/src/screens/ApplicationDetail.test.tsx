@@ -125,6 +125,24 @@ describe('the header', () => {
     expect(screen.getByText(/succeeded at/)).toBeDefined()
   })
 
+  // #329: what a short SHA cannot say. The deployed commit is named only when it
+  // is another commit than the assessed one, which the Revision row has named.
+  it.each([
+    ['behind', '0f26181bbbbb', 1],
+    ['up to date', '0435e70aaaaa', 0],
+  ])('names each commit by its subject when %s', async (_, deployed, shown) => {
+    const view = detail()
+    view.status.sync.revision = '0435e70aaaaa'
+    view.status.sync.subject = 'Bump academy to 2.1'
+    view.status.sync.lastSync = { ...view.status.sync.lastSync!, revision: deployed, subject: 'Fix the scheduler' }
+    serve(view)
+    render(<App />)
+
+    await screen.findByRole('heading', { name: 'edge', level: 1 })
+    expect(screen.getAllByText('Bump academy to 2.1')).toHaveLength(1)
+    expect(screen.queryAllByText('Fix the scheduler')).toHaveLength(shown)
+  })
+
   it('says the whole document is stale when the last reconcile failed', async () => {
     const view = detail()
     view.status.error = 'clone https://git.example/apps: connection refused'
