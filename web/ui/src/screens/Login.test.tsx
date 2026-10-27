@@ -41,6 +41,7 @@ describe('the login screen', () => {
     render(<App />)
 
     expect(await screen.findByLabelText('Admin token')).toBeDefined()
+    expect(document.title).toBe('Sign in · SwarmCLI CD')
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeDefined()
     // No sign-in method drawn as a link: a typed credential is a box, not a
     // button-to-somewhere.

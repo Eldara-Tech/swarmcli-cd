@@ -16,6 +16,7 @@ import { CompatChip, DriftCell, HealthChip, SyncChip } from '../components/State
 import { TopologyTree } from '../components/TopologyTree'
 import { chartRef, destination, serviceCounts, shortRevision, tasksUp } from '../format'
 import { ErrorState, Loading } from '../components/StateBlock'
+import { PageTitle } from '../components/PageTitle'
 
 /**
  * The application's identity, and the three tabs that read it.
@@ -46,6 +47,7 @@ export function ApplicationDetail() {
 
   return (
     <section className="screen">
+      <PageTitle page={spec.name} />
       <p className="crumb">
         <Link to="/">← Applications</Link>
       </p>

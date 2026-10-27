@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
+import { PageTitle } from '../components/PageTitle'
+
 /**
  * Where the Projects nav item goes, until the screen behind it is built.
  *
@@ -17,6 +19,7 @@
 export function Projects() {
   return (
     <section className="screen">
+      <PageTitle page="Projects" />
       <h1>Projects</h1>
       <p className="empty">This build grants projects. The screen that lists them has not been built yet.</p>
     </section>

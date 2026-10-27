@@ -15,6 +15,7 @@ import { Dot, type DotTone } from '../components/Dot'
 import { DriftCell, HealthChip, SyncChip } from '../components/StateChip'
 import { Empty, ErrorState, Loading } from '../components/StateBlock'
 import { Instant } from '../components/Instant'
+import { PageTitle } from '../components/PageTitle'
 import { destination, plural, serviceCounts, shortRevision } from '../format'
 
 /**
@@ -91,6 +92,7 @@ export function Applications() {
 
   return (
     <section className="screen">
+      <PageTitle page="Applications" />
       <header className="screen-header">
         <h1>Applications</h1>
         <p data-testid="application-count">

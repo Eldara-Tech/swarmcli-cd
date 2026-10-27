@@ -11,6 +11,7 @@ import { Dot, type DotTone } from '../components/Dot'
 import { Instant } from '../components/Instant'
 import { shortRevision } from '../format'
 import { ErrorState, Loading } from '../components/StateBlock'
+import { PageTitle } from '../components/PageTitle'
 
 /**
  * The controller itself, as distinct from the applications it reconciles.
@@ -42,6 +43,7 @@ export function ControllerStatusScreen() {
 
   return (
     <section className="screen">
+      <PageTitle page="Controller" />
       <header className="screen-header">
         <h1>Controller</h1>
       </header>

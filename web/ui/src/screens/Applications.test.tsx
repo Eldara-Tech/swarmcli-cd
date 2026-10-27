@@ -88,6 +88,7 @@ describe('the applications list', () => {
     render(<App />)
 
     expect((await screen.findByTestId('application-count')).textContent).toBe('2 applications')
+    expect(document.title).toBe('Applications · SwarmCLI CD')
     expect(screen.getByRole('link', { name: 'edge' }).getAttribute('href')).toBe('/applications/edge')
     expect(screen.getByRole('link', { name: 'ingress' })).toBeDefined()
   })

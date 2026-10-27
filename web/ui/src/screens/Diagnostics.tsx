@@ -8,6 +8,7 @@ import { useCapability } from '../api/discovery'
 import type { DiagnosticsResponse, NodesResponse } from '../api/types'
 import { Icon } from '../components/Icon'
 import { Empty, Loading } from '../components/StateBlock'
+import { PageTitle } from '../components/PageTitle'
 
 /**
  * Diagnostics 2.0: Unified cluster health assessment and Swarm node topology matrix.
@@ -75,6 +76,7 @@ export function Diagnostics() {
 
   return (
     <section className="screen">
+      <PageTitle page="Diagnostics" />
       <header className="screen-header">
         <div>
           <h1>Diagnostics</h1>

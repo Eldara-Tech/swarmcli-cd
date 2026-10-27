@@ -177,6 +177,7 @@ describe('the licensed shells', () => {
     // path no route claims matches nothing, which unmounts the shell with it and
     // presents as the whole UI disappearing.
     expect(screen.getByRole('heading', { name: 'Projects' })).toBeDefined()
+    expect(document.title).toBe('Projects · SwarmCLI CD')
     expect(screen.getByRole('button', { name: 'Sign out' })).toBeDefined()
   })
 

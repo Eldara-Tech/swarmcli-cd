@@ -7,6 +7,7 @@ import { verify } from '../api/client'
 import { useBootstrap, type LoginOption } from '../api/discovery'
 import { setToken } from '../auth/session'
 import { BrandMark } from '../components/Icon'
+import { PageTitle } from '../components/PageTitle'
 
 /**
  * The login screen: whatever /ui/bootstrap.json says a browser may sign in with.
@@ -74,6 +75,7 @@ export function Login() {
 
   const card = (
     <>
+      <PageTitle page="Sign in" />
       <div className="login-brand">
         <BrandMark />
         <div className="login-title">
