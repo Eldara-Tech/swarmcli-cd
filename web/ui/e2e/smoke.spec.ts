@@ -104,6 +104,15 @@ test('logs in, watches an application converge without reloading, and reads ever
 
   await page.goto('/')
 
+  // The tab icon (#328). Only a real controller proves that the path Vite emits
+  // is one web.go serves as a file: anything else it answers with the SPA's
+  // HTML, and the browser draws its default globe instead.
+  const icon = (await page.locator('link[rel="icon"]').getAttribute('href')) ?? ''
+  expect(icon).toMatch(/^\/assets\/favicon-.*\.svg$/)
+  const served = await page.request.get(icon)
+  expect(served.ok(), `fetching the tab icon failed: ${served.status()}`).toBe(true)
+  expect(served.headers()['content-type']).toBe('image/svg+xml')
+
   // The login screen is drawn from /ui/bootstrap.json, which a real browser
   // fetches with no credential — the one request in this application that must
   // not carry the bearer, and the only place that can be observed end to end.
