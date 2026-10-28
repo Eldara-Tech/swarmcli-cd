@@ -78,10 +78,11 @@ test('logs in, watches an application converge without reloading, and reads ever
   // any build, since every community assertion is an absence.
   expect(editions, `SWARMCLI_CD_EDITION is ${JSON.stringify(edition)}`).toContain(edition)
 
-  if (edition === 'community') {
-    expect(adminToken, 'SWARMCLI_CD_ADMIN_TOKEN must name the token the controller was started with')
-      .not.toBe('')
-  } else {
+  // Both editions sign in with it: the licensed run as well, after signing out
+  // of SSO, through the form beside the button (#327).
+  expect(adminToken, 'SWARMCLI_CD_ADMIN_TOKEN must name the token the controller was started with')
+    .not.toBe('')
+  if (edition === 'business') {
     expect(ssoUser, 'SWARMCLI_CD_SSO_USER must name the account registered with the identity provider').not.toBe('')
     expect(ssoPassword, 'SWARMCLI_CD_SSO_PASSWORD must be the password for that account').not.toBe('')
   }
@@ -363,6 +364,14 @@ test('logs in, watches an application converge without reloading, and reads ever
     await page.getByRole('link', { name: 'Sign out' }).click()
     await expect(page.locator('.login-start')).toHaveCount(1)
     await expect(page.getByRole('link', { name: 'Sign out' })).toHaveCount(0)
+
+    // And the other way in, which is #327: the username and token beside the
+    // SSO button sign in on a licensed controller as they do on a free one, and
+    // a token session signs out in the tab.
+    await page.getByLabel('Username').fill(adminUsername)
+    await page.getByLabel('Admin token').fill(adminToken)
+    await page.getByRole('button', { name: 'Sign in' }).click()
+    await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible()
   }
 
   expect(refusals, 'the browser refused something the policy in web.go forbids').toEqual([])
