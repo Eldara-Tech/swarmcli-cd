@@ -241,8 +241,9 @@ navigated to, so the credential never enters a URL, a history entry or a
 
 What that choice buys is a controller that had to learn nothing new: no cookie,
 no session endpoint, no CSRF token, no `SameSite` reasoning. The browser sends
-`Authorization: Bearer …` on every request exactly as the CLI does, and the
-server cannot tell them apart. What it costs is the sentence this section opens
+`Authorization: Basic …`, the username and token, on every request; the CLI
+sends the token alone as `Authorization: Bearer …`, and the server attributes
+both to the same subject. What it costs is the sentence this section opens
 with.
 
 The bundle ships no source maps — a source map is the application's whole source

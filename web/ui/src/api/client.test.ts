@@ -63,6 +63,17 @@ describe('the fetch wrapper', () => {
     expect(bearer()).toBe('Basic asOzenNlZjpzM2NyZXQ=')
   })
 
+  // A token stored without a username must not inherit the previous one.
+  it('sends a bearer once a token is stored without a username', async () => {
+    setToken('old', 'ops')
+    setToken('s3cret')
+    fakeFetch(() => json(200, { applications: [] }))
+
+    await apiGet('/api/v1/applications')
+
+    expect(bearer()).toBe('Bearer s3cret')
+  })
+
   it('sends no header at all when there is no credential', async () => {
     fakeFetch(() => json(200, {}))
 

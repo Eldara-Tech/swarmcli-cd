@@ -176,8 +176,8 @@ func New(rec Reconciler, o Options) *Server {
 // collision check with a hole in it.
 var coreRoutes = []RegisteredRoute{
 	{Pattern: "GET /healthz", Public: true},
-	// Public because a login screen has to know whether to draw a token box or
-	// an SSO button before anyone has a credential to authenticate with. Under
+	// Public because a login screen has to know whether to draw a token box, an
+	// SSO button or both before anyone has a credential to authenticate with. Under
 	// /ui/ rather than /api/v1/ because docs/api.md states that every
 	// /api/v1/… endpoint requires the admin token, and that invariant is worth
 	// more than the tidiness of one path: a public route under the API prefix
@@ -477,8 +477,10 @@ func (s *Server) guard(act authz.Action, h guarded) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		subject, err := s.authz.Authenticate(r)
 		if err != nil {
-			// No WWW-Authenticate challenge: a browser prompting for basic
-			// credentials on an API that takes a bearer token helps nobody.
+			// No WWW-Authenticate challenge, and it must stay that way now
+			// that Basic credentials are accepted: a browser that prompted for
+			// them would cache them and attach them to every later request to
+			// this origin, a cross-site POST to sync included.
 			fail(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}

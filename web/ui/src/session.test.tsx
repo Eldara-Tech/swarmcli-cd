@@ -128,6 +128,8 @@ describe('a session the browser cannot see', () => {
 
     expect(await screen.findByRole('button', { name: 'Sign out' })).toBeDefined()
     expect(screen.queryByRole('link', { name: 'Sign out' })).toBeNull()
+    // A token stored without a username is the single admin it always was.
+    expect(screen.getByText('Administrator')).toBeDefined()
   })
 
   // A controller that advertises SSO and has not been logged into yet is the

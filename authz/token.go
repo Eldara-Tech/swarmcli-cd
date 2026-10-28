@@ -114,10 +114,11 @@ func (t *token) Authenticate(r *http.Request) (Subject, error) {
 
 func (t *token) accepts(r *http.Request) bool {
 	if username, presented, ok := r.BasicAuth(); ok {
-		// Both compared whatever the first says: an && would answer a wrong
-		// username sooner than a wrong token.
-		user := subtle.ConstantTimeCompare([]byte(username), []byte(t.username))
-		tok := subtle.ConstantTimeCompare([]byte(presented), []byte(t.value))
+		// Trimmed as bearer trims, so a token pasted with a stray space signs
+		// in here as it does from the CLI. Both compared whatever the first
+		// says: an && would answer a wrong username sooner than a wrong token.
+		user := subtle.ConstantTimeCompare([]byte(strings.TrimSpace(username)), []byte(t.username))
+		tok := subtle.ConstantTimeCompare([]byte(strings.TrimSpace(presented)), []byte(t.value))
 		return user&tok == 1
 	}
 	presented, ok := bearer(r.Header.Get("Authorization"))

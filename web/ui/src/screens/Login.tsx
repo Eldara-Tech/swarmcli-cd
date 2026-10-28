@@ -207,9 +207,9 @@ function Username({ value, onChange }: { value: string; onChange: (value: string
 /**
  * The box, as a fragment rather than a wrapper element.
  *
- * The fragment is deliberate: it keeps the card's children exactly the sequence
- * Phase B rendered — heading, label, input, hint, error, button — so a free
- * build's login screen is the one that shipped, down to the DOM.
+ * The fragment is deliberate: it keeps the card's children the flat sequence
+ * Phase B rendered — heading, label, input, hint, error, button — with the
+ * username's label and input now ahead of the token's.
  */
 function TypedCredential({
   method,

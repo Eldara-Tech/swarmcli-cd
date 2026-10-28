@@ -128,7 +128,7 @@ the process and cannot carry one without putting it in the stack file and in
 connect already tells you.
 
 `/ui/bootstrap.json` is unauthenticated because a login screen has to know
-whether to draw a token box or an SSO button *before* anyone has a credential to
+whether to draw a token box, an SSO button or both *before* anyone has a credential to
 present. It is under `/ui/` rather than `/api/v1/` precisely so that the sentence
 at the top of this section stays true without exceptions: a public route under
 the API prefix would make an operator check each one before believing it. It

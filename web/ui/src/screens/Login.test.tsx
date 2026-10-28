@@ -94,9 +94,9 @@ describe('the login screen', () => {
     expect(screen.queryByLabelText('Username')).toBeNull()
   })
 
-  // The point of the whole document: a deployment that has moved to SSO must
-  // stop offering a box for a credential it no longer issues. A UI that kept
-  // the box would be asking operators to keep a shared admin token alive.
+  // The point of the whole document: the methods are the authorizer's to name,
+  // and one that advertises only SSO gets no box for a credential it does not
+  // offer.
   it('offers no box when the authorizer advertises only SSO', async () => {
     advertising(sso)
     render(<App />)

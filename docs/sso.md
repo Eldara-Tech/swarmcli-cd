@@ -5,8 +5,8 @@ Copyright © 2026 Eldara Tech
 
 # Single sign-on
 
-Signing in to the web UI with an OpenID Connect provider instead of the shared
-admin token. This is a **licensed** capability: it is compiled into the default
+Signing in to the web UI with an OpenID Connect provider, beside the admin
+username and token. This is a **licensed** capability: it is compiled into the default
 `swarmcli-cd` artefact and does nothing until a licence verifies, and it is not
 in the `swarmcli-cd-oss` artefact at all. See [editions](editions.md) for which
 one you are running.

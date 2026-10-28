@@ -189,10 +189,10 @@ type LoginMethod struct {
 // precisely because its absence would make a list disclose more, and
 // authorisation may only degrade closed.
 //
-// **The default authorizer implements it**, and returns the token box. An
-// SSO-only companion returns only its own method, so the box disappears — which
-// is the point: a deployment that has moved to SSO should not offer a box for a
-// credential it no longer issues.
+// **The default authorizer implements it**, and returns the token box. A
+// companion returns its own methods and so decides whether the box stays among
+// them: one issuing no admin token drops it, and the licensed SSO build keeps it
+// below its button as the way in when the provider is down (#327).
 type LoginMethods interface {
 	// LoginMethods names every way a browser may obtain a credential, in the
 	// order the login screen should offer them.

@@ -48,8 +48,7 @@ func discoveryServerWith(t *testing.T, rec Reconciler, o Options) http.Handler {
 	return h
 }
 
-// ssoOnly is the companion shape: it issues no admin token, so the token box
-// would be a dead end.
+// ssoOnly issues no admin token, so the token box would be a dead end.
 //
 // It embeds denyAuthn rather than the bare interface, because the bootstrap
 // handler now authenticates the request it is given and a nil embedded
@@ -121,9 +120,9 @@ func TestBootstrapIsPublicAndCarriesNoVersion(t *testing.T) {
 	}
 }
 
-// A deployment that has moved to SSO must not offer a box for a credential it
-// no longer issues, which is the whole point of asking the authorizer rather
-// than hardcoding the box here.
+// An authorizer that issues no admin token must not be presented with a box for
+// one, which is the whole point of asking the authorizer rather than hardcoding
+// the box here.
 func TestBootstrapReportsTheAuthorizersOwnMethods(t *testing.T) {
 	h := discoveryServer(t, Options{Authorizer: ssoOnly{}})
 
