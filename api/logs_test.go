@@ -50,6 +50,9 @@ type logStreamer struct {
 	// ended is closed when the producer notices its context was cancelled, so
 	// a test can assert the seam was actually stopped rather than sleeping.
 	ended chan struct{}
+	// endOnce closes ended once however many held streams end together, as
+	// all of TestOpenLogStreamsAreBounded's do when it returns.
+	endOnce sync.Once
 }
 
 func (l *logStreamer) ServiceLogs(ctx context.Context, app, svc string, req application.ServiceLogRequest) (<-chan application.ServiceLogEvent, error) {
@@ -76,11 +79,7 @@ func (l *logStreamer) ServiceLogs(ctx context.Context, app, svc string, req appl
 	go func() {
 		<-ctx.Done()
 		close(ch)
-		select {
-		case <-ended:
-		default:
-			close(ended)
-		}
+		l.endOnce.Do(func() { close(ended) })
 	}()
 	return ch, nil
 }
