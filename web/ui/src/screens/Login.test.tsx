@@ -41,6 +41,7 @@ describe('the login screen', () => {
     render(<App />)
 
     expect(await screen.findByLabelText('Admin token')).toBeDefined()
+    expect(screen.getByLabelText('Username')).toBeDefined()
     expect(document.title).toBe('Sign in · SwarmCLI CD')
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeDefined()
     // No sign-in method drawn as a link: a typed credential is a box, not a
@@ -68,6 +69,29 @@ describe('the login screen', () => {
     // the authorizer's own route, and the credential comes back through it.
     expect(start.getAttribute('href')).toBe('/auth/login')
     expect(screen.getByLabelText('Admin token')).toBeDefined()
+  })
+
+  // What a licensed build with SSO live advertises (#327): the button, then the
+  // admin's username and token as the other way in, told apart by a divider.
+  it('separates the SSO button from the form that follows it', async () => {
+    advertising(sso, token)
+    render(<App />)
+
+    expect(await screen.findByRole('link', { name: 'Sign in with SSO' })).toBeDefined()
+    expect(screen.getByText('or').className).toBe('login-or')
+    expect(screen.getByLabelText('Username')).toBeDefined()
+    expect(screen.getByLabelText('Admin token')).toBeDefined()
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeDefined()
+  })
+
+  // The username is SWARMCLI_CD_ADMIN_USERNAME, so another typed-in method does
+  // not grow one.
+  it('asks for a username only beside the admin token', async () => {
+    advertising({ id: 'otp', label: 'One-time code' })
+    render(<App />)
+
+    expect(await screen.findByLabelText('One-time code')).toBeDefined()
+    expect(screen.queryByLabelText('Username')).toBeNull()
   })
 
   // The point of the whole document: a deployment that has moved to SSO must

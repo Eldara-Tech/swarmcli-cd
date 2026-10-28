@@ -138,6 +138,8 @@ Docker secrets and a flag would put them in "docker inspect" output and in argv:
 
   ` + authz.EnvTokenFile + `   API admin token, read from a file
   ` + authz.EnvToken + `        API admin token, given directly
+  ` + authz.EnvUsername + `     Username the login screen asks for with the
+                                 token (default ` + authz.DefaultUsername + `)
   ` + git.EnvTokenFile + `     Git password/token, read from a file
   ` + git.EnvToken + `          Git password/token, given directly
   ` + git.EnvUsername + `       Git username

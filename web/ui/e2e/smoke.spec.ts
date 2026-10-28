@@ -49,6 +49,8 @@ type Edition = (typeof editions)[number]
 const edition = (process.env.SWARMCLI_CD_EDITION ?? 'community') as Edition
 
 const adminToken = process.env.SWARMCLI_CD_ADMIN_TOKEN ?? ''
+// The controller's own default when the variable is unset; see authz.DefaultUsername.
+const adminUsername = process.env.SWARMCLI_CD_ADMIN_USERNAME ?? 'admin'
 
 // The Keycloak account the licensed run authenticates as. Read here rather than
 // inline so that a business run started without them fails on the assertion
@@ -118,21 +120,24 @@ test('logs in, watches an application converge without reloading, and reads ever
   // not carry the bearer, and the only place that can be observed end to end.
   // What the document says is the whole difference between the two builds here:
   // a free controller advertises exactly one method and it is typed in, and a
-  // licensed one advertises exactly one and it is a link.
+  // licensed one advertises the SSO link with that same typed-in method beside
+  // it (#327).
   if (edition === 'community') {
     // An SSO button here would mean the public document had grown a method the
     // Apache-2.0 authorizer does not offer.
     await expect(page.getByLabel('Admin token')).toBeVisible()
-    await expect(page.locator('.login-form input')).toHaveCount(1)
+    await expect(page.locator('.login-form input')).toHaveCount(2)
     await expect(page.locator('.login-start')).toHaveCount(0)
 
+    await page.getByLabel('Username').fill(adminUsername)
     await page.getByLabel('Admin token').fill(adminToken)
     await page.getByRole('button', { name: 'Sign in' }).click()
   } else {
-    // And a box here would mean a deployment that has moved to SSO still
-    // offering a browser the shared admin token.
+    // The username and token stay a way in beside SSO, for when the identity
+    // provider is down. This run still signs in through the provider.
     await expect(page.locator('.login-start')).toHaveCount(1)
-    await expect(page.getByLabel('Admin token')).toHaveCount(0)
+    await expect(page.getByLabel('Username')).toBeVisible()
+    await expect(page.getByLabel('Admin token')).toBeVisible()
 
     // The single most valuable assertion in this file, and the only one that
     // cannot be faked anywhere: the redirect is followed to a real identity

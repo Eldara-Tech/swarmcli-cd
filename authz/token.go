@@ -19,7 +19,15 @@ import (
 const (
 	EnvToken     = "SWARMCLI_CD_ADMIN_TOKEN"
 	EnvTokenFile = "SWARMCLI_CD_ADMIN_TOKEN_FILE"
+	// EnvUsername is the name the login screen asks for beside the token, and
+	// the name everything the token authenticates is attributed to. It is not
+	// a secret, so it has no file form.
+	EnvUsername = "SWARMCLI_CD_ADMIN_USERNAME"
 )
+
+// DefaultUsername is the username when EnvUsername is unset, and the subject
+// name every request carried before the variable existed.
+const DefaultUsername = "admin"
 
 // ErrNoToken is what Ready returns when neither variable is set. The
 // controller turns it into a refusal to start rather than serving an open API:
@@ -28,7 +36,7 @@ const (
 // the one an operator has to remember.
 var ErrNoToken = fmt.Errorf("no admin token configured: set %s to a file (a Docker secret) or %s to the token itself", EnvTokenFile, EnvToken)
 
-var errBadToken = errors.New("invalid or missing bearer token")
+var errBadToken = errors.New("invalid or missing credential")
 
 func init() { Register("token", newToken(os.Getenv, os.ReadFile)) }
 
@@ -36,18 +44,28 @@ func init() { Register("token", newToken(os.Getenv, os.ReadFile)) }
 // it authenticates. Anything finer — per-user identity, per-project scoping —
 // is the Business Edition's job.
 type token struct {
-	value string
-	err   error // why there is no token, reported by Ready
+	value    string
+	username string
+	err      error // why there is no token, reported by Ready
 }
 
 // newToken takes its environment and file reader as arguments so the tests can
 // drive it without touching the process environment.
 func newToken(getenv func(string) string, readFile func(string) ([]byte, error)) *token {
+	username := strings.TrimSpace(getenv(EnvUsername))
+	if username == "" {
+		username = DefaultUsername
+	}
+	// A colon ends the username in a Basic credential (RFC 7617), so a name
+	// holding one could never sign in, and nothing else would say why.
+	if strings.Contains(username, ":") {
+		return &token{err: fmt.Errorf("%s must not contain ':', which separates the username from the token at login", EnvUsername)}
+	}
 	v, err := TokenFromEnv(getenv, readFile)
 	if err != nil {
 		return &token{err: err}
 	}
-	return &token{value: v}
+	return &token{value: v, username: username}
 }
 
 // TokenFromEnv resolves the admin token, preferring the file form. It is
@@ -79,18 +97,31 @@ func (t *token) Ready() error { return t.err }
 
 // Authenticate implements Authorizer. The comparison is constant-time: the
 // token is a shared secret and a timing oracle on it is a full compromise.
+//
+// Two forms are accepted. The login screen sends Basic credentials, the
+// username beside the token. The CLI, scripts and the container healthcheck
+// send the token alone as a bearer, as they always have, so the username names
+// the subject rather than adding a second secret.
 func (t *token) Authenticate(r *http.Request) (Subject, error) {
 	if t.err != nil {
 		return Subject{}, t.err
 	}
+	if !t.accepts(r) {
+		return Subject{}, errBadToken
+	}
+	return Subject{Name: t.username}, nil
+}
+
+func (t *token) accepts(r *http.Request) bool {
+	if username, presented, ok := r.BasicAuth(); ok {
+		// Both compared whatever the first says: an && would answer a wrong
+		// username sooner than a wrong token.
+		user := subtle.ConstantTimeCompare([]byte(username), []byte(t.username))
+		tok := subtle.ConstantTimeCompare([]byte(presented), []byte(t.value))
+		return user&tok == 1
+	}
 	presented, ok := bearer(r.Header.Get("Authorization"))
-	if !ok {
-		return Subject{}, errBadToken
-	}
-	if subtle.ConstantTimeCompare([]byte(presented), []byte(t.value)) != 1 {
-		return Subject{}, errBadToken
-	}
-	return Subject{Name: "admin"}, nil
+	return ok && subtle.ConstantTimeCompare([]byte(presented), []byte(t.value)) == 1
 }
 
 // Authorize implements Authorizer. A subject this build authenticated is the

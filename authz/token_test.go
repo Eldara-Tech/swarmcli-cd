@@ -137,6 +137,75 @@ func TestAuthenticateAcceptsAnySchemeCase(t *testing.T) {
 	}
 }
 
+func basic(username, password string) string {
+	r, _ := http.NewRequest(http.MethodGet, "/", nil)
+	r.SetBasicAuth(username, password)
+	return r.Header.Get("Authorization")
+}
+
+// The login screen sends the username beside the token, the CLI sends the token
+// alone, and both are the same subject: the one the username names.
+func TestTheUsernameNamesTheSubject(t *testing.T) {
+	for name, tc := range map[string]struct {
+		username, want string
+	}{
+		"unset":      {"", DefaultUsername},
+		"configured": {"  józsef  ", "józsef"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tok := newToken(env(map[string]string{EnvToken: "s3cret", EnvUsername: tc.username}), files(nil))
+			if err := tok.Ready(); err != nil {
+				t.Fatalf("Ready = %v, want nil", err)
+			}
+			for _, header := range []string{"Bearer s3cret", basic(tc.want, "s3cret")} {
+				got, err := tok.Authenticate(request(header))
+				if err != nil {
+					t.Errorf("Authenticate(%q) = %v, want nil", header, err)
+					continue
+				}
+				if got.Name != tc.want {
+					t.Errorf("Authenticate(%q) subject = %q, want %q", header, got.Name, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestBasicRejects(t *testing.T) {
+	tok := newToken(env(map[string]string{EnvToken: "s3cret", EnvUsername: "ops"}), files(nil))
+
+	for name, header := range map[string]string{
+		"wrong username":   basic("admin", "s3cret"),
+		"wrong token":      basic("ops", "wrong"),
+		"no username":      basic("", "s3cret"),
+		"no token":         basic("ops", ""),
+		"token as user":    basic("s3cret", "ops"),
+		"username only":    "Basic b3Bz",
+		"not base64":       "Basic ops:s3cret",
+		"token after both": basic("ops:s3cret", "s3cret"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := tok.Authenticate(request(header)); err == nil {
+				t.Errorf("Authenticate(%q) = nil, want an error", header)
+			}
+		})
+	}
+}
+
+// A colon ends the username in a Basic credential, so a username holding one
+// could never sign in. Refusing to start names the variable instead.
+func TestAUsernameWithAColonIsNotReady(t *testing.T) {
+	tok := newToken(env(map[string]string{EnvToken: "s3cret", EnvUsername: "ops:team"}), files(nil))
+
+	err := tok.Ready()
+	if err == nil {
+		t.Fatal("Ready = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), EnvUsername) {
+		t.Errorf("error %q does not name %s", err, EnvUsername)
+	}
+}
+
 // The default authorises everything it authenticates; finer scoping is the
 // Business Edition's job.
 //

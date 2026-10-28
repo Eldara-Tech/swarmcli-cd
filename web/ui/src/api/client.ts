@@ -3,14 +3,14 @@
 
 // Every request the UI makes goes through this file.
 //
-// It is one seam on purpose. The bearer header, the 401 rule and the unwrapping
+// It is one seam on purpose. The credential header, the 401 rule and the unwrapping
 // of the API's error body are each a thing that has to be true of every request
 // including the ones nobody has written yet, and a screen that called fetch
 // directly would be a screen where one of them silently is not. Tests fake
 // globalThis.fetch, which puts all three *under* the seam and exercises them
 // from every screen test rather than only from this file's own.
 
-import { clearSession, getToken } from '../auth/session'
+import { clearSession, getToken, getUsername } from '../auth/session'
 
 /** The endpoint the login screen probes; see verify. */
 export const probePath = '/api/v1/status'
@@ -58,7 +58,7 @@ export function hasStatus(error: unknown, status: number): boolean {
  * projects — and signing the operator out over it would lose a working one.
  */
 export async function authorized(path: string, init?: RequestInit): Promise<Response> {
-  const response = await fetch(path, withBearer(init, getToken()))
+  const response = await fetch(path, withCredential(init, getToken(), getUsername()))
   if (response.status === 401) {
     clearSession()
     throw new ApiError(401, 'the controller rejected the token')
@@ -121,8 +121,8 @@ export async function apiPost<T>(path: string): Promise<T> {
  * app set has not loaded, and it is behind the `read` action every token that
  * can see anything already holds.
  */
-export async function verify(candidate: string): Promise<boolean> {
-  const response = await fetch(probePath, withBearer(undefined, candidate))
+export async function verify(candidate: string, username?: string): Promise<boolean> {
+  const response = await fetch(probePath, withCredential(undefined, candidate, username ?? null))
   if (response.status === 401) return false
   if (!response.ok) {
     throw new ApiError(response.status, await failureMessage(response))
@@ -130,10 +130,20 @@ export async function verify(candidate: string): Promise<boolean> {
   return true
 }
 
-function withBearer(init: RequestInit | undefined, token: string | null): RequestInit {
+/**
+ * withCredential attaches the token: as Basic credentials when it was signed in
+ * with a username, which the controller checks too, and as a bearer otherwise.
+ */
+function withCredential(init: RequestInit | undefined, token: string | null, username: string | null): RequestInit {
   const headers = new Headers(init?.headers)
-  if (token !== null) headers.set('Authorization', `Bearer ${token}`)
+  if (token !== null) headers.set('Authorization', username === null ? `Bearer ${token}` : basic(username, token))
   return { ...init, headers }
+}
+
+/** basic encodes RFC 7617 credentials as UTF-8, which btoa alone cannot: it throws past Latin-1. */
+function basic(username: string, token: string): string {
+  const bytes = new TextEncoder().encode(`${username}:${token}`)
+  return `Basic ${btoa(String.fromCharCode(...bytes))}`
 }
 
 /**

@@ -1609,6 +1609,7 @@ does, so it does not make either kind of line easier to read.
 |---|---|
 | `SWARMCLI_CD_ADMIN_TOKEN_FILE` | API admin token, read from a file — the Docker-secret form |
 | `SWARMCLI_CD_ADMIN_TOKEN` | API admin token, given directly |
+| `SWARMCLI_CD_ADMIN_USERNAME` | the username the login screen asks for beside the token, and the name syncs are attributed to (default `admin`). Not a secret, so it has no file form |
 | `SWARMCLI_CD_GIT_USERNAME` | git username; forges often ignore it, GitHub wants it non-empty (`x-access-token`) |
 | `SWARMCLI_CD_GIT_TOKEN_FILE` | git password or token, read from a file — the Docker-secret form |
 | `SWARMCLI_CD_GIT_TOKEN` | git password or token, given directly |

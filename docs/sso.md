@@ -17,17 +17,17 @@ spellings in [§ the provider](#1-register-a-client-with-the-provider).
 
 ## What it changes, and what it does not
 
-It replaces the **token box on the login screen** with a "Sign in with SSO"
-button. That is the whole of the user-visible change, and the distinction is
-worth holding on to, because two things people expect to follow do not.
+It adds a **"Sign in with SSO" button** to the login screen, above the admin
+username and token form, which stays as the way in when the identity provider is
+down. That is the whole of the user-visible change, and the distinction is worth
+holding on to, because two things people expect to follow do not.
 
 **The admin token is still required.** The controller refuses to start without
 one, licensed or not. It is what the CLI, every script and the container
 healthcheck send — none of which can complete a browser login — and it is what
 the deployment falls back to if the licence lapses. Without it, a lapse would be
 either an outage nobody can sign in through or an unauthenticated API on a
-process holding the docker socket. What SSO removes is the box, not the
-credential.
+process holding the docker socket.
 
 **Every subject it authenticates is an administrator.** Per-user identity is
 what SSO establishes; per-user *authorisation* — projects, and RBAC scoping an
@@ -78,10 +78,10 @@ rather than an empty one.
 
 ## 2. Configure the controller
 
-Five environment variables, and nothing else. There are no flags for any of
-this: like every other credential the controller takes, these arrive as docker
-secrets, and a flag would put them in `docker service inspect` output and in
-`argv`.
+Five environment variables, and an optional sixth for the button. There are no
+flags for any of this: like every other credential the controller takes, these
+arrive as docker secrets, and a flag would put them in `docker service inspect`
+output and in `argv`.
 
 | Variable | |
 |---|---|
@@ -90,8 +90,10 @@ secrets, and a flag would put them in `docker service inspect` output and in
 | `SWARMCLI_CD_OIDC_CLIENT_SECRET_FILE` | the client secret, read from a file — the docker-secret form |
 | `SWARMCLI_CD_OIDC_CLIENT_SECRET` | the same secret given directly. The file form is preferred: a secret arrives as a file, encrypted at rest in the raft log and delivered in memory, and the string form gives that up |
 | `SWARMCLI_CD_OIDC_REDIRECT_URL` | where the provider sends the browser back — the controller's external URL plus `/auth/callback`. It **must** end in that path |
+| `SWARMCLI_CD_OIDC_NAME` | optional: the provider's name on the button, so `Keycloak` reads "Sign in with Keycloak". The default is `SSO` |
 
-Both secret forms may be omitted for a public client.
+Both secret forms may be omitted for a public client, and the name always may:
+it is not one of the variables the rule below counts.
 
 **Set some but not all of them and the controller refuses to start**, naming
 what is missing:
@@ -169,12 +171,12 @@ Apache-2.0 build's, string for string.
 
 ```bash
 curl http://127.0.0.1:8080/ui/bootstrap.json
-{"login":[{"id":"sso","label":"Sign in with SSO","start":"/auth/login"}]}
+{"login":[{"id":"sso","label":"Sign in with SSO","start":"/auth/login"},{"id":"token","label":"Admin token"}]}
 ```
 
-Exactly that, and nothing else, is SSO being live: a deployment that has moved to
-SSO does not offer a browser a box for the shared admin token. If it still names
-the token method, the licence was not read or the controller has not restarted.
+The `sso` entry is SSO being live. The token method beside it is the username
+and token form, which stays. If the token method is all it names, the licence
+was not read or the controller has not restarted.
 
 **The capability document**, with the admin token:
 
@@ -259,7 +261,7 @@ session to, put [TLS](configuration.md#tls) in front of it.
 |---|---|
 | The controller refuses to start, naming a variable | SSO is half-configured. Set the named variable, or none of the five |
 | `SWARMCLI_CD_OIDC_REDIRECT_URL must end in /auth/callback` | The controller serves one callback path. A mismatch would end a login on a 404 with the authorization code in the operator's browser history |
-| The login screen still shows a token box | The licence was not read, or the controller has not restarted since it was installed. Check `bootstrap.json` and the startup route log |
+| The login screen shows no SSO button | The licence was not read, or the controller has not restarted since it was installed. Check `bootstrap.json` and the startup route log |
 | `/auth/login` renders the UI instead of redirecting | No route is registered, so `GET /` — the single-page app's fallback — answered it. That is exactly what the Apache-2.0 build does. With `--ui=false` it is a plain `404` |
 | `403 SSO is not licensed on this controller` | The routes are on the mux from a licence that has since lapsed or expired. The token still works |
 | `502 the identity provider could not be reached` | Discovery or the code exchange failed. The controller logs the issuer and the underlying error; it does not cache a failure, so a provider that comes back needs no restart |
