@@ -25,11 +25,12 @@ tunnel:
 ssh -L 8080:127.0.0.1:8080 your-manager-host
 ```
 
-Then open `http://127.0.0.1:8080` and sign in with the admin token, the same
-value `SWARMCLI_CD_ADMIN_TOKEN` holds. A wrong token is rejected before anybody
-is signed in — the login screen probes the status endpoint with what you typed
-rather than storing it and letting the first 401 undo it — so "that token was
-rejected" is a message you actually get.
+Then open `http://127.0.0.1:8080` and sign in with the admin username and
+token: the username is `SWARMCLI_CD_ADMIN_USERNAME`, `admin` unless set, and the
+token is the value `SWARMCLI_CD_ADMIN_TOKEN` holds. A wrong pair is rejected
+before anybody is signed in — the login screen probes the status endpoint with
+what you typed rather than storing it and letting the first 401 undo it — so
+"that username and token were rejected" is a message you actually get.
 
 `--ui=false` turns it off. It does not remove the two routes; it answers them
 with `404`, so the exposure of a controller that serves no UI is the same as one
@@ -240,8 +241,9 @@ navigated to, so the credential never enters a URL, a history entry or a
 
 What that choice buys is a controller that had to learn nothing new: no cookie,
 no session endpoint, no CSRF token, no `SameSite` reasoning. The browser sends
-`Authorization: Bearer …` on every request exactly as the CLI does, and the
-server cannot tell them apart. What it costs is the sentence this section opens
+`Authorization: Basic …`, the username and token, on every request; the CLI
+sends the token alone as `Authorization: Bearer …`, and the server attributes
+both to the same subject. What it costs is the sentence this section opens
 with.
 
 The bundle ships no source maps — a source map is the application's whole source
@@ -252,11 +254,11 @@ package in it runs in a page holding the swarm's root credential, and each one
 is something this project has to keep vetting.
 
 One thing the UI does not add is identity. Signing in with the shared admin
-token makes every operator the same subject, so the `actor` on a sync event
-names that one subject and not a person; see
+token makes every operator the same subject, named by the admin username, so the
+`actor` on a sync event names that one subject and not a person; see
 [api § authentication](api.md#authentication). Per-user login is a licensed
-capability — [single sign-on](sso.md), which replaces the token box on this
-login screen with a provider's — and the paths it serves are the ones reserved
+capability — [single sign-on](sso.md), which puts a provider's button above
+this login screen's form — and the paths it serves are the ones reserved
 in [extensibility § reserved paths](extensibility.md#reserved-paths). Everything
 in this section is about a deployment that has not enabled it, which includes
 every OSS build.

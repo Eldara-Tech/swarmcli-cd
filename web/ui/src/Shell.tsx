@@ -6,6 +6,7 @@ import { Link, NavLink, Outlet } from 'react-router'
 import { signOutPath, useFeature, useSession } from './api/discovery'
 import { useEventStream } from './api/useEventStream'
 import { clearSession } from './auth/session'
+import { useUsername } from './auth/useToken'
 import { BrandMark, Icon, type IconName } from './components/Icon'
 import { LicenceBadge } from './components/LicenceBadge'
 import { LiveIndicator } from './components/LiveIndicator'
@@ -90,13 +91,15 @@ function RailLink({ to, end, icon, label }: { to: string; end?: boolean; icon: I
 /**
  * Who is signed in, at the foot of the rail.
  *
- * A cookie session carries a name; the token build has none — it is the single
- * admin the token is — so it is labelled as that rather than left blank. Both
+ * A cookie session carries a name, and a token carries the username it was
+ * signed in with. A token stored without one is the single admin the token is,
+ * so it is labelled as that rather than left blank. Both
  * cases render the same element, which is what keeps the free shell's DOM
  * identical whether or not a capability document was read.
  */
 function OperatorBadge() {
   const session = useSession()
+  const username = useUsername()
   return (
     <div className="rail-user">
       <div className="rail-avatar">
@@ -104,7 +107,7 @@ function OperatorBadge() {
       </div>
       <div className="rail-user-meta">
         <span className="rail-user-name">
-          {session === undefined || session.name === '' ? 'Administrator' : session.name}
+          {session !== undefined && session.name !== '' ? session.name : (username ?? 'Administrator')}
         </span>
         <span className="rail-user-sub label-caps">{session === undefined ? 'Token auth' : 'SSO session'}</span>
       </div>

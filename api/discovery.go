@@ -70,9 +70,9 @@ type sessionDocument struct {
 // guarded document below.
 //
 // no-store because installing a licence, or loading an SSO companion, changes
-// what this says — and a login screen cached from before that offers a box for
-// a credential the deployment no longer issues, with no way for the operator to
-// tell that the browser is the thing that is wrong. The session below makes the
+// what this says — and a login screen cached from before that offers the
+// methods the deployment used to, with no way for the operator to tell that the
+// browser is the thing that is wrong. The session below makes the
 // header load-bearing rather than merely correct: it is now the one thing here
 // that differs between two requests to the same controller.
 func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {

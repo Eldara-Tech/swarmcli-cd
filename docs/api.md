@@ -79,6 +79,17 @@ curl -H "Authorization: Bearer $SWARMCLI_CD_ADMIN_TOKEN" \
      http://127.0.0.1:8080/api/v1/applications
 ```
 
+or as Basic credentials beside the admin username, which is what the login
+screen sends (`SWARMCLI_CD_ADMIN_USERNAME`, `admin` unless set):
+
+```bash
+curl -u "admin:$SWARMCLI_CD_ADMIN_TOKEN" http://127.0.0.1:8080/api/v1/applications
+```
+
+Either way the subject is the one the admin username names. The username is
+not a second secret: a bearer without it is accepted, so the CLI, scripts and
+the healthcheck send the token alone, as they always have.
+
 The default authorizer checks one shared token and grants every action there is:
 `read` (the status, list, detail and event-stream endpoints), `diff`, `history`,
 `sync` (the `POST`) and `controller`. Those are five rather than two so that a
@@ -117,7 +128,7 @@ the process and cannot carry one without putting it in the stack file and in
 connect already tells you.
 
 `/ui/bootstrap.json` is unauthenticated because a login screen has to know
-whether to draw a token box or an SSO button *before* anyone has a credential to
+whether to draw a token box, an SSO button or both *before* anyone has a credential to
 present. It is under `/ui/` rather than `/api/v1/` precisely so that the sentence
 at the top of this section stays true without exceptions: a public route under
 the API prefix would make an operator check each one before believing it. It
@@ -353,8 +364,8 @@ build. The first is as small as it can be.
 
 `start` appears only on a method the browser has to navigate to — an SSO button
 carries `"start": "/auth/login"`, a typed-in credential carries nothing. The
-list comes from the authorizer, so a deployment that has moved to SSO stops
-offering a box for a credential it no longer issues.
+list comes from the authorizer, in the order the login screen offers it; the
+token method is drawn as a username and token form.
 
 The capability document is reachable with `read` and split at `controller` —
 `version`, `licence` and `seams` are the latter's, and are absent or empty for a

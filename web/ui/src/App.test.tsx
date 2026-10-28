@@ -13,7 +13,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, queryClient } from './App'
-import { getToken, setToken } from './auth/session'
+import { getToken, getUsername, setToken } from './auth/session'
 import { clone, communityDiscovery, controller, json, openStream } from './test/fakeApi'
 import viewFull from './test/fixtures/view-full.json'
 
@@ -74,22 +74,36 @@ describe('the shell', () => {
     // fireEvent rather than setting .value and dispatching by hand: React
     // tracks the last value it wrote, so a direct assignment looks like no
     // change at all and the handler never runs.
-    fireEvent.change(await screen.findByLabelText('Admin token'), { target: { value: 'right' } })
+    fireEvent.change(await screen.findByLabelText('Username'), { target: { value: 'ops' } })
+    fireEvent.change(screen.getByLabelText('Admin token'), { target: { value: 'right' } })
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }))
 
     expect(await screen.findByTestId('application-count')).toBeDefined()
     expect(screen.getByTestId('application-count').textContent).toBe('2 applications')
     expect(getToken()).toBe('right')
+    expect(getUsername()).toBe('ops')
+    // The rail names who signed in rather than the generic administrator.
+    expect(screen.getByText('ops')).toBeDefined()
+  })
+
+  it('asks for the username as well as the token', async () => {
+    controller(communityDiscovery())
+    render(<App />)
+
+    fireEvent.change(await screen.findByLabelText('Admin token'), { target: { value: 'right' } })
+
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Sign in' }).disabled).toBe(true)
   })
 
   it('says so and stays put when the controller rejects the token', async () => {
     controller({ ...communityDiscovery(), '/api/v1/status': () => json(401, { error: 'unauthorized' }) })
     render(<App />)
 
-    fireEvent.change(await screen.findByLabelText('Admin token'), { target: { value: 'wrong' } })
+    fireEvent.change(await screen.findByLabelText('Username'), { target: { value: 'ops' } })
+    fireEvent.change(screen.getByLabelText('Admin token'), { target: { value: 'wrong' } })
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }))
 
-    expect(await screen.findByRole('alert')).toBeDefined()
+    expect((await screen.findByRole('alert')).textContent).toBe('The controller rejected that username and token.')
     // Not signed in, and — the point of probing before storing — the message
     // survived, because the login screen was never unmounted and remounted.
     expect(getToken()).toBeNull()
@@ -114,7 +128,7 @@ describe('the shell', () => {
   })
 
   it('forgets the credential when the operator signs out', async () => {
-    setToken('good')
+    setToken('good', 'ops')
     controller({
       ...communityDiscovery(),
       '/api/v1/status': () => json(200, healthyStatus),
@@ -128,6 +142,7 @@ describe('the shell', () => {
     await waitFor(() => {
       expect(getToken()).toBeNull()
     })
+    expect(getUsername()).toBeNull()
     expect(await screen.findByLabelText('Admin token')).toBeDefined()
   })
 

@@ -104,14 +104,14 @@ func TestAuthenticateRejects(t *testing.T) {
 	tok := newToken(env(map[string]string{EnvToken: "s3cret"}), files(nil))
 
 	for name, header := range map[string]string{
-		"no header":     "",
-		"wrong token":   "Bearer wrong",
-		"wrong scheme":  "Basic s3cret",
-		"bare token":    "s3cret",
-		"empty bearer":  "Bearer ",
-		"prefix only":   "Bearer s3cre",
-		"longer token":  "Bearer s3crets",
-		"schemeless sp": " s3cret",
+		"no header":      "",
+		"wrong token":    "Bearer wrong",
+		"basic, no pair": "Basic s3cret",
+		"bare token":     "s3cret",
+		"empty bearer":   "Bearer ",
+		"prefix only":    "Bearer s3cre",
+		"longer token":   "Bearer s3crets",
+		"schemeless sp":  " s3cret",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := tok.Authenticate(request(header)); err == nil {
@@ -134,6 +134,76 @@ func TestAuthenticateAcceptsAnySchemeCase(t *testing.T) {
 		if got.Name != "admin" {
 			t.Errorf("subject = %q, want admin", got.Name)
 		}
+	}
+}
+
+func basic(username, password string) string {
+	r, _ := http.NewRequest(http.MethodGet, "/", nil)
+	r.SetBasicAuth(username, password)
+	return r.Header.Get("Authorization")
+}
+
+// The login screen sends the username beside the token, the CLI sends the token
+// alone, and both are the same subject: the one the username names.
+func TestTheUsernameNamesTheSubject(t *testing.T) {
+	for name, tc := range map[string]struct {
+		username, want string
+	}{
+		"unset":      {"", DefaultUsername},
+		"configured": {"  józsef  ", "józsef"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tok := newToken(env(map[string]string{EnvToken: "s3cret", EnvUsername: tc.username}), files(nil))
+			if err := tok.Ready(); err != nil {
+				t.Fatalf("Ready = %v, want nil", err)
+			}
+			// The last as pasted from a terminal: Bearer trims, and so must Basic.
+			for _, header := range []string{"Bearer s3cret", basic(tc.want, "s3cret"), basic(" "+tc.want+" ", " s3cret\n")} {
+				got, err := tok.Authenticate(request(header))
+				if err != nil {
+					t.Errorf("Authenticate(%q) = %v, want nil", header, err)
+					continue
+				}
+				if got.Name != tc.want {
+					t.Errorf("Authenticate(%q) subject = %q, want %q", header, got.Name, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestBasicRejects(t *testing.T) {
+	tok := newToken(env(map[string]string{EnvToken: "s3cret", EnvUsername: "ops"}), files(nil))
+
+	for name, header := range map[string]string{
+		"wrong username":   basic("admin", "s3cret"),
+		"wrong token":      basic("ops", "wrong"),
+		"no username":      basic("", "s3cret"),
+		"no token":         basic("ops", ""),
+		"token as user":    basic("s3cret", "ops"),
+		"username only":    "Basic b3Bz",
+		"not base64":       "Basic ops:s3cret",
+		"token after both": basic("ops:s3cret", "s3cret"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := tok.Authenticate(request(header)); err == nil {
+				t.Errorf("Authenticate(%q) = nil, want an error", header)
+			}
+		})
+	}
+}
+
+// A colon ends the username in a Basic credential, so a username holding one
+// could never sign in. Refusing to start names the variable instead.
+func TestAUsernameWithAColonIsNotReady(t *testing.T) {
+	tok := newToken(env(map[string]string{EnvToken: "s3cret", EnvUsername: "ops:team"}), files(nil))
+
+	err := tok.Ready()
+	if err == nil {
+		t.Fatal("Ready = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), EnvUsername) {
+		t.Errorf("error %q does not name %s", err, EnvUsername)
 	}
 }
 
@@ -258,9 +328,9 @@ func TestTheFallbackMatchesTheTokenAuthorizer(t *testing.T) {
 	}
 }
 
-// The point of the interface: a deployment that has moved to SSO must not offer
-// a box for a credential it no longer issues. An authorizer that names its own
-// methods replaces the fallback rather than adding to it.
+// The point of the interface: the methods are the authorizer's to name, so one
+// that issues no admin token offers no box for it. An authorizer that names its
+// own methods replaces the fallback rather than adding to it.
 func TestAnAuthorizerThatNamesItsOwnMethodsReplacesTheBox(t *testing.T) {
 	want := []LoginMethod{{ID: "sso", Label: "Sign in with SSO", Start: "/auth/login"}}
 	got := MethodsFor(ssoAuthorizer{})
@@ -269,8 +339,7 @@ func TestAnAuthorizerThatNamesItsOwnMethodsReplacesTheBox(t *testing.T) {
 	}
 }
 
-// ssoAuthorizer is the shape a companion has: it issues no token, so the token
-// box would be a dead end.
+// ssoAuthorizer issues no token, so the token box would be a dead end.
 type ssoAuthorizer struct{ stubAuthorizer }
 
 func (ssoAuthorizer) LoginMethods() []LoginMethod {

@@ -3,7 +3,7 @@
 
 import { useSyncExternalStore } from 'react'
 
-import { cookieSessionRefused, getToken, subscribe } from './session'
+import { cookieSessionRefused, getToken, getUsername, subscribe } from './session'
 
 /**
  * useToken re-renders whoever calls it when the credential appears or goes.
@@ -18,6 +18,11 @@ import { cookieSessionRefused, getToken, subscribe } from './session'
  */
 export function useToken(): string | null {
   return useSyncExternalStore(subscribe, getToken)
+}
+
+/** useUsername is who the token was signed in as, or null; see getUsername. */
+export function useUsername(): string | null {
+  return useSyncExternalStore(subscribe, getUsername)
 }
 
 /**

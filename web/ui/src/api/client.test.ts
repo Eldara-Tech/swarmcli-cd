@@ -11,7 +11,7 @@ let requests: { url: string; init: RequestInit | undefined }[] = []
 
 function fakeFetch(answer: (url: string) => Response) {
   // Typed as a string because that is all this module ever passes: every call
-  // goes through withBearer with a path. A Request object would stringify to
+  // goes through withCredential with a path. A Request object would stringify to
   // "[object Object]" and the assertions would quietly stop meaning anything.
   const spy = vi.fn((url: string, init?: RequestInit) => {
     requests.push({ url, init })
@@ -44,6 +44,28 @@ afterEach(() => {
 
 describe('the fetch wrapper', () => {
   it('attaches the session credential to every request', async () => {
+    setToken('s3cret')
+    fakeFetch(() => json(200, { applications: [] }))
+
+    await apiGet('/api/v1/applications')
+
+    expect(bearer()).toBe('Bearer s3cret')
+  })
+
+  // What the login screen stores: the controller checks the username too.
+  // UTF-8, which btoa alone would throw on.
+  it('sends Basic credentials for a token signed in with a username', async () => {
+    setToken('s3cret', 'józsef')
+    fakeFetch(() => json(200, { applications: [] }))
+
+    await apiGet('/api/v1/applications')
+
+    expect(bearer()).toBe('Basic asOzenNlZjpzM2NyZXQ=')
+  })
+
+  // A token stored without a username must not inherit the previous one.
+  it('sends a bearer once a token is stored without a username', async () => {
+    setToken('old', 'ops')
     setToken('s3cret')
     fakeFetch(() => json(200, { applications: [] }))
 
@@ -130,6 +152,13 @@ describe('the login probe', () => {
     expect(await verify('the-new-one')).toBe(true)
     expect(requests[0].url).toBe(probePath)
     expect(bearer()).toBe('Bearer the-new-one')
+  })
+
+  it('probes with the typed username beside the typed token', async () => {
+    fakeFetch(() => json(200, { applications: 0 }))
+
+    expect(await verify('the-token', 'ops')).toBe(true)
+    expect(bearer()).toBe('Basic b3BzOnRoZS10b2tlbg==')
   })
 
   it('reports a rejected token without touching the session', async () => {

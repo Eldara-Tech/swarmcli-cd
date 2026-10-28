@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
-import { useState, type FormEvent } from 'react'
+import { Fragment, useState, type FormEvent } from 'react'
 
 import { verify } from '../api/client'
 import { useBootstrap, type LoginOption } from '../api/discovery'
@@ -27,11 +27,14 @@ import { PageTitle } from '../components/PageTitle'
  */
 export function Login() {
   const bootstrap = useBootstrap()
+  const [username, setUsername] = useState('')
   const [candidate, setCandidate] = useState('')
   const [checking, setChecking] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  async function submit(event: FormEvent) {
+  // name is the username to sign in with, or undefined for a method that asks
+  // for none.
+  async function submit(event: FormEvent, name: string | undefined) {
     // No action and no method on the form, so this is the only thing that can
     // submit it — but preventDefault is what stops a browser from ever falling
     // back to a GET that would put the token in the address bar.
@@ -39,13 +42,15 @@ export function Login() {
     setChecking(true)
     setError(null)
     try {
-      if (await verify(candidate)) {
+      if (await verify(candidate, name)) {
         // Stored only now that the controller has accepted it, so a wrong token
         // never signs anybody in for the length of a request; see client.verify.
-        setToken(candidate)
+        setToken(candidate, name)
         return
       }
-      setError('The controller rejected that token.')
+      setError(
+        name === undefined ? 'The controller rejected that token.' : 'The controller rejected that username and token.',
+      )
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : 'The controller could not be reached.')
     } finally {
@@ -68,10 +73,13 @@ export function Login() {
   const methods = bootstrap.isError ? [tokenFallback] : bootstrap.data.login
 
   // The one credential this screen collects. A second typed-in method is not a
-  // shape it has: two boxes above one Sign in button is a form nobody can use,
-  // and no authorizer offers one — the core's returns exactly the token method,
-  // and a companion that has moved to SSO returns only a link.
+  // shape it has: two credentials above one Sign in button is a form nobody can
+  // use, and no authorizer offers one — the core's returns exactly the token
+  // method, and a companion with SSO live returns its link before it.
   const typed = methods.find(isTypedIn)
+  // The username belongs to the admin token, SWARMCLI_CD_ADMIN_USERNAME, so
+  // only that method asks for one.
+  const asksUsername = typed?.id === 'token'
 
   const card = (
     <>
@@ -88,7 +96,7 @@ export function Login() {
           This controller advertises no way to sign in from a browser.
         </p>
       )}
-      {methods.map((method) => {
+      {methods.map((method, index) => {
         if (!isTypedIn(method)) {
           return (
             <a key={method.id} className="login-start" href={method.start}>
@@ -98,7 +106,13 @@ export function Login() {
         }
         if (method !== typed) return null
         return (
-          <TypedCredential key={method.id} method={method} value={candidate} onChange={setCandidate} />
+          <Fragment key={method.id}>
+            {/* Between a link above and the form below, so the two read as
+                alternatives rather than as steps. */}
+            {methods.slice(0, index).some((m) => !isTypedIn(m)) && <p className="login-or">or</p>}
+            {asksUsername && <Username value={username} onChange={setUsername} />}
+            <TypedCredential method={method} value={candidate} focus={!asksUsername} onChange={setCandidate} />
+          </Fragment>
         )
       })}
       {error !== null && (
@@ -107,7 +121,7 @@ export function Login() {
         </p>
       )}
       {typed !== undefined && (
-        <button type="submit" disabled={checking || candidate === ''}>
+        <button type="submit" disabled={checking || candidate === '' || (asksUsername && username === '')}>
           {checking ? 'Checking…' : 'Sign in'}
         </button>
       )}
@@ -148,7 +162,7 @@ export function Login() {
         // that returns a promise is one nothing awaits, so a rejection inside it
         // would be an unhandled rejection rather than the message below.
         onSubmit={(event) => {
-          void submit(event)
+          void submit(event, asksUsername ? username : undefined)
         }}
       >
         {card}
@@ -165,20 +179,48 @@ function isTypedIn(method: LoginOption): boolean {
   return method.start === undefined || method.start === ''
 }
 
+/** The username the admin token is signed in with; see the hint below the token. */
+function Username({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  return (
+    <>
+      <label htmlFor="admin-username">Username</label>
+      <input
+        // Not "username": that is the id Keycloak's own page gives its field,
+        // which the licensed smoke run fills right after leaving this one.
+        id="admin-username"
+        type="text"
+        // Off for the reason the token's is: a password manager offering to
+        // save the pair would write the token to disk with it.
+        autoComplete="off"
+        autoCapitalize="off"
+        spellCheck={false}
+        autoFocus
+        value={value}
+        onChange={(event) => {
+          onChange(event.target.value)
+        }}
+      />
+    </>
+  )
+}
+
 /**
  * The box, as a fragment rather than a wrapper element.
  *
- * The fragment is deliberate: it keeps the card's children exactly the sequence
- * Phase B rendered — heading, label, input, hint, error, button — so a free
- * build's login screen is the one that shipped, down to the DOM.
+ * The fragment is deliberate: it keeps the card's children the flat sequence
+ * Phase B rendered — heading, label, input, hint, error, button — with the
+ * username's label and input now ahead of the token's.
  */
 function TypedCredential({
   method,
   value,
+  focus,
   onChange,
 }: {
   method: LoginOption
   value: string
+  /** False when a username field above it takes the focus instead. */
+  focus: boolean
   onChange: (value: string) => void
 }) {
   return (
@@ -192,7 +234,7 @@ function TypedCredential({
         type="password"
         autoComplete="off"
         spellCheck={false}
-        autoFocus
+        autoFocus={focus}
         value={value}
         onChange={(event) => {
           onChange(event.target.value)
@@ -205,7 +247,8 @@ function TypedCredential({
             to the wrong place. */}
         {method.id === 'token' && (
           <>
-            The value of <code>SWARMCLI_CD_ADMIN_TOKEN</code>.{' '}
+            The username is <code>SWARMCLI_CD_ADMIN_USERNAME</code>, <code>admin</code> unless set, and the token
+            is the value of <code>SWARMCLI_CD_ADMIN_TOKEN</code>.{' '}
           </>
         )}
         It is kept for this tab only and is forgotten when the tab closes.

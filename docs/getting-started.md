@@ -131,7 +131,8 @@ ssh -L 8080:127.0.0.1:8080 your-manager-host
 ```
 
 One tunnel is enough for both, because there is only one port. Open
-<http://127.0.0.1:8080> and sign in with the token from step 3: the web UI is
+<http://127.0.0.1:8080> and sign in as `admin` with the token from step 3 (the
+username is `SWARMCLI_CD_ADMIN_USERNAME` when set): the web UI is
 served by the controller itself, out of the same binary, and every screen it
 draws is one call to the same API the commands below use. A page saying the
 binary was built without its web UI means exactly that — a local `go build` with

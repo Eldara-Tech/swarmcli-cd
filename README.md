@@ -210,6 +210,7 @@ output and in argv.
 |---|---|
 | `SWARMCLI_CD_ADMIN_TOKEN_FILE` | API admin token, read from a file — the Docker-secret form |
 | `SWARMCLI_CD_ADMIN_TOKEN` | API admin token, given directly |
+| `SWARMCLI_CD_ADMIN_USERNAME` | the username the login screen asks for beside the token (default `admin`) |
 | `SWARMCLI_CD_GIT_USERNAME` | git username; forges usually ignore it, GitHub wants it non-empty |
 | `SWARMCLI_CD_GIT_TOKEN_FILE` | git password or token, read from a file |
 | `SWARMCLI_CD_GIT_TOKEN` | git password or token, given directly |

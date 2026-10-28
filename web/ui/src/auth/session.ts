@@ -23,6 +23,7 @@
 // auth/useToken.ts is the three lines that make it a hook.
 
 const storageKey = 'swarmcli-cd.token'
+const usernameKey = 'swarmcli-cd.username'
 
 // listeners are the React subscriptions; see useToken. A Set rather than the
 // `storage` event, which sessionStorage never fires for the tab that wrote it —
@@ -33,8 +34,15 @@ export function getToken(): string | null {
   return sessionStorage.getItem(storageKey)
 }
 
-export function setToken(token: string): void {
+/** getUsername is who the token was signed in as, or null for a token stored without one. */
+export function getUsername(): string | null {
+  return sessionStorage.getItem(usernameKey)
+}
+
+export function setToken(token: string, username?: string): void {
   sessionStorage.setItem(storageKey, token)
+  if (username === undefined) sessionStorage.removeItem(usernameKey)
+  else sessionStorage.setItem(usernameKey, username)
   announce()
 }
 
@@ -55,6 +63,7 @@ export function setToken(token: string): void {
  */
 export function clearSession(): void {
   sessionStorage.removeItem(storageKey)
+  sessionStorage.removeItem(usernameKey)
   cookieRefused = true
   announce()
 }

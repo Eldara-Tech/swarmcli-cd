@@ -1609,6 +1609,7 @@ does, so it does not make either kind of line easier to read.
 |---|---|
 | `SWARMCLI_CD_ADMIN_TOKEN_FILE` | API admin token, read from a file — the Docker-secret form |
 | `SWARMCLI_CD_ADMIN_TOKEN` | API admin token, given directly |
+| `SWARMCLI_CD_ADMIN_USERNAME` | the username the login screen asks for beside the token, and the name syncs are attributed to (default `admin`). Not a secret, so it has no file form |
 | `SWARMCLI_CD_GIT_USERNAME` | git username; forges often ignore it, GitHub wants it non-empty (`x-access-token`) |
 | `SWARMCLI_CD_GIT_TOKEN_FILE` | git password or token, read from a file — the Docker-secret form |
 | `SWARMCLI_CD_GIT_TOKEN` | git password or token, given directly |
@@ -1625,10 +1626,11 @@ set `SWARMCLI_CD_GIT_USERNAME` and a token via `SWARMCLI_CD_GIT_TOKEN_FILE`. The
 same credential is used for the app-set repository in git mode — one credential
 for the controller, not one per repository.
 
-A licensed build reads seven more. Five are `SWARMCLI_CD_OIDC_*`, which
-configure the identity provider browsers sign in against. They are set together
-or not at all — a half-configured provider refuses to start — and they are
-documented with the rest of that feature in [single sign-on](sso.md).
+A licensed build reads eight more. Six are `SWARMCLI_CD_OIDC_*`, which
+configure the identity provider browsers sign in against and name it on the
+login button. All but the name are set together or not at all — a
+half-configured provider refuses to start — and they are documented with the
+rest of that feature in [single sign-on](sso.md).
 
 The other two carry no `_CD_` in their names, because they are the licensed
 module's rather than this controller's, and they are the only controls over the
