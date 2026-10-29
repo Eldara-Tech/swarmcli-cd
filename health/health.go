@@ -157,7 +157,8 @@ func Release(in Input) (application.Health, []application.ServiceStatus) {
 // update for a service nothing is drifting (#130). `paused` and
 // `rollback_paused` are swarm stopped part-way with its tasks in two
 // generations, which a comparison of specs says nothing about, so both stay
-// degraded whatever AsDeclared says.
+// degraded whatever AsDeclared says. A pause every slot has since outgrown is
+// not one of them, and the engine already settles it (#336).
 //
 // It is overturned by asking the engine again with the field the verdict came
 // from cleared, rather than by substituting an answer. Every other rule then
