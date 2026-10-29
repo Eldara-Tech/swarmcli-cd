@@ -55,6 +55,18 @@ func TestReleaseHealthPerService(t *testing.T) {
 			message: "update paused",
 		},
 		{
+			// The pause #336 reported. Swarm keeps it until the next update,
+			// while a restart brought the new spec up in the only slot, so
+			// nothing is left for it to finish (Eldara-Tech/swarmcli#705); this
+			// case holds the pin that the engine compiled in settles it.
+			name: "a pause every slot has outgrown",
+			state: charts.ServiceState{
+				Name: "keycloak", Running: 1, UpToDate: 1, Desired: 1,
+				UpdateState: "paused", NewestTaskAge: stableAge,
+			},
+			want: application.HealthHealthy,
+		},
+		{
 			name: "a completed rollback is wedged",
 			// At parity, and past the stability window, on the spec the deploy
 			// set out to replace: swarmkit restores the previous spec before it
