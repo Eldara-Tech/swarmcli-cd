@@ -2,7 +2,7 @@
 SPDX-License-Identifier: Apache-2.0
 Copyright © 2026 Eldara Tech
 
-The rail's BrandMark (components/Icon.tsx) as the tab icon, in --primary: a
+The rail's BrandMark (components/Icon.tsx) as the tab icon, in the primary colour: a
 favicon has no currentColor to inherit. Linked from index.html as a source file
 so Vite emits it under assets/, the one prefix web.go serves as files.
 -->
