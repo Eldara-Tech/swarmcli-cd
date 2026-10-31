@@ -244,7 +244,9 @@ it surprises somebody.
 
 A browser holding a stale session cookie is not rejected for it — it falls
 through to the token, which is how the CLI has always authenticated and what a
-lapsed licence degrades to.
+lapsed licence degrades to. The other way round, a request carrying a valid
+token is the token's whatever cookie comes with it, so a tab signed in with the
+token keeps every action while another tab holds a readonly SSO session.
 
 ## Signing out
 
