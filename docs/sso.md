@@ -61,10 +61,13 @@ In Keycloak, create a client in the realm you will authenticate against:
 - **Confidential or public.** A confidential client has a secret, which you pass
   as a docker secret. A public client has none and is protected by PKCE, which
   this controller always sends.
-- A **Group Membership** mapper named `groups` with *Add to ID token* on and
-  *Full group path* off. It is required: a login whose token names neither
-  group below is refused. With *Full group path* on, Keycloak sends `/admin`
-  rather than `admin`, and that matches nothing.
+- A **Group Membership** mapper named `groups` with *Add to ID token* on. It is
+  required: a login whose token names neither group below is refused. Names
+  match exactly, so the mapper's *Full group path* decides what one means. Off,
+  the claim carries `admin` for a group of that name at any depth,
+  `/billing/admin` included. On, it carries `/admin`, which matches only once
+  the group variables below name full paths — `/admin`, or `/cd/admin` — and
+  then only that group. In a realm that nests groups, leave it on.
 - **Two groups**, `admin` and `readonly` unless you rename them below, with
   your operators in them.
 
@@ -94,8 +97,10 @@ controller takes, these arrive as docker secrets, and a flag would put them in
 
 Both secret forms may be omitted for a public client, and the name and the two
 groups always may: none of them is a variable the rule below counts. Rename a
-group when your realm already has one called `admin` that means something else
-— membership of it would otherwise carry the right to deploy.
+group when your realm already has one of that name meaning something else:
+membership of `admin` would otherwise carry the right to deploy, and of
+`readonly` the right to read every rendered manifest and log. Neither role can
+be switched off — an empty value means the default.
 
 **Set some but not all of them and the controller refuses to start**, naming
 what is missing:
