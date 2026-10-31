@@ -64,11 +64,15 @@ export function ApplicationDetail() {
             lands on nothing. It does not need to hold for longer than that —
             the handler answers 202 in milliseconds, and a press after it has
             answered is coalesced by the controller onto the sync already
-            queued rather than starting a second one. */}
+            queued rather than starting a second one.
+
+            Disabled for good when the document says this caller may not sync
+            (#341): pressing it could only answer 403. */}
         <button
           type="button"
           className="sync-button"
-          disabled={sync.isPending}
+          disabled={sync.isPending || !detail.data.permissions.sync}
+          title={detail.data.permissions.sync ? undefined : 'You do not have permission to sync this application'}
           onClick={() => {
             sync.mutate()
           }}
@@ -113,8 +117,19 @@ function tab({ isActive }: { isActive: boolean }): string {
 function useApplication(app: string) {
   return useQuery({
     queryKey: applicationKey(app),
-    queryFn: () => apiGet<View>(`/api/v1/applications/${encodeURIComponent(app)}`),
+    queryFn: () => apiGet<Detail>(`/api/v1/applications/${encodeURIComponent(app)}`),
   })
+}
+
+/**
+ * The document api.go's detail handler writes: the view, and what the caller
+ * may do to it.
+ *
+ * Not in api/types.ts, for the reason SyncAccepted is not: the handler wraps
+ * the View, and no generated fixture polices the wrapper.
+ */
+interface Detail extends View {
+  permissions: { sync: boolean }
 }
 
 /**

@@ -28,7 +28,7 @@ function view(mutate: (v: View) => void = () => {}): View {
 
 function serve(body: View): void {
   controller({
-    '/api/v1/applications/edge': () => json(200, body),
+    '/api/v1/applications/edge': () => json(200, { ...body, permissions: { sync: true } }),
     '/api/v1/events': openStream,
   })
 }

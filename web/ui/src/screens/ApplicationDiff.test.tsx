@@ -47,7 +47,7 @@ function serve(body: DiffResponse, status = 200): void {
     // Longer than the detail path, so fakeApi's longest-prefix rule sends the
     // tab's request here and not to the document below it.
     '/api/v1/applications/edge/diff': () => json(status, body),
-    '/api/v1/applications/edge': () => json(200, view()),
+    '/api/v1/applications/edge': () => json(200, { ...view(), permissions: { sync: true } }),
     '/api/v1/events': openStream,
   })
 }

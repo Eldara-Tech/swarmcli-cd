@@ -281,6 +281,19 @@ revision, planned action, sync state, health, and its services (name, mode,
 `running`/`desired`, health, update state). Absent releases means "not requested"
 here rather than "none" — the engine rejects a release file declaring none.
 
+Beside `spec` and `status` it carries what the caller may do to the application:
+
+```json
+{ "spec": { ... }, "status": { ... }, "permissions": { "sync": false } }
+```
+
+`sync` is the authorizer's answer to the `sync` action for this application,
+which is how the UI disables its button for a subject that holds `read` and not
+`sync` — the readonly role of a licensed SSO build, for one (see
+[single sign-on § roles](sso.md#roles)). It is a hint, not the gate: the `POST`
+below is authorised for itself whatever this said. The default authorizer's
+admin token holds every action, so it always reads `true` there.
+
 A release's `revision` is the chart engine's revision number, the newest row of
 its [history](#history--get-apiv1applicationsapphistory): 0 when it has never
 been installed, or when the release records could not be read. It is read on the

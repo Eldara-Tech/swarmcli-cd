@@ -49,7 +49,7 @@ function revisions(body: History): Revision[] {
 function serve(body: unknown, status = 200): void {
   controller({
     '/api/v1/applications/edge/history': () => json(status, body),
-    '/api/v1/applications/edge': () => json(200, view()),
+    '/api/v1/applications/edge': () => json(200, { ...view(), permissions: { sync: true } }),
     '/api/v1/events': openStream,
   })
 }

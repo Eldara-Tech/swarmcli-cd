@@ -704,14 +704,39 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, subject authz.Subj
 	write(w, http.StatusOK, map[string]any{"applications": out})
 }
 
-// detail serves one application with its releases and their services.
-func (s *Server) detail(w http.ResponseWriter, r *http.Request, _ authz.Subject) {
-	view, ok := s.rec.View(r.PathValue("app"))
+// detailDocument is one application as the detail screen draws it: the view,
+// and what the caller may do to it.
+type detailDocument struct {
+	application.View
+	Permissions permissions `json:"permissions"`
+}
+
+// permissions is what the caller may do to one application, beyond reading it.
+//
+// Sync only, because the button is the only control the UI draws for an action
+// a subject may hold or not (#341): diff and history are tabs that already
+// answer a 403 with a notice of their own. A struct rather than a bool on the
+// document so the next one is a field rather than a second key at the top.
+type permissions struct {
+	Sync bool `json:"sync"`
+}
+
+// detail serves one application with its releases and their services, and
+// whether the caller may sync it.
+//
+// The sync answer is the guard's own question asked early, scoped to this
+// application, so the UI can disable the button instead of drawing one that
+// answers 403 when pressed. It is a hint and not the gate: POST …/sync is
+// authorised for itself, whatever this said.
+func (s *Server) detail(w http.ResponseWriter, r *http.Request, subject authz.Subject) {
+	app := r.PathValue("app")
+	view, ok := s.rec.View(app)
 	if !ok {
 		fail(w, http.StatusNotFound, "no such application")
 		return
 	}
-	write(w, http.StatusOK, view)
+	sync := s.authz.Authorize(r.Context(), subject, authz.ActionSync, app) == nil
+	write(w, http.StatusOK, detailDocument{View: view, Permissions: permissions{Sync: sync}})
 }
 
 // diff serves the manifest change each release would undergo.
