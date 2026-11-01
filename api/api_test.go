@@ -303,6 +303,51 @@ func TestDetailCarriesReleasesAndServices(t *testing.T) {
 	}
 }
 
+// readOnly grants everything but sync: the readonly role a licensed SSO build
+// gives (#341).
+type readOnly struct{ *allowAll }
+
+func (r readOnly) Authorize(ctx context.Context, s authz.Subject, act authz.Action, app string) error {
+	if act == authz.ActionSync {
+		return errors.New("read-only")
+	}
+	return r.allowAll.Authorize(ctx, s, act, app)
+}
+
+// TestDetailSaysWhetherTheCallerMaySync is what lets the UI disable the button
+// rather than draw one that answers 403. A subject refused sync still reads the
+// application: the refusal is a field, not a status.
+func TestDetailSaysWhetherTheCallerMaySync(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a    authz.Authorizer
+		want bool
+	}{
+		{"may sync", &allowAll{}, true},
+		{"read-only", readOnly{&allowAll{}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, h := testServer(t, &fakeReconciler{views: []application.View{view("edge")}}, tc.a)
+			rr := do(t, h, "GET", "/api/v1/applications/edge")
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rr.Code)
+			}
+			got := decode[struct {
+				application.View
+				Permissions *struct {
+					Sync bool `json:"sync"`
+				} `json:"permissions"`
+			}](t, rr)
+			if got.Permissions == nil || got.Permissions.Sync != tc.want {
+				t.Errorf("permissions = %s, want sync %v", rr.Body, tc.want)
+			}
+			if got.Spec.Name != "edge" {
+				t.Errorf("the view is no longer at the top level of the document: %s", rr.Body)
+			}
+		})
+	}
+}
+
 func TestUnknownApplicationIs404(t *testing.T) {
 	_, h := testServer(t, &fakeReconciler{}, nil)
 	for _, path := range []string{
@@ -685,7 +730,9 @@ func TestAuthorizerIsAskedTheRightQuestion(t *testing.T) {
 	do(t, h, "GET", "/api/v1/applications/edge/history")
 	do(t, h, "POST", "/api/v1/applications/edge/sync")
 
-	want := []string{"read:", "read:edge", "diff:edge", "history:edge", "sync:edge"}
+	// The detail view asks sync as well as read: it reports whether the caller
+	// may press the button.
+	want := []string{"read:", "read:edge", "sync:edge", "diff:edge", "history:edge", "sync:edge"}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if len(a.calls) != len(want) {

@@ -19,8 +19,8 @@ spellings in [§ the provider](#1-register-a-client-with-the-provider).
 
 It adds a **"Sign in with SSO" button** to the login screen, above the admin
 username and token form, which stays as the way in when the identity provider is
-down. That is the whole of the user-visible change, and the distinction is worth
-holding on to, because two things people expect to follow do not.
+down, and it gives every login one of **two roles**, admin or readonly, from its
+groups — see [§ roles](#roles). Two things people expect to follow do not.
 
 **The admin token is still required.** The controller refuses to start without
 one, licensed or not. It is what the CLI, every script and the container
@@ -29,15 +29,9 @@ the deployment falls back to if the licence lapses. Without it, a lapse would be
 either an outage nobody can sign in through or an unauthenticated API on a
 process holding the docker socket.
 
-**Every subject it authenticates is an administrator.** Per-user identity is
-what SSO establishes; per-user *authorisation* — projects, and RBAC scoping an
-action to one of them — is the next slice and is not here yet. A login names who
-asked for a sync in the log and on the event stream; it does not yet decide what
-they may sync.
-
-Group membership is carried from the ID token into the subject and nothing reads
-it yet, deliberately: it is what projects will scope against, and a mapper
-configured now costs nothing and saves a second round of provider changes later.
+**Roles are not projects.** A role holds across every application: projects,
+and RBAC scoping an action to one of them, are the next slice and are not here
+yet.
 
 ## What you need
 
@@ -67,8 +61,15 @@ In Keycloak, create a client in the realm you will authenticate against:
 - **Confidential or public.** A confidential client has a secret, which you pass
   as a docker secret. A public client has none and is protected by PKCE, which
   this controller always sends.
-- Optionally, a **Group Membership** mapper named `groups` with *Add to ID
-  token* on. Nothing reads it today; see above.
+- A **Group Membership** mapper named `groups` with *Add to ID token* on. It is
+  required: a login whose token names neither group below is refused. Names
+  match exactly, so the mapper's *Full group path* decides what one means. Off,
+  the claim carries `admin` for a group of that name at any depth,
+  `/billing/admin` included. On, it carries `/admin`, which matches only once
+  the group variables below name full paths — `/admin`, or `/cd/admin` — and
+  then only that group. In a realm that nests groups, leave it on.
+- **Two groups**, `admin` and `readonly` unless you rename them below, with
+  your operators in them.
 
 The controller asks for the `openid`, `profile` and `email` scopes and reads
 three claims from the ID token: `preferred_username`, `email` and `groups`. The
@@ -78,10 +79,10 @@ rather than an empty one.
 
 ## 2. Configure the controller
 
-Five environment variables, and an optional sixth for the button. There are no
-flags for any of this: like every other credential the controller takes, these
-arrive as docker secrets, and a flag would put them in `docker service inspect`
-output and in `argv`.
+Five environment variables, and three optional ones: the button's name and the
+two groups. There are no flags for any of this: like every other credential the
+controller takes, these arrive as docker secrets, and a flag would put them in
+`docker service inspect` output and in `argv`.
 
 | Variable | |
 |---|---|
@@ -91,9 +92,15 @@ output and in `argv`.
 | `SWARMCLI_CD_OIDC_CLIENT_SECRET` | the same secret given directly. The file form is preferred: a secret arrives as a file, encrypted at rest in the raft log and delivered in memory, and the string form gives that up |
 | `SWARMCLI_CD_OIDC_REDIRECT_URL` | where the provider sends the browser back — the controller's external URL plus `/auth/callback`. It **must** end in that path |
 | `SWARMCLI_CD_OIDC_NAME` | optional: the provider's name on the button, so `Keycloak` reads "Sign in with Keycloak". The default is `SSO` |
+| `SWARMCLI_CD_OIDC_ADMIN_GROUP` | optional: the group whose members get the admin role. The default is `admin` |
+| `SWARMCLI_CD_OIDC_READONLY_GROUP` | optional: the group whose members get the readonly role. The default is `readonly` |
 
-Both secret forms may be omitted for a public client, and the name always may:
-it is not one of the variables the rule below counts.
+Both secret forms may be omitted for a public client, and the name and the two
+groups always may: none of them is a variable the rule below counts. Rename a
+group when your realm already has one of that name meaning something else:
+membership of `admin` would otherwise carry the right to deploy, and of
+`readonly` the right to read every rendered manifest and log. Neither role can
+be switched off — an empty value means the default.
 
 **Set some but not all of them and the controller refuses to start**, naming
 what is missing:
@@ -188,6 +195,30 @@ curl -H "Authorization: Bearer $SWARMCLI_CD_ADMIN_TOKEN" \
 `"edition": "business"` with `"sso": true` is the licence having verified. See
 [api § discovery](api.md#discovery--get-uibootstrapjson-and-get-apiv1capabilities).
 
+## Roles
+
+Every completed login is given one role, once, from the `groups` claim of its ID
+token:
+
+| The login is in | Role | What it may do |
+|---|---|---|
+| the admin group | admin | everything, sync included |
+| the readonly group | readonly | everything an admin can see — diffs, history, logs, nodes, the controller page — and no sync. The Sync button is disabled, and `POST …/sync` answers `403` |
+| both | admin | |
+| neither | none | nothing: the login is refused with `403 permission denied` and no session is issued |
+
+Group names match exactly, case included. The admin token is not a login and
+has no role: it keeps every action, as it does in the free build.
+
+**A role lasts as long as its session.** It is read from the ID token at login,
+so adding somebody to a group or removing them takes effect at their next login:
+after signing out and in again, after a restart, or at most twelve hours later.
+
+**Upgrading from a release without roles**, every SSO login used to be an
+administrator. Put your operators in the admin group, or point
+`SWARMCLI_CD_OIDC_ADMIN_GROUP` at the group they are already in, before you
+upgrade, or their next login is refused.
+
 ## Sessions
 
 A completed login issues an opaque session held **in the controller's memory**
@@ -213,7 +244,9 @@ it surprises somebody.
 
 A browser holding a stale session cookie is not rejected for it — it falls
 through to the token, which is how the CLI has always authenticated and what a
-lapsed licence degrades to.
+lapsed licence degrades to. The other way round, a request carrying a valid
+token is the token's whatever cookie comes with it, so a tab signed in with the
+token keeps every action while another tab holds a readonly SSO session.
 
 ## Signing out
 
@@ -269,6 +302,8 @@ session to, put [TLS](configuration.md#tls) in front of it.
 | `400 this login has expired or has already been completed` | More than ten minutes elapsed, or the callback URL was replayed. An authorization code is redeemable once, on purpose |
 | `401 the login could not be completed` | The ID token did not verify, or belonged to a different login. The controller logs which |
 | `503 too many logins in flight` / `too many sessions` | A bounded store is full. It refuses rather than evicting somebody live |
+| `403 permission denied: this account is not in a group with access to this controller` | The login is in neither group. The controller logs the groups it saw, as `sso: login refused` with `groups=[…]`; a `/admin` there is Keycloak's *Full group path* |
+| The Sync button is greyed out | The login has the readonly role. See [§ roles](#roles) |
 
 Everything the flow rejects is logged with a reason and answered to the browser
 without one: every value in a callback's query string is written by whoever sent

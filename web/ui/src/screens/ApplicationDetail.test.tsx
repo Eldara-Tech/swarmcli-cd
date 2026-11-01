@@ -77,9 +77,15 @@ async function driftPanel() {
   return within(ancestor(await screen.findByRole('heading', { name: 'Drift' }), 'section'))
 }
 
+/** What the detail endpoint serves for view: the view, and whether the caller
+ *  may sync it. */
+function served(view: View, sync = true) {
+  return { ...view, permissions: { sync } }
+}
+
 function serve(view: View): void {
   controller({
-    '/api/v1/applications/edge': () => json(200, view),
+    '/api/v1/applications/edge': () => json(200, served(view)),
     '/api/v1/events': openStream,
   })
 }
@@ -337,7 +343,7 @@ describe('the sync button', () => {
   /** The detail document, plus whatever the sync endpoint should answer. */
   function servingSync(sync: () => Response | Promise<Response>): void {
     controller({
-      '/api/v1/applications/edge': () => json(200, detail()),
+      '/api/v1/applications/edge': () => json(200, served(detail())),
       '/api/v1/applications/edge/sync': sync,
       '/api/v1/events': openStream,
     })
@@ -392,6 +398,26 @@ describe('the sync button', () => {
     expect(forbidden.textContent).toMatch(/do not have permission/)
     expect(forbidden.textContent).toMatch(/granted separately/)
     expect(screen.queryByTestId('sync-outcome')).toBeNull()
+  })
+
+  it('is disabled for a caller the controller says may not sync', async () => {
+    let syncs = 0
+    controller({
+      '/api/v1/applications/edge': () => json(200, served(detail(), false)),
+      '/api/v1/applications/edge/sync': () => {
+        syncs++
+        return json(202, { application: 'edge', accepted: true })
+      },
+      '/api/v1/events': openStream,
+    })
+    render(<App />)
+
+    const button = (await press()) as HTMLButtonElement
+    expect(button.disabled).toBe(true)
+    expect(button.title).toMatch(/do not have permission/)
+    fireEvent.click(button)
+    await deliver(() => {})
+    expect(syncs).toBe(0)
   })
 
   it('cannot be pressed twice into two syncs', async () => {
@@ -452,7 +478,7 @@ describe('live updates', () => {
     failed.status.error = 'clone https://git.example/apps: connection refused'
     let reads = 0
     controller({
-      '/api/v1/applications/edge': () => json(200, reads++ === 0 ? detail() : failed),
+      '/api/v1/applications/edge': () => json(200, served(reads++ === 0 ? detail() : failed)),
       '/api/v1/events': stream.open,
     })
     render(<App />)
@@ -476,7 +502,7 @@ describe('live updates', () => {
     controller({
       '/api/v1/applications/edge': () => {
         reads++
-        return json(200, detail())
+        return json(200, served(detail()))
       },
       '/api/v1/events': stream.open,
     })
