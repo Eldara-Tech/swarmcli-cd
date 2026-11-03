@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright © 2026 Eldara Tech
 
-import { Fragment, useState, type FormEvent } from 'react'
+import { Fragment, useEffect, useState, type FormEvent } from 'react'
 
 import { verify } from '../api/client'
 import { useBootstrap, type LoginOption } from '../api/discovery'
@@ -31,6 +31,17 @@ export function Login() {
   const [candidate, setCandidate] = useState('')
   const [checking, setChecking] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Read on the first render and then taken out of the address bar, so that a
+  // reload or a copied link does not say it again about a sign-in that is over.
+  const [refusal] = useState(() =>
+    loginErrors.get(new URLSearchParams(window.location.search).get(loginErrorParam) ?? ''),
+  )
+  useEffect(() => {
+    const url = new URL(window.location.href)
+    if (!url.searchParams.has(loginErrorParam)) return
+    url.searchParams.delete(loginErrorParam)
+    window.history.replaceState(window.history.state, '', url)
+  }, [])
 
   // name is the username to sign in with, or undefined for a method that asks
   // for none.
@@ -91,6 +102,13 @@ export function Login() {
           <p className="login-tagline">Continuous delivery for Docker Swarm</p>
         </div>
       </div>
+      {/* Above every way in, so it reads as the answer to the last attempt
+          rather than to the box nearest it. */}
+      {refusal !== undefined && (
+        <p className="login-error" role="alert">
+          {refusal}
+        </p>
+      )}
       {methods.length === 0 && (
         <p className="login-error" role="alert">
           This controller advertises no way to sign in from a browser.
@@ -170,6 +188,30 @@ export function Login() {
     </main>
   )
 }
+
+/** The query parameter a companion's /auth/login or /auth/callback sends the browser back with. */
+const loginErrorParam = 'login_error'
+
+/**
+ * Why that sign-in ended without a session, by the codes docs/extensibility.md
+ * § Reserved paths fixes.
+ *
+ * A code and never the sentence, because the query string is anybody's to
+ * write: a link can put any code here, and all it can make this screen say is
+ * one of these. A Map rather than an object, so that `constructor` is not one.
+ */
+const loginErrors = new Map([
+  [
+    'denied',
+    'Permission denied: this account is not in a group with access to this controller. Ask an administrator to add it to one.',
+  ],
+  ['refused', 'The identity provider refused the sign-in.'],
+  ['expired', 'That sign-in expired or was already completed. Try again.'],
+  ['unlicensed', 'SSO is not licensed on this controller.'],
+  ['unreachable', 'The identity provider could not be reached.'],
+  ['busy', 'Too many sign-ins at once. Try again.'],
+  ['failed', 'The sign-in could not be completed.'],
+])
 
 /** The method assumed for a controller that could not be asked; see above. */
 const tokenFallback: LoginOption = { id: 'token', label: 'Admin token' }

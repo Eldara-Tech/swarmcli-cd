@@ -205,7 +205,7 @@ token:
 | the admin group | admin | everything, sync included |
 | the readonly group | readonly | everything an admin can see — diffs, history, logs, nodes, the controller page — and no sync. The Sync button is disabled, and `POST …/sync` answers `403` |
 | both | admin | |
-| neither | none | nothing: the login is refused with `403 permission denied` and no session is issued |
+| neither | none | nothing: no session is issued, and the login screen says *Permission denied: this account is not in a group with access to this controller* |
 
 Group names match exactly, case included. The admin token is not a login and
 has no role: it keeps every action, as it does in the free build.
@@ -296,18 +296,20 @@ session to, put [TLS](configuration.md#tls) in front of it.
 | `SWARMCLI_CD_OIDC_REDIRECT_URL must end in /auth/callback` | The controller serves one callback path. A mismatch would end a login on a 404 with the authorization code in the operator's browser history |
 | The login screen shows no SSO button | The licence was not read, or the controller has not restarted since it was installed. Check `bootstrap.json` and the startup route log |
 | `/auth/login` renders the UI instead of redirecting | No route is registered, so `GET /` — the single-page app's fallback — answered it. That is exactly what the Apache-2.0 build does. With `--ui=false` it is a plain `404` |
-| `403 SSO is not licensed on this controller` | The routes are on the mux from a licence that has since lapsed or expired. The token still works |
-| `502 the identity provider could not be reached` | Discovery or the code exchange failed. The controller logs the issuer and the underlying error; it does not cache a failure, so a provider that comes back needs no restart |
-| `400 no login is in flight for this browser` | The login cookie did not come back with the callback — a different browser or tab completed it, or something stripped the cookie |
-| `400 this login has expired or has already been completed` | More than ten minutes elapsed, or the callback URL was replayed. An authorization code is redeemable once, on purpose |
-| `401 the login could not be completed` | The ID token did not verify, or belonged to a different login. The controller logs which |
-| `503 too many logins in flight` / `too many sessions` | A bounded store is full. It refuses rather than evicting somebody live |
-| `403 permission denied: this account is not in a group with access to this controller` | The login is in neither group. The controller logs the groups it saw, as `sso: login refused` with `groups=[…]`; a `/admin` there is Keycloak's *Full group path* |
+| The login screen says *SSO is not licensed on this controller* | The routes are on the mux from a licence that has since lapsed or expired. The token still works |
+| The login screen says *The identity provider could not be reached* | Discovery failed. The controller logs the issuer and the underlying error; it does not cache a failure, so a provider that comes back needs no restart |
+| The login screen says *The identity provider refused the sign-in* | The provider came back with an error instead of a code — the user cancelled, or the provider would not sign them in to this client. The controller logs the provider's `error` and `error_description` |
+| The login screen says *That sign-in expired or was already completed* | More than ten minutes elapsed, the callback URL was replayed, or the login cookie did not come back with the callback — a different browser or tab completed it, or something stripped the cookie. An authorization code is redeemable once, on purpose |
+| The login screen says *The sign-in could not be completed* | The code exchange failed, or the ID token did not verify, belonged to a different login or could not be read. The controller logs which |
+| The login screen says *Too many sign-ins at once* | A bounded store is full. It refuses rather than evicting somebody live |
+| The login screen says *Permission denied: this account is not in a group with access to this controller* | The login is in neither group. The controller logs the groups it saw, as `sso: login refused` with `groups=[…]`; a `/admin` there is Keycloak's *Full group path* |
 | The Sync button is greyed out | The login has the readonly role. See [§ roles](#roles) |
 
-Everything the flow rejects is logged with a reason and answered to the browser
-without one: every value in a callback's query string is written by whoever sent
-the browser there, and a response body is a thing a browser renders.
+Everything the flow rejects sends the browser back to the login screen with one
+of a fixed set of codes, and the screen says which of the sentences above
+applies. Nothing from the callback's query string is repeated: every value in it
+is written by whoever sent the browser there. What more the controller knows, it
+logs.
 
 ## See also
 

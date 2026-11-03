@@ -128,6 +128,48 @@ describe('the login screen', () => {
     expect(await screen.findByLabelText('Admin token')).toBeDefined()
   })
 
+  // #341: a companion that refuses a sign-in sends the browser back here with a
+  // code, and the screen says why above the way back in.
+  it('says why the last sign-in was refused and takes the code out of the address bar', async () => {
+    window.history.pushState({}, '', '/?login_error=denied')
+    advertising(sso, token)
+    render(<App />)
+
+    const refusal = await screen.findByRole('alert')
+    expect(refusal.textContent).toBe(
+      'Permission denied: this account is not in a group with access to this controller. Ask an administrator to add it to one.',
+    )
+    const start = screen.getByRole('link', { name: 'Sign in with SSO' })
+    expect(refusal.compareDocumentPosition(start) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+    expect(window.location.search).toBe('')
+  })
+
+  // The codes are the contract with the companion's /auth/login and
+  // /auth/callback (docs/extensibility.md § Reserved paths), so renaming one
+  // here is a message that silently stops appearing.
+  it.each(['denied', 'refused', 'expired', 'unlicensed', 'unreachable', 'busy', 'failed'])(
+    'knows the code %s',
+    async (code) => {
+      window.history.pushState({}, '', `/?login_error=${code}`)
+      advertising(sso, token)
+      render(<App />)
+
+      expect((await screen.findByRole('alert')).textContent).not.toBe('')
+    },
+  )
+
+  // The query string is anybody's to write, so a code the screen does not know
+  // says nothing rather than anything a link chose.
+  it('says nothing for a code it does not know', async () => {
+    window.history.pushState({}, '', '/?login_error=constructor')
+    advertising(sso, token)
+    render(<App />)
+
+    expect(await screen.findByRole('link', { name: 'Sign in with SSO' })).toBeDefined()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(window.location.search).toBe('')
+  })
+
   // The rule the endpoint exists for. bootstrap.json is what a browser reads
   // *before* it has a credential, so it must be read without one — and the
   // check is made with a token in the session precisely because a login screen
