@@ -263,6 +263,17 @@ its own. It is the same shape of contract as the other five and enforced the
 same way, which is to say not at all; what makes it different is that a
 companion can meet every other one and still ship a button that does nothing.
 
+**A login that ends without a session goes back to the login screen.** When
+`/auth/login` or `/auth/callback` refuses, it redirects to `/?login_error=<code>`
+rather than answering with an error body, which a browser shows as plain text
+outside the UI. The login screen says why for these codes and nothing for any
+other: `denied` (the account has no role on this controller), `refused` (the
+identity provider refused), `expired` (the login expired or was already
+completed), `unlicensed`, `unreachable` (the identity provider), `busy` (too many
+logins or sessions) and `failed` (anything else). A code rather than a sentence,
+because the query string is anybody's to write: all a forged link can make the
+screen say is one of its own sentences.
+
 The corresponding half in this repository is `/ui/bootstrap.json`, which reports
 `session` when the request it arrives on already authenticates. That is how a
 tab holding a cookie discovers it is signed in, and it is why a companion that
