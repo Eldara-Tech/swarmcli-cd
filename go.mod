@@ -2,10 +2,10 @@ module github.com/Eldara-Tech/swarmcli-cd
 
 go 1.27
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
-	github.com/Eldara-Tech/swarmcli/v2 v2.2.1
+	github.com/Eldara-Tech/swarmcli/v2 v2.2.2
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/distribution/reference v0.6.0
