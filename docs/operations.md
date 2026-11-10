@@ -304,14 +304,14 @@ it blocks until the rollout settles and fails loudly if it did not.
 
 **With webhooks on**, the forge's own delivery log is the other half of the
 picture. Every delivery the controller could authenticate and parse was answered
-`202`, so a red row there is a wrong secret (`401`), a GitHub hook left on form encoding
-(`415`), more deliveries at once than the listener takes (`503`, overload — what
-a rate-limiting proxy in front is for), or a controller the forge could not
-reach — and GitLab disables a hook after four of those in a row. On this side, each accepted delivery is one
-`webhook delivery accepted` line at `INFO`; rejections are only at `DEBUG`. A
-push whose application never moved is usually a `source.revision` or `repoURL`
-that does not match what the forge sends; see [configuration §
-webhooks](configuration.md#webhooks).
+`202`, so a red row there is a wrong secret (`401`), a GitHub hook left on form
+encoding (`415`), more deliveries at once than the listener takes (`503`,
+overload — what a rate-limiting proxy in front is for), or a controller the
+forge could not reach — and GitLab disables a hook after four of those in a row.
+On this side, each accepted delivery is one `webhook delivery accepted` line at
+`INFO`; rejections are only at `DEBUG`. A push whose application never moved is
+usually a `source.revision` or `repoURL` that does not match what the forge
+sends; see [configuration § webhooks](configuration.md#webhooks).
 
 ## Logs
 

@@ -1305,18 +1305,18 @@ shut down. The refusal is logged and the next reconcile tries again; nothing is
 lost by waiting, because the evidence is a stored revision that is still there.
 A network with tasks still draining routinely takes a second pass.
 
-**Some refusals never clear, and after three intervals the controller stops
-trying.** Refusals are counted at most once per the application's reconcile
-interval, so a webhook refresh, a manual sync or an edit in between retries the
-deletion without using up an attempt. A chart that drops a network another stack
-is still attached to gets the same refusal on every reconcile for ever, and it is
-indistinguishable from a slow drain except by how long it has been going on. Retrying indefinitely is not
-free: it costs a history walk, a deploy of an unchanged plan, an event and an
-application permanently reporting out of sync, every interval, over something
-that will never happen. So the resource is **left in place, warned about on
-every pass that still finds it, and dropped from the sync axis** — the
-application goes back to `synced`, because nothing it will do is outstanding.
-Removing the resource is then yours:
+**Some refusals never clear, and after three attempts an interval apart the
+controller stops trying.** Refusals are counted at most once per the
+application's reconcile interval, so a webhook refresh, a manual sync or an edit
+in between retries the deletion without using up an attempt. A chart that drops
+a network another stack is still attached to gets the same refusal on every
+reconcile for ever, and it is indistinguishable from a slow drain except by how
+long it has been going on. Retrying indefinitely is not free: it costs a history
+walk, a deploy of an unchanged plan, an event and an application permanently
+reporting out of sync, every interval, over something that will never happen. So
+the resource is **left in place, warned about on every pass that still finds it,
+and dropped from the sync axis** — the application goes back to `synced`,
+because nothing it will do is outstanding. Removing the resource is then yours:
 
 ```
 WARN resources the release no longer declares could not be removed and will not
@@ -1644,11 +1644,12 @@ ping and any other event alike. Every configured secret is good for every
 repository, so an answer that said what a push woke would let whoever holds any
 one of them probe what this controller follows; the log says it instead. It is
 2xx at all because GitLab disables a hook after four failed deliveries in a row.
-`401` for a missing or wrong signature, with no detail; `400` for a signed body that is not
-JSON; `413` above 4 MiB, checked before the signature; `415` as above; `503` with
-sixteen deliveries already in flight, which is overload rather than anything
-wrong with the delivery; `404` and `405` for anything else. Each body has five
-seconds to arrive, so a connection that stalls gives its place back quickly.
+`401` for a missing or wrong signature, with no detail; `400` for a signed body
+that is not JSON; `413` above 4 MiB, checked before the signature; `415` as
+above; `503` with sixteen deliveries already in flight, which is overload rather
+than anything wrong with the delivery; `404` and `405` for anything else. Each
+body has five seconds to arrive, so a connection that stalls gives its place
+back quickly.
 
 **The secret** comes from `SWARMCLI_CD_WEBHOOK_SECRET_FILE`, a Docker secret, or
 `SWARMCLI_CD_WEBHOOK_SECRET`. The file may hold several, one per line: GitLab
