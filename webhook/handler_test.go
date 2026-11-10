@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -332,7 +333,8 @@ func TestEveryParsedDeliveryGetsTheSameAnswer(t *testing.T) {
 	var first string
 	for _, d := range deliveries {
 		w := f.do(http.MethodPost, d.path, d.h, d.body)
-		got := strconv.Itoa(w.Code) + " " + w.Body.String()
+		// Headers too: an answer can differ in more places than its body.
+		got := fmt.Sprintf("%d %v %s", w.Code, w.Header(), w.Body)
 		if first == "" {
 			first = got
 		}
