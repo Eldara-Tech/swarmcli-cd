@@ -1,0 +1,20 @@
+# One of the files in an app set split across apps/; see edge.yaml for the
+# layout and the flags. Adding a file like this one adds its applications to the
+# set, and deleting it makes them leave — reported as orphaned, or with --prune
+# deleted.
+apiVersion: v1
+
+applications:
+  # A single chart pinned here: bumping the version is a commit to this file,
+  # picked up within --appset-interval.
+  - name: hello
+    source:
+      repoURL: https://github.com/your-org/infra.git
+      revision: v1.2.0
+      chart:
+        release: hello
+        ref: swarmcli-charts/whoami
+        version: "0.1.8"
+        repositories:
+          - name: swarmcli-charts
+            url: https://eldara-tech.github.io/swarmcli-charts

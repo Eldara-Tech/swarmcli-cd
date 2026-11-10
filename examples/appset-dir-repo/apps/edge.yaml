@@ -1,0 +1,50 @@
+# An app set split across a directory — one file per team, or per application.
+#
+# This is ../../appset-repo/ with its one applications.yaml cut in two. Every
+# .yaml or .yml file directly in apps/ is a whole applications file, and the set
+# is all of them in filename order:
+#
+#   apps/
+#     edge.yaml               <- this file, owned by the edge team
+#     hello.yaml              <- the platform team's
+#
+# Point a controller at the directory rather than at a file:
+#
+#   swarmcli-cd controller \
+#     --appset-repo https://github.com/your-org/apps.git \
+#     --appset-revision main \
+#     --appset-files apps \
+#     --appset-interval 1m
+#
+# and check it in CI the same way the controller reads it, as a required check:
+#
+#   swarmcli-cd validate --dir apps
+#
+# One bad file fails the whole load and the last good set keeps running, and a
+# name or a release declared in two files is refused naming both. Subdirectories
+# are not read.
+#
+# ---------------------------------------------------------------------------
+# A file per team is not a permission per team. Whoever can change this file can
+# write anything an application entry can say — `allow:` (a host path can grant
+# the docker socket), `self:` and `registryAuth:` included — so this repository
+# is as root-equivalent as ../../appset-repo/. Give each team's file its own
+# CODEOWNERS entry if you like, but keep a directory-wide default owned by the
+# platform team, so every change still needs its review.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+
+applications:
+  # A release file committed to the application's own repository: the versions
+  # live there, so bumping one is a commit in that repo and does not touch this
+  # file at all.
+  - name: edge
+    source:
+      repoURL: https://github.com/your-org/infra.git
+      revision: main
+      releaseFile: swarm/prod/swarmcli-release.yaml
+    syncPolicy:
+      automated: true
+      interval: 3m
+      wait: true
+      timeout: 10m
