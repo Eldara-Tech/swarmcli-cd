@@ -150,6 +150,8 @@ controller/        entry point, command dispatch, daemon wiring, CLI rendering
 client/            HTTP client for the API; the CLI goes through it, not the
                    reconciler, so a UI can do everything the CLI can (D3)
 api/               the HTTP server: the endpoint set and the SSE event stream
+webhook/           forge push notifications, on a listener of their own: a
+                   verified push refreshes whatever tracks the pushed ref
 web/               the browser UI: the Vite project in ui/, its build output in
                    dist/ (go:embed'ed, with a committed .gitkeep so a tree that
                    never ran Vite still compiles), and the handler api serves it
