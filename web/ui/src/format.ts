@@ -72,8 +72,15 @@ export function serviceCounts(counts: ServiceCounts): string {
  * pair an operator reads as a failure (#290). `completed` is the controller's
  * count of the tasks that ended cleanly, absent on every service that is not a
  * job, and the chart engine's own replica column adds it the same way.
+ *
+ * Swarm's own job modes are the exception. Their `desired` is a number of
+ * completions, so a task still running is not done yet: counting it would read
+ * 2/2 beside a health chip saying 0/2 completed (#300). There only `completed`
+ * counts, as in the engine's column and `docker service ls`, whose mode names
+ * these are.
  */
 export function tasksUp(service: ServiceStatus): number {
+  if (service.mode === 'replicated job' || service.mode === 'global job') return service.completed ?? 0
   return service.running + (service.completed ?? 0)
 }
 

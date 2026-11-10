@@ -60,4 +60,13 @@ describe('tasksUp', () => {
   it('is the running count on a service with no completed tasks to add', () => {
     expect(tasksUp({ name: 'web', mode: 'replicated', running: 2, desired: 3, health: 'progressing' as const })).toBe(2)
   })
+
+  it('counts only completions on a native job, so one still running is not 2/2', () => {
+    expect(tasksUp({ name: 'seed', mode: 'replicated job', running: 2, desired: 2, health: 'progressing' as const })).toBe(0)
+    expect(tasksUp({ name: 'seed', mode: 'replicated job', running: 1, desired: 2, completed: 1, health: 'progressing' as const })).toBe(1)
+  })
+
+  it('counts a global job by its completions too', () => {
+    expect(tasksUp({ name: 'warm', mode: 'global job', running: 1, desired: 3, completed: 2, health: 'progressing' as const })).toBe(2)
+  })
 })
