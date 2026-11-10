@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -37,6 +38,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/source"
 	"github.com/Eldara-Tech/swarmcli-cd/swarms"
 	"github.com/Eldara-Tech/swarmcli-cd/web"
+	"github.com/Eldara-Tech/swarmcli-cd/webhook"
 
 	swarmlog "github.com/Eldara-Tech/swarmcli/v2/utils/log"
 )
@@ -95,6 +97,14 @@ Options:
                     this binary, so nothing is fetched and no second port is
                     opened; --ui=false answers its routes with 404 instead
 
+  --webhook-listen <addr>
+                    Also receive forge push webhooks on this address (off by
+                    default), so a push is picked up at once rather than at the
+                    next interval. A listener of its own, so that the API can
+                    stay unpublished while a forge reaches this one. Needs a
+                    webhook secret below, and serves TLS with --tls-cert and
+                    --tls-key when they are set
+
   --reconcile-interval <dur>
                     How often an application is reconciled, for those that do
                     not set syncPolicy.interval (default ` + reconcile.DefaultInterval.String() + `). Every tick
@@ -143,6 +153,9 @@ Docker secrets and a flag would put them in "docker inspect" output and in argv:
   ` + git.EnvTokenFile + `     Git password/token, read from a file
   ` + git.EnvToken + `          Git password/token, given directly
   ` + git.EnvUsername + `       Git username
+  ` + webhook.EnvSecretFile + `
+                                 Webhook secrets, one per line, read from a file
+  ` + webhook.EnvSecret + `     Webhook secret, given directly
 `
 
 // runController parses the daemon's flags and runs it.
@@ -159,6 +172,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.tlsCert, "tls-cert", "", "")
 	fs.StringVar(&o.tlsKey, "tls-key", "", "")
 	fs.BoolVar(&o.ui, "ui", true, "")
+	fs.StringVar(&o.webhookListen, "webhook-listen", "", "")
 	fs.DurationVar(&o.interval, "reconcile-interval", reconcile.DefaultInterval, "")
 	fs.StringVar(&o.appSetRepo, "appset-repo", "", "")
 	fs.StringVar(&o.appSetRevision, "appset-revision", "", "")
@@ -241,6 +255,11 @@ type options struct {
 	// build serves has to be the same list every time, or an extension could
 	// claim GET / in the gap.
 	ui bool
+
+	// webhookListen is where forge webhooks are received, and empty is off. A
+	// second listener rather than routes on the API's, because a forge has to
+	// reach it and nothing has to reach the API.
+	webhookListen string
 
 	// interval is how often an application that names no syncPolicy.interval is
 	// reconciled. Controller-wide and deliberately not floored by
@@ -363,6 +382,10 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	)
 
 	auth, err := git.AuthFromEnv(os.Getenv, os.ReadFile)
+	if err != nil {
+		return err
+	}
+	hookSecrets, err := webhookSecrets(o.webhookListen, os.Getenv, os.ReadFile)
 	if err != nil {
 		return err
 	}
@@ -549,6 +572,31 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// and then reported a failure that had not happened.
 	httpSrv.RegisterOnShutdown(srv.Drain)
 
+	servers := []*http.Server{httpSrv}
+	if o.webhookListen != "" {
+		servers = append(servers, &http.Server{
+			Addr: o.webhookListen,
+			// The app set's repository and revision are empty outside git mode,
+			// which is what keeps a push from waking a set that has none.
+			Handler: webhook.New(webhook.Options{
+				Secrets: hookSecrets, Reconciler: rec,
+				AppSet: loop, AppSetRepo: o.appSetRepo, AppSetRevision: o.appSetRevision,
+				Log: log,
+			}),
+			// All three bounds, not only the API's one: this listener is the one
+			// meant to face the forge, and a delivery is a small body and a short
+			// answer, so nothing here has a reason to hold a connection open.
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			// The API's pair, when it has one. Without it this is plaintext,
+			// which the startup line says: tolerable because what a delivery can
+			// do is ask for a refresh, but a forge across the internet should
+			// still reach it over TLS here or at the edge.
+			TLSConfig: tlsConfig,
+		})
+	}
+
 	// Nothing about licensing may stop the controller converging, which is why
 	// this is a goroutine that only logs: an expiring licence used to produce
 	// no warning anywhere an operator looks, and then SSO stopped — locking out
@@ -568,10 +616,39 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 	// restarts the task forever with everything else working perfectly.
 	log.Info("starting",
 		"version", version, "engine", engineVersion(),
-		"applications", len(cfg.Applications), "listen", o.listen, "tls", o.tlsCert != "",
-		"mode", mode, "appSet", sourceDesc,
+		"applications", len(cfg.Applications), "listen", o.listen, "webhookListen", o.webhookListen,
+		"tls", o.tlsCert != "", "mode", mode, "appSet", sourceDesc,
 		"prune", o.prune, "pruneVolumes", o.pruneVolumes, "controllerID", o.controllerID)
-	return runUntilStopped(ctx, rec, loop, httpSrv, log)
+	return runUntilStopped(ctx, rec, loop, servers, log)
+}
+
+// webhookSecrets reads the secrets webhook deliveries are signed with, and
+// refuses a configuration that says half of one: a listener with no secret, or
+// a secret with no listener — an operator who set one believes webhooks are on.
+//
+// And a secret equal to the admin token. The webhook secret is pasted into the
+// forge's hook settings, where every repository administrator can read it, so
+// the same string as the token would hand each of them root-equivalent access
+// to the swarm through the API.
+func webhookSecrets(listen string, getenv func(string) string, readFile func(string) ([]byte, error)) ([]string, error) {
+	secrets, err := webhook.SecretsFromEnv(getenv, readFile)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case listen != "" && len(secrets) == 0:
+		return nil, fmt.Errorf("--webhook-listen needs a secret: set %s to a file (a Docker secret) or %s to the secret itself",
+			webhook.EnvSecretFile, webhook.EnvSecret)
+	case listen == "" && len(secrets) > 0:
+		return nil, fmt.Errorf("a webhook secret is set but --webhook-listen is not, so no delivery would ever be received: set the flag, or unset %s and %s",
+			webhook.EnvSecretFile, webhook.EnvSecret)
+	}
+	// Only when there is one: an authorizer that needs none has nothing to
+	// collide with, and one that is missing its token has already refused.
+	if token, err := authz.TokenFromEnv(getenv, readFile); err == nil && slices.Contains(secrets, token) {
+		return nil, errors.New("the webhook secret is the admin token: it is pasted into the forge's hook settings, so every repository administrator could read it; give the webhook a secret of its own")
+	}
+	return secrets, nil
 }
 
 // tlsConfigFor loads the certificate pair, or returns nil for a controller that
@@ -717,11 +794,12 @@ func appSetSource(o options, auth git.Auth, root string) (*appset.Loader, string
 	}
 }
 
-// runUntilStopped runs the reconciler, the app-set loop and the listener as
-// peers and returns once all three have stopped. Whichever stops first stops the
-// others: a listener that cannot bind must not leave a controller reconciling
-// with no way to observe it, and a reconciler that returns must not leave an API
-// serving views that will never update.
+// runUntilStopped runs the reconciler, the app-set loop and the listeners — the
+// API's, and the webhook one when it is on — as peers and returns once all of
+// them have stopped. Whichever stops first stops the others: a listener that
+// cannot bind must not leave a controller reconciling with no way to observe it,
+// and a reconciler that returns must not leave an API serving views that will
+// never update.
 // The two are stopped in that order and not together, which is the whole of the
 // shutdown fix. One context used to cancel the reconciler the moment the signal
 // arrived and only then drain the listener, so the gap between them was a window
@@ -729,10 +807,10 @@ func appSetSource(o options, auth git.Auth, root string) (*appset.Loader, string
 // on after the reconciler had provably stopped — with Shutdown seeing nothing in
 // flight and reporting a clean exit over a process leaving mid-apply.
 //
-// So the listener goes down first: it is the only thing that can create new
-// work, and once it is drained the reconciler cannot be given anything more to
-// do. Then the reconciler is cancelled and drains what it already had.
-func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, loop *appset.Loop, httpSrv *http.Server, log *slog.Logger) error {
+// So the listeners go down first: they are the only things that can create new
+// work, and once they are drained the reconciler cannot be given anything more
+// to do. Then the reconciler is cancelled and drains what it already had.
+func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, loop *appset.Loop, servers []*http.Server, log *slog.Logger) error {
 	// stopping is the "something ended" signal, whichever peer ends first.
 	stopping, stopAll := context.WithCancel(ctx)
 	defer stopAll()
@@ -742,7 +820,7 @@ func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, loop *appse
 	recCtx, stopReconciling := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopReconciling()
 
-	errs := make(chan error, 3)
+	errs := make(chan error, 2+len(servers))
 
 	go func() {
 		err := rec.Run(recCtx)
@@ -765,28 +843,37 @@ func runUntilStopped(ctx context.Context, rec *reconcile.Reconciler, loop *appse
 		errs <- err
 	}()
 
-	go func() {
-		err := listenAndServe(httpSrv)
-		if errors.Is(err, http.ErrServerClosed) {
-			err = nil
-		}
-		stopAll()
-		errs <- err
-	}()
+	for _, srv := range servers {
+		go func() {
+			err := listenAndServe(srv)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			stopAll()
+			errs <- err
+		}()
+	}
 
 	<-stopping.Done()
 	log.Info("stopping")
 
 	// Not the signal context: it is already cancelled, and Shutdown given a
-	// cancelled context returns immediately without draining anything.
+	// cancelled context returns immediately without draining anything. One
+	// budget for every listener, because SIGKILL's ten seconds are one budget.
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 	defer cancel()
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		log.Warn("the API did not shut down cleanly", "error", err)
+	for _, srv := range servers {
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Warn("a listener did not shut down cleanly", "listen", srv.Addr, "error", err)
+		}
 	}
 
 	// Only now, with nothing able to ask for more.
 	stopReconciling()
 
-	return errors.Join(<-errs, <-errs, <-errs)
+	stopped := make([]error, 0, cap(errs))
+	for range cap(errs) {
+		stopped = append(stopped, <-errs)
+	}
+	return errors.Join(stopped...)
 }

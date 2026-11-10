@@ -9,6 +9,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 )
@@ -89,6 +90,39 @@ func TestDriftIsDetectedAndSynced(t *testing.T) {
 	if view.Status.Sync.State != application.SyncSynced {
 		t.Errorf("sync state = %q, want synced after the sync", view.Status.Sync.State)
 	}
+}
+
+// What a verified webhook delivery asks for: a refresh. Under an hour's interval
+// a commit can only reach the swarm before the test times out through one, so
+// the second replica appearing is the refresh and not a tick.
+func TestRefreshDeploysACommitWithoutWaitingForTheInterval(t *testing.T) {
+	cli := dockerClient(t)
+	const release = "e2e-refresh"
+	repo := gitRepo(t, chartFiles(release, 1))
+	t.Cleanup(func() { removeStack(t, release) })
+
+	app := releaseApp("refresh", repo, true)
+	app.SyncPolicy.Interval = application.Duration(time.Hour)
+	rec := reconciler(t, app)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = rec.Run(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	// The loop's first tick is immediate, and deploys.
+	waitForRunning(t, cli, release, 1)
+
+	commitChange(t, repo, chartFiles(release, 2))
+	if err := rec.Refresh("refresh"); err != nil {
+		t.Fatalf("Refresh = %v, want nil", err)
+	}
+	waitForRunning(t, cli, release, 2)
 }
 
 // The destination is not decoration. A seam that is silent when it is wrong

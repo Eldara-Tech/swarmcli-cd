@@ -1456,6 +1456,15 @@ In the OSS build, protecting that repository is the deployment's responsibility:
 Per-user identity and RBAC over who may change what are a licensed capability;
 see [extensibility.md](extensibility.md).
 
+The [webhook](#webhooks) secret is not on this tier, and is kept off it on
+purpose. What it authenticates is a request to *refresh*: re-read the app set
+from the repository the bootstrap already names, or reconcile applications the
+set already declares. Nothing in a delivery says what is deployed, a manual
+policy is not applied, and prune keeps its own interval. Somebody holding the
+secret can make the controller fetch and render sooner than it otherwise would,
+at most once every ten seconds for each application and for the app set, and
+nothing more.
+
 It is also where an application's permissions live. [`allow`](#allow-optional)
 says what each application's charts may reach outside their own releases — host
 paths on the nodes, and another stack's secrets, configs, volumes and networks —
@@ -1516,6 +1525,7 @@ line that shows exactly what the controller is following is worth having in
 | `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume so a restart does not re-clone everything. An application that leaves the set has both reclaimed, one app-set interval after it goes |
 | `--tls-cert`, `--tls-key` | — | serve the API over TLS. Both or neither; see [TLS](#tls) |
 | `--ui` | on | serve the web UI at `/`. It is embedded in the binary, so nothing is fetched and no port is opened beyond `--listen`. `--ui=false` does not remove the routes; it answers them with `404` |
+| `--webhook-listen` | off | receive forge push webhooks on this address — a listener of its own, never `--listen`'s. Needs a webhook secret; see [webhooks](#webhooks) |
 | `--reconcile-interval` | `3m` | how often an application that sets no [`syncPolicy.interval`](#syncpolicy-optional) is reconciled. Every tick is a git fetch, a full render and a read of the swarm's release records, per application. Unlike the per-application field it has no floor: the app set is the untrusted tier, and this one is set by whoever runs the controller |
 | `--appset-repo` | — | pull the app set from this repository. Selects **git** mode |
 | `--appset-revision` | — | branch, tag or SHA to track. Required with `--appset-repo`; an unpinned app set would follow whatever the default branch happens to point at |
@@ -1566,6 +1576,92 @@ swarmcli-cd app list --server https://controller.example.com:8080 \
                      --ca-cert /run/secrets/swarmcli-cd-tls-cert
 ```
 
+### Webhooks
+
+Without them a commit lands at the next interval: `--appset-interval` for the
+app set, `syncPolicy.interval` or `--reconcile-interval` for an application.
+`--webhook-listen` takes the forge's push notification instead and refreshes
+what the push touched within seconds.
+
+```yaml
+command: ["controller", "--appset-repo", "https://github.com/your-org/apps.git",
+          "--appset-revision", "main", "--appset-path", "apps/applications.yaml",
+          "--webhook-listen", ":8081"]
+environment:
+  SWARMCLI_CD_WEBHOOK_SECRET_FILE: /run/secrets/swarmcli-cd-webhook-secret
+```
+
+It is a **listener of its own**, never the API's. The API stays unpublished, as
+`stack.yml` explains, and only this port has to face the forge. It serves two
+routes and nothing else:
+
+| Route | Forges | Verified by |
+|---|---|---|
+| `POST /hooks/github` | GitHub, GitHub Enterprise, Gitea, Forgejo | the HMAC-SHA256 of the body: `X-Hub-Signature-256`, or failing that `X-Gitea-Signature` or `X-Forgejo-Signature` |
+| `POST /hooks/gitlab` | GitLab | the signing token's `webhook-signature` (GitLab 19.0 and later), whose timestamp must be within five minutes of the controller's clock; otherwise the secret token in `X-Gitlab-Token` |
+
+Point the hook at `https://<host>:8081/hooks/github` or `…/hooks/gitlab`, for
+push events, with the content type set to `application/json`. GitHub defaults a
+new hook to a form-encoded body, which is answered `415`.
+
+**What a delivery does.** The signature is checked over the raw body before any
+of it is parsed, and then only the pushed ref and the repository's URLs are
+read. The **app set** is re-read if the controller is in git mode and the push
+is to `--appset-repo` at `--appset-revision`; every **application** whose
+`source.repoURL` is the pushed repository and whose `source.revision` is the
+pushed branch or tag is reconciled now. Nothing else is touched.
+
+The revision must match exactly: `refs/heads/main` and `refs/tags/main` both
+match `revision: main`, and an application pinned to a SHA never matches, since
+no push moves it. The repository is matched more forgivingly, because the
+payload carries the forge's spelling and the spec carries yours: https only, the
+host and the path compared case-insensitively, and `.git`, a trailing `/`,
+userinfo and `:443` ignored. An `ssh://` or local-path source never matches.
+
+**A refresh is not a sync.** It is the reconcile the next tick would have done,
+early. An application with a manual policy plans and reports the drift and is
+not deployed — that still takes `app sync` or the sync button. A refreshed app
+set is loaded and applied, but neither [pruned](#prune) nor swept for caches,
+and the next tick stays where it was: both of those count passes, and a burst of
+pushes must not stand in for the second pass an empty set needs before `--prune`
+deletes anything.
+
+Deliveries arriving more often than every ten seconds for one application, or
+for the app set, are folded into one refresh at the ten-second mark rather than
+dropped — the floor under [`syncPolicy.interval`](#syncpolicy-optional), for the
+same reason.
+
+**What it answers.** `202` with `{"accepted": true, "appSet": …, "applications":
+<count>}`, which is counts rather than names because the forge shows the
+response to the repository's administrators. `200 {"ignored": true}` for a ping,
+another event, or a push nothing tracks — 2xx, because GitLab disables a hook
+after four failed deliveries in a row and none of these is a failure. `401` for a
+missing or wrong signature, with no detail; `400` for a signed body that is not
+JSON; `413` above 4 MiB, checked before the signature; `415` as above; `503` with
+four deliveries already in flight; `404` and `405` for anything else.
+
+**The secret** comes from `SWARMCLI_CD_WEBHOOK_SECRET_FILE`, a Docker secret, or
+`SWARMCLI_CD_WEBHOOK_SECRET`. The file may hold several, one per line: GitLab
+mints a signing token per hook, and a rotation needs the old one and the new one
+accepted together. For GitLab, paste the hook's `whsec_…` signing token as GitLab
+shows it; a hook still on a secret token works too. The controller refuses to
+start with `--webhook-listen` and no secret, with a secret and no
+`--webhook-listen`, and with a secret that is the admin token, because a hook's
+settings are readable by everyone who administers the repository.
+
+**TLS.** With `--tls-cert` and `--tls-key` the webhook listener serves the same
+pair. Without them it is plaintext, and the startup line says so (`tls=false`).
+The secret can ask for no more than a refresh, so that is tolerable on a private
+network, but a forge across the internet should reach this over TLS — here, or
+at a reverse proxy in front.
+
+**Logs.** One `INFO` line per accepted delivery, `webhook delivery accepted`,
+naming the forge, the delivery id, the repository, the ref, whether the app set
+was woken, the applications refreshed and how many of those were deferred by the
+floor. A rejected or ignored delivery is `DEBUG`, so that nobody unauthenticated
+can fill the log; turn on `--log-level debug` while setting a hook up. No line
+carries a secret, a signature or a body.
+
 ### Logs
 
 Everything the controller writes goes to **stderr**, through one handler, in one
@@ -1613,6 +1709,8 @@ does, so it does not make either kind of line easier to read.
 | `SWARMCLI_CD_GIT_USERNAME` | git username; forges often ignore it, GitHub wants it non-empty (`x-access-token`) |
 | `SWARMCLI_CD_GIT_TOKEN_FILE` | git password or token, read from a file — the Docker-secret form |
 | `SWARMCLI_CD_GIT_TOKEN` | git password or token, given directly |
+| `SWARMCLI_CD_WEBHOOK_SECRET_FILE` | webhook secrets, one per line, read from a file — the Docker-secret form. See [webhooks](#webhooks) |
+| `SWARMCLI_CD_WEBHOOK_SECRET` | a webhook secret, given directly |
 | `SWARMCLI_CD_SERVER` | *client only* — which controller the `app`, `status` and `healthcheck` commands talk to (default `http://127.0.0.1:8080`) |
 | `SWARMCLI_CD_CA_CERT` | *client only* — PEM certificate to trust for an `https` server; `--ca-cert` wins over it. See [TLS](#tls) |
 

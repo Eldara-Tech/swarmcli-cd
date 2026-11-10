@@ -70,6 +70,12 @@ and the module that registered it — so what a build actually exposes is readab
 from its own log rather than from the companion's source. See
 [extensibility.md](extensibility.md).
 
+Forge webhooks are not part of this API. They arrive on a listener of their own,
+`--webhook-listen`, which serves `POST /hooks/github` and `POST /hooks/gitlab`
+and nothing else, authenticated by the webhook secret rather than the admin
+token: nothing under `/api/v1/` is reachable there, and no `/hooks/` route is
+served here. See [configuration § webhooks](configuration.md#webhooks).
+
 ## Authentication
 
 Every `/api/v1/…` endpoint requires the admin token as a bearer credential:

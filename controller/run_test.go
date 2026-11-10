@@ -8,10 +8,13 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -21,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -33,6 +37,7 @@ import (
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 	"github.com/Eldara-Tech/swarmcli-cd/reconcile"
 	"github.com/Eldara-Tech/swarmcli-cd/source"
+	"github.com/Eldara-Tech/swarmcli-cd/webhook"
 
 	swarmlog "github.com/Eldara-Tech/swarmcli/v2/utils/log"
 )
@@ -763,6 +768,158 @@ func TestTheHealthcheckStaysHealthyWithTLSOn(t *testing.T) {
 	}
 }
 
+// Half a webhook configuration is refused, as half a TLS pair is: a listener
+// with no secret would refuse every delivery, and a secret with no listener is
+// an operator who believes webhooks are on. So is a secret that is the admin
+// token, which goes into every forge's hook settings for its administrators to
+// read.
+func TestWebhookSecretsRefuseHalfAConfigurationAndTheAdminToken(t *testing.T) {
+	files := map[string]string{
+		"/run/secrets/hooks": "gitlab-signing\nadmin-token\n",
+		"/run/secrets/admin": "admin-token\n",
+	}
+	readFile := func(path string) ([]byte, error) {
+		if body, ok := files[path]; ok {
+			return []byte(body), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	for _, tc := range []struct {
+		name    string
+		listen  string
+		env     map[string]string
+		want    []string
+		wantErr string
+	}{
+		{"neither", "", nil, nil, ""},
+		{"both", ":8081", map[string]string{webhook.EnvSecret: "hook", authz.EnvToken: "admin-token"}, []string{"hook"}, ""},
+		{"a listener with no secret", ":8081", nil, nil, webhook.EnvSecretFile},
+		{"a secret with no listener", "", map[string]string{webhook.EnvSecret: "hook"}, nil, "--webhook-listen"},
+		{"a secret file with no listener", "", map[string]string{webhook.EnvSecretFile: "/run/secrets/hooks"}, nil, "--webhook-listen"},
+		{"the admin token", ":8081", map[string]string{webhook.EnvSecret: "admin-token", authz.EnvToken: "admin-token"}, nil, "admin token"},
+		{"the admin token among several", ":8081", map[string]string{webhook.EnvSecretFile: "/run/secrets/hooks", authz.EnvToken: "admin-token"}, nil, "admin token"},
+		{"the admin token's file", ":8081", map[string]string{webhook.EnvSecret: "admin-token", authz.EnvTokenFile: "/run/secrets/admin"}, nil, "admin token"},
+		{"an unreadable secret file", ":8081", map[string]string{webhook.EnvSecretFile: "/run/secrets/absent"}, nil, webhook.EnvSecretFile},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := webhookSecrets(tc.listen, func(k string) string { return tc.env[k] }, readFile)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("webhookSecrets = %v, want an error naming %s", err, tc.wantErr)
+				}
+				if strings.Contains(err.Error(), "admin-token") {
+					t.Errorf("the refusal quotes the secret: %v", err)
+				}
+				return
+			}
+			if err != nil || !slices.Equal(got, tc.want) {
+				t.Errorf("webhookSecrets = %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestControllerHelpNamesTheWebhookFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run = %d, want 0", code)
+	}
+	for _, want := range []string{"--webhook-listen", webhook.EnvSecretFile, webhook.EnvSecret} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout = %q, want it to mention %q", stdout.String(), want)
+		}
+	}
+}
+
+// The refusal comes before anything binds or reconciles, beside the TLS pair's.
+func TestServeRefusesAWebhookListenerWithoutASecret(t *testing.T) {
+	swapAuthorizer(t, readyAuthorizer{})
+	t.Setenv(webhook.EnvSecret, "")
+	t.Setenv(webhook.EnvSecretFile, "")
+
+	o := staticOptions(writeConfig(t), t.TempDir())
+	o.listen = freePort(t)
+	o.webhookListen = freePort(t)
+
+	// Already cancelled, so that a serve which failed to refuse returns rather
+	// than running the whole controller until the test timeout.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := serve(ctx, o, discardLog())
+	if err == nil || !strings.Contains(err.Error(), "--webhook-listen") {
+		t.Fatalf("serve = %v, want a refusal naming --webhook-listen", err)
+	}
+	for _, addr := range []string{o.listen, o.webhookListen} {
+		ln, bindErr := net.Listen("tcp", addr)
+		if bindErr != nil {
+			t.Fatalf("something is listening on %s: %v", addr, bindErr)
+		}
+		_ = ln.Close()
+	}
+}
+
+// End to end through serve: the webhook listener is up on its own address and
+// verifies what it is sent, and the API's listener serves none of its routes.
+func TestServeReceivesWebhooksOnTheirOwnListener(t *testing.T) {
+	swapAuthorizer(t, readyAuthorizer{})
+	const secret = "a-webhook-secret"
+	t.Setenv(webhook.EnvSecretFile, "")
+	t.Setenv(webhook.EnvSecret, secret)
+	t.Setenv(authz.EnvTokenFile, "")
+	t.Setenv(authz.EnvToken, "")
+
+	o := staticOptions(writeOfflineConfig(t), t.TempDir())
+	o.listen = freePort(t)
+	o.webhookListen = freePort(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() { stopped <- serve(ctx, o, discardLog()) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-stopped:
+			if err != nil {
+				t.Errorf("serve = %v, want nil", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("serve did not return")
+		}
+	})
+	waitListening(t, o.webhookListen)
+	waitListening(t, o.listen)
+
+	ping := []byte(`{"zen":"Keep it logically awesome."}`)
+	post := func(addr, signedWith string) int {
+		t.Helper()
+		mac := hmac.New(sha256.New, []byte(signedWith))
+		mac.Write(ping)
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/hooks/github", bytes.NewReader(ping))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-GitHub-Event", "ping")
+		req.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := post(o.webhookListen, secret); code != http.StatusOK {
+		t.Errorf("a signed ping = %d, want 200", code)
+	}
+	if code := post(o.webhookListen, "guessed"); code != http.StatusUnauthorized {
+		t.Errorf("a ping signed with another secret = %d, want 401", code)
+	}
+	if code := post(o.listen, secret); code == http.StatusOK {
+		t.Errorf("the API's listener answered a webhook route with %d", code)
+	}
+}
+
 // waitListening blocks until the server under test has finished binding, so the
 // first probe is not racing the listener it is aimed at. Accepting a connection
 // is the right signal for both protocols: ListenAndServeTLS wraps the listener
@@ -915,6 +1072,10 @@ func (f *countingFetcher) Fetch(_ context.Context, app string, _ application.Sou
 //
 // What is asserted is the inverse: while a request is still in flight and the
 // listener is therefore still draining, the reconciler has not been stopped.
+// Each row runs both listeners, the API's and the webhook one, and holds the
+// request on one of them: the webhook listener creates work too, and the rows
+// holding it are the ones that fail if it is drained after the reconciler stops
+// rather than before, since the API's then drains at once.
 //
 // The TLS row is also the evidence D23 stands on. Server.ServeTLS calls
 // setupHTTP2_ServeTLS, so Go's client negotiates h2 against the API and the
@@ -929,9 +1090,13 @@ func TestTheListenerIsDrainedBeforeTheReconcilerStops(t *testing.T) {
 		name      string
 		tls       bool
 		wantProto string
+		// hold is the listener the request is held on: 0 the API, 1 the webhook.
+		hold int
 	}{
-		{"plaintext", false, "HTTP/1.1"},
-		{"TLS, and therefore h2", true, "HTTP/2.0"},
+		{"plaintext", false, "HTTP/1.1", 0},
+		{"TLS, and therefore h2", true, "HTTP/2.0", 0},
+		{"the webhook listener", false, "HTTP/1.1", 1},
+		{"the webhook listener over TLS", true, "HTTP/2.0", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fetcher := &countingFetcher{}
@@ -967,8 +1132,12 @@ func TestTheListenerIsDrainedBeforeTheReconcilerStops(t *testing.T) {
 			// address goes on the server rather than the test serving a listener
 			// of its own. An http.Server runs once, and doing both left Addr
 			// empty, which means ":80" and is not bindable on a CI runner.
-			addr := freePort(t)
-			httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: time.Second}
+			servers := []*http.Server{
+				{Addr: freePort(t), Handler: http.NewServeMux(), ReadHeaderTimeout: time.Second},
+				{Addr: freePort(t), Handler: http.NewServeMux(), ReadHeaderTimeout: time.Second},
+			}
+			servers[tc.hold].Handler = mux
+			addr := servers[tc.hold].Addr
 			scheme, probeClient := "http", http.DefaultClient
 			if tc.tls {
 				certPath, keyPath := selfSignedPair(t)
@@ -976,14 +1145,17 @@ func TestTheListenerIsDrainedBeforeTheReconcilerStops(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				httpSrv.TLSConfig = cfg
+				// Shared, as serve shares it: ServeTLS clones what it is given.
+				for _, srv := range servers {
+					srv.TLSConfig = cfg
+				}
 				scheme, probeClient = "https", loopbackTLSClient()
 			}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			stopped := make(chan error, 1)
 			go func() {
-				stopped <- runUntilStopped(ctx, rec, loop, httpSrv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+				stopped <- runUntilStopped(ctx, rec, loop, servers, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			}()
 
 			probed := make(chan string, 1)
@@ -1114,5 +1286,10 @@ func TestTheStartupLineNamesTheBuild(t *testing.T) {
 	// wrong number for half the questions asked of it.
 	if !strings.Contains(out, "engine=") {
 		t.Errorf("the startup line does not name the chart engine:\n%s", out)
+	}
+	// And where webhooks arrive, which is the other address a forge or a
+	// firewall rule has to agree with.
+	if !strings.Contains(out, "webhookListen=") {
+		t.Errorf("the startup line does not name the webhook listener:\n%s", out)
 	}
 }
