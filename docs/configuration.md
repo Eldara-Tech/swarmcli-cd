@@ -1305,10 +1305,12 @@ shut down. The refusal is logged and the next reconcile tries again; nothing is
 lost by waiting, because the evidence is a stored revision that is still there.
 A network with tasks still draining routinely takes a second pass.
 
-**Some refusals never clear, and after three passes the controller stops
-trying.** A chart that drops a network another stack is still attached to gets
-the same refusal on every reconcile for ever, and it is indistinguishable from a
-slow drain except by how long it has been going on. Retrying indefinitely is not
+**Some refusals never clear, and after three intervals the controller stops
+trying.** Refusals are counted at most once per the application's reconcile
+interval, so a webhook refresh, a manual sync or an edit in between retries the
+deletion without using up an attempt. A chart that drops a network another stack
+is still attached to gets the same refusal on every reconcile for ever, and it is
+indistinguishable from a slow drain except by how long it has been going on. Retrying indefinitely is not
 free: it costs a history walk, a deploy of an unchanged plan, an event and an
 application permanently reporting out of sync, every interval, over something
 that will never happen. So the resource is **left in place, warned about on

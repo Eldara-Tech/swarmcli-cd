@@ -128,14 +128,16 @@ type appEntry struct {
 	// pruneFailures counts consecutive failed deletions of one resource, keyed
 	// by pruneKey, and is the whole of what makes maxPruneAttempts possible: a
 	// sweep re-derives its candidates from the swarm on every pass and so
-	// cannot otherwise tell the first refusal from the hundredth.
+	// cannot otherwise tell the first refusal from the hundredth. Each carries
+	// when its last counted refusal was, because the limit counts intervals,
+	// not passes.
 	//
 	// Kept in memory rather than on the swarm deliberately. It is a judgement
 	// about how long this controller has been trying, not a fact about the
 	// deployment, and a restart is a reasonable moment to try again — the
 	// operator may well have restarted it *because* they cleared whatever was
 	// holding the resource.
-	pruneFailures map[string]int
+	pruneFailures map[string]pruneTries
 
 	// revisions is the revision each release on the swarm was at when record
 	// last read the release records, so that a pass with nothing to move one

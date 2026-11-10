@@ -4766,6 +4766,32 @@ func refusingSweep() *driftBackend {
 	return b
 }
 
+// intervalClock is the reconciler's clock for the tests that count prune
+// attempts. They are counted at most once an interval, so whether two
+// reconciles are an attempt apart is the test's to say: it moves only when told.
+type intervalClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func onIntervalClock(r *Reconciler) *intervalClock {
+	c := &intervalClock{t: time.Unix(0, 0).UTC()}
+	r.now = c.now
+	return c
+}
+
+func (c *intervalClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *intervalClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
 // Retrying for ever is not the same as costing nothing. Each pass was a full
 // observe with a history walk, an apply that deploys nothing, a warning, a
 // PruneFailed event and an application reporting out of sync — for ever, since
@@ -4780,11 +4806,14 @@ func TestAResourceThatWillNeverGoStopsBeingRetried(t *testing.T) {
 	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
 	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
 		fakeRegistry{backend: backend})
+	clock := onIntervalClock(r)
 
+	// An interval apart, as the ticks that the limit was chosen for are.
 	for i := range 4 {
 		if err := r.Sync(context.Background(), "edge"); err != nil {
 			t.Fatalf("Sync %d = %v, want nil — a refusal is not a failed sync", i+1, err)
 		}
+		clock.advance(DefaultInterval)
 	}
 
 	// Three resources, two attempts each, and then nothing.
@@ -4811,10 +4840,12 @@ func TestAnApplicationIsSyncedOnceItHasGivenUpOnAResource(t *testing.T) {
 	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
 	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
 		fakeRegistry{backend: backend})
+	clock := onIntervalClock(r)
 
 	if err := r.Sync(context.Background(), "edge"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
 	}
+	clock.advance(DefaultInterval)
 	view, _ := r.View("edge")
 	if view.Status.Sync.State != application.SyncOutOfSync {
 		t.Fatalf("state after the first refusal = %q, want out of sync — it is still going to try", view.Status.Sync.State)
@@ -4831,6 +4862,45 @@ func TestAnApplicationIsSyncedOnceItHasGivenUpOnAResource(t *testing.T) {
 		if rel.Drift != nil && len(rel.Drift.Resources) > 0 {
 			t.Errorf("release %q still reports %v as drift a sync will remove", rel.Name, rel.Drift.Resources)
 		}
+	}
+}
+
+// A webhook refresh is a full reconcile, and so is a manual sync and the pass
+// after an edit; none of them comes an interval after the last. Counting each
+// as an attempt would spend the budget during one ordinary drain and retain the
+// resource until a restart, so they retry the deletion without counting, and
+// only a pass an interval on from the last counted refusal counts.
+func TestPruneAttemptsCountAtMostOncePerInterval(t *testing.T) {
+	restore := maxPruneAttempts
+	maxPruneAttempts = 2
+	t.Cleanup(func() { maxPruneAttempts = restore })
+
+	backend := refusingSweep()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+	clock := onIntervalClock(r)
+
+	// Five passes at the webhook floor, all inside one interval.
+	for i := range 5 {
+		if err := r.Sync(context.Background(), "edge"); err != nil {
+			t.Fatalf("Sync %d = %v, want nil", i+1, err)
+		}
+		clock.advance(application.MinInterval)
+	}
+	if got := len(backend.attempted()); got != 15 {
+		t.Fatalf("attempted %d removals over five passes inside one interval, want 15 — each retried, none given up on", got)
+	}
+
+	// An interval on, the second refusal counts, and the pass after gives up.
+	clock.advance(DefaultInterval)
+	for range 2 {
+		if err := r.Sync(context.Background(), "edge"); err != nil {
+			t.Fatalf("Sync = %v, want nil", err)
+		}
+	}
+	if got := len(backend.attempted()); got != 18 {
+		t.Errorf("attempted %d removals, want 18 — one more pass an interval on, then retained", got)
 	}
 }
 
