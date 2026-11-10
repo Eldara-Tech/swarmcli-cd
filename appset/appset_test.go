@@ -5,10 +5,12 @@ package appset
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/config"
 	"github.com/Eldara-Tech/swarmcli-cd/git"
 )
 
@@ -27,6 +30,11 @@ var _ Fetcher = (*git.Sourcer)(nil)
 // setPath is where the app set lives in both modes: a path within a tree, not
 // the tree's root, so the containment check has something to resolve.
 const setPath = "apps/applications.yaml"
+
+// setDir is the directory setPath is in, which is what a loader reading a
+// directory of files is pointed at: the shared suite then runs over a directory
+// holding that one file.
+const setDir = "apps"
 
 const oneApp = `applications:
   - name: edge
@@ -107,11 +115,15 @@ type mode struct {
 }
 
 // modes builds one of each on demand, so every subtest gets a tree of its own
-// and a failure is reported against the subtest that caused it.
+// and a failure is reported against the subtest that caused it. Each mode runs
+// twice, reading one file and reading the directory it is in, because a set
+// split across files is held to every rule a single file is.
 func modes(initial string) map[string]func(*testing.T) mode {
 	return map[string]func(*testing.T) mode{
-		"git":  func(t *testing.T) mode { return gitMode(t, initial) },
-		"path": func(t *testing.T) mode { return pathMode(t, initial) },
+		"git":        func(t *testing.T) mode { return gitMode(t, initial) },
+		"path":       func(t *testing.T) mode { return pathMode(t, initial) },
+		"git files":  func(t *testing.T) mode { return gitFilesMode(t, initial) },
+		"path files": func(t *testing.T) mode { return pathFilesMode(t, initial) },
 	}
 }
 
@@ -124,6 +136,18 @@ func gitMode(t *testing.T, initial string) mode {
 		loader:  NewGit(sourcer, GitConfig{RepoURL: f.dir, Revision: f.branch(), Path: setPath}),
 		publish: func(content string) { f.commit(map[string]string{setPath: content}) },
 	}
+}
+
+// gitFilesMode is gitMode read as a directory of files: the same repository,
+// with the loader pointed at the directory the one file is in.
+func gitFilesMode(t *testing.T, initial string) mode {
+	t.Helper()
+	m := gitMode(t, initial)
+	r := m.loader.reader.(*gitReader)
+	cfg := r.cfg
+	cfg.Path, cfg.Files = setDir, true
+	m.loader = NewGit(r.fetch, cfg)
+	return m
 }
 
 func pathMode(t *testing.T, initial string) mode {
@@ -146,6 +170,15 @@ func pathMode(t *testing.T, initial string) mode {
 	}
 	write(initial)
 	return mode{loader: NewPath(PathConfig{Dir: dir, Path: setPath}), publish: write}
+}
+
+// pathFilesMode is pathMode read as a directory of files: the same tree, with
+// the loader pointed at the directory the one file is in.
+func pathFilesMode(t *testing.T, initial string) mode {
+	t.Helper()
+	m := pathMode(t, initial)
+	m.loader = NewPath(PathConfig{Dir: currentDir(t, m), Path: setDir, Files: true})
+	return m
 }
 
 // fixture is a real repository on disk, built through go-git so the tests need
@@ -735,5 +768,372 @@ func TestAnAppSetAtTheLimitLoads(t *testing.T) {
 	}
 	if len(file.Applications) != 1 {
 		t.Errorf("got %d applications, want 1", len(file.Applications))
+	}
+}
+
+// appFile is an applications file declaring each name, every one with a release
+// file of its own.
+func appFile(names ...string) string {
+	out := "applications:\n"
+	for _, name := range names {
+		out += "  - name: " + name + "\n    source: {repoURL: https://example.com/infra.git, revision: main, releaseFile: releases/" + name + ".yaml}\n"
+	}
+	return out
+}
+
+// writeFiles writes each file under dir, creating what it needs to.
+func writeFiles(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// filesLoader is a path-mode loader over a directory of app-set files holding
+// files, which have been loaded once. It returns the directory, for a test to
+// change what is in it, and that first set.
+func filesLoader(t *testing.T, files map[string]string) (*Loader, string, *config.File) {
+	t.Helper()
+	root := t.TempDir()
+	writeFiles(t, filepath.Join(root, setDir), files)
+	loader := NewPath(PathConfig{Dir: root, Path: setDir, Files: true})
+	first, _, err := loader.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load = %v, want nil", err)
+	}
+	return loader, filepath.Join(root, setDir), first
+}
+
+// The set is the files' applications in filename order, whatever order they
+// were written in, so the same directory always loads as the same list.
+func TestFilesAreConcatenatedInNameOrder(t *testing.T) {
+	root := t.TempDir()
+	for _, f := range []struct{ name, content string }{
+		{"zulu.yaml", appFile("zulu")},
+		{"alpha.yaml", appFile("alpha")},
+		{"mike.yml", appFile("mike", "mike-2")},
+	} {
+		writeFiles(t, filepath.Join(root, setDir), map[string]string{f.name: f.content})
+	}
+
+	file, _, err := NewPath(PathConfig{Dir: root, Path: setDir, Files: true}).Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load = %v, want nil", err)
+	}
+	if got, want := strings.Join(names(t, file.Applications), " "), "alpha mike mike-2 zulu"; got != want {
+		t.Errorf("applications = %s, want %s", got, want)
+	}
+}
+
+// Any file changing is the set changing, a rename included; the same files
+// rewritten are not.
+func TestFilesChangeIsAnyFileChanging(t *testing.T) {
+	start := map[string]string{"a.yaml": appFile("alpha"), "b.yaml": appFile("bravo")}
+	for name, tc := range map[string]struct {
+		change      func(t *testing.T, dir string)
+		wantChanged bool
+	}{
+		"an edit": {func(t *testing.T, dir string) {
+			writeFiles(t, dir, map[string]string{"b.yaml": appFile("bravo", "charlie")})
+		}, true},
+		"an add": {func(t *testing.T, dir string) {
+			writeFiles(t, dir, map[string]string{"c.yaml": appFile("charlie")})
+		}, true},
+		"a removal": {func(t *testing.T, dir string) {
+			mustRemove(t, filepath.Join(dir, "b.yaml"))
+		}, true},
+		"a rename": {func(t *testing.T, dir string) {
+			mustRename(t, filepath.Join(dir, "b.yaml"), filepath.Join(dir, "c.yaml"))
+		}, true},
+		"a rewrite of the same bytes": {func(t *testing.T, dir string) {
+			writeFiles(t, dir, start)
+		}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			loader, dir, first := filesLoader(t, start)
+			tc.change(t, dir)
+
+			file, changed, err := loader.Load(context.Background())
+			if err != nil {
+				t.Fatalf("Load = %v, want nil", err)
+			}
+			if changed != tc.wantChanged {
+				t.Errorf("changed = %v, want %v", changed, tc.wantChanged)
+			}
+			if !tc.wantChanged && file != first {
+				t.Error("the set was replaced by an equal one; the running set should have been kept")
+			}
+		})
+	}
+}
+
+// Where one file ends and the next one's name begins must not be readable two
+// ways. Without the length in the digest these two directories hash alike, and
+// the second — which does not even parse — would be taken for the first.
+func TestFilesDigestCannotConfuseTwoDirectories(t *testing.T) {
+	loader, dir, _ := filesLoader(t, map[string]string{"a.yaml": appFile("alpha"), "b.yaml": appFile("bravo")})
+
+	writeFiles(t, dir, map[string]string{"a.yaml": appFile("alpha") + "b.yaml\x00" + appFile("bravo")})
+	mustRemove(t, filepath.Join(dir, "b.yaml"))
+
+	if _, changed, err := loader.Load(context.Background()); err == nil && !changed {
+		t.Error("a different directory was read as the unchanged set")
+	}
+}
+
+// A commit that touches nothing the set is read from is not a change: not a
+// file outside the directory, and not one inside it that is not an app-set file.
+func TestGitFilesUnrelatedCommitIsNotAChange(t *testing.T) {
+	f := newFixture(t)
+	f.commit(map[string]string{setDir + "/a.yaml": appFile("alpha"), setDir + "/b.yaml": appFile("bravo")})
+	loader := NewGit(git.New(t.TempDir(), git.Auth{}), GitConfig{RepoURL: f.dir, Revision: f.branch(), Path: setDir, Files: true})
+
+	first, _, err := loader.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load = %v, want nil", err)
+	}
+
+	f.commit(map[string]string{"README.md": "unrelated", setDir + "/NOTES.md": "unrelated"})
+	again, changed, err := loader.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load = %v, want nil", err)
+	}
+	if changed || again != first {
+		t.Error("a commit that touches no app-set file was reported as a change")
+	}
+}
+
+// The error a set split across files raises names the commit, the file and the
+// one it collides with — which of many files to open is the question.
+func TestGitFilesErrorsNameTheCommitAndBothFiles(t *testing.T) {
+	f := newFixture(t)
+	f.commit(map[string]string{setDir + "/team-a.yaml": appFile("edge"), setDir + "/team-b.yaml": appFile("edge")})
+	head, err := f.rep.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loader := NewGit(git.New(t.TempDir(), git.Auth{}), GitConfig{RepoURL: f.dir, Revision: f.branch(), Path: setDir, Files: true})
+
+	_, _, err = loader.Load(context.Background())
+	want := setDir + "@" + head.Hash().String() + ": team-b.yaml: applications[0]: duplicate application name 'edge', also declared in team-a.yaml"
+	if err == nil || err.Error() != want {
+		t.Errorf("Load = %v, want %q", err, want)
+	}
+}
+
+// One file failing fails the whole load, and the good files beside it are not
+// applied on their own: the set is never partially applied.
+func TestFilesOneBadFileKeepsTheLastGood(t *testing.T) {
+	loader, dir, good := filesLoader(t, map[string]string{"a.yaml": appFile("alpha"), "b.yaml": appFile("bravo")})
+
+	writeFiles(t, dir, map[string]string{"a.yaml": appFile("alpha", "charlie"), "b.yaml": invalidSets["unknown key"]})
+	file, changed, err := loader.Load(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "b.yaml") {
+		t.Fatalf("Load = %v, want the error naming b.yaml", err)
+	}
+	if file != nil || changed {
+		t.Error("a failed load returned a set")
+	}
+	if loader.Current() != good {
+		t.Error("Current moved off the last good set")
+	}
+}
+
+// A directory with nothing to read — emptied, never there, or holding nothing
+// that counts — is a failed load, not a set declaring none: an emptied directory
+// must not stop every application, and with prune delete them.
+func TestFilesWithNothingToReadIsAFailedLoad(t *testing.T) {
+	for name, empty := range map[string]func(t *testing.T, dir string){
+		"emptied": func(t *testing.T, dir string) {
+			mustRemove(t, filepath.Join(dir, "a.yaml"))
+		},
+		"missing": func(t *testing.T, dir string) {
+			if err := os.RemoveAll(dir); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"nothing that counts": func(t *testing.T, dir string) {
+			mustRemove(t, filepath.Join(dir, "a.yaml"))
+			writeFiles(t, dir, map[string]string{"README.md": "x", ".a.yaml": appFile("alpha")})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			loader, dir, good := filesLoader(t, map[string]string{"a.yaml": appFile("alpha")})
+			empty(t, dir)
+
+			_, _, err := loader.Load(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "no app-set files") || !strings.Contains(err.Error(), "applications: []") {
+				t.Fatalf("Load = %v, want the refusal saying how to declare none", err)
+			}
+			if loader.Current() != good {
+				t.Error("Current moved off the last good set")
+			}
+		})
+	}
+}
+
+// Files that each declare none are how a directory says none, and that loads.
+func TestFilesDeclaringNoneIsAnEmptySet(t *testing.T) {
+	loader, dir, _ := filesLoader(t, map[string]string{"a.yaml": appFile("alpha"), "b.yaml": appFile("bravo")})
+
+	writeFiles(t, dir, map[string]string{"a.yaml": "applications: []\n", "b.yaml": "applications: []\n"})
+	file, changed, err := loader.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load = %v, want nil", err)
+	}
+	if !changed || len(file.Applications) != 0 || loader.Current() != file {
+		t.Errorf("changed=%v applications=%v, want an empty set swapped in", changed, names(t, file.Applications))
+	}
+}
+
+// Only .yaml and .yml files directly in the directory are read. What else is
+// there is not, so none of it can fail the load.
+func TestFilesReadsOnlyAppSetFiles(t *testing.T) {
+	_, _, file := filesLoader(t, map[string]string{
+		"a.yaml":        appFile("alpha"),
+		"b.yml":         appFile("bravo"),
+		".hidden.yaml":  "not: [yaml",
+		"notes.txt":     "not: [yaml",
+		"a.yaml.bak":    "not: [yaml",
+		"sub/c.yaml":    "not: [yaml",
+		"d.yaml/e.yaml": "not: [yaml",
+	})
+	if got := strings.Join(names(t, file.Applications), " "); got != "alpha bravo" {
+		t.Errorf("applications = %s, want alpha bravo", got)
+	}
+}
+
+// Every file is held inside the directory, and the directory inside the tree,
+// for the reason a single file is.
+func TestFilesRefusesAPathLeavingTheTree(t *testing.T) {
+	outside := t.TempDir()
+	writeFiles(t, outside, map[string]string{"a.yaml": appFile("alpha")})
+
+	for name, link := range map[string]func(root string){
+		"a file linked out": func(root string) {
+			writeFiles(t, filepath.Join(root, setDir), map[string]string{"b.yaml": appFile("bravo")})
+			mustSymlink(t, filepath.Join(outside, "a.yaml"), filepath.Join(root, setDir, "a.yaml"))
+		},
+		"the directory linked out": func(root string) {
+			mustSymlink(t, outside, filepath.Join(root, setDir))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			link(root)
+			if _, _, err := NewPath(PathConfig{Dir: root, Path: setDir, Files: true}).Load(context.Background()); err == nil || !strings.Contains(err.Error(), "outside") {
+				t.Errorf("Load = %v, want a refusal to read outside the tree", err)
+			}
+		})
+	}
+}
+
+// git-sync publishes by swapping a symlink to the whole directory. A load that
+// straddles a swap still reads one version: the directory is resolved once, so
+// a file read after the swap is the old version's, not the new one's.
+//
+// The swap is made to land between two reads by making the first file a FIFO:
+// opening it blocks until a writer opens it too, by which point the directory
+// has been listed, and the writer swaps the link before it lets the read finish.
+func TestFilesAreReadFromOneVersionOfTheDirectory(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{
+		"v1/b.yaml": appFile("bravo-1"),
+		"v2/a.yaml": appFile("alpha-2"),
+		"v2/b.yaml": appFile("bravo-2"),
+	})
+	fifo := filepath.Join(root, "v1", "a.yaml")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, "v1", filepath.Join(root, "current"))
+
+	swapped := make(chan error, 1)
+	go func() {
+		w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+		if err != nil {
+			swapped <- err
+			return
+		}
+		err = os.Symlink("v2", filepath.Join(root, "next"))
+		if err == nil {
+			err = os.Rename(filepath.Join(root, "next"), filepath.Join(root, "current"))
+		}
+		if err == nil {
+			_, err = w.WriteString(appFile("alpha-1"))
+		}
+		swapped <- errors.Join(err, w.Close())
+	}()
+
+	file, _, err := NewPath(PathConfig{Dir: root, Path: "current", Files: true}).Load(context.Background())
+	select {
+	case werr := <-swapped:
+		if werr != nil {
+			t.Fatal(werr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the swap never happened, so the first file was never opened (Load = %v)", err)
+	}
+	if err != nil {
+		t.Fatalf("Load = %v, want nil", err)
+	}
+	if got := strings.Join(names(t, file.Applications), " "); got != "alpha-1 bravo-1" {
+		t.Errorf("applications = %s, want alpha-1 bravo-1: one version of the directory, not parts of two", got)
+	}
+}
+
+// The size bound is over the files together, so splitting a set across many
+// does not multiply it; and a set exactly at it still loads.
+func TestFilesAreBoundedTogether(t *testing.T) {
+	half := maxAppSetSize / 2
+	pad := func(content string, size int) string {
+		return content + strings.Repeat("#", size-len(content)-1) + "\n"
+	}
+
+	t.Run("over", func(t *testing.T) {
+		loader, dir, good := filesLoader(t, map[string]string{"a.yaml": appFile("alpha")})
+		writeFiles(t, dir, map[string]string{"a.yaml": pad(appFile("alpha"), half), "b.yaml": pad(appFile("bravo"), half+1)})
+
+		_, _, err := loader.Load(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "together") || !strings.Contains(err.Error(), "b.yaml") {
+			t.Fatalf("Load = %v, want the bound refusing them together, naming b.yaml", err)
+		}
+		if loader.Current() != good {
+			t.Error("Current moved off the last good set")
+		}
+	})
+
+	t.Run("at", func(t *testing.T) {
+		_, _, file := filesLoader(t, map[string]string{"a.yaml": pad(appFile("alpha"), half), "b.yaml": pad(appFile("bravo"), maxAppSetSize-half)})
+		if len(file.Applications) != 2 {
+			t.Errorf("got %d applications, want 2", len(file.Applications))
+		}
+	})
+}
+
+func mustRemove(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustRename(t *testing.T, from, to string) {
+	t.Helper()
+	if err := os.Rename(from, to); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -4,6 +4,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -693,5 +694,135 @@ func TestTheWholeNodeIsAValidHostPath(t *testing.T) {
 	if _, err := Parse([]byte("applications:\n  - name: edge\n    source:\n      repoURL: https://x/y.git\n"+
 		"      revision: main\n      releaseFile: r.yaml\n    allow:\n      hostPaths: [/]\n"), "applications.yaml"); err != nil {
 		t.Fatalf("Parse = %v, want an operator able to say what they mean", err)
+	}
+}
+
+// setFile is a one-application file for the ParseSet tests. Each gets a chart
+// release of its own unless the test names one, so that two of them collide
+// only where a test means them to.
+func setFile(name, release string, self bool) Document {
+	if release == "" {
+		release = name
+	}
+	return Document{Name: name + ".yaml", Data: []byte(fmt.Sprintf(
+		"applications:\n  - name: %s\n    self: %t\n    source: {repoURL: https://x/y.git, revision: main, chart: {release: %s, path: ./c}}\n",
+		name, self, release))}
+}
+
+// One file is a set too, and ParseSet adds nothing to it but the set's name in
+// front of an error: the same applications, defaulted the same way, and the same
+// refusals.
+func TestParseSetOfOneFileIsParse(t *testing.T) {
+	for name, src := range map[string]string{
+		"valid":          valid,
+		"invalid":        "applications:\n  - name: edge\n    source: {repoURL: https://x/y.git}\n",
+		"duplicate name": "applications:\n  - name: a\n    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}\n  - name: a\n    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			want, wantErr := Parse([]byte(src), "a.yaml")
+			got, err := ParseSet([]Document{{Name: "a.yaml", Data: []byte(src)}}, "apps")
+			if wantErr != nil {
+				if err == nil || err.Error() != "apps: "+wantErr.Error() {
+					t.Fatalf("ParseSet = %v, want %q", err, "apps: "+wantErr.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseSet = %v, want nil", err)
+			}
+			if !reflect.DeepEqual(got.Applications, want.Applications) {
+				t.Errorf("applications = %+v, want Parse's %+v", got.Applications, want.Applications)
+			}
+			if got.Path != "apps" {
+				t.Errorf("Path = %q, want the set's", got.Path)
+			}
+		})
+	}
+}
+
+// The set is every file's applications, in the order the files were given.
+func TestParseSetConcatenatesTheFiles(t *testing.T) {
+	f, err := ParseSet([]Document{
+		setFile("zulu", "", false),
+		{Name: "none.yaml", Data: []byte("applications: []\n")},
+		{Name: "valid.yaml", Data: []byte(valid)},
+	}, "apps")
+	if err != nil {
+		t.Fatalf("ParseSet = %v, want nil", err)
+	}
+	var got []string
+	for _, app := range f.Applications {
+		got = append(got, app.Name)
+	}
+	if want := []string{"zulu", "edge", "hello"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("applications = %v, want %v", got, want)
+	}
+}
+
+// Files that each declare none are a set declaring none, which loads: removing
+// the last application must still be a commit.
+func TestParseSetOfFilesDeclaringNoneIsAnEmptySet(t *testing.T) {
+	none := []byte("applications: []\n")
+	f, err := ParseSet([]Document{{Name: "a.yaml", Data: none}, {Name: "b.yaml", Data: none}}, "apps")
+	if err != nil {
+		t.Fatalf("ParseSet = %v, want an explicitly empty set accepted", err)
+	}
+	if f.Applications == nil || len(f.Applications) != 0 {
+		t.Errorf("applications = %#v, want empty and not nil", f.Applications)
+	}
+}
+
+// No files at all is not a declaration of none: it is what an emptied directory
+// looks like, and loading it would stop every application.
+func TestParseSetOfNoFilesIsRefused(t *testing.T) {
+	_, err := ParseSet(nil, "apps")
+	if err == nil || !strings.Contains(err.Error(), "applications: []") {
+		t.Errorf("ParseSet = %v, want the refusal naming 'applications: []'", err)
+	}
+}
+
+// A file that fails is named, under the set, so the error says which of many
+// to open.
+func TestParseSetNamesTheFileThatFails(t *testing.T) {
+	_, err := ParseSet([]Document{
+		setFile("edge", "", false),
+		{Name: "broken.yaml", Data: []byte("applications:\n  - name: core\n    source: {repoURL: https://x/y.git}\n")},
+	}, "apps@abc")
+	if err == nil || !strings.HasPrefix(err.Error(), "apps@abc: broken.yaml: applications[0]: 'core': source.revision is required") {
+		t.Errorf("ParseSet = %v, want the set, the file, the entry and the rule", err)
+	}
+}
+
+// Two files that are each valid alone can still be a set that cannot be obeyed.
+// The rules spanning a set run over all of them, and their errors name both
+// files.
+func TestParseSetRefusesWhatSpansTheFiles(t *testing.T) {
+	for name, tc := range map[string]struct {
+		docs []Document
+		want string
+	}{
+		"duplicate name": {
+			[]Document{setFile("edge", "", false), {Name: "team-b.yaml", Data: setFile("edge", "edge-b", false).Data}},
+			"apps@abc: team-b.yaml: applications[0]: duplicate application name 'edge', also declared in edge.yaml",
+		},
+		"two self": {
+			[]Document{setFile("cd", "", true), setFile("cd-again", "", true)},
+			"apps@abc: cd-again.yaml: applications[0]: 'cd' in cd.yaml and 'cd-again' both declare self",
+		},
+		"one release": {
+			[]Document{setFile("eldara", "zammad", false), setFile("acme", "zammad", false)},
+			"apps@abc: acme.yaml: applications[0]: 'eldara' in eldara.yaml and 'acme' both declare the release 'zammad'",
+		},
+		"releases differing in case": {
+			[]Document{setFile("eldara", "Zammad", false), setFile("acme", "zammad", false)},
+			"apps@abc: acme.yaml: applications[0]: 'eldara' in eldara.yaml and 'acme' declare the releases 'Zammad' and 'zammad', which differ only in case",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseSet(tc.docs, "apps@abc")
+			if err == nil || !strings.HasPrefix(err.Error(), tc.want) {
+				t.Errorf("ParseSet = %v, want it to begin %q", err, tc.want)
+			}
+		})
 	}
 }

@@ -153,3 +153,62 @@ applications:
 		t.Errorf("stderr = %q, want it to name the application", stderr.String())
 	}
 }
+
+// --dir validates a directory of files the way the controller reads
+// --appset-files: every app-set file in it, together, under the rules that span
+// a set.
+func TestValidateDir(t *testing.T) {
+	app := func(name, repo string) string {
+		return "applications:\n  - name: " + name + "\n    source: {repoURL: https://github.com/acme/" + repo + ".git, revision: main, releaseFile: r.yaml}\n"
+	}
+	for name, tc := range map[string]struct {
+		files  map[string]string
+		code   int
+		stdout string
+		stderr string
+	}{
+		"valid": {
+			files:  map[string]string{"team-a.yaml": app("edge", "a"), "team-b.yml": app("core", "b"), "notes.txt": "not: [yaml"},
+			stdout: "(2 applications)",
+		},
+		"a name in two files": {
+			files:  map[string]string{"team-a.yaml": app("edge", "a"), "team-b.yaml": app("edge", "b")},
+			code:   1,
+			stderr: "team-b.yaml: applications[0]: duplicate application name 'edge', also declared in team-a.yaml",
+		},
+		"nothing to read": {
+			files:  map[string]string{"notes.txt": "x"},
+			code:   1,
+			stderr: "no app-set files",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			for file, content := range tc.files {
+				if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := run([]string{"validate", "--dir", dir}, &stdout, &stderr); code != tc.code {
+				t.Fatalf("run(validate) = %d, want %d (stderr: %q)", code, tc.code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), tc.stdout) || !strings.Contains(stderr.String(), tc.stderr) {
+				t.Errorf("stdout = %q, stderr = %q, want %q and %q", stdout.String(), stderr.String(), tc.stdout, tc.stderr)
+			}
+		})
+	}
+}
+
+// --file and --dir are one set or the other; given both, which was meant is
+// not this command's to guess.
+func TestValidateRefusesFileAndDir(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"validate", "--file", "applications.yaml", "--dir", t.TempDir()}, &stdout, &stderr); code != 2 {
+		t.Fatalf("run(validate) = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "--file and --dir are alternatives") {
+		t.Errorf("stderr = %q, want the refusal", stderr.String())
+	}
+}

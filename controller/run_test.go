@@ -26,6 +26,9 @@ import (
 	"testing"
 	"time"
 
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
+
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/appset"
 	"github.com/Eldara-Tech/swarmcli-cd/authz"
@@ -270,6 +273,9 @@ func TestAppSetSelectorsAreValidated(t *testing.T) {
 		{"a repository with no path", valid(options{appSetRepo: "https://example.com/apps.git", appSetRevision: "main"}), "--appset-path"},
 		{"a revision with no repository", valid(options{appSetRevision: "main"}), "--appset-revision"},
 		{"a path with no source", valid(options{appSetPath: "applications.yaml"}), "--appset-path"},
+		{"a path and files", valid(options{appSetDir: "/var/lib/appset", appSetPath: "applications.yaml", appSetFiles: "apps"}), "--appset-files"},
+		{"files with no source", valid(options{appSetFiles: "apps"}), "--appset-files"},
+		{"files beside an explicit config", valid(options{configSet: true, appSetFiles: "apps"}), "--appset-files"},
 		{"an interval of zero", options{appSetDir: "/var/lib/appset", controllerID: application.DefaultControllerID}, "--appset-interval"},
 		{"a reconcile interval of zero", options{appSetDir: "/var/lib/appset", appSetInterval: appset.DefaultInterval, controllerID: application.DefaultControllerID}, "--reconcile-interval"},
 		{"a controller id with a slash", valid(options{controllerID: "a/b"}), "--controller-id"},
@@ -288,6 +294,35 @@ func TestAppSetSelectorsAreValidated(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("validate = %v, want it to name %s", err, tc.want)
+			}
+		})
+	}
+}
+
+// The flag reaches the options, which is what the refusal of one with no source
+// to be inside says: asserted on its words, because a flag that was never
+// registered is a usage error too.
+func TestControllerTakesAppSetFiles(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"controller", "--appset-files", "apps"}, &stdout, &stderr); code != 2 {
+		t.Fatalf("run = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), "--appset-files means nothing without") {
+		t.Errorf("stderr = %q, want the refusal of --appset-files with no source", stderr.String())
+	}
+}
+
+// A directory of files stands in for --appset-path in either mode, the
+// repository's requirement for one included.
+func TestAppSetFilesReplaceThePath(t *testing.T) {
+	for name, o := range map[string]options{
+		"a repository": {appSetRepo: "https://example.com/apps.git", appSetRevision: "main", appSetFiles: "apps"},
+		"a directory":  {appSetDir: "/var/lib/appset", appSetFiles: "apps"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			o.appSetInterval, o.interval, o.controllerID = appset.DefaultInterval, reconcile.DefaultInterval, application.DefaultControllerID
+			if err := o.validate(); err != nil {
+				t.Errorf("validate = %v, want nil", err)
 			}
 		})
 	}
@@ -343,6 +378,16 @@ func TestAppSetSourceDescribesWhereTheSetLives(t *testing.T) {
 			"/var/lib/appset (prod.yaml)",
 		},
 		{
+			"a repository names a directory of files",
+			options{appSetRepo: "https://example.com/apps.git", appSetRevision: "main", appSetFiles: "apps"},
+			"https://example.com/apps.git @ main (apps)",
+		},
+		{
+			"a directory names a directory of files within it",
+			options{appSetDir: "/var/lib/appset", appSetFiles: "apps"},
+			"/var/lib/appset (apps)",
+		},
+		{
 			"the mounted file is itself the description",
 			options{configPath: "/etc/swarmcli-cd/applications.yaml"},
 			"/etc/swarmcli-cd/applications.yaml",
@@ -355,6 +400,58 @@ func TestAppSetSourceDescribesWhereTheSetLives(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("description = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// --appset-files reaches the loader in both modes: every file in the directory
+// is read, not one file named after it.
+func TestAppSetSourceReadsADirectoryOfFiles(t *testing.T) {
+	files := map[string]string{
+		"apps/a.yaml": "applications:\n  - name: alpha\n    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}\n",
+		"apps/b.yaml": "applications:\n  - name: bravo\n    source: {repoURL: https://x/y.git, revision: main, releaseFile: r.yaml}\n",
+	}
+	tree := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tree, "apps"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(tree, filepath.FromSlash(name)), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repo, err := gogit.PlainInit(tree, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.AddGlob("apps"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Commit("apps", &gogit.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@example.com", When: time.Unix(0, 0)}}); err != nil {
+		t.Fatal(err)
+	}
+	head, err := repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, o := range map[string]options{
+		"git":  {appSetRepo: tree, appSetRevision: head.Name().Short(), appSetFiles: "apps"},
+		"path": {appSetDir: tree, appSetFiles: "apps"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			src, _ := appSetSource(o, git.Auth{}, t.TempDir())
+			cfg, _, err := src.Load(context.Background())
+			if err != nil {
+				t.Fatalf("Load = %v, want nil", err)
+			}
+			if len(cfg.Applications) != 2 {
+				t.Errorf("got %d applications, want both files' 2", len(cfg.Applications))
 			}
 		})
 	}
@@ -432,7 +529,7 @@ func TestControllerHelpNamesTheAppSetFlags(t *testing.T) {
 	if code := run([]string{"controller", "--help"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("run = %d, want 0", code)
 	}
-	for _, flagName := range []string{"--appset-repo", "--appset-revision", "--appset-dir", "--appset-path", "--appset-interval"} {
+	for _, flagName := range []string{"--appset-repo", "--appset-revision", "--appset-dir", "--appset-path", "--appset-files", "--appset-interval"} {
 		if !strings.Contains(stdout.String(), flagName) {
 			t.Errorf("stdout = %q, want it to name %s", stdout.String(), flagName)
 		}
