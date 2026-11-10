@@ -996,8 +996,8 @@ this makes easy; nothing enforces it.
   other extension and subdirectories are ignored, so nothing below the directory
   itself is part of the set.
 - **The rules that span a set span the files**: a name used twice, two
-  applications both `self`, one release claimed twice. The error names both
-  files:
+  applications both `self`, one chart release claimed twice. The error names
+  both files:
   ```
   apps@d4e5f6: team-b.yaml: applications[0]: duplicate application name 'edge', also declared in team-a.yaml
   ```
@@ -1519,15 +1519,21 @@ who could widen their own permissions would collapse the two privileges above
 into one, which is the whole of what this boundary is for.
 
 A [directory of files](#a-directory-of-files) invites per-team ownership, with a
-`CODEOWNERS` entry per file. Know what that hands each team: everything an
-application entry can say, which includes `allow` (a host path can grant the
-docker socket itself), `self` (which hands a chart the controller's own secrets,
-admin token included) and `registryAuth` (any registry credential the controller
-mounts). Any file can also hold up the whole set, by declaring a name or a
-release another file already has — a refusal rather than a takeover, but every
-team's change waits until it is fixed. Keep a directory-wide `CODEOWNERS` default
-owned by the platform team, so that every change to the set still needs its
-review. Limiting what one team's file may say is not something this build does.
+`CODEOWNERS` entry per file. Know what that hands a team: its approval alone then
+covers everything an application entry can say, which includes `allow` (a host
+path can grant the docker socket itself), `self` (which hands a chart the
+controller's own secrets, admin token included) and `registryAuth` (any registry
+credential the controller mounts). On GitHub the last `CODEOWNERS` pattern that
+matches a file is the one that counts, and an approval from any one of its owners
+satisfies it, so an entry for a team's file takes the platform team out of that
+file's required review rather than adding the team to it. If the platform team
+must review every change to the set, keep the files owned by it: teams propose
+changes to their own file, and the platform team approves them. Nothing in this
+build limits what one team's file may say.
+
+Any file can also hold up the whole set, by declaring a name, or a chart release,
+that another file already declares — a refusal rather than a takeover, but every
+team's change waits until it is fixed.
 
 One thing a commit **cannot** do: deliver a new secret. An application that names
 a `registryAuth:` needs that Docker secret mounted into the controller in

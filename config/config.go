@@ -209,9 +209,9 @@ type Document struct {
 //
 // Each file is held to everything Parse holds one to, under its own name. The
 // rules that span a set — a name used twice, two applications both self, one
-// release claimed twice — then run over all of them, because two files that are
-// each valid alone can still be a set that cannot be obeyed, and those errors
-// name both files.
+// chart release claimed twice — then run over all of them, because two files
+// that are each valid alone can still be a set that cannot be obeyed, and those
+// errors name both files.
 func ParseSet(docs []Document, path string) (*File, error) {
 	// No files is not a declaration of none, for the reason validate gives: it is
 	// what an emptied directory looks like.

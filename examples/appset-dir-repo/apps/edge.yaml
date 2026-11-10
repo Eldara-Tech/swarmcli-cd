@@ -21,16 +21,18 @@
 #   swarmcli-cd validate --dir apps
 #
 # One bad file fails the whole load and the last good set keeps running, and a
-# name or a release declared in two files is refused naming both. Subdirectories
-# are not read.
+# name or a chart release declared in two files is refused naming both.
+# Subdirectories are not read.
 #
 # ---------------------------------------------------------------------------
 # A file per team is not a permission per team. Whoever can change this file can
 # write anything an application entry can say — `allow:` (a host path can grant
 # the docker socket), `self:` and `registryAuth:` included — so this repository
-# is as root-equivalent as ../../appset-repo/. Give each team's file its own
-# CODEOWNERS entry if you like, but keep a directory-wide default owned by the
-# platform team, so every change still needs its review.
+# is as root-equivalent as ../../appset-repo/. A CODEOWNERS entry giving a team
+# its own file lets that team alone approve all of that: on GitHub the last
+# matching pattern is the one that counts, and any one of its owners is enough.
+# For the platform team to review every change, keep the files owned by it —
+# teams propose changes to their file, and the platform team approves them.
 # ---------------------------------------------------------------------------
 apiVersion: v1
 
