@@ -295,6 +295,37 @@ func TestAnAcceptedDeliveryRefreshesWhatTracksThePush(t *testing.T) {
 	}
 }
 
+// Only a push or a tag push wakes anything. With one answer for every delivery
+// that parses, the answer cannot say so, so this asks what was refreshed.
+func TestOnlyPushesWake(t *testing.T) {
+	ghMain := githubPush("refs/heads/main", "https://github.com/org/infra")
+	glMain := gitlabPush("refs/heads/main", "https://github.com/org/infra")
+	glTag := gitlabPush("refs/tags/v1.0.0", "https://github.com/org/infra")
+	for _, tc := range []struct {
+		name, path string
+		h          http.Header
+		body       []byte
+		want       []string
+	}{
+		{"a GitHub push", "/hooks/github", githubHeaders("push", ghMain), ghMain, []string{"billing-api", "billing-worker"}},
+		{"a GitHub event that is not a push, shaped like one", "/hooks/github", githubHeaders("issues", ghMain), ghMain, nil},
+		{"a GitHub ping", "/hooks/github", githubHeaders("ping", ghMain), ghMain, nil},
+		{"a GitLab push", "/hooks/gitlab", gitlabSigned("Push Hook", glMain, testNow), glMain, []string{"billing-api", "billing-worker"}},
+		{"a GitLab tag push", "/hooks/gitlab", gitlabSigned("Tag Push Hook", glTag, testNow), glTag, []string{"billing-release"}},
+		{"a GitLab merge request, shaped like a push", "/hooks/gitlab", gitlabSigned("Merge Request Hook", glMain, testNow), glMain, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			if w := f.do(http.MethodPost, tc.path, tc.h, tc.body); w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202", w.Code)
+			}
+			if got := f.rec.refreshes(); !slices.Equal(got, tc.want) {
+				t.Errorf("refreshed %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // Every configured secret is good for every repository, on either route — a
 // GitLab hook's signing token signs a GitHub-shaped delivery as well as its own.
 // So the answer is the same for everything authenticated that parses: a push to
