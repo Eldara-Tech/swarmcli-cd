@@ -75,9 +75,9 @@ export function serviceCounts(counts: ServiceCounts): string {
  *
  * Swarm's own job modes are the exception. Their `desired` is a number of
  * completions, so a task still running is not done yet: counting it would read
- * 2/2 beside a health chip saying 0/2 completed (#300). There only `completed`
- * counts, as in the engine's column and `docker service ls`, whose mode names
- * these are.
+ * 2/2 on a progressing service whose message says 0/2 completed (#300). There
+ * only `completed` counts, as in the engine's column and `docker service ls`,
+ * whose mode names these are.
  */
 export function tasksUp(service: ServiceStatus): number {
   if (service.mode === 'replicated job' || service.mode === 'global job') return service.completed ?? 0
