@@ -1081,11 +1081,11 @@ you would rather not install one:
 docker run --rm -v "$PWD:/w" eldaratech/swarmcli-cd:latest validate --file /w/applications.yaml
 ```
 
-It reads the file and nothing else. A set that validates can still fail to
-deploy: whether a `releaseFile` or chart path exists in its repository, whether
-a `destination` names a swarm this controller knows, and whether a
-`registryAuth` secret is mounted are all answered at reconcile time, against
-things this command cannot see.
+It reads the file or the directory and nothing else. A set that validates can
+still fail to deploy: whether a `releaseFile` or chart path exists in its
+repository, whether a `destination` names a swarm this controller knows, and
+whether a `registryAuth` secret is mounted are all answered at reconcile time,
+against things this command cannot see.
 
 ### Prune
 

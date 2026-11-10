@@ -137,8 +137,9 @@ Run `swarmcli-cd controller --help` or `swarmcli-cd app help` for the rest.
   capability that ships today.
 - [Extensibility](docs/extensibility.md) — the open-core seams, for contributors.
 - Examples: a commented [`applications.yaml`](examples/applications.yaml), a
-  ready-to-push [quickstart repository](examples/quickstart-repo/), and an
-  [app-set repository](examples/appset-repo/) for the git-sourced layout.
+  ready-to-push [quickstart repository](examples/quickstart-repo/), an
+  [app-set repository](examples/appset-repo/) for the git-sourced layout, and
+  [one whose set is a directory of files](examples/appset-dir-repo/).
 
 ## Deploying it
 

@@ -26,11 +26,11 @@ starting the controller. This is the check to run in the app set's own CI: it is
 the same parse and the same rules the controller applies before it will swap a
 new set in.
 
-It reads the file and nothing else. A file that validates can still fail to
-deploy — whether a releaseFile or chart path exists in its repository, whether
-a destination names a swarm this controller knows, and whether a registryAuth
-secret is mounted are all answered at reconcile time, against things this
-command cannot see.
+It reads the file or the directory and nothing else. A set that validates can
+still fail to deploy — whether a releaseFile or chart path exists in its
+repository, whether a destination names a swarm this controller knows, and
+whether a registryAuth secret is mounted are all answered at reconcile time,
+against things this command cannot see.
 
 Options:
   --file <path>   Applications file path (default ` + defaultAppSetFile + `)
