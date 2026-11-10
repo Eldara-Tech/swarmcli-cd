@@ -144,9 +144,15 @@ type Loop struct {
 	pruneHeldBy []string
 
 	// emptyBefore is whether the last pass that reached the sweep loaded an empty
-	// set. Only Once touches it. In memory, as reclaim's absent set is: a restart
+	// set. Only pass touches it. In memory, as reclaim's absent set is: a restart
 	// holds an empty set for one more pass, which is the safe direction.
 	emptyBefore bool
+
+	// sweepErr is how the last pass that swept went, and only pass touches it.
+	// A pass Refresh asked for does not sweep, so it cannot say the sweeps have
+	// recovered: it reports this beside its own outcome, and the failure stays on
+	// the status endpoint until a tick sweeps again.
+	sweepErr error
 }
 
 // NewLoop returns a Loop driving rec from src.
@@ -180,7 +186,8 @@ func NewLoop(src *Loader, rec Reconciler, o LoopOptions) *Loop {
 // would collapse both windows to nothing, and a force-push that briefly showed
 // `applications: []` would then sweep every stack this controller installed.
 // Leaving the timer alone is what keeps the sweeps on their interval however
-// often somebody pushes.
+// often somebody pushes. For the same reason the pass reports the last sweep's
+// failure rather than clearing it: it never looked.
 func (l *Loop) Refresh() {
 	select {
 	case l.wake <- struct{}{}:
@@ -275,14 +282,15 @@ func (l *Loop) pass(ctx context.Context, sweep bool) (err error) {
 
 	err = l.apply(file.Applications)
 	if !sweep {
-		l.record(err, false)
+		l.record(errors.Join(err, l.sweepErr), false)
 		return err
 	}
 	// Only behind a clean apply. A set that loaded but could not be brought up
 	// is a set whose running state is not yet the declared one, and deletions
 	// derived from it would be acting on a diff that is still half-applied.
+	var swept error
 	if err == nil {
-		err = l.pruneDeparted(ctx, file.Applications)
+		swept = l.pruneDeparted(ctx, file.Applications)
 	}
 	// Deliberately not behind that gate. What this deletes is a cache rebuilt on
 	// the next fetch, and it is keyed on the set the reconciler actually holds
@@ -291,8 +299,10 @@ func (l *Loop) pass(ctx context.Context, sweep bool) (err error) {
 	// directory fill because some unrelated application will not start is the
 	// worse failure by a distance, and the volume it fills is the manager's.
 	if rerr := l.reclaimDeparted(); rerr != nil {
-		err = errors.Join(err, rerr)
+		swept = errors.Join(swept, rerr)
 	}
+	l.sweepErr = swept
+	err = errors.Join(err, swept)
 	// Recorded either way, so a pass that succeeded clears a previous failure —
 	// including a pass that found nothing to do, because the set having become
 	// readable again is itself the news.

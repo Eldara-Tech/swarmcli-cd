@@ -890,6 +890,91 @@ func TestRefreshesDoNotPostponeTheTick(t *testing.T) {
 	stop()
 }
 
+// A pass a push asked for does not sweep, so it cannot report that the sweeps
+// recovered. A tick's prune or reclaim failure stays on the status endpoint
+// through any number of clean woken passes, and only a tick that sweeps cleanly
+// clears it — after which a woken pass must not bring it back.
+func TestASweepFailureStaysReportedAcrossARefresh(t *testing.T) {
+	for _, sweep := range []string{"prune", "reclaim"} {
+		t.Run(sweep, func(t *testing.T) {
+			p, r := &fakePruner{}, &fakeReclaimer{}
+			fail := func(err error) {
+				if sweep == "prune" {
+					p.err = err
+				} else {
+					r.err = err
+				}
+			}
+			m := pathMode(t, oneApp)
+			loop := NewLoop(m.loader, newFakeReconciler(spec("edge", "releases/edge.yaml")), LoopOptions{
+				Log: discard(), Credentials: noCredentials, Pruner: p, Reclaimer: r,
+			})
+			reported := func() string { return loop.Status().AppSet.Error }
+			const failure = "the sweep could not finish"
+
+			fail(errors.New(failure))
+			if err := loop.Once(t.Context()); err == nil {
+				t.Fatal("Once = nil, want the sweep failure")
+			}
+			if !strings.Contains(reported(), failure) {
+				t.Fatalf("status error = %q, want the sweep failure", reported())
+			}
+
+			if err := loop.pass(t.Context(), false); err != nil {
+				t.Fatalf("a woken pass that loaded and applied cleanly = %v, want nil", err)
+			}
+			if !strings.Contains(reported(), failure) {
+				t.Errorf("status error = %q after a woken pass, want the sweep failure still reported: that pass never swept", reported())
+			}
+
+			fail(nil)
+			if err := loop.Once(t.Context()); err != nil {
+				t.Fatalf("Once = %v, want a clean sweep", err)
+			}
+			if got := reported(); got != "" {
+				t.Errorf("status error = %q after a clean tick, want it cleared", got)
+			}
+			if err := loop.pass(t.Context(), false); err != nil {
+				t.Fatalf("a woken pass = %v, want nil", err)
+			}
+			if got := reported(); got != "" {
+				t.Errorf("status error = %q, want a woken pass after a clean tick not to bring the old failure back", got)
+			}
+		})
+	}
+}
+
+// What a woken pass does report is its own outcome, beside the last sweep's. It
+// returns only its own, because that is what Run logs for it: the sweep failure
+// was logged by the tick that had it.
+func TestAWokenPassReportsItsOwnApplyFailure(t *testing.T) {
+	m := pathMode(t, oneApp)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"))
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Log: discard(), Credentials: noCredentials,
+		Reclaimer: &fakeReclaimer{err: errors.New("permission denied")},
+	})
+	if err := loop.Once(t.Context()); err == nil {
+		t.Fatal("Once = nil, want the sweep failure")
+	}
+
+	rec.setFailAdd("core")
+	m.publish(twoApps)
+	err := loop.pass(t.Context(), false)
+	if err == nil || !strings.Contains(err.Error(), "adding 'core'") {
+		t.Fatalf("woken pass = %v, want its apply failure", err)
+	}
+	if strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("woken pass = %v, want only its own outcome returned", err)
+	}
+	got := loop.Status().AppSet.Error
+	for _, want := range []string{"adding 'core'", "permission denied"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status error = %q, want it to carry %q", got, want)
+		}
+	}
+}
+
 // ---------------------------------------------------------------- prune
 
 type fakePruner struct {
