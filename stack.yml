@@ -83,9 +83,12 @@ services:
     # (mode 2) or to an application's is picked up in seconds rather than at the
     # next interval. They arrive on a listener of their own, 8081 here, never on
     # the API's: this is the port the forge has to reach, and all a delivery can
-    # do is ask for a refresh — never a deploy of a manual application, never a
-    # prune. The secret is what you paste into the forge's hook settings, so it
-    # must not be the admin token (the controller refuses to start if it is).
+    # do is ask for what the next tick would have done — never a deploy of a
+    # manual application, and never the app set's prune of departed
+    # applications, though an application's own syncPolicy.prune runs on a
+    # refresh as at a tick. The secret is handled by whoever configures the
+    # forge's hooks, so it must not be the admin token (the controller refuses
+    # to start if it is).
     # Create it first:
     #   printf '%s' "$(openssl rand -hex 32)" | docker secret create swarmcli-cd-webhook-secret -
     # then uncomment SWARMCLI_CD_WEBHOOK_SECRET_FILE under `environment:`, the two

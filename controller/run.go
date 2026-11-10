@@ -626,10 +626,11 @@ func serve(ctx context.Context, o options, log *slog.Logger) error {
 // refuses a configuration that says half of one: a listener with no secret, or
 // a secret with no listener — an operator who set one believes webhooks are on.
 //
-// And a secret equal to the admin token. The webhook secret is pasted into the
-// forge's hook settings, where every repository administrator can read it, so
-// the same string as the token would hand each of them root-equivalent access
-// to the swarm through the API.
+// And a secret equal to the admin token. The webhook secret is handled by
+// whoever configures the forge's hooks, and GitLab's plain secret-token mode
+// sends it with every delivery, so the same string as the token would hand
+// root-equivalent access to the swarm to everyone who handles the one — and,
+// over plaintext, to anyone on the path of a delivery.
 func webhookSecrets(listen string, getenv func(string) string, readFile func(string) ([]byte, error)) ([]string, error) {
 	secrets, err := webhook.SecretsFromEnv(getenv, readFile)
 	if err != nil {
@@ -646,7 +647,7 @@ func webhookSecrets(listen string, getenv func(string) string, readFile func(str
 	// Only when there is one: an authorizer that needs none has nothing to
 	// collide with, and one that is missing its token has already refused.
 	if token, err := authz.TokenFromEnv(getenv, readFile); err == nil && slices.Contains(secrets, token) {
-		return nil, errors.New("the webhook secret is the admin token: it is pasted into the forge's hook settings, so every repository administrator could read it; give the webhook a secret of its own")
+		return nil, errors.New("the webhook secret is the admin token: it is handled by whoever configures the forge's hooks, and GitLab's secret-token mode sends it with every delivery; give the webhook a secret of its own")
 	}
 	return secrets, nil
 }

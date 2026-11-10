@@ -17,7 +17,9 @@
 // anyway — re-read the app set from the repository it already follows, or
 // reconcile the applications that already track the pushed branch or tag. The
 // payload never chooses what is deployed, a manual policy is never applied, and
-// the sweeps that delete stay on their own interval.
+// the app set's own sweeps — the prune of departed applications and the cache
+// reclaim — stay on its interval. An application's reconcile is the one its tick
+// runs, though, so its own prune and pruneResources run on a refresh too.
 package webhook
 
 import (
@@ -142,11 +144,13 @@ func (h *handler) routes() http.Handler {
 // serve handles one forge's deliveries, in an order that is the point: bounded,
 // then authenticated, and only then parsed.
 //
-// Every authenticated delivery that parses is answered 2xx, including one that
-// wakes nothing. GitLab disables a hook after four failed deliveries in a row,
-// and a push to a branch nothing tracks is not a failure. The 202 carries counts
-// rather than names, because the forge shows it to whoever administers the
-// repository, and they need not learn what else this controller runs.
+// Every authenticated delivery that parses gets the same answer, 202 and
+// {"accepted": true}, whether it woke anything or not — a push nothing tracks,
+// a ping, another event. Every configured secret is good for every repository,
+// so an answer that differed would let whoever holds any one of them probe what
+// else this controller follows; what was woken is in the log instead. And 2xx
+// at all because GitLab disables a hook after four failed deliveries in a row,
+// and none of these is a failure.
 func (h *handler) serve(f forge) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Before the slot, so that it is the request's arrival and not its turn
@@ -194,36 +198,38 @@ func (h *handler) serve(f forge) http.HandlerFunc {
 			fail(w, http.StatusBadRequest, "the body is not JSON")
 			return
 		}
-		if !ok {
+		if ok {
+			h.wake(f, p)
+		} else {
 			h.log.Debug("webhook delivery ignored: not a push", "forge", f.name)
-			write(w, http.StatusOK, map[string]any{"ignored": true})
-			return
 		}
+		write(w, http.StatusAccepted, map[string]bool{"accepted": true})
+	}
+}
 
-		repo, appSet, apps := h.match(p)
-		if !appSet && len(apps) == 0 {
-			h.log.Debug("webhook delivery ignored: nothing tracks this repository at this ref",
-				"forge", f.name, "delivery", p.delivery, "repository", repo, "ref", p.ref)
-			write(w, http.StatusOK, map[string]any{"ignored": true})
-			return
-		}
+// wake refreshes what a push touched, through the floor, and logs what it did.
+func (h *handler) wake(f forge, p push) {
+	repo, appSet, apps := h.match(p)
+	if !appSet && len(apps) == 0 {
+		h.log.Debug("webhook delivery ignored: nothing tracks this repository at this ref",
+			"forge", f.name, "delivery", p.delivery, "repository", repo, "ref", p.ref)
+		return
+	}
 
-		deferred := 0
-		if appSet && h.floor.wake(target{appSet: true}, h.appSet.Refresh) {
+	deferred := 0
+	if appSet && h.floor.wake(target{appSet: true}, h.appSet.Refresh) {
+		deferred++
+	}
+	for _, app := range apps {
+		// An application that left the set since match read it has nothing
+		// to refresh, and its error says only that.
+		if h.floor.wake(target{app: app}, func() { _ = h.rec.Refresh(app) }) {
 			deferred++
 		}
-		for _, app := range apps {
-			// An application that left the set since match read it has nothing
-			// to refresh, and its error says only that.
-			if h.floor.wake(target{app: app}, func() { _ = h.rec.Refresh(app) }) {
-				deferred++
-			}
-		}
-		h.log.Info("webhook delivery accepted",
-			"forge", f.name, "delivery", p.delivery, "repository", repo, "ref", p.ref,
-			"appSet", appSet, "applications", apps, "deferred", deferred)
-		write(w, http.StatusAccepted, map[string]any{"accepted": true, "appSet": appSet, "applications": len(apps)})
 	}
+	h.log.Info("webhook delivery accepted",
+		"forge", f.name, "delivery", p.delivery, "repository", repo, "ref", p.ref,
+		"appSet", appSet, "applications", apps, "deferred", deferred)
 }
 
 func write(w http.ResponseWriter, code int, body any) {

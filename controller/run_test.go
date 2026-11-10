@@ -771,8 +771,8 @@ func TestTheHealthcheckStaysHealthyWithTLSOn(t *testing.T) {
 // Half a webhook configuration is refused, as half a TLS pair is: a listener
 // with no secret would refuse every delivery, and a secret with no listener is
 // an operator who believes webhooks are on. So is a secret that is the admin
-// token, which goes into every forge's hook settings for its administrators to
-// read.
+// token, which whoever configures the forge's hooks handles, and which GitLab's
+// secret-token mode sends with every delivery.
 func TestWebhookSecretsRefuseHalfAConfigurationAndTheAdminToken(t *testing.T) {
 	files := map[string]string{
 		"/run/secrets/hooks": "gitlab-signing\nadmin-token\n",
@@ -909,13 +909,13 @@ func TestServeReceivesWebhooksOnTheirOwnListener(t *testing.T) {
 		_ = resp.Body.Close()
 		return resp.StatusCode
 	}
-	if code := post(o.webhookListen, secret); code != http.StatusOK {
-		t.Errorf("a signed ping = %d, want 200", code)
+	if code := post(o.webhookListen, secret); code != http.StatusAccepted {
+		t.Errorf("a signed ping = %d, want 202", code)
 	}
 	if code := post(o.webhookListen, "guessed"); code != http.StatusUnauthorized {
 		t.Errorf("a ping signed with another secret = %d, want 401", code)
 	}
-	if code := post(o.listen, secret); code == http.StatusOK {
+	if code := post(o.listen, secret); code == http.StatusAccepted {
 		t.Errorf("the API's listener answered a webhook route with %d", code)
 	}
 }

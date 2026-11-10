@@ -1461,11 +1461,14 @@ see [extensibility.md](extensibility.md).
 The [webhook](#webhooks) secret is not on this tier, and is kept off it on
 purpose. What it authenticates is a request to *refresh*: re-read the app set
 from the repository the bootstrap already names, or reconcile applications the
-set already declares. Nothing in a delivery says what is deployed, a manual
-policy is not applied, and prune keeps its own interval. Somebody holding the
-secret can make the controller fetch and render sooner than it otherwise would,
-at most once every ten seconds for each application and for the app set, and
-nothing more.
+set already declares. Nothing in a delivery says what is deployed, and a manual
+policy is not applied. Somebody holding the secret can make the controller do
+sooner what its next tick would have done, at most once every ten seconds for
+each application and for the app set. For an application that is the whole
+reconcile, its own `syncPolicy.prune` and `pruneResources` included; what keeps
+the app-set interval is the app set's prune of departed applications and its
+cache reclaim. And any configured secret can refresh any tracked repository: a
+delivery is not bound to the hook whose secret signed it.
 
 It is also where an application's permissions live. [`allow`](#allow-optional)
 says what each application's charts may reach outside their own releases — host
@@ -1622,7 +1625,9 @@ userinfo and `:443` ignored. An `ssh://` or local-path source never matches.
 
 **A refresh is not a sync.** It is the reconcile the next tick would have done,
 early. An application with a manual policy plans and reports the drift and is
-not deployed — that still takes `app sync` or the sync button. A refreshed app
+not deployed — that still takes `app sync` or the sync button. An application's
+own `syncPolicy.prune` and `pruneResources` run on a refresh as at a tick, and a
+refused deletion uses up an attempt at most once per interval. A refreshed app
 set is loaded and applied, but neither [pruned](#prune) nor swept for caches,
 and the next tick stays where it was: both of those count passes, and a burst of
 pushes must not stand in for the second pass an empty set needs before `--prune`
@@ -1633,12 +1638,13 @@ for the app set, are folded into one refresh at the ten-second mark rather than
 dropped — the floor under [`syncPolicy.interval`](#syncpolicy-optional), for the
 same reason.
 
-**What it answers.** `202` with `{"accepted": true, "appSet": …, "applications":
-<count>}`, which is counts rather than names because the forge shows the
-response to the repository's administrators. `200 {"ignored": true}` for a ping,
-another event, or a push nothing tracks — 2xx, because GitLab disables a hook
-after four failed deliveries in a row and none of these is a failure. `401` for a
-missing or wrong signature, with no detail; `400` for a signed body that is not
+**What it answers.** `202 {"accepted": true}` for every delivery that
+authenticates and parses — a push that woke something, a push nothing tracks, a
+ping and any other event alike. Every configured secret is good for every
+repository, so an answer that said what a push woke would let whoever holds any
+one of them probe what this controller follows; the log says it instead. It is
+2xx at all because GitLab disables a hook after four failed deliveries in a row.
+`401` for a missing or wrong signature, with no detail; `400` for a signed body that is not
 JSON; `413` above 4 MiB, checked before the signature; `415` as above; `503` with
 sixteen deliveries already in flight, which is overload rather than anything
 wrong with the delivery; `404` and `405` for anything else. Each body has five
@@ -1650,8 +1656,10 @@ mints a signing token per hook, and a rotation needs the old one and the new one
 accepted together. For GitLab, paste the hook's `whsec_…` signing token as GitLab
 shows it; a hook still on a secret token works too. The controller refuses to
 start with `--webhook-listen` and no secret, with a secret and no
-`--webhook-listen`, and with a secret that is the admin token, because a hook's
-settings are readable by everyone who administers the repository.
+`--webhook-listen`, and with a secret that is the admin token: the webhook
+secret is handled by whoever configures the forge's hooks, and GitLab's plain
+secret-token mode sends it with every delivery — which is also why TLS matters
+below.
 
 **TLS.** With `--tls-cert` and `--tls-key` the webhook listener serves the same
 pair. Without them it is plaintext, and the startup line says so (`tls=false`).

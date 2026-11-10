@@ -141,15 +141,15 @@ func TestResponses(t *testing.T) {
 		{"a GitLab tag push to a tracked tag", http.MethodPost, "/hooks/gitlab",
 			gitlabSigned("Tag Push Hook", gitlabPush("refs/tags/v1.0.0", "https://github.com/org/infra"), testNow),
 			gitlabPush("refs/tags/v1.0.0", "https://github.com/org/infra"), http.StatusAccepted},
-		// 2xx for everything authenticated that wakes nothing, because GitLab
-		// disables a hook after four failures and none of these is one.
-		{"a ping", http.MethodPost, "/hooks/github", githubHeaders("ping", []byte(`{"zen":"x"}`)), []byte(`{"zen":"x"}`), http.StatusOK},
-		{"an event that is not a push", http.MethodPost, "/hooks/github", githubHeaders("issues", infra), infra, http.StatusOK},
+		// The same 202 for everything authenticated that parses, whether it woke
+		// anything or not: see TestEveryParsedDeliveryGetsTheSameAnswer.
+		{"a ping", http.MethodPost, "/hooks/github", githubHeaders("ping", []byte(`{"zen":"x"}`)), []byte(`{"zen":"x"}`), http.StatusAccepted},
+		{"an event that is not a push", http.MethodPost, "/hooks/github", githubHeaders("issues", infra), infra, http.StatusAccepted},
 		{"a GitLab merge request", http.MethodPost, "/hooks/gitlab",
-			gitlabSigned("Merge Request Hook", infra, testNow), infra, http.StatusOK},
+			gitlabSigned("Merge Request Hook", infra, testNow), infra, http.StatusAccepted},
 		{"a push nothing tracks", http.MethodPost, "/hooks/github",
 			githubHeaders("push", githubPush("refs/heads/feature", "https://github.com/org/infra")),
-			githubPush("refs/heads/feature", "https://github.com/org/infra"), http.StatusOK},
+			githubPush("refs/heads/feature", "https://github.com/org/infra"), http.StatusAccepted},
 		{"a bad signature", http.MethodPost, "/hooks/github",
 			headers("Content-Type", "application/json", "X-GitHub-Event", "push", "X-Hub-Signature-256", hubSignature("guessed", infra)),
 			infra, http.StatusUnauthorized},
@@ -264,10 +264,9 @@ func TestStalledBodiesGiveTheirSlotsBack(t *testing.T) {
 	}
 }
 
-// An accepted delivery refreshes exactly what tracks the push and says how much
-// that was — in counts, because the forge shows this answer to whoever
-// administers the repository, and they need not learn what else runs here.
-func TestAnAcceptedDeliveryRefreshesWhatTracksThePushAndCountsIt(t *testing.T) {
+// An accepted delivery refreshes exactly what tracks the push, and says nothing
+// about it in the answer.
+func TestAnAcceptedDeliveryRefreshesWhatTracksThePush(t *testing.T) {
 	f := newFixture(t)
 	infra := githubPush("refs/heads/main", "https://github.com/org/infra")
 	w := f.do(http.MethodPost, "/hooks/github", githubHeaders("push", infra), infra)
@@ -276,12 +275,8 @@ func TestAnAcceptedDeliveryRefreshesWhatTracksThePushAndCountsIt(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatalf("body %s: %v", w.Body, err)
 	}
-	want := map[string]any{"accepted": true, "appSet": false, "applications": float64(2)}
-	if w.Code != http.StatusAccepted || !maps.Equal(got, want) {
+	if want := map[string]any{"accepted": true}; w.Code != http.StatusAccepted || !maps.Equal(got, want) {
 		t.Errorf("response = %d %v, want 202 %v", w.Code, got, want)
-	}
-	if strings.Contains(w.Body.String(), "billing") {
-		t.Errorf("the response names applications: %s", w.Body)
 	}
 	if r := f.rec.refreshes(); !slices.Equal(r, []string{"billing-api", "billing-worker"}) {
 		t.Errorf("refreshed %v, want the two applications on that repository and branch", r)
@@ -296,6 +291,58 @@ func TestAnAcceptedDeliveryRefreshesWhatTracksThePushAndCountsIt(t *testing.T) {
 	}
 	if n := f.appSet.n.Load(); n != 1 {
 		t.Errorf("the app set was woken %d times by a push to its own repository, want 1", n)
+	}
+}
+
+// Every configured secret is good for every repository, on either route — a
+// GitLab hook's signing token signs a GitHub-shaped delivery as well as its own.
+// So the answer is the same for everything authenticated that parses: a push to
+// an application's repository, to the app set's, to a ref nothing tracks, a
+// ping, another event. If it differed, any one secret's holder could map what
+// this controller follows by asking.
+func TestEveryParsedDeliveryGetsTheSameAnswer(t *testing.T) {
+	f := newFixture(t)
+	asGitHub := func(event string, body []byte) http.Header {
+		return headers("Content-Type", "application/json", "X-GitHub-Event", event,
+			"X-Hub-Signature-256", hubSignature(signingSecret, body))
+	}
+	type delivery struct {
+		name, path string
+		h          http.Header
+		body       []byte
+	}
+	var deliveries []delivery
+	for _, d := range []struct{ name, ref, repo string }{
+		{"an application's repository", "refs/heads/main", "https://github.com/org/infra"},
+		{"the app set's repository", "refs/heads/main", "https://github.com/org/apps"},
+		{"a ref nothing tracks", "refs/heads/nope", "https://github.com/org/infra"},
+		{"a repository nothing tracks", "refs/heads/main", "https://github.com/org/elsewhere"},
+	} {
+		gh := githubPush(d.ref, d.repo)
+		gl := gitlabPush(d.ref, d.repo)
+		deliveries = append(deliveries,
+			delivery{"github: " + d.name, "/hooks/github", asGitHub("push", gh), gh},
+			delivery{"gitlab: " + d.name, "/hooks/gitlab", gitlabSigned("Push Hook", gl, testNow), gl})
+	}
+	ping := []byte(`{"zen":"x"}`)
+	deliveries = append(deliveries,
+		delivery{"a ping", "/hooks/github", asGitHub("ping", ping), ping},
+		delivery{"another event", "/hooks/github", asGitHub("issues", ping), ping})
+
+	var first string
+	for _, d := range deliveries {
+		w := f.do(http.MethodPost, d.path, d.h, d.body)
+		got := strconv.Itoa(w.Code) + " " + w.Body.String()
+		if first == "" {
+			first = got
+		}
+		if got != first {
+			t.Errorf("%s answered %q, want %q like every other authenticated delivery", d.name, got, first)
+		}
+	}
+	// And they did not all answer alike because nothing worked.
+	if len(f.rec.refreshes()) == 0 || f.appSet.n.Load() == 0 {
+		t.Errorf("refreshed %v and the app set %d times, want the tracked pushes to have woken both", f.rec.refreshes(), f.appSet.n.Load())
 	}
 }
 
