@@ -1753,6 +1753,23 @@ func (r *Reconciler) entry(app string) (*appEntry, error) {
 	return nil, fmt.Errorf("no such application '%s'", app)
 }
 
+// Refresh asks one application's loop to reconcile now rather than when its
+// timer says so. It is what a webhook delivery triggers.
+//
+// A wake rather than SyncNow, because a push says the repository moved, not
+// that anybody decided to deploy it: the pass is the loop's own, so a manual
+// policy plans and reports the drift without applying it, exactly as a tick
+// would. It returns without waiting, and a refresh arriving while one is
+// already pending is the same refresh (see poke).
+func (r *Reconciler) Refresh(app string) error {
+	e, err := r.entry(app)
+	if err != nil {
+		return err
+	}
+	e.poke()
+	return nil
+}
+
 // Sync reconciles one application now, applying if its policy allows.
 func (r *Reconciler) Sync(ctx context.Context, app string) error {
 	e, err := r.entry(app)

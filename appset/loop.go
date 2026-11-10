@@ -120,6 +120,11 @@ type Loop struct {
 	pruner    Pruner
 	reclaimer Reclaimer
 
+	// wake asks Run for a pass now rather than at the next tick. Capacity one
+	// and never blocking, so a burst of pushes is one pass and a webhook
+	// handler never waits on a loop that is busy loading.
+	wake chan struct{}
+
 	mu sync.RWMutex
 	// lastErr is why the last attempt failed, and stale reports that the load
 	// itself failed over a set that is already running — so what is running is
@@ -159,6 +164,27 @@ func NewLoop(src *Loader, rec Reconciler, o LoopOptions) *Loop {
 		src: src, rec: rec, mode: o.Mode, source: o.Source,
 		interval: o.Interval, log: o.Log, creds: o.Credentials,
 		pruner: o.Pruner, reclaimer: o.Reclaimer,
+		wake: make(chan struct{}, 1),
+	}
+}
+
+// Refresh asks Run for a pass now rather than at the next tick. It is what a
+// webhook delivery for the app set's own repository triggers, and it returns
+// without waiting for the pass.
+//
+// That pass loads and applies, and stops there: no prune and no cache reclaim,
+// and the tick stays where it was. Both sweeps guard against a mistake by
+// counting passes rather than time — prune deletes everything only after a
+// second pass also loads an empty set, and reclaim deletes a cache only if the
+// application was absent from the previous sweep too. Pushes seconds apart
+// would collapse both windows to nothing, and a force-push that briefly showed
+// `applications: []` would then sweep every stack this controller installed.
+// Leaving the timer alone is what keeps the sweeps on their interval however
+// often somebody pushes.
+func (l *Loop) Refresh() {
+	select {
+	case l.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -173,13 +199,16 @@ func (l *Loop) Run(ctx context.Context) error {
 	defer timer.Stop()
 
 	for {
+		sweep := true
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
+		case <-l.wake:
+			sweep = false
 		}
 
-		if err := l.Once(ctx); err != nil {
+		if err := l.pass(ctx, sweep); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -187,13 +216,19 @@ func (l *Loop) Run(ctx context.Context) error {
 			// reason to stop, which is the entire point of keeping last-good.
 			l.log.Error("app-set reconcile failed", "error", err)
 		}
-		timer.Reset(l.interval)
+		// Only after a tick; see Refresh. A tick that fired during a woken pass
+		// is not lost: since Go 1.23 the receive above still gets it.
+		if sweep {
+			timer.Reset(l.interval)
+		}
 	}
 }
 
 // Once loads the app set and brings the running set to it. It is what Run
-// calls, exported so a caller — a test, or a webhook later — can drive one pass
-// without waiting for a tick.
+// calls on a tick, exported so a test can drive one pass without waiting for
+// one. It must not run beside Run — the empty-set confirmation is state only a
+// pass touches, and two applies would race to add the same application — which
+// is why a webhook goes through Refresh instead.
 //
 // The diff runs on every pass, not only when the file has changed. What is
 // being reconciled towards is the desired state, not the last edit to it: an
@@ -209,7 +244,11 @@ func (l *Loop) Run(ctx context.Context) error {
 // exits. It also matches the per-application recover in reconcile — one bad
 // application must not take the others down — since a panic here would be
 // reached through exactly such an application's spec.
-func (l *Loop) Once(ctx context.Context) (err error) {
+func (l *Loop) Once(ctx context.Context) error { return l.pass(ctx, true) }
+
+// pass is Once, and with sweep false the pass Refresh asks for: the same load
+// and apply, without the two sweeps.
+func (l *Loop) pass(ctx context.Context, sweep bool) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("panic reconciling the app set: %v", p)
@@ -235,6 +274,10 @@ func (l *Loop) Once(ctx context.Context) (err error) {
 	}
 
 	err = l.apply(file.Applications)
+	if !sweep {
+		l.record(err, false)
+		return err
+	}
 	// Only behind a clean apply. A set that loaded but could not be brought up
 	// is a set whose running state is not yet the declared one, and deletions
 	// derived from it would be acting on a diff that is still half-applied.

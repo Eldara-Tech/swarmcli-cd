@@ -10,9 +10,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -758,6 +760,134 @@ func TestRunKeepsTickingThroughFailures(t *testing.T) {
 		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+// sweepCounter is both things in this loop that delete, counting how often a
+// pass reached each. Atomic because Run calls it from its own goroutine while
+// the test reads it.
+type sweepCounter struct{ departed, departing, swept atomic.Int64 }
+
+func (c *sweepCounter) Departed(context.Context, []string, []string) ([]string, error) {
+	c.departed.Add(1)
+	return nil, nil
+}
+
+func (c *sweepCounter) Departing(context.Context, []string, []string) ([]string, error) {
+	c.departing.Add(1)
+	return nil, nil
+}
+
+func (c *sweepCounter) Sweep([]string) error {
+	c.swept.Add(1)
+	return nil
+}
+
+// runLoop starts Run over a sweeping loop and returns the function that stops
+// it. Run returns only between passes, so once stop has returned every pass it
+// started has finished.
+func runLoop(t *testing.T, m mode, rec *fakeReconciler, c *sweepCounter, interval time.Duration) (*Loop, func()) {
+	t.Helper()
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Interval: interval, Log: discard(), Credentials: noCredentials, Pruner: c, Reclaimer: c,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = loop.Run(ctx)
+		close(done)
+	}()
+	stop := sync.OnceFunc(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("Run did not return after its context was cancelled")
+		}
+	})
+	t.Cleanup(stop)
+	return loop, stop
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for !cond() {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// A refresh is what a push to the app set's repository asks for, and it applies
+// the set without waiting for the tick — but deletes nothing. Prune's empty-set
+// confirmation and reclaim's previous-sweep rule both count passes, so pushes
+// seconds apart must not be passes they count, or the windows those guards hold
+// open would collapse to nothing.
+func TestARefreshAppliesTheSetWithoutSweeping(t *testing.T) {
+	m := pathMode(t, twoApps)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+	c := &sweepCounter{}
+	loop, stop := runLoop(t, m, rec, c, time.Hour)
+	eventually(t, "the first tick to sweep", func() bool { return c.swept.Load() == 1 })
+
+	m.publish(oneApp)
+	loop.Refresh()
+	eventually(t, "the refresh to apply the set", func() bool { return slices.Equal(rec.removes(), []string{"core"}) })
+	stop()
+
+	if got := c.departed.Load() + c.departing.Load(); got != 1 {
+		t.Errorf("prune was reached %d times, want only the first tick's 1", got)
+	}
+	if got := c.swept.Load(); got != 1 {
+		t.Errorf("reclaim swept %d times, want only the first tick's 1", got)
+	}
+}
+
+// Asking never waits. A webhook handler must not stall on a loop that is busy
+// loading, and refreshes before the loop has looked are one refresh.
+func TestRefreshNeverBlocks(t *testing.T) {
+	loop, _, _ := newLoop(t, oneApp)
+	done := make(chan struct{})
+	go func() {
+		for range 3 {
+			loop.Refresh()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Refresh blocked on a loop that is not running")
+	}
+}
+
+// Nor does a refresh postpone the tick. If it did, a repository pushed to more
+// often than the interval would never be swept at all.
+func TestRefreshesDoNotPostponeTheTick(t *testing.T) {
+	m := pathMode(t, oneApp)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"))
+	c := &sweepCounter{}
+	loop, stop := runLoop(t, m, rec, c, 20*time.Millisecond)
+
+	// A wake always waiting, so every pass Run starts could be a woken one.
+	pushing := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-pushing:
+				return
+			default:
+				loop.Refresh()
+				runtime.Gosched()
+			}
+		}
+	}()
+	defer close(pushing)
+
+	eventually(t, "ticks to keep sweeping under a stream of refreshes", func() bool { return c.swept.Load() >= 3 })
+	stop()
 }
 
 // ---------------------------------------------------------------- prune

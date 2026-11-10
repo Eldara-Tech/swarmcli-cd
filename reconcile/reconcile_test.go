@@ -903,6 +903,55 @@ func TestReplaceWakesALoopOutOfItsBackoff(t *testing.T) {
 	}
 }
 
+// A webhook delivery is a refresh: the application is reconciled now rather than
+// at its next tick, and because the pass is the loop's own, a manual policy plans
+// and reports the drift without deploying it. A push is evidence that the
+// repository moved, not somebody deciding to deploy what is in it.
+//
+// Two refreshes, because a forced pass applies and then re-plans to confirm: by
+// the time a third plan is seen, a refresh that had applied would show it.
+func TestRefreshReconcilesNowWithoutForcingAnApply(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync()}}
+	r := New([]application.Spec{spec("edge", false)}, Options{
+		Fetcher:   &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{},
+		NewEngine: func(charts.Backend) Engine { return engine },
+		// Long enough that every plan after the first is a refresh.
+		Interval: time.Hour,
+		Log:      discardLog(),
+		Now:      func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+
+	waitFor(t, "the first reconcile", func() bool { return engine.planCallCount() == 1 })
+	for want := 2; want <= 3; want++ {
+		if err := r.Refresh("edge"); err != nil {
+			t.Fatalf("Refresh = %v", err)
+		}
+		waitFor(t, "the refresh to reconcile without waiting for the interval", func() bool {
+			return engine.planCallCount() >= want
+		})
+	}
+	if n := engine.applyCount(); n != 0 {
+		t.Errorf("a refresh deployed a manual application %d times, want 0", n)
+	}
+	if v, _ := r.View("edge"); v.Status.Sync.State != application.SyncOutOfSync {
+		t.Errorf("state = %q, want the drift reported as out-of-sync", v.Status.Sync.State)
+	}
+}
+
+// An application the set no longer holds has nothing to refresh, and saying so
+// is the only way a caller holding a stale name can tell.
+func TestRefreshOfAnUnknownApplicationFails(t *testing.T) {
+	r := newTest(t, nil, &fakeEngine{}, nil)
+	if err := r.Refresh("ghost"); err == nil || !strings.Contains(err.Error(), "'ghost'") {
+		t.Errorf("Refresh = %v, want an error naming the application", err)
+	}
+}
+
 // And the count with it. The wake alone gets the corrected spec reconciled at
 // once; clearing the count is what stops a correction that does not work first
 // time resuming at the old spec's exponent — thirty minutes rather than six.
