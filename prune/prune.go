@@ -130,7 +130,7 @@ type Engine interface {
 	List(ctx context.Context) ([]charts.Release, error)
 }
 
-// How long settle waits for **one** volume to be released by the tasks that
+// How long a purge waits for **one** volume to be released by the tasks that
 // were using it, and how often it retries. Variables rather than constants so a
 // test does not spend the real interval discovering that the retry works.
 //
@@ -341,41 +341,6 @@ func nodeNames(nodes []swarms.Node) []string {
 	return out
 }
 
-// settle retries one volume's removal until the tasks that mounted it have let
-// go of it.
-//
-// The services were removed a moment ago and Swarm does not wait for their
-// containers to die, so the first attempt routinely fails with "volume is in
-// use". Retrying is not papering over a race — it is the only way to observe
-// the thing this is waiting for; the daemon offers no "tasks have drained"
-// signal to poll instead.
-//
-// The budget is per volume and starts here, because the thing being waited for
-// is per volume: each one is held by its own containers, which shut down in
-// their own time. Sharing a budget across a stack makes the last volume answer
-// for the first, so the same stack passes or fails depending on how many
-// volumes it happens to declare.
-func settle(ctx context.Context, remove func(context.Context) error) error {
-	deadline := time.Now().Add(volumeSettleTimeout)
-	for {
-		err := remove(ctx)
-		if err == nil {
-			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("still in use after %s: %w", volumeSettleTimeout, err)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(volumeSettleInterval):
-		}
-	}
-}
-
 // purgeThisNode deletes the stack's named volumes that the controller's own
 // node can see, and says plainly when that was not all of them.
 //
@@ -480,12 +445,26 @@ func withinRelease(log *slog.Logger, release string, names []string, attrs ...an
 	return own
 }
 
-// removeVolume removes one volume with settle's retries, and reports whether it
-// is gone: a volume the backend left in place (capability.ErrVolumeLeft) is not
-// a failure, and not a deletion either.
+// removeVolume removes one volume, and reports whether it is gone: a volume the
+// backend left in place (capability.ErrVolumeLeft) is not a failure, and not a
+// deletion either.
+//
+// The services were removed a moment ago and Swarm does not wait for their
+// containers to die, so the first attempt routinely fails with the daemon's
+// "volume is in use" conflict. Retrying is not papering over a race — it is the
+// only way to observe the thing this is waiting for; the daemon offers no "tasks
+// have drained" signal to poll instead. charts.RemoveWhenReleased retries that
+// conflict and nothing else, so a permission or driver error is reported at once
+// rather than after the whole budget.
+//
+// The budget is per volume and starts here, because the thing being waited for
+// is per volume: each one is held by its own containers, which shut down in
+// their own time. Sharing a budget across a stack makes the last volume answer
+// for the first, so the same stack passes or fails depending on how many
+// volumes it happens to declare.
 func removeVolume(ctx context.Context, remove func(context.Context, string) error, name string) (bool, error) {
 	left := false
-	err := settle(ctx, func(ctx context.Context) error {
+	err := charts.RemoveWhenReleased(ctx, volumeSettleTimeout, volumeSettleInterval, func(ctx context.Context) error {
 		err := remove(ctx, name)
 		if errors.Is(err, capability.ErrVolumeLeft) {
 			left = true

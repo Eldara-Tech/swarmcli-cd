@@ -439,9 +439,8 @@ func (b *Backend) SwarmNodes(ctx context.Context) (int, error) {
 // removals in live.go. The caller retries this for as long as the volume is
 // still held by a container that has not finished shutting down, so a volume
 // that vanished in between — another sweep, an operator, a `docker volume
-// prune` — would otherwise burn the whole settle budget and then fail the prune
-// naming "still in use" for something that had reached the asked-for state on
-// the first attempt.
+// prune` — would otherwise fail the prune for something that had reached the
+// asked-for state on the first attempt.
 //
 // The classification is reliable here in a way it is not for a network: a
 // missing volume is answered by the local volume store, or on a manager by
