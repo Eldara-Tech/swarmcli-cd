@@ -4904,6 +4904,32 @@ func TestPruneAttemptsCountAtMostOncePerInterval(t *testing.T) {
 	}
 }
 
+// The interval is the application's own, the one its ticks actually run at: an
+// application reconciling every thirty seconds reaches the limit in a minute,
+// not in the controller-wide three.
+func TestPruneAttemptsFollowTheApplicationsOwnInterval(t *testing.T) {
+	restore := maxPruneAttempts
+	maxPruneAttempts = 2
+	t.Cleanup(func() { maxPruneAttempts = restore })
+
+	app := sweepingSpec("edge", application.DriftManifest)
+	app.SyncPolicy.Interval = application.Duration(30 * time.Second)
+	backend := refusingSweep()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{app}, engine, nil, fakeRegistry{backend: backend})
+	clock := onIntervalClock(r)
+
+	for range 3 {
+		if err := r.Sync(context.Background(), "edge"); err != nil {
+			t.Fatalf("Sync = %v, want nil", err)
+		}
+		clock.advance(30 * time.Second)
+	}
+	if got := len(backend.attempted()); got != 6 {
+		t.Errorf("attempted %d removals over three passes 30s apart, want 6 — two counted, then retained", got)
+	}
+}
+
 // Given up on is not forgotten. There is nowhere else for this to be said — the
 // status reports what a sync will do, and this is no longer one of those things
 // — so it is warned about on every pass that still finds it, the same choice
