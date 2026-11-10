@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
+	"github.com/containerd/errdefs"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
 	"github.com/Eldara-Tech/swarmcli-cd/capability"
@@ -50,6 +51,9 @@ type fakeBackend struct {
 	// volInUse counts, per volume, how many removal attempts still fail before
 	// it frees — the "container has not let go yet" case.
 	volInUse map[string]int
+	// volErr is what those attempts fail with instead of the daemon's in-use
+	// conflict.
+	volErr map[string]error
 	// volDelay is how long one volume's removal takes, so that a test can spend
 	// a settle budget rather than assert about one.
 	volDelay map[string]time.Duration
@@ -84,7 +88,10 @@ func (b *fakeBackend) RemoveVolume(_ context.Context, name string) error {
 	defer b.mu.Unlock()
 	if n := b.volInUse[name]; n > 0 {
 		b.volInUse[name] = n - 1
-		return errors.New("volume is in use")
+		if err := b.volErr[name]; err != nil {
+			return err
+		}
+		return fmt.Errorf("volume is in use: %w", errdefs.ErrConflict)
 	}
 	time.Sleep(b.volDelay[name])
 	b.removedVol = append(b.removedVol, name)
@@ -434,6 +441,31 @@ func TestAVolumeStillInUseIsRetried(t *testing.T) {
 	}
 	if !slices.Equal(got, []string{"gone"}) {
 		t.Errorf("pruned = %v, want [gone]", got)
+	}
+}
+
+// Only the daemon's in-use conflict is a wait. A permission or driver error is
+// not cured by waiting, so it is reported on the first attempt rather than
+// after the whole budget (#301).
+func TestAVolumeRemovalThatIsNotInUseIsNotRetried(t *testing.T) {
+	restore := volumeSettleInterval
+	volumeSettleInterval = 0
+	t.Cleanup(func() { volumeSettleInterval = restore })
+
+	boom := errors.New("permission denied")
+	e := &fakeEngine{releases: []charts.Release{owned("api", "gone")}}
+	b := &fakeBackend{
+		volumes: map[string][]string{"api": {"api_data"}},
+		// One failure, which a retry would get past.
+		volInUse: map[string]int{"api_data": 1},
+		volErr:   map[string]error{"api_data": boom},
+	}
+
+	if _, err := prunerWith(t, e, b, true).Departed(t.Context(), []string{"kept"}, nil); !errors.Is(err, boom) {
+		t.Fatalf("Departed = %v, want it to carry %v", err, boom)
+	}
+	if len(b.removedVol) != 0 {
+		t.Errorf("removed volumes %v, want none — the error was retried", b.removedVol)
 	}
 }
 
