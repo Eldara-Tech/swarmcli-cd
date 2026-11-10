@@ -40,8 +40,19 @@ const maxBody = 4 << 20 // 4 MiB
 
 // maxDeliveries bounds how many deliveries are handled at once. Taken without
 // blocking, so the one over the bound is refused at once rather than queued: a
-// delivery holds up to maxBody in memory until it is verified.
-const maxDeliveries = 4
+// delivery holds up to maxBody in memory until it is verified, so the worst case
+// is 64 MiB buffered. Sixteen rather than a handful because a slot is held while
+// an unauthenticated body arrives, and every slot a stalled one holds is a real
+// delivery answered 503 — four of which in a row disable a GitLab hook.
+const maxDeliveries = 16
+
+// bodyReadTimeout bounds how long one delivery's body may take to arrive, which
+// is how long a slot can be held by somebody who has not authenticated. The
+// listener's own ReadTimeout is thirty seconds, so without this a handful of
+// connections that send headers and then stall would hold every slot that long,
+// over and over. Five seconds is far more than a 4 MiB body needs on any link a
+// forge delivers over.
+const bodyReadTimeout = 5 * time.Second
 
 // Reconciler is what a delivery refreshes. *reconcile.Reconciler implements it.
 type Reconciler interface {
@@ -93,6 +104,9 @@ type handler struct {
 	now            func() time.Time
 	floor          *floor
 	slots          chan struct{}
+	// bodyTimeout is bodyReadTimeout, a field so a test can wait it out in
+	// milliseconds.
+	bodyTimeout time.Duration
 }
 
 // New returns the handler the webhook listener serves.
@@ -111,6 +125,8 @@ func newHandler(o Options) *handler {
 		log: o.Log, now: time.Now,
 		floor: newFloor(application.MinInterval),
 		slots: make(chan struct{}, maxDeliveries),
+
+		bodyTimeout: bodyReadTimeout,
 	}
 }
 
@@ -133,6 +149,10 @@ func (h *handler) routes() http.Handler {
 // repository, and they need not learn what else this controller runs.
 func (h *handler) serve(f forge) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Before the slot, so that it is the request's arrival and not its turn
+		// that starts the clock. Real time, not h.now: it is the connection's.
+		// The error is a writer that cannot set one, which only a test has.
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(h.bodyTimeout))
 		select {
 		case h.slots <- struct{}{}:
 			defer func() { <-h.slots }()

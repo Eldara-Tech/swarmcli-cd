@@ -4,10 +4,13 @@
 package webhook
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -197,6 +200,67 @@ func TestDeliveriesBeyondTheBoundAreRefused(t *testing.T) {
 	<-f.h.slots
 	if w := f.do(http.MethodPost, "/hooks/github", githubHeaders("push", infra), infra); w.Code != http.StatusAccepted {
 		t.Errorf("status = %d once a slot was free, want 202", w.Code)
+	}
+}
+
+// A slot is held while the body arrives, and the body is unauthenticated until
+// it has. So connections that send headers and then stall must each give their
+// slot back once the body deadline passes, rather than at the listener's own
+// thirty-second ReadTimeout — and a signed delivery then gets through. The
+// server here has the controller's timeouts; only the body deadline is short.
+func TestStalledBodiesGiveTheirSlotsBack(t *testing.T) {
+	f := newFixture(t)
+	f.h.bodyTimeout = 50 * time.Millisecond
+	srv := httptest.NewUnstartedServer(f.h.routes())
+	srv.Config.ReadHeaderTimeout = 10 * time.Second
+	srv.Config.ReadTimeout = 30 * time.Second
+	srv.Config.WriteTimeout = 10 * time.Second
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	stalled := make([]net.Conn, 0, maxDeliveries)
+	for range maxDeliveries {
+		c, err := net.Dial("tcp", srv.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		// Headers, no signature, and a body that never comes.
+		if _, err := io.WriteString(c, "POST /hooks/github HTTP/1.1\r\nHost: x\r\n"+
+			"Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n"); err != nil {
+			t.Fatal(err)
+		}
+		stalled = append(stalled, c)
+	}
+
+	// Each is answered once its deadline passes, and the handler gives its slot
+	// back before the answer leaves. Five seconds is the test failing, not the
+	// test waiting: without the deadline nothing answers for thirty.
+	for i, c := range stalled {
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil {
+			t.Fatalf("stalled body %d was never answered, so it still holds its slot: %v", i, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("stalled body %d answered %d, want 400 for a body that did not arrive", i, resp.StatusCode)
+		}
+	}
+
+	infra := githubPush("refs/heads/main", "https://github.com/org/infra")
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/hooks/github", bytes.NewReader(infra))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header = githubHeaders("push", infra)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("a signed delivery after the stalled ones = %d, want 202", resp.StatusCode)
 	}
 }
 

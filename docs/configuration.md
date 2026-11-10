@@ -1638,7 +1638,9 @@ another event, or a push nothing tracks — 2xx, because GitLab disables a hook
 after four failed deliveries in a row and none of these is a failure. `401` for a
 missing or wrong signature, with no detail; `400` for a signed body that is not
 JSON; `413` above 4 MiB, checked before the signature; `415` as above; `503` with
-four deliveries already in flight; `404` and `405` for anything else.
+sixteen deliveries already in flight, which is overload rather than anything
+wrong with the delivery; `404` and `405` for anything else. Each body has five
+seconds to arrive, so a connection that stalls gives its place back quickly.
 
 **The secret** comes from `SWARMCLI_CD_WEBHOOK_SECRET_FILE`, a Docker secret, or
 `SWARMCLI_CD_WEBHOOK_SECRET`. The file may hold several, one per line: GitLab
@@ -1653,7 +1655,9 @@ settings are readable by everyone who administers the repository.
 pair. Without them it is plaintext, and the startup line says so (`tls=false`).
 The secret can ask for no more than a refresh, so that is tolerable on a private
 network, but a forge across the internet should reach this over TLS — here, or
-at a reverse proxy in front.
+at a reverse proxy in front. An internet-facing listener belongs behind a proxy
+that rate-limits as well: the controller bounds what one delivery can cost, not
+how many arrive.
 
 **Logs.** One `INFO` line per accepted delivery, `webhook delivery accepted`,
 naming the forge, the delivery id, the repository, the ref, whether the app set
