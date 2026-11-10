@@ -54,7 +54,9 @@
 // the directory the way git-sync does. Renaming each file into place is not
 // enough. An application moving from one file to another is then, between the
 // two renames, in neither, and a load in that gap reads it as having left the
-// set — which, with prune, deletes it.
+// set — which, with prune, deletes it. The reader's half is to load one version
+// or none: a load during which the symlink moved is a failed load, and the next
+// pass reads the version it moved to.
 //
 // # Not here
 //
@@ -356,7 +358,12 @@ func readContained(root, path string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("the app-set file %s: %w", filepath.Join(root, path), err)
 	}
+	return readBounded(file, filepath.Join(root, path))
+}
 
+// readBounded is readContained's read, of a file already resolved; name is the
+// file as its errors call it.
+func readBounded(file, name string) ([]byte, error) {
 	f, err := os.Open(file)
 	if err != nil {
 		return nil, fmt.Errorf("reading the app-set file: %w", err)
@@ -370,7 +377,7 @@ func readContained(root, path string) ([]byte, error) {
 		return nil, fmt.Errorf("reading the app-set file: %w", err)
 	}
 	if len(data) > maxAppSetSize {
-		return nil, fmt.Errorf("the app-set file %s is larger than the %d-byte limit", filepath.Join(root, path), maxAppSetSize)
+		return nil, fmt.Errorf("the app-set file %s is larger than the %d-byte limit", name, maxAppSetSize)
 	}
 	return data, nil
 }
@@ -383,11 +390,17 @@ const noAppSetFiles = "no app-set files in %s; commit one with 'applications: []
 // under root: every .yaml or .yml file directly in it, skipping hidden ones and
 // everything else, subdirectories included.
 //
-// The directory is resolved once, and listed and read under what it resolved
-// to. git-sync publishes by swapping a symlink, and a read that went back
-// through the link for each file could straddle a swap and load half of one
-// version and half of the next. Each file is still held inside that directory,
-// for the reason readContained gives.
+// The directory is resolved once, listed and read under what it resolved to,
+// and resolved again at the end. git-sync publishes by swapping a symlink and
+// then deletes the version it swapped away from at once, so a read that
+// resolved to that version can list and read a directory being deleted under
+// it and come back with fewer files than were committed and no error: a smaller
+// set that is still valid, and prune acts on it. Deleting only starts once the
+// link has moved, so any read it reaches finds the link moved when it is
+// resolved again, and is refused; the next pass reads the new version.
+//
+// Each file is held inside the directory, not merely inside the tree, for the
+// reason readContained gives: what is in the set is what is in this directory.
 //
 // The size bound is the one file's, applied to them together, and the error
 // names the file that takes them over it. Each file is read under the bound on
@@ -415,7 +428,20 @@ func readDir(root, path string) ([]config.Document, error) {
 		if e.IsDir() || strings.HasPrefix(name, ".") || (ext != ".yaml" && ext != ".yml") {
 			continue
 		}
-		data, err := readContained(dir, name)
+		file, err := source.Contained(dir, name)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil, fmt.Errorf("no app-set file at %s", filepath.Join(where, name))
+		case err != nil && errors.Unwrap(err) == nil:
+			// Contained's own refusals wrap nothing, and a failure to resolve
+			// wraps why; for a bare name its one refusal is a link leading out.
+			// It says out of the repository, which sends an operator looking in
+			// the wrong place: the target may well be in the repository.
+			return nil, fmt.Errorf("the app-set file %s resolves outside the app-set directory %s", filepath.Join(where, name), where)
+		case err != nil:
+			return nil, fmt.Errorf("the app-set file %s: %w", filepath.Join(where, name), err)
+		}
+		data, err := readBounded(file, filepath.Join(where, name))
 		if err != nil {
 			return nil, err
 		}
@@ -424,6 +450,9 @@ func readDir(root, path string) ([]config.Document, error) {
 			return nil, fmt.Errorf("the app-set files in %s are larger than the %d-byte limit together; %s takes them over it", where, maxAppSetSize, name)
 		}
 		docs = append(docs, config.Document{Name: name, Data: data})
+	}
+	if again, err := source.Contained(root, path); err != nil || again != dir {
+		return nil, fmt.Errorf("the app-set directory %s changed while it was read; the next pass reads it again", where)
 	}
 	if len(docs) == 0 {
 		return nil, fmt.Errorf(noAppSetFiles, where)

@@ -1034,16 +1034,34 @@ func TestFilesRefusesAPathLeavingTheTree(t *testing.T) {
 	}
 }
 
-// git-sync publishes by swapping a symlink to the whole directory. A load that
-// straddles a swap still reads one version: the directory is resolved once, so
-// a file read after the swap is the old version's, not the new one's.
+// The set is what is in its directory. A file linked to somewhere else in the
+// same tree is refused too, and said to leave the directory rather than the
+// repository, which it does not.
+func TestFilesRefusesALinkOutOfTheDirectory(t *testing.T) {
+	root := t.TempDir()
+	writeFiles(t, root, map[string]string{"shared/edge.yaml": appFile("edge"), setDir + "/core.yaml": appFile("core")})
+	mustSymlink(t, filepath.Join("..", "shared", "edge.yaml"), filepath.Join(root, setDir, "edge.yaml"))
+
+	_, _, err := NewPath(PathConfig{Dir: root, Path: setDir, Files: true}).Load(context.Background())
+	want := "the app-set file " + filepath.Join(root, setDir, "edge.yaml") + " resolves outside the app-set directory " + filepath.Join(root, setDir)
+	if err == nil || err.Error() != want {
+		t.Errorf("Load = %v, want %q", err, want)
+	}
+}
+
+// git-sync publishes by swapping a symlink to the whole directory and then
+// deletes the version it swapped away from, so a load that straddles a swap may
+// have read a directory that was being deleted under it. It is a failed load,
+// not whatever it managed to read, and the next pass reads the new version.
 //
-// The swap is made to land between two reads by making the first file a FIFO:
-// opening it blocks until a writer opens it too, by which point the directory
-// has been listed, and the writer swaps the link before it lets the read finish.
-func TestFilesAreReadFromOneVersionOfTheDirectory(t *testing.T) {
+// The swap is made to land mid-read by making the first file a FIFO: opening it
+// blocks until a writer opens it too, by which point the directory has been
+// listed, and the writer swaps the link before it lets the read finish.
+func TestFilesReadAcrossASwapIsAFailedLoad(t *testing.T) {
 	root := t.TempDir()
 	writeFiles(t, root, map[string]string{
+		"v0/a.yaml": appFile("alpha-0"),
+		"v0/b.yaml": appFile("bravo-0"),
 		"v1/b.yaml": appFile("bravo-1"),
 		"v2/a.yaml": appFile("alpha-2"),
 		"v2/b.yaml": appFile("bravo-2"),
@@ -1052,7 +1070,25 @@ func TestFilesAreReadFromOneVersionOfTheDirectory(t *testing.T) {
 	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mustSymlink(t, "v1", filepath.Join(root, "current"))
+	// The swap git-sync makes: a new link renamed over the old one.
+	swap := func(version string) error {
+		next := filepath.Join(root, "next")
+		if err := os.Symlink(version, next); err != nil {
+			return err
+		}
+		return os.Rename(next, filepath.Join(root, "current"))
+	}
+	if err := swap("v0"); err != nil {
+		t.Fatal(err)
+	}
+	loader := NewPath(PathConfig{Dir: root, Path: "current", Files: true})
+	good, _, err := loader.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load = %v, want nil", err)
+	}
+	if err := swap("v1"); err != nil {
+		t.Fatal(err)
+	}
 
 	swapped := make(chan error, 1)
 	go func() {
@@ -1061,17 +1097,14 @@ func TestFilesAreReadFromOneVersionOfTheDirectory(t *testing.T) {
 			swapped <- err
 			return
 		}
-		err = os.Symlink("v2", filepath.Join(root, "next"))
-		if err == nil {
-			err = os.Rename(filepath.Join(root, "next"), filepath.Join(root, "current"))
-		}
+		err = swap("v2")
 		if err == nil {
 			_, err = w.WriteString(appFile("alpha-1"))
 		}
 		swapped <- errors.Join(err, w.Close())
 	}()
 
-	file, _, err := NewPath(PathConfig{Dir: root, Path: "current", Files: true}).Load(context.Background())
+	_, _, err = loader.Load(context.Background())
 	select {
 	case werr := <-swapped:
 		if werr != nil {
@@ -1080,11 +1113,20 @@ func TestFilesAreReadFromOneVersionOfTheDirectory(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatalf("the swap never happened, so the first file was never opened (Load = %v)", err)
 	}
-	if err != nil {
-		t.Fatalf("Load = %v, want nil", err)
+	if err == nil || !strings.Contains(err.Error(), "changed while it was read") {
+		t.Fatalf("Load = %v, want a failed load for a directory that moved while it was read", err)
 	}
-	if got := strings.Join(names(t, file.Applications), " "); got != "alpha-1 bravo-1" {
-		t.Errorf("applications = %s, want alpha-1 bravo-1: one version of the directory, not parts of two", got)
+	if loader.Current() != good {
+		t.Error("Current moved off the last good set")
+	}
+
+	// And the next pass reads the version the link moved to.
+	file, _, err := loader.Load(context.Background())
+	if err != nil {
+		t.Fatalf("next Load = %v, want nil", err)
+	}
+	if got := strings.Join(names(t, file.Applications), " "); got != "alpha-2 bravo-2" {
+		t.Errorf("applications = %s, want alpha-2 bravo-2", got)
 	}
 }
 
