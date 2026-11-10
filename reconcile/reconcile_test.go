@@ -4872,7 +4872,7 @@ func TestAnApplicationIsSyncedOnceItHasGivenUpOnAResource(t *testing.T) {
 // only a pass an interval on from the last counted refusal counts.
 func TestPruneAttemptsCountAtMostOncePerInterval(t *testing.T) {
 	restore := maxPruneAttempts
-	maxPruneAttempts = 2
+	maxPruneAttempts = 3
 	t.Cleanup(func() { maxPruneAttempts = restore })
 
 	backend := refusingSweep()
@@ -4880,28 +4880,37 @@ func TestPruneAttemptsCountAtMostOncePerInterval(t *testing.T) {
 	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
 		fakeRegistry{backend: backend})
 	clock := onIntervalClock(r)
-
-	// Five passes at the webhook floor, all inside one interval.
-	for i := range 5 {
-		if err := r.Sync(context.Background(), "edge"); err != nil {
-			t.Fatalf("Sync %d = %v, want nil", i+1, err)
+	passes := func(n int) {
+		t.Helper()
+		for range n {
+			if err := r.Sync(context.Background(), "edge"); err != nil {
+				t.Fatalf("Sync = %v, want nil", err)
+			}
+			clock.advance(application.MinInterval)
 		}
-		clock.advance(application.MinInterval)
 	}
-	if got := len(backend.attempted()); got != 15 {
-		t.Fatalf("attempted %d removals over five passes inside one interval, want 15 — each retried, none given up on", got)
+	attempted := func(want int, after string) {
+		t.Helper()
+		if got := len(backend.attempted()); got != want {
+			t.Fatalf("attempted %d removals %s, want %d", got, after, want)
+		}
 	}
 
-	// An interval on, the second refusal counts, and the pass after gives up.
+	// Five passes at the webhook floor, all inside one interval: each retries,
+	// one counts.
+	passes(5)
+	attempted(15, "over five passes inside one interval")
+
+	// An interval on, the second counts — and the interval is then measured
+	// from it, not from the first, so the passes just after it do not count.
 	clock.advance(DefaultInterval)
-	for range 2 {
-		if err := r.Sync(context.Background(), "edge"); err != nil {
-			t.Fatalf("Sync = %v, want nil", err)
-		}
-	}
-	if got := len(backend.attempted()); got != 18 {
-		t.Errorf("attempted %d removals, want 18 — one more pass an interval on, then retained", got)
-	}
+	passes(3)
+	attempted(24, "over three more passes, the first an interval on")
+
+	// A third interval on, the third counts, and the pass after gives up.
+	clock.advance(DefaultInterval)
+	passes(2)
+	attempted(27, "once the third counted refusal was reached")
 }
 
 // The interval is the application's own, the one its ticks actually run at: an
