@@ -2944,11 +2944,15 @@ func TestAVolumeIsNotRemovedWhenItCouldNotBeInspected(t *testing.T) {
 }
 
 func TestRemoveVolumeSurfacesARefusal(t *testing.T) {
-	api := &fakeAPI{volumes: []volume.Volume{{Name: "s_data"}}, removeErr: map[string]error{"volume:s_data": errors.New("volume is in use")}}
+	api := &fakeAPI{volumes: []volume.Volume{{Name: "s_data"}}, removeErr: map[string]error{"volume:s_data": fmt.Errorf("volume is in use: %w", errdefs.ErrConflict)}}
 
 	err := testBackend(t, api, nil).RemoveVolume(context.Background(), "s_data")
 	if err == nil || !strings.Contains(err.Error(), "in use") {
 		t.Fatalf("RemoveVolume = %v, want the daemon's refusal surfaced", err)
+	}
+	// Kept as a conflict, because that is the one error a purge waits out.
+	if !errdefs.IsConflict(err) {
+		t.Errorf("RemoveVolume = %v, want the daemon's conflict kept", err)
 	}
 }
 
