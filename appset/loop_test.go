@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/reclaim"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 )
 
@@ -972,6 +973,102 @@ func TestAWokenPassReportsItsOwnApplyFailure(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("status error = %q, want it to carry %q", got, want)
 		}
+	}
+}
+
+// A tick whose apply fails runs reclaim but not prune, so it must not leave
+// prune looking recovered: the clean woken pass after it still reports prune's
+// last failure, and only a tick that prunes again clears it.
+func TestATickThatSkipsPruneKeepsItsFailureReported(t *testing.T) {
+	p := &fakePruner{err: errors.New("the prune could not finish")}
+	m := pathMode(t, oneApp)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"))
+	loop := NewLoop(m.loader, rec, LoopOptions{Log: discard(), Credentials: noCredentials, Pruner: p, Reclaimer: &fakeReclaimer{}})
+	reported := func() string { return loop.Status().AppSet.Error }
+
+	_ = loop.Once(t.Context())
+	if !strings.Contains(reported(), "the prune could not finish") {
+		t.Fatalf("status error = %q after a tick whose prune failed", reported())
+	}
+
+	rec.setFailAdd("core")
+	m.publish(twoApps)
+	_ = loop.Once(t.Context())
+	if !strings.Contains(reported(), "adding 'core'") {
+		t.Fatalf("status error = %q after a tick whose apply failed", reported())
+	}
+
+	rec.setFailAdd("")
+	m.publish(oneApp)
+	if err := loop.pass(t.Context(), false); err != nil {
+		t.Fatalf("a clean woken pass = %v", err)
+	}
+	if !strings.Contains(reported(), "the prune could not finish") {
+		t.Errorf("status error = %q after a clean woken pass, want prune's failure: no pass has pruned since it failed", reported())
+	}
+
+	p.err = nil
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want a clean tick", err)
+	}
+	if err := loop.pass(t.Context(), false); err != nil || reported() != "" {
+		t.Errorf("woken pass = %v, status error = %q, want both clean once a tick pruned", err, reported())
+	}
+}
+
+// Two sweeps in a row missing a name used to mean it had been gone a whole
+// interval. A woken pass changes the set between ticks, so a name can leave,
+// come back and leave again just before a tick — and if its sync has outlived
+// Remove's bounded wait it is still reading the clone. So a draining
+// application keeps its cache, and once it stops draining the grace period
+// starts again from there.
+func TestADrainingApplicationsCacheIsNotReclaimed(t *testing.T) {
+	root := t.TempDir()
+	cache := filepath.Join(root, "core")
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := pathMode(t, twoApps)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Log: discard(), Credentials: noCredentials,
+		Reclaimer: reclaim.New(reclaim.Options{Roots: []string{root}, Log: discard()}),
+	})
+	ctx := t.Context()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	exists := func() bool {
+		_, err := os.Stat(cache)
+		return err == nil
+	}
+
+	must(loop.Once(ctx)) // a tick with core in the set
+	m.publish(oneApp)
+	must(loop.pass(ctx, false)) // a push: core leaves
+	must(loop.Once(ctx))        // the next tick misses it once
+	m.publish(twoApps)
+	must(loop.pass(ctx, false)) // a push: core is back, and syncing
+	m.publish(oneApp)
+	must(loop.pass(ctx, false)) // a push moments later: core leaves again
+	rec.stillSyncing("core")    // with its sync outliving Remove's wait
+
+	must(loop.Once(ctx))
+	if !exists() {
+		t.Fatal("the cache of an application still draining was reclaimed")
+	}
+
+	rec.stillSyncing()
+	must(loop.Once(ctx))
+	if !exists() {
+		t.Fatal("reclaimed on the first tick after the drain, want the grace period to start again")
+	}
+	must(loop.Once(ctx))
+	if exists() {
+		t.Error("still there on the second tick missing it, want it reclaimed")
 	}
 }
 

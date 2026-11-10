@@ -148,11 +148,12 @@ type Loop struct {
 	// holds an empty set for one more pass, which is the safe direction.
 	emptyBefore bool
 
-	// sweepErr is how the last pass that swept went, and only pass touches it.
-	// A pass Refresh asked for does not sweep, so it cannot say the sweeps have
-	// recovered: it reports this beside its own outcome, and the failure stays on
-	// the status endpoint until a tick sweeps again.
-	sweepErr error
+	// pruneErr and reclaimErr are how each sweep went the last time a pass ran
+	// it, and only pass touches them. Two, because a tick whose apply failed runs
+	// reclaim and not prune, and must not leave prune looking recovered; and a
+	// pass Refresh asked for runs neither, so it reports both beside its own
+	// outcome until a tick that runs them says otherwise.
+	pruneErr, reclaimErr error
 }
 
 // NewLoop returns a Loop driving rec from src.
@@ -282,7 +283,7 @@ func (l *Loop) pass(ctx context.Context, sweep bool) (err error) {
 
 	err = l.apply(file.Applications)
 	if !sweep {
-		l.record(errors.Join(err, l.sweepErr), false)
+		l.record(errors.Join(err, l.pruneErr, l.reclaimErr), false)
 		return err
 	}
 	// Only behind a clean apply. A set that loaded but could not be brought up
@@ -290,7 +291,8 @@ func (l *Loop) pass(ctx context.Context, sweep bool) (err error) {
 	// derived from it would be acting on a diff that is still half-applied.
 	var swept error
 	if err == nil {
-		swept = l.pruneDeparted(ctx, file.Applications)
+		l.pruneErr = l.pruneDeparted(ctx, file.Applications)
+		swept = l.pruneErr
 	}
 	// Deliberately not behind that gate. What this deletes is a cache rebuilt on
 	// the next fetch, and it is keyed on the set the reconciler actually holds
@@ -298,10 +300,9 @@ func (l *Loop) pass(ctx context.Context, sweep bool) (err error) {
 	// clone, and one whose add failed loses only a cache. Letting the data
 	// directory fill because some unrelated application will not start is the
 	// worse failure by a distance, and the volume it fills is the manager's.
-	if rerr := l.reclaimDeparted(); rerr != nil {
-		swept = errors.Join(swept, rerr)
+	if l.reclaimErr = l.reclaimDeparted(); l.reclaimErr != nil {
+		swept = errors.Join(swept, l.reclaimErr)
 	}
-	l.sweepErr = swept
 	err = errors.Join(err, swept)
 	// Recorded either way, so a pass that succeeded clears a previous failure —
 	// including a pass that found nothing to do, because the set having become
@@ -413,18 +414,27 @@ func (l *Loop) pruneDeparted(ctx context.Context, desired []application.Spec) er
 // Driven by the running set rather than by the file, and that is what makes it
 // safe rather than merely tidy: an application whose Remove failed is still in
 // it and keeps its checkout, so there is no pass in which the file has dropped a
-// name that something here is still reconciling. The other direction — a sync
-// the API started before the removal, which Remove neither cancels nor waits for
-// (#106) — is covered by the sweep's own grace period, not by this.
+// name that something here is still reconciling.
+//
+// The other direction is an application that has left the set and whose work
+// has not stopped, since Remove's wait is bounded — and that is why the draining
+// ones are kept as well. The sweep's own grace period used to cover it: a name
+// missed by two consecutive sweeps had been gone a whole interval while only a
+// tick changed the set. A pass Refresh asks for changes it between ticks, so a
+// name can leave, come back and leave again moments before the second sweep,
+// and what holds now is that nothing is reclaimed while it is in the set or
+// still draining.
 func (l *Loop) reclaimDeparted() error {
 	if l.reclaimer == nil {
 		return nil
 	}
 	views := l.rec.Views()
-	names := make([]string, 0, len(views))
+	draining := l.rec.Draining()
+	names := make([]string, 0, len(views)+len(draining))
 	for _, view := range views {
 		names = append(names, view.Spec.Name)
 	}
+	names = append(names, draining...)
 	if err := l.reclaimer.Sweep(names); err != nil {
 		return fmt.Errorf("reclaiming the caches of departed applications: %w", err)
 	}

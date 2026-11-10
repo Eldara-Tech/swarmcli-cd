@@ -180,8 +180,9 @@ drift/             whether the swarm matches git: drift.go is manifest mode,
 prune/             deletes what git no longer declares, and the ownership rules
                    deciding what may be deleted at all
 reclaim/           deletes the on-disk caches — clone and chart cache — of an
-                   application that has left the set, a whole interval after it
-                   did, so nothing racing the removal reads a deleted tree
+                   application that has left the set, two sweeps after it did
+                   and never while its work is still draining, so nothing
+                   racing the removal reads a deleted tree
 regauth/           per-application registry credentials, from Docker secrets
 
 seam/              the init()-registration mechanism the six seams share (D6)

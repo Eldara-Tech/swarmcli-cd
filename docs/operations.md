@@ -201,9 +201,9 @@ Two consequences follow, and neither is a fault to investigate:
   `swarmcli-cd status`. See [configuration § startup, when the set is not there
   yet](configuration.md#startup-when-the-set-is-not-there-yet).
 
-An application that leaves the app set has its clone and chart cache reclaimed a
-whole app-set interval after it goes, so nothing racing the removal reads a
-deleted tree.
+An application that leaves the app set has its clone and chart cache reclaimed at
+the second app-set tick that finds it gone, and never while a sync of it is
+still running, so nothing racing the removal reads a deleted tree.
 
 ## What to back up
 
