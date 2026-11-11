@@ -110,7 +110,10 @@ setting both, or either alongside an explicit --config, is an error.
   --appset-revision <ref>   Branch, tag or SHA to track (required with --appset-repo)
   --appset-dir <dir>        Read the set from a directory something else keeps current
   --appset-path <file>      The set's path within the repository or the directory
-                            (required with --appset-repo; default ` + defaultAppSetFile + ` with --appset-dir)
+                            (default ` + defaultAppSetFile + ` with --appset-dir)
+  --appset-files <dir>      Instead of --appset-path, a directory there whose .yaml
+                            and .yml files together are the set, in name order.
+                            --appset-repo needs one of the two
   --appset-interval <dur>   How often the set is re-read (default ` + appset.DefaultInterval.String() + `)
 
 An application that leaves the set stops being reconciled and its stack is left
@@ -164,6 +167,7 @@ func runController(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.appSetRevision, "appset-revision", "", "")
 	fs.StringVar(&o.appSetDir, "appset-dir", "", "")
 	fs.StringVar(&o.appSetPath, "appset-path", "", "")
+	fs.StringVar(&o.appSetFiles, "appset-files", "", "")
 	fs.DurationVar(&o.appSetInterval, "appset-interval", appset.DefaultInterval, "")
 	fs.BoolVar(&o.prune, "prune", false, "")
 	fs.BoolVar(&o.pruneVolumes, "prune-volumes", false, "")
@@ -256,6 +260,7 @@ type options struct {
 	appSetRevision string
 	appSetDir      string
 	appSetPath     string
+	appSetFiles    string
 	appSetInterval time.Duration
 
 	// prune deletes the resources of an application that has left the app set,
@@ -645,12 +650,19 @@ func (o options) validate() error {
 		return errors.New("--config names a mounted file and --appset-dir a directory, so which one holds the app set is ambiguous")
 	case o.appSetRepo != "" && o.appSetRevision == "":
 		return errors.New("--appset-repo needs --appset-revision: an unpinned app set would follow whatever the default branch happens to point at")
-	case o.appSetRepo != "" && o.appSetPath == "":
-		return errors.New("--appset-repo needs --appset-path: the app set's path within the repository")
+	case o.appSetRepo != "" && o.appSetPath == "" && o.appSetFiles == "":
+		return errors.New("--appset-repo needs --appset-path or --appset-files: where the app set is within the repository")
+	case o.appSetPath != "" && o.appSetFiles != "":
+		return errors.New("--appset-path and --appset-files are alternatives: the app set is one file or a directory of them")
 	case o.appSetRevision != "" && o.appSetRepo == "":
 		return errors.New("--appset-revision means nothing without --appset-repo")
 	case o.appSetPath != "" && o.appSetRepo == "" && o.appSetDir == "":
 		return errors.New("--appset-path means nothing without --appset-repo or --appset-dir")
+	case o.appSetFiles != "" && o.appSetRepo == "" && o.appSetDir == "":
+		// Not offered for the mounted file: a directory of Docker configs is one
+		// config per file, and self-upgrade checks that the one --config names
+		// is still mounted.
+		return errors.New("--appset-files means nothing without --appset-repo or --appset-dir")
 	case o.appSetInterval <= 0:
 		// Not silently defaulted: an operator writing 0 means something by it,
 		// and "never re-read" is not a thing this controller can do.
@@ -684,6 +696,13 @@ func (o options) validate() error {
 // startup log line and the endpoint cannot disagree about what is being
 // followed.
 func appSetSource(o options, auth git.Auth, root string) (*appset.Loader, string) {
+	// Where the set is within the repository or the directory: one file, or a
+	// directory of them. Validate has let through one of the two at most.
+	within, files := o.appSetPath, o.appSetFiles != ""
+	if files {
+		within = o.appSetFiles
+	}
+
 	switch o.mode() {
 	case appSetModeGit:
 		// Its own sourcer under its own root, sharing only the type and the
@@ -692,16 +711,17 @@ func appSetSource(o options, auth git.Auth, root string) (*appset.Loader, string
 		src := appset.NewGit(git.New(root, auth), appset.GitConfig{
 			RepoURL:  o.appSetRepo,
 			Revision: o.appSetRevision,
-			Path:     o.appSetPath,
+			Path:     within,
+			Files:    files,
 		})
-		return src, fmt.Sprintf("%s @ %s (%s)", o.appSetRepo, o.appSetRevision, o.appSetPath)
+		return src, fmt.Sprintf("%s @ %s (%s)", o.appSetRepo, o.appSetRevision, within)
 
 	case appSetModePath:
-		file := o.appSetPath
+		file := within
 		if file == "" {
 			file = defaultAppSetFile
 		}
-		return appset.NewPath(appset.PathConfig{Dir: o.appSetDir, Path: file}),
+		return appset.NewPath(appset.PathConfig{Dir: o.appSetDir, Path: file, Files: files}),
 			fmt.Sprintf("%s (%s)", o.appSetDir, file)
 
 	default:

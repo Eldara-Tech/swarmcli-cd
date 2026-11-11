@@ -137,8 +137,9 @@ Run `swarmcli-cd controller --help` or `swarmcli-cd app help` for the rest.
   capability that ships today.
 - [Extensibility](docs/extensibility.md) — the open-core seams, for contributors.
 - Examples: a commented [`applications.yaml`](examples/applications.yaml), a
-  ready-to-push [quickstart repository](examples/quickstart-repo/), and an
-  [app-set repository](examples/appset-repo/) for the git-sourced layout.
+  ready-to-push [quickstart repository](examples/quickstart-repo/), an
+  [app-set repository](examples/appset-repo/) for the git-sourced layout, and
+  [one whose set is a directory of files](examples/appset-dir-repo/).
 
 ## Deploying it
 
@@ -199,6 +200,7 @@ output and in argv.
 | `--ui` | on | serve the embedded web UI at `/`; `--ui=false` answers its routes with `404` |
 | `--appset-repo` `--appset-revision` `--appset-path` | — | source the application set from a git repository instead |
 | `--appset-dir` | — | source it from a directory a git-sync sidecar keeps current |
+| `--appset-files` | — | instead of `--appset-path`, a directory whose `.yaml` and `.yml` files together are the set |
 | `--appset-interval` | `3m` | how often the application set is re-read |
 | `--prune` | off | delete the resources of an application that has left the application set, instead of leaving the stack running and reporting it as orphaned |
 | `--prune-volumes` | off | extend `--prune` to named volumes, the one part nothing can restore; requires `--prune` |

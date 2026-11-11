@@ -183,62 +183,144 @@ func (f *File) validate() error {
 		return errors.New("no applications declared; write 'applications: []' to run none")
 	}
 
-	seen := make(map[string]bool, len(f.Applications))
-	// Keyed by the release name in lower case: Swarm compares the names a stack
-	// deploy creates without regard to case, so two releases differing only in
-	// case collide wherever the names they scope match, and on their release
-	// records.
-	claimed := make(map[string]claim, len(f.Applications))
-	selfApp := ""
+	set := newSetCheck()
 	for i, app := range f.Applications {
 		if err := validateApplication(app); err != nil {
 			return fmt.Errorf("applications[%d]: %w", i, err)
 		}
-		if seen[app.Name] {
-			return fmt.Errorf("applications[%d]: duplicate application name '%s'", i, app.Name)
-		}
-		seen[app.Name] = true
-
-		// One controller runs as one stack, so two applications claiming to be
-		// it is a file that cannot be obeyed either way round. Named rather than
-		// resolved by order: whichever this took, the other would deploy the
-		// controller's chart as an ordinary release and be refused for mounting
-		// the controller's secrets, which reads like a different bug.
-		if app.Self {
-			if selfApp != "" {
-				return fmt.Errorf("applications[%d]: '%s' and '%s' both declare self, and this controller runs as one stack", i, selfApp, app.Name)
-			}
-			selfApp = app.Name
-		}
-
-		// Two applications may not claim one release. A release name is the
-		// Swarm stack namespace, so a shared one is a shared stack: each
-		// application deploys its own manifest over the other's on every
-		// interval, and each takes the owner stamp from the other as it goes —
-		// after which the one that stops declaring the release reads it as its
-		// own orphan and, with pruneVolumes, takes the data too.
-		//
-		// Only chart sources are visible from here: what a releaseFile declares
-		// is in a repository this has not fetched. The reconciler holds the
-		// other half — it refuses to delete a release another application in the
-		// set declares — but this is the half with an operator present to fix
-		// it, which is where a name collision belongs.
-		if c := app.Source.Chart; c != nil {
-			key := strings.ToLower(c.Release)
-			if other, taken := claimed[key]; taken {
-				if other.release != c.Release {
-					return fmt.Errorf("applications[%d]: '%s' and '%s' declare the releases '%s' and '%s', which differ only in case, and Swarm compares the names a stack creates without regard to case, so they would collide on their release records and wherever the names they scope match", i, other.app, app.Name, other.release, c.Release)
-				}
-				return fmt.Errorf("applications[%d]: '%s' and '%s' both declare the release '%s', and a release name is the Swarm stack namespace, so they would share one stack", i, other.app, app.Name, c.Release)
-			}
-			claimed[key] = claim{app: app.Name, release: c.Release}
+		if err := set.add("", i, app); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// claim is the application holding a release name, and that name as it wrote it.
-type claim struct{ app, release string }
+// Document is one file of an app set split across several: its name within the
+// set, which its errors are reported against, and its content.
+type Document struct {
+	Name string
+	Data []byte
+}
+
+// ParseSet validates an app set split across several files, each of them a whole
+// applications file declaring zero or more applications. The set is their
+// applications in the order given. Path names the set: it prefixes every error
+// and becomes the File's Path.
+//
+// Each file is held to everything Parse holds one to, under its own name. The
+// rules that span a set — a name used twice, two applications both self, one
+// chart release claimed twice — then run over all of them, because two files
+// that are each valid alone can still be a set that cannot be obeyed, and those
+// errors name both files.
+func ParseSet(docs []Document, path string) (*File, error) {
+	// No files is not a declaration of none, for the reason validate gives: it is
+	// what an emptied directory looks like.
+	if len(docs) == 0 {
+		return nil, fmt.Errorf("%s: no applications declared; write 'applications: []' to run none", path)
+	}
+	// Not nil, even when every file declares none: each one said so on purpose.
+	f := &File{Path: path, Applications: []application.Spec{}}
+	set := newSetCheck()
+	for _, doc := range docs {
+		part, err := Parse(doc.Data, doc.Name)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		for i, app := range part.Applications {
+			if err := set.add(doc.Name, i, app); err != nil {
+				return nil, fmt.Errorf("%s: %w", path, err)
+			}
+		}
+		f.Applications = append(f.Applications, part.Applications...)
+	}
+	return f, nil
+}
+
+// setCheck holds the rules that span a set rather than one application. They
+// are the only ones that need every file of a set split across several, so each
+// application carries the file it was declared in — empty for a set that is one
+// file, whose errors name no file and read as they always have.
+type setCheck struct {
+	// seen is the file each name was declared in.
+	seen map[string]string
+	// Keyed by the release name in lower case: Swarm compares the names a stack
+	// deploy creates without regard to case, so two releases differing only in
+	// case collide wherever the names they scope match, and on their release
+	// records.
+	claimed  map[string]claim
+	selfApp  string
+	selfFile string
+}
+
+func newSetCheck() *setCheck {
+	return &setCheck{seen: map[string]string{}, claimed: map[string]claim{}}
+}
+
+// add checks the application at index i of file against everything added
+// before it.
+func (s *setCheck) add(file string, i int, app application.Spec) error {
+	at := fmt.Sprintf("applications[%d]", i)
+	if file != "" {
+		at = file + ": " + at
+	}
+
+	if other, dup := s.seen[app.Name]; dup {
+		if other != "" {
+			return fmt.Errorf("%s: duplicate application name '%s', also declared in %s", at, app.Name, other)
+		}
+		return fmt.Errorf("%s: duplicate application name '%s'", at, app.Name)
+	}
+	s.seen[app.Name] = file
+
+	// One controller runs as one stack, so two applications claiming to be
+	// it is a file that cannot be obeyed either way round. Named rather than
+	// resolved by order: whichever this took, the other would deploy the
+	// controller's chart as an ordinary release and be refused for mounting
+	// the controller's secrets, which reads like a different bug.
+	if app.Self {
+		if s.selfApp != "" {
+			return fmt.Errorf("%s: '%s'%s and '%s' both declare self, and this controller runs as one stack", at, s.selfApp, inFile(s.selfFile), app.Name)
+		}
+		s.selfApp, s.selfFile = app.Name, file
+	}
+
+	// Two applications may not claim one release. A release name is the
+	// Swarm stack namespace, so a shared one is a shared stack: each
+	// application deploys its own manifest over the other's on every
+	// interval, and each takes the owner stamp from the other as it goes —
+	// after which the one that stops declaring the release reads it as its
+	// own orphan and, with pruneVolumes, takes the data too.
+	//
+	// Only chart sources are visible from here: what a releaseFile declares
+	// is in a repository this has not fetched. The reconciler holds the
+	// other half — it refuses to delete a release another application in the
+	// set declares — but this is the half with an operator present to fix
+	// it, which is where a name collision belongs.
+	if c := app.Source.Chart; c != nil {
+		key := strings.ToLower(c.Release)
+		if other, taken := s.claimed[key]; taken {
+			if other.release != c.Release {
+				return fmt.Errorf("%s: '%s'%s and '%s' declare the releases '%s' and '%s', which differ only in case, and Swarm compares the names a stack creates without regard to case, so they would collide on their release records and wherever the names they scope match", at, other.app, inFile(other.file), app.Name, other.release, c.Release)
+			}
+			return fmt.Errorf("%s: '%s'%s and '%s' both declare the release '%s', and a release name is the Swarm stack namespace, so they would share one stack", at, other.app, inFile(other.file), app.Name, c.Release)
+		}
+		s.claimed[key] = claim{app: app.Name, release: c.Release, file: file}
+	}
+	return nil
+}
+
+// inFile names the file an application was declared in, for a set split across
+// several. A set that is one file names none.
+func inFile(file string) string {
+	if file == "" {
+		return ""
+	}
+	return " in " + file
+}
+
+// claim is the application holding a release name, that name as it wrote it,
+// and the file it wrote it in.
+type claim struct{ app, release, file string }
 
 func validateApplication(app application.Spec) error {
 	if app.Name == "" {

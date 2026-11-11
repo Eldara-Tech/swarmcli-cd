@@ -36,6 +36,8 @@ services:
     # using this. Whoever can commit to that repository defines every
     # application, destination and policy this controller applies with the
     # docker socket: protect it with branch protection and signed commits.
+    # --appset-files apps instead of --appset-path reads every .yaml and .yml
+    # file directly in apps/ as one set, say one file per team.
     # command: ["controller",
     #           "--appset-repo", "https://github.com/your-org/apps.git",
     #           "--appset-revision", "main",
@@ -47,7 +49,11 @@ services:
     # atomically (write a temporary file, rename it over the target); a file
     # rewritten in place can be read half-written, which the controller refuses
     # and keeps its last-good set for, but a truncation that is still valid YAML
-    # cannot be told from a set you meant to shrink.
+    # cannot be told from a set you meant to shrink. With --appset-files that
+    # covers the whole directory: a change to several files must land as one,
+    # by swapping a symlink to the directory as git-sync does. Renaming each file
+    # in turn can be read between two renames, with an application moving from
+    # one file to another in neither, which with --prune deletes it.
     # command: ["controller", "--appset-dir", "/var/lib/swarmcli-cd/appset"]
 
     # Prune — add to any of the three. Without it an application removed from

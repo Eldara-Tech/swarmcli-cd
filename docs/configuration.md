@@ -975,6 +975,52 @@ other. A writer that rewrites the file in place can be read half-written; that
 read fails to parse, which is safe, but a truncation that happens to still be
 valid YAML is indistinguishable from a set you meant to shrink.
 
+### A directory of files
+
+```bash
+swarmcli-cd controller \
+  --appset-repo https://github.com/your-org/apps.git \
+  --appset-revision main \
+  --appset-files apps \
+  --appset-interval 1m
+```
+
+`--appset-files` takes the place of `--appset-path`, in git or path mode, and
+names a directory rather than a file. Every `.yaml` or `.yml` file directly in it
+is a whole applications file — an `applications:` list, and `apiVersion` if you
+write one — declaring as many applications as you like, and the set is all of
+them in filename order. One file per team or per application is a convention
+this makes easy; nothing enforces it.
+
+- **Only the top level is read.** Hidden files (a leading `.`), files with any
+  other extension and subdirectories are ignored, so nothing below the directory
+  itself is part of the set.
+- **The rules that span a set span the files**: a name used twice, two
+  applications both `self`, one chart release claimed twice. The error names
+  both files:
+  ```
+  apps@d4e5f6: team-b.yaml: applications[0]: duplicate application name 'edge', also declared in team-a.yaml
+  ```
+- **One bad file fails the whole load**, and the last set that validated keeps
+  running, as it does for one file. The good files are not applied without it:
+  the set is never partially applied. So make
+  [`validate --dir`](#catching-it-before-the-commit) a required check on the
+  repository.
+- **A directory with no such file is a failed load**, not an empty set: an
+  emptied directory must not stop every application, and with prune delete them.
+  To run none, commit a file that says `applications: []`.
+- The 4 MiB bound on the set is over all its files together.
+
+It is not offered with `--config`: a mounted set is one Docker config.
+
+In path mode, publishing atomically covers the whole directory: a change to
+several files has to land as one, which is what git-sync's symlink swap does.
+Renaming each file into place is not enough. An application moving from one file
+to another is then, between the two renames, in neither, and a load in that gap
+reads it as having left the set — which, with [prune](#prune), deletes it.
+
+A layout is in [`../examples/appset-dir-repo/`](../examples/appset-dir-repo/).
+
 ### What a bad commit does — nothing
 
 In every mode the controller parses and **fully validates** before it swaps
@@ -992,7 +1038,7 @@ Revision      a1b2c3d
 Loaded        2026-07-27T09:12:04Z
 Applications  4
 Stale         yes — the running set is the last one that validated
-Error         apps/applications.yaml@d4e5f6: applications[1]: duplicate application name "edge"
+Error         apps/applications.yaml@d4e5f6: applications[1]: duplicate application name 'edge'
 ```
 
 `Stale` means exactly that: what is running is last-good and a newer version is
@@ -1017,6 +1063,15 @@ swarmcli-cd validate --file applications.yaml
 # OK: applications.yaml (4 applications)
 ```
 
+For a [directory of files](#a-directory-of-files), `--dir` reads it the way
+`--appset-files` does — which files count, the rules across them and the size
+bound are the controller's own:
+
+```bash
+swarmcli-cd validate --dir apps
+# OK: apps (4 applications)
+```
+
 It exits 0 on a valid file, 1 on an invalid one with the reason on stderr, and
 2 on a misuse — so it is a one-line CI job on the app-set repository, run before
 the branch the controller tracks ever moves. The image is the same binary, if
@@ -1026,11 +1081,11 @@ you would rather not install one:
 docker run --rm -v "$PWD:/w" eldaratech/swarmcli-cd:latest validate --file /w/applications.yaml
 ```
 
-It reads the file and nothing else. A set that validates can still fail to
-deploy: whether a `releaseFile` or chart path exists in its repository, whether
-a `destination` names a swarm this controller knows, and whether a
-`registryAuth` secret is mounted are all answered at reconcile time, against
-things this command cannot see.
+It reads the file or the directory and nothing else. A set that validates can
+still fail to deploy: whether a `releaseFile` or chart path exists in its
+repository, whether a `destination` names a swarm this controller knows, and
+whether a `registryAuth` secret is mounted are all answered at reconcile time,
+against things this command cannot see.
 
 ### Prune
 
@@ -1463,6 +1518,23 @@ and it is deliberately a field of the app set and of nowhere else. A chart autho
 who could widen their own permissions would collapse the two privileges above
 into one, which is the whole of what this boundary is for.
 
+A [directory of files](#a-directory-of-files) invites per-team ownership, with a
+`CODEOWNERS` entry per file. Know what that hands a team: its approval alone then
+covers everything an application entry can say, which includes `allow` (a host
+path can grant the docker socket itself), `self` (which hands a chart the
+controller's own secrets, admin token included) and `registryAuth` (any registry
+credential the controller mounts). On GitHub the last `CODEOWNERS` pattern that
+matches a file is the one that counts, and an approval from any one of its owners
+satisfies it, so an entry for a team's file takes the platform team out of that
+file's required review rather than adding the team to it. If the platform team
+must review every change to the set, keep the files owned by it: teams propose
+changes to their own file, and the platform team approves them. Nothing in this
+build limits what one team's file may say.
+
+Any file can also hold up the whole set, by declaring a name, or a chart release,
+that another file already declares — a refusal rather than a takeover, but every
+team's change waits until it is fixed.
+
 One thing a commit **cannot** do: deliver a new secret. An application that names
 a `registryAuth:` needs that Docker secret mounted into the controller in
 `stack.yml`, so introducing a new private-registry credential is still a
@@ -1520,7 +1592,8 @@ line that shows exactly what the controller is following is worth having in
 | `--appset-repo` | — | pull the app set from this repository. Selects **git** mode |
 | `--appset-revision` | — | branch, tag or SHA to track. Required with `--appset-repo`; an unpinned app set would follow whatever the default branch happens to point at |
 | `--appset-dir` | — | read the app set from a directory something else keeps current. Selects **path** mode |
-| `--appset-path` | `applications.yaml` in path mode | the set's path within the repository or the directory. Required with `--appset-repo` |
+| `--appset-path` | `applications.yaml` in path mode | the set's path within the repository or the directory. With `--appset-repo`, this or `--appset-files` is required |
+| `--appset-files` | — | instead of `--appset-path`, a directory within the repository or the directory whose `.yaml` and `.yml` files together are the set. See [a directory of files](#a-directory-of-files) |
 | `--appset-interval` | `3m` | how often the app set is re-read |
 | `--prune` | off | delete the resources of an application that has left the app set instead of leaving its stack running and reporting it as orphaned. See [prune](#prune) |
 | `--prune-volumes` | off | extend `--prune` to named volumes, the one part nothing can restore — and only on the controller's own node; see [prune](#prune). Requires `--prune` |

@@ -198,8 +198,8 @@ feature/           seam — what the build grants, for display only. api is its
 
 Dockerfile         alpine, no docker binary; stamps both version ldflags
 stack.yml          the in-swarm deploy: manager node, docker.sock, config+secret
-examples/          a commented applications.yaml, a quickstart repo, an app-set
-                   repo
+examples/          a commented applications.yaml, a quickstart repo, and two
+                   app-set repos: one file, and a directory of them
 integration-tests/ `-tags integration`, against a real swarm
 scripts/           check-spdx.sh, check-npm-licences.sh, check-npm-scripts.sh,
                    check-node-pins.sh, check-oss-artefact.sh, smoke-fixture.sh

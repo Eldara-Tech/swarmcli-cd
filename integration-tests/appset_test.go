@@ -262,6 +262,64 @@ func TestGitSourcedAppSet(t *testing.T) {
 	}
 }
 
+// A set split across a directory, one file per application, driven through the
+// binary the way a team-per-file layout is (#66): committing a file adds its
+// application, and deleting the file makes it leave the set.
+func TestGitSourcedAppSetFiles(t *testing.T) {
+	dockerClient(t) // skips unless the daemon is a swarm manager
+	bin := buildBinary(t)
+
+	const stays, joins = "e2e-files-core", "e2e-files-joiner"
+	apps := gitRepo(t, chartFiles(stays, 1))
+	appSet := gitRepo(t, map[string]string{"apps/" + stays + ".yaml": appSetYAML(apps, stays)})
+
+	const token = "e2e-appset-files-token"
+	addr := freeAddr(t)
+	server := "http://" + addr
+
+	ctl := startControllerWith(t, bin, t.TempDir(), addr, token,
+		"--appset-repo", appSet,
+		"--appset-revision", branch,
+		"--appset-files", "apps",
+		"--appset-interval", "1s")
+	waitHealthy(t, bin, server, token, ctl)
+
+	// waitFor polls the running set until has reports what is expected of it.
+	waitFor := func(what string, has func(list string) bool) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			r := runCLI(t, bin, server, token, "app", "list")
+			if r.code == 0 && has(r.stdout) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s\napp list: code=%d stdout=%q stderr=%q\n%s", what, r.code, r.stdout, r.stderr, ctl.log())
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+
+	waitFor("the first file's application never loaded", func(list string) bool {
+		return strings.Contains(list, stays)
+	})
+
+	commitChange(t, appSet, map[string]string{"apps/" + joins + ".yaml": appSetYAML(apps, joins)})
+	waitFor("the committed file's application never joined the running set", func(list string) bool {
+		return strings.Contains(list, stays) && strings.Contains(list, joins)
+	})
+
+	// The deletion is staged by commitChange's add of the whole tree, which
+	// records a file gone from the working tree as removed.
+	if err := os.Remove(filepath.Join(appSet, "apps", joins+".yaml")); err != nil {
+		t.Fatal(err)
+	}
+	commitChange(t, appSet, nil)
+	waitFor("the deleted file's application never left the running set", func(list string) bool {
+		return strings.Contains(list, stays) && !strings.Contains(list, joins)
+	})
+}
+
 // appSetYAML is an app set declaring each name against the same repository.
 // Every application is manual: this test is about the set moving, and a
 // background deploy would only slow it down.

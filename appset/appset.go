@@ -30,6 +30,15 @@
 // cannot break a running controller. Until the first successful load there is
 // no current set and a failure is all the caller gets.
 //
+// # One file, or a directory of them
+//
+// The set is one applications file, or a directory of them (issue #66): every
+// .yaml or .yml file directly inside it is a whole applications file, and the
+// set is their applications in filename order. One file failing fails the load,
+// because the rules that span a set need all of it and a set is never partially
+// applied. A directory holding no such file is a failed load too, not an empty
+// set, for the reason config refuses an emptied file.
+//
 // # The path mode's one extra rule
 //
 // The writer must publish atomically: write a temporary file and rename it over
@@ -39,6 +48,15 @@
 // failed load with the last-good set kept, which is the safe outcome but not a
 // substitute for publishing atomically — a truncation that happens to still be
 // valid YAML would be indistinguishable from a set an operator meant to shrink.
+//
+// A directory of files raises that from one file to the whole directory: a
+// change spanning two files has to be published as one, by swapping a symlink to
+// the directory the way git-sync does. Renaming each file into place is not
+// enough. An application moving from one file to another is then, between the
+// two renames, in neither, and a load in that gap reads it as having left the
+// set — which, with prune, deletes it. The reader's half is to load one version
+// or none: a load during which the symlink moved is a failed load, and the next
+// pass reads the version it moved to.
 //
 // # Not here
 //
@@ -57,6 +75,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,8 +105,11 @@ type GitConfig struct {
 	// Revision is a branch, tag or commit. A branch is the useful case here:
 	// the point of app-of-apps is that a commit to it is picked up.
 	Revision string
-	// Path is the app-set file within the repository.
+	// Path is the app-set file within the repository, or with Files the
+	// directory of them.
 	Path string
+	// Files reads Path as a directory of applications files rather than as one.
+	Files bool
 }
 
 // PathConfig locates the app set on a volume an external process keeps current.
@@ -99,19 +121,54 @@ type GitConfig struct {
 type PathConfig struct {
 	Dir  string
 	Path string
+	// Files reads Path as a directory of applications files rather than as one.
+	Files bool
 }
 
-// document is one app-set file as it was read.
+// document is one app-set file as it was read, or a directory of them.
 //
 // Path is what parse errors are prefixed with, so it names the file the way the
 // operator wrote it — and, for the git mode, the commit it came from, because
 // "which commit broke the app set" is the first question a failed load raises.
 // Revision is that commit on its own, for the controller's status: an operator
 // reading an error wants it in the message, and a UI wants it in a field.
+//
+// Data is the file. A directory leaves it nil and fills Parts instead, one per
+// file in the order they are concatenated, named relative to the directory.
 type document struct {
 	Data     []byte
+	Parts    []config.Document
 	Path     string
 	Revision string
+}
+
+// digest is what change detection compares: the file's bytes, or for a
+// directory every file's name, length and bytes in order. The name is in it so
+// that a rename registers, at the cost of one re-parse whose diff then finds
+// nothing; the length so that where one file ends and the next one's name
+// begins cannot be read two ways. Names relative to the directory and not Path,
+// which carries the commit and would make every unrelated commit a change.
+func (d document) digest() [sha256.Size]byte {
+	if d.Parts == nil {
+		return sha256.Sum256(d.Data)
+	}
+	h := sha256.New()
+	for _, p := range d.Parts {
+		_, _ = fmt.Fprintf(h, "%s\x00%d\x00", p.Name, len(p.Data))
+		_, _ = h.Write(p.Data)
+	}
+	var sum [sha256.Size]byte
+	h.Sum(sum[:0])
+	return sum
+}
+
+// parse validates the document, whichever shape it is. A single file goes
+// through Parse exactly as it always has, so its errors read as they did.
+func (d document) parse() (*config.File, error) {
+	if d.Parts == nil {
+		return config.Parse(d.Data, d.Path)
+	}
+	return config.ParseSet(d.Parts, d.Path)
 }
 
 // reader produces the app-set document. It is the only thing the two modes
@@ -171,7 +228,7 @@ func (l *Loader) Load(ctx context.Context) (*config.File, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	digest := sha256.Sum256(doc.Data)
+	digest := doc.digest()
 
 	l.mu.RLock()
 	current, unchanged := l.current, l.loaded && digest == l.digest
@@ -182,7 +239,7 @@ func (l *Loader) Load(ctx context.Context) (*config.File, bool, error) {
 
 	// The whole file, every rule: unknown keys, duplicate names, per-application
 	// source validation. Nothing is swapped in until this has passed.
-	file, err := config.Parse(doc.Data, doc.Path)
+	file, err := doc.parse()
 	if err != nil {
 		return nil, false, err
 	}
@@ -230,15 +287,16 @@ func (r *gitReader) read(ctx context.Context) (document, error) {
 		return document{}, fmt.Errorf("fetching the app set: %w", err)
 	}
 
-	data, err := readContained(checkout.Dir, r.cfg.Path)
+	doc := document{Path: r.cfg.Path + "@" + checkout.Revision, Revision: checkout.Revision}
+	if r.cfg.Files {
+		doc.Parts, err = readDir(checkout.Dir, r.cfg.Path)
+	} else {
+		doc.Data, err = readContained(checkout.Dir, r.cfg.Path)
+	}
 	if err != nil {
 		return document{}, err
 	}
-	return document{
-		Data:     data,
-		Path:     r.cfg.Path + "@" + checkout.Revision,
-		Revision: checkout.Revision,
-	}, nil
+	return doc, nil
 }
 
 // pathReader reads the app set from a directory an external process keeps
@@ -248,11 +306,17 @@ type pathReader struct {
 }
 
 func (r *pathReader) read(context.Context) (document, error) {
-	data, err := readContained(r.cfg.Dir, r.cfg.Path)
+	doc := document{Path: filepath.Join(r.cfg.Dir, r.cfg.Path)}
+	var err error
+	if r.cfg.Files {
+		doc.Parts, err = readDir(r.cfg.Dir, r.cfg.Path)
+	} else {
+		doc.Data, err = readContained(r.cfg.Dir, r.cfg.Path)
+	}
 	if err != nil {
 		return document{}, err
 	}
-	return document{Data: data, Path: filepath.Join(r.cfg.Dir, r.cfg.Path)}, nil
+	return doc, nil
 }
 
 // maxAppSetSize bounds the app-set file.
@@ -294,7 +358,12 @@ func readContained(root, path string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("the app-set file %s: %w", filepath.Join(root, path), err)
 	}
+	return readBounded(file, filepath.Join(root, path))
+}
 
+// readBounded is readContained's read, of a file already resolved; name is the
+// file as its errors call it.
+func readBounded(file, name string) ([]byte, error) {
 	f, err := os.Open(file)
 	if err != nil {
 		return nil, fmt.Errorf("reading the app-set file: %w", err)
@@ -308,7 +377,85 @@ func readContained(root, path string) ([]byte, error) {
 		return nil, fmt.Errorf("reading the app-set file: %w", err)
 	}
 	if len(data) > maxAppSetSize {
-		return nil, fmt.Errorf("the app-set file %s is larger than the %d-byte limit", filepath.Join(root, path), maxAppSetSize)
+		return nil, fmt.Errorf("the app-set file %s is larger than the %d-byte limit", name, maxAppSetSize)
 	}
 	return data, nil
+}
+
+// noAppSetFiles is what a directory with nothing to read says, missing or empty
+// alike: neither is a declaration of none.
+const noAppSetFiles = "no app-set files in %s; commit one with 'applications: []' to run none"
+
+// readDir returns the files of an app set split across the directory at path
+// under root: every .yaml or .yml file directly in it, skipping hidden ones and
+// everything else, subdirectories included.
+//
+// The directory is resolved once, listed and read under what it resolved to,
+// and resolved again at the end. git-sync publishes by swapping a symlink and
+// then deletes the version it swapped away from at once, so a read that
+// resolved to that version can list and read a directory being deleted under
+// it and come back with fewer files than were committed and no error: a smaller
+// set that is still valid, and prune acts on it. Deleting only starts once the
+// link has moved, so any read it reaches finds the link moved when it is
+// resolved again, and is refused; the next pass reads the new version.
+//
+// Each file is held inside the directory, not merely inside the tree, for the
+// reason readContained gives: what is in the set is what is in this directory.
+//
+// The size bound is the one file's, applied to them together, and the error
+// names the file that takes them over it. Each file is read under the bound on
+// its own first, so no more than twice it is ever held.
+func readDir(root, path string) ([]config.Document, error) {
+	where := filepath.Join(root, path)
+	dir, err := source.Contained(root, path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf(noAppSetFiles, where)
+		}
+		return nil, fmt.Errorf("the app-set directory %s: %w", where, err)
+	}
+	// Sorted by name, which is the order the set is concatenated in.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("reading the app-set directory: %w", err)
+	}
+
+	var docs []config.Document
+	total := 0
+	for _, e := range entries {
+		name := e.Name()
+		ext := filepath.Ext(name)
+		if e.IsDir() || strings.HasPrefix(name, ".") || (ext != ".yaml" && ext != ".yml") {
+			continue
+		}
+		file, err := source.Contained(dir, name)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil, fmt.Errorf("no app-set file at %s", filepath.Join(where, name))
+		case err != nil && errors.Unwrap(err) == nil:
+			// Contained's own refusals wrap nothing, and a failure to resolve
+			// wraps why; for a bare name its one refusal is a link leading out.
+			// It says out of the repository, which sends an operator looking in
+			// the wrong place: the target may well be in the repository.
+			return nil, fmt.Errorf("the app-set file %s resolves outside the app-set directory %s", filepath.Join(where, name), where)
+		case err != nil:
+			return nil, fmt.Errorf("the app-set file %s: %w", filepath.Join(where, name), err)
+		}
+		data, err := readBounded(file, filepath.Join(where, name))
+		if err != nil {
+			return nil, err
+		}
+		total += len(data)
+		if total > maxAppSetSize {
+			return nil, fmt.Errorf("the app-set files in %s are larger than the %d-byte limit together; %s takes them over it", where, maxAppSetSize, name)
+		}
+		docs = append(docs, config.Document{Name: name, Data: data})
+	}
+	if again, err := source.Contained(root, path); err != nil || again != dir {
+		return nil, fmt.Errorf("the app-set directory %s changed while it was read; the next pass reads it again", where)
+	}
+	if len(docs) == 0 {
+		return nil, fmt.Errorf(noAppSetFiles, where)
+	}
+	return docs, nil
 }
