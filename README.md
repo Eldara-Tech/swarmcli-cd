@@ -13,10 +13,10 @@ way Argo CD does for Kubernetes.
 > from the same binary and the same port as the API, and with it the first
 > licensed capability — [single sign-on](docs/sso.md), compiled into the default
 > artefact and inert until a licence verifies.
-> [Webhook triggers](https://github.com/Eldara-Tech/swarmcli-cd/issues/65) are
-> what Phase 2 still wants. Pin the tag you deploy rather than tracking
-> `:latest`, so that upgrading is a moment you chose. The design, decisions and
-> phase plan live in
+> [Webhook triggers](docs/configuration.md#webhooks) have landed too: a push is
+> picked up in seconds rather than at the next interval. Pin the tag you deploy
+> rather than tracking `:latest`, so that upgrading is a moment you chose. The
+> design, decisions and phase plan live in
 > [issue #1](https://github.com/Eldara-Tech/swarmcli-cd/issues/1).
 >
 > **New here?** Start with the [getting-started guide](docs/getting-started.md).
@@ -198,6 +198,7 @@ output and in argv.
 | `--listen` | `:8080` | API listen address |
 | `--data` | `/var/lib/swarmcli-cd` | repository clones and the chart cache, on a volume |
 | `--ui` | on | serve the embedded web UI at `/`; `--ui=false` answers its routes with `404` |
+| `--webhook-listen` | off | receive forge push webhooks on this address, a listener separate from the API's; see [webhooks](docs/configuration.md#webhooks) |
 | `--appset-repo` `--appset-revision` `--appset-path` | — | source the application set from a git repository instead |
 | `--appset-dir` | — | source it from a directory a git-sync sidecar keeps current |
 | `--appset-files` | — | instead of `--appset-path`, a directory whose `.yaml` and `.yml` files together are the set |
@@ -216,6 +217,8 @@ output and in argv.
 | `SWARMCLI_CD_GIT_USERNAME` | git username; forges usually ignore it, GitHub wants it non-empty |
 | `SWARMCLI_CD_GIT_TOKEN_FILE` | git password or token, read from a file |
 | `SWARMCLI_CD_GIT_TOKEN` | git password or token, given directly |
+| `SWARMCLI_CD_WEBHOOK_SECRET_FILE` | webhook secrets, one per line, read from a file |
+| `SWARMCLI_CD_WEBHOOK_SECRET` | a webhook secret, given directly |
 | `SWARMCLI_CD_SERVER` | for the client commands: which controller to talk to |
 
 The controller **refuses to start** when no admin token is configured. An

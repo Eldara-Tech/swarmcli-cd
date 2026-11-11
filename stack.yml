@@ -85,6 +85,28 @@ services:
     #           "--tls-cert", "/run/secrets/swarmcli-cd-tls-cert",
     #           "--tls-key", "/run/secrets/swarmcli-cd-tls-key"]
 
+    # Webhooks — add to any of the three, and a push to the app set's repository
+    # (mode 2) or to an application's is picked up in seconds rather than at the
+    # next interval. They arrive on a listener of their own, 8081 here, never on
+    # the API's: this is the port the forge has to reach, and all a delivery can
+    # do is ask for what the next tick would have done — never a deploy of a
+    # manual application, and never the app set's prune of departed
+    # applications, though an application's own syncPolicy.prune runs on a
+    # refresh as at a tick. The secret is handled by whoever configures the
+    # forge's hooks, so it must not be the admin token (the controller refuses
+    # to start if it is).
+    # Create it first:
+    #   printf '%s' "$(openssl rand -hex 32)" | docker secret create swarmcli-cd-webhook-secret -
+    # then uncomment SWARMCLI_CD_WEBHOOK_SECRET_FILE under `environment:`, the two
+    # swarmcli-cd-webhook-secret entries and the 8081 port below. The file may
+    # hold several secrets, one per line — GitLab mints one per hook. Plaintext
+    # unless the TLS flags above are set too; see docs/configuration.md#webhooks.
+    # command: ["controller",
+    #           "--appset-repo", "https://github.com/your-org/apps.git",
+    #           "--appset-revision", "main",
+    #           "--appset-path", "apps/applications.yaml",
+    #           "--webhook-listen", ":8081"]
+
     healthcheck:
       # The image carries no curl and needs none: the binary probes itself.
       test: ["CMD", "/swarmcli-cd", "healthcheck"]
@@ -139,6 +161,9 @@ services:
       # username is often ignored by the forge, but GitHub wants a non-empty one.
       # SWARMCLI_CD_GIT_USERNAME: x-access-token
       # SWARMCLI_CD_GIT_TOKEN_FILE: /run/secrets/swarmcli-cd-git-token
+      #
+      # For the webhook command above, the secret deliveries are signed with.
+      # SWARMCLI_CD_WEBHOOK_SECRET_FILE: /run/secrets/swarmcli-cd-webhook-secret
       #
       # Private image registries are per application, not here: an application's
       # `registryAuth:` in applications.yaml names a Docker secret holding a
@@ -198,6 +223,14 @@ services:
     # ports:
     #   - "8080:8080"
 
+    # The webhook listener is the opposite case: the forge has to reach it, and
+    # what reaching it buys is a refresh. Publish it — under the same `ports:`
+    # as above if you publish both — behind TLS, the flags above or a reverse
+    # proxy, and where a firewall can, only to the forge's published hook
+    # addresses. The routing mesh publishes it on every node, as above.
+    # ports:
+    #   - "8081:8081"
+
     # Mode 1 only. In git and path mode the app set does not come from a config,
     # and leaving this mounted would leave a stale copy of it on disk.
     configs:
@@ -211,6 +244,8 @@ services:
       # The TLS pair, for the --tls-cert/--tls-key command above.
       # - swarmcli-cd-tls-cert
       # - swarmcli-cd-tls-key
+      # The webhook secret, for the --webhook-listen command above.
+      # - swarmcli-cd-webhook-secret
       # The OIDC client secret, for the SSO variables above. Create it first:
       #   printf '%s' "$THE_CLIENT_SECRET" | docker secret create swarmcli-cd-oidc-secret -
       # A public client has no secret and is protected by PKCE; omit both.
@@ -232,6 +267,8 @@ secrets:
   # swarmcli-cd-tls-cert:
   #   external: true
   # swarmcli-cd-tls-key:
+  #   external: true
+  # swarmcli-cd-webhook-secret:
   #   external: true
   # swarmcli-cd-oidc-secret:
   #   external: true

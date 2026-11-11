@@ -201,9 +201,9 @@ Two consequences follow, and neither is a fault to investigate:
   `swarmcli-cd status`. See [configuration § startup, when the set is not there
   yet](configuration.md#startup-when-the-set-is-not-there-yet).
 
-An application that leaves the app set has its clone and chart cache reclaimed a
-whole app-set interval after it goes, so nothing racing the removal reads a
-deleted tree.
+An application that leaves the app set has its clone and chart cache reclaimed at
+the second app-set tick that finds it gone, and never while a sync of it is
+still running, so nothing racing the removal reads a deleted tree.
 
 ## What to back up
 
@@ -301,6 +301,17 @@ rather than report:
 
 `app sync --wait` is the one to reach for in a smoke test or a deploy pipeline:
 it blocks until the rollout settles and fails loudly if it did not.
+
+**With webhooks on**, the forge's own delivery log is the other half of the
+picture. Every delivery the controller could authenticate and parse was answered
+`202`, so a red row there is a wrong secret (`401`), a GitHub hook left on form
+encoding (`415`), more deliveries at once than the listener takes (`503`,
+overload — what a rate-limiting proxy in front is for), or a controller the
+forge could not reach — and GitLab disables a hook after four of those in a row.
+On this side, each accepted delivery is one `webhook delivery accepted` line at
+`INFO`; rejections are only at `DEBUG`. A push whose application never moved is
+usually a `source.revision` or `repoURL` that does not match what the forge
+sends; see [configuration § webhooks](configuration.md#webhooks).
 
 ## Logs
 

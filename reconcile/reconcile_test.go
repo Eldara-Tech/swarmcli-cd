@@ -903,6 +903,55 @@ func TestReplaceWakesALoopOutOfItsBackoff(t *testing.T) {
 	}
 }
 
+// A webhook delivery is a refresh: the application is reconciled now rather than
+// at its next tick, and because the pass is the loop's own, a manual policy plans
+// and reports the drift without deploying it. A push is evidence that the
+// repository moved, not somebody deciding to deploy what is in it.
+//
+// Two refreshes, because a forced pass applies and then re-plans to confirm: by
+// the time a third plan is seen, a refresh that had applied would show it.
+func TestRefreshReconcilesNowWithoutForcingAnApply(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync()}}
+	r := New([]application.Spec{spec("edge", false)}, Options{
+		Fetcher:   &fakeFetcher{revision: strings.Repeat("a", 40)},
+		Builder:   &fakeBuilder{},
+		Swarms:    fakeRegistry{},
+		NewEngine: func(charts.Backend) Engine { return engine },
+		// Long enough that every plan after the first is a refresh.
+		Interval: time.Hour,
+		Log:      discardLog(),
+		Now:      func() time.Time { return time.Unix(0, 0).UTC() },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.Run(ctx) }()
+
+	waitFor(t, "the first reconcile", func() bool { return engine.planCallCount() == 1 })
+	for want := 2; want <= 3; want++ {
+		if err := r.Refresh("edge"); err != nil {
+			t.Fatalf("Refresh = %v", err)
+		}
+		waitFor(t, "the refresh to reconcile without waiting for the interval", func() bool {
+			return engine.planCallCount() >= want
+		})
+	}
+	if n := engine.applyCount(); n != 0 {
+		t.Errorf("a refresh deployed a manual application %d times, want 0", n)
+	}
+	if v, _ := r.View("edge"); v.Status.Sync.State != application.SyncOutOfSync {
+		t.Errorf("state = %q, want the drift reported as out-of-sync", v.Status.Sync.State)
+	}
+}
+
+// An application the set no longer holds has nothing to refresh, and saying so
+// is the only way a caller holding a stale name can tell.
+func TestRefreshOfAnUnknownApplicationFails(t *testing.T) {
+	r := newTest(t, nil, &fakeEngine{}, nil)
+	if err := r.Refresh("ghost"); err == nil || !strings.Contains(err.Error(), "'ghost'") {
+		t.Errorf("Refresh = %v, want an error naming the application", err)
+	}
+}
+
 // And the count with it. The wake alone gets the corrected spec reconciled at
 // once; clearing the count is what stops a correction that does not work first
 // time resuming at the old spec's exponent — thirty minutes rather than six.
@@ -4717,6 +4766,32 @@ func refusingSweep() *driftBackend {
 	return b
 }
 
+// intervalClock is the reconciler's clock for the tests that count prune
+// attempts. They are counted at most once an interval, so whether two
+// reconciles are an attempt apart is the test's to say: it moves only when told.
+type intervalClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func onIntervalClock(r *Reconciler) *intervalClock {
+	c := &intervalClock{t: time.Unix(0, 0).UTC()}
+	r.now = c.now
+	return c
+}
+
+func (c *intervalClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *intervalClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
 // Retrying for ever is not the same as costing nothing. Each pass was a full
 // observe with a history walk, an apply that deploys nothing, a warning, a
 // PruneFailed event and an application reporting out of sync — for ever, since
@@ -4731,11 +4806,14 @@ func TestAResourceThatWillNeverGoStopsBeingRetried(t *testing.T) {
 	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
 	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
 		fakeRegistry{backend: backend})
+	clock := onIntervalClock(r)
 
+	// An interval apart, as the ticks that the limit was chosen for are.
 	for i := range 4 {
 		if err := r.Sync(context.Background(), "edge"); err != nil {
 			t.Fatalf("Sync %d = %v, want nil — a refusal is not a failed sync", i+1, err)
 		}
+		clock.advance(DefaultInterval)
 	}
 
 	// Three resources, two attempts each, and then nothing.
@@ -4762,10 +4840,12 @@ func TestAnApplicationIsSyncedOnceItHasGivenUpOnAResource(t *testing.T) {
 	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
 	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
 		fakeRegistry{backend: backend})
+	clock := onIntervalClock(r)
 
 	if err := r.Sync(context.Background(), "edge"); err != nil {
 		t.Fatalf("Sync = %v, want nil", err)
 	}
+	clock.advance(DefaultInterval)
 	view, _ := r.View("edge")
 	if view.Status.Sync.State != application.SyncOutOfSync {
 		t.Fatalf("state after the first refusal = %q, want out of sync — it is still going to try", view.Status.Sync.State)
@@ -4782,6 +4862,80 @@ func TestAnApplicationIsSyncedOnceItHasGivenUpOnAResource(t *testing.T) {
 		if rel.Drift != nil && len(rel.Drift.Resources) > 0 {
 			t.Errorf("release %q still reports %v as drift a sync will remove", rel.Name, rel.Drift.Resources)
 		}
+	}
+}
+
+// A webhook refresh is a full reconcile, and so is a manual sync and the pass
+// after an edit; none of them comes an interval after the last. Counting each
+// as an attempt would spend the budget during one ordinary drain and retain the
+// resource until a restart, so they retry the deletion without counting, and
+// only a pass an interval on from the last counted refusal counts.
+func TestPruneAttemptsCountAtMostOncePerInterval(t *testing.T) {
+	restore := maxPruneAttempts
+	maxPruneAttempts = 3
+	t.Cleanup(func() { maxPruneAttempts = restore })
+
+	backend := refusingSweep()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{sweepingSpec("edge", application.DriftManifest)}, engine, nil,
+		fakeRegistry{backend: backend})
+	clock := onIntervalClock(r)
+	passes := func(n int) {
+		t.Helper()
+		for range n {
+			if err := r.Sync(context.Background(), "edge"); err != nil {
+				t.Fatalf("Sync = %v, want nil", err)
+			}
+			clock.advance(application.MinInterval)
+		}
+	}
+	attempted := func(want int, after string) {
+		t.Helper()
+		if got := len(backend.attempted()); got != want {
+			t.Fatalf("attempted %d removals %s, want %d", got, after, want)
+		}
+	}
+
+	// Five passes at the webhook floor, all inside one interval: each retries,
+	// one counts.
+	passes(5)
+	attempted(15, "over five passes inside one interval")
+
+	// An interval on, the second counts — and the interval is then measured
+	// from it, not from the first, so the passes just after it do not count.
+	clock.advance(DefaultInterval)
+	passes(3)
+	attempted(24, "over three more passes, the first an interval on")
+
+	// A third interval on, the third counts, and the pass after gives up.
+	clock.advance(DefaultInterval)
+	passes(2)
+	attempted(27, "once the third counted refusal was reached")
+}
+
+// The interval is the application's own, the one its ticks actually run at: an
+// application reconciling every thirty seconds reaches the limit in a minute,
+// not in the controller-wide three.
+func TestPruneAttemptsFollowTheApplicationsOwnInterval(t *testing.T) {
+	restore := maxPruneAttempts
+	maxPruneAttempts = 2
+	t.Cleanup(func() { maxPruneAttempts = restore })
+
+	app := sweepingSpec("edge", application.DriftManifest)
+	app.SyncPolicy.Interval = application.Duration(30 * time.Second)
+	backend := refusingSweep()
+	engine := &fakeEngine{plans: []*charts.Plan{synced()}, history: sweepHistory("edge", "had-a-sidecar")}
+	r := newTestWith(t, []application.Spec{app}, engine, nil, fakeRegistry{backend: backend})
+	clock := onIntervalClock(r)
+
+	for range 3 {
+		if err := r.Sync(context.Background(), "edge"); err != nil {
+			t.Fatalf("Sync = %v, want nil", err)
+		}
+		clock.advance(30 * time.Second)
+	}
+	if got := len(backend.attempted()); got != 6 {
+		t.Errorf("attempted %d removals over three passes 30s apart, want 6 — two counted, then retained", got)
 	}
 }
 

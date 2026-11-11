@@ -10,13 +10,16 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Eldara-Tech/swarmcli-cd/application"
+	"github.com/Eldara-Tech/swarmcli-cd/reclaim"
 	"github.com/Eldara-Tech/swarmcli-cd/regauth"
 )
 
@@ -757,6 +760,315 @@ func TestRunKeepsTickingThroughFailures(t *testing.T) {
 			t.Fatalf("the loop did not recover: %+v", status)
 		case <-time.After(time.Millisecond):
 		}
+	}
+}
+
+// sweepCounter is both things in this loop that delete, counting how often a
+// pass reached each. Atomic because Run calls it from its own goroutine while
+// the test reads it.
+type sweepCounter struct{ departed, departing, swept atomic.Int64 }
+
+func (c *sweepCounter) Departed(context.Context, []string, []string) ([]string, error) {
+	c.departed.Add(1)
+	return nil, nil
+}
+
+func (c *sweepCounter) Departing(context.Context, []string, []string) ([]string, error) {
+	c.departing.Add(1)
+	return nil, nil
+}
+
+func (c *sweepCounter) Sweep([]string) error {
+	c.swept.Add(1)
+	return nil
+}
+
+// runLoop starts Run over a sweeping loop and returns the function that stops
+// it. Run returns only between passes, so once stop has returned every pass it
+// started has finished.
+func runLoop(t *testing.T, m mode, rec *fakeReconciler, c *sweepCounter, interval time.Duration) (*Loop, func()) {
+	t.Helper()
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Interval: interval, Log: discard(), Credentials: noCredentials, Pruner: c, Reclaimer: c,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = loop.Run(ctx)
+		close(done)
+	}()
+	stop := sync.OnceFunc(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("Run did not return after its context was cancelled")
+		}
+	})
+	t.Cleanup(stop)
+	return loop, stop
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for !cond() {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", what)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// A refresh is what a push to the app set's repository asks for, and it applies
+// the set without waiting for the tick — but deletes nothing. Prune's empty-set
+// confirmation and reclaim's previous-sweep rule both count passes, so pushes
+// seconds apart must not be passes they count, or the windows those guards hold
+// open would collapse to nothing.
+func TestARefreshAppliesTheSetWithoutSweeping(t *testing.T) {
+	m := pathMode(t, twoApps)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+	c := &sweepCounter{}
+	loop, stop := runLoop(t, m, rec, c, time.Hour)
+	eventually(t, "the first tick to sweep", func() bool { return c.swept.Load() == 1 })
+
+	m.publish(oneApp)
+	loop.Refresh()
+	eventually(t, "the refresh to apply the set", func() bool { return slices.Equal(rec.removes(), []string{"core"}) })
+	stop()
+
+	if got := c.departed.Load() + c.departing.Load(); got != 1 {
+		t.Errorf("prune was reached %d times, want only the first tick's 1", got)
+	}
+	if got := c.swept.Load(); got != 1 {
+		t.Errorf("reclaim swept %d times, want only the first tick's 1", got)
+	}
+}
+
+// Asking never waits. A webhook handler must not stall on a loop that is busy
+// loading, and refreshes before the loop has looked are one refresh.
+func TestRefreshNeverBlocks(t *testing.T) {
+	loop, _, _ := newLoop(t, oneApp)
+	done := make(chan struct{})
+	go func() {
+		for range 3 {
+			loop.Refresh()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Refresh blocked on a loop that is not running")
+	}
+}
+
+// Nor does a refresh postpone the tick. If it did, a repository pushed to more
+// often than the interval would never be swept at all.
+func TestRefreshesDoNotPostponeTheTick(t *testing.T) {
+	m := pathMode(t, oneApp)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"))
+	c := &sweepCounter{}
+	loop, stop := runLoop(t, m, rec, c, 20*time.Millisecond)
+
+	// A wake always waiting, so every pass Run starts could be a woken one.
+	pushing := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-pushing:
+				return
+			default:
+				loop.Refresh()
+				runtime.Gosched()
+			}
+		}
+	}()
+	defer close(pushing)
+
+	eventually(t, "ticks to keep sweeping under a stream of refreshes", func() bool { return c.swept.Load() >= 3 })
+	stop()
+}
+
+// A pass a push asked for does not sweep, so it cannot report that the sweeps
+// recovered. A tick's prune or reclaim failure stays on the status endpoint
+// through any number of clean woken passes, and only a tick that sweeps cleanly
+// clears it — after which a woken pass must not bring it back.
+func TestASweepFailureStaysReportedAcrossARefresh(t *testing.T) {
+	for _, sweep := range []string{"prune", "reclaim"} {
+		t.Run(sweep, func(t *testing.T) {
+			p, r := &fakePruner{}, &fakeReclaimer{}
+			fail := func(err error) {
+				if sweep == "prune" {
+					p.err = err
+				} else {
+					r.err = err
+				}
+			}
+			m := pathMode(t, oneApp)
+			loop := NewLoop(m.loader, newFakeReconciler(spec("edge", "releases/edge.yaml")), LoopOptions{
+				Log: discard(), Credentials: noCredentials, Pruner: p, Reclaimer: r,
+			})
+			reported := func() string { return loop.Status().AppSet.Error }
+			const failure = "the sweep could not finish"
+
+			fail(errors.New(failure))
+			if err := loop.Once(t.Context()); err == nil {
+				t.Fatal("Once = nil, want the sweep failure")
+			}
+			if !strings.Contains(reported(), failure) {
+				t.Fatalf("status error = %q, want the sweep failure", reported())
+			}
+
+			if err := loop.pass(t.Context(), false); err != nil {
+				t.Fatalf("a woken pass that loaded and applied cleanly = %v, want nil", err)
+			}
+			if !strings.Contains(reported(), failure) {
+				t.Errorf("status error = %q after a woken pass, want the sweep failure still reported: that pass never swept", reported())
+			}
+
+			fail(nil)
+			if err := loop.Once(t.Context()); err != nil {
+				t.Fatalf("Once = %v, want a clean sweep", err)
+			}
+			if got := reported(); got != "" {
+				t.Errorf("status error = %q after a clean tick, want it cleared", got)
+			}
+			if err := loop.pass(t.Context(), false); err != nil {
+				t.Fatalf("a woken pass = %v, want nil", err)
+			}
+			if got := reported(); got != "" {
+				t.Errorf("status error = %q, want a woken pass after a clean tick not to bring the old failure back", got)
+			}
+		})
+	}
+}
+
+// What a woken pass does report is its own outcome, beside the last sweep's. It
+// returns only its own, because that is what Run logs for it: the sweep failure
+// was logged by the tick that had it.
+func TestAWokenPassReportsItsOwnApplyFailure(t *testing.T) {
+	m := pathMode(t, oneApp)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"))
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Log: discard(), Credentials: noCredentials,
+		Reclaimer: &fakeReclaimer{err: errors.New("permission denied")},
+	})
+	if err := loop.Once(t.Context()); err == nil {
+		t.Fatal("Once = nil, want the sweep failure")
+	}
+
+	rec.setFailAdd("core")
+	m.publish(twoApps)
+	err := loop.pass(t.Context(), false)
+	if err == nil || !strings.Contains(err.Error(), "adding 'core'") {
+		t.Fatalf("woken pass = %v, want its apply failure", err)
+	}
+	if strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("woken pass = %v, want only its own outcome returned", err)
+	}
+	got := loop.Status().AppSet.Error
+	for _, want := range []string{"adding 'core'", "permission denied"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status error = %q, want it to carry %q", got, want)
+		}
+	}
+}
+
+// A tick whose apply fails runs reclaim but not prune, so it must not leave
+// prune looking recovered: the clean woken pass after it still reports prune's
+// last failure, and only a tick that prunes again clears it.
+func TestATickThatSkipsPruneKeepsItsFailureReported(t *testing.T) {
+	p := &fakePruner{err: errors.New("the prune could not finish")}
+	m := pathMode(t, oneApp)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"))
+	loop := NewLoop(m.loader, rec, LoopOptions{Log: discard(), Credentials: noCredentials, Pruner: p, Reclaimer: &fakeReclaimer{}})
+	reported := func() string { return loop.Status().AppSet.Error }
+
+	_ = loop.Once(t.Context())
+	if !strings.Contains(reported(), "the prune could not finish") {
+		t.Fatalf("status error = %q after a tick whose prune failed", reported())
+	}
+
+	rec.setFailAdd("core")
+	m.publish(twoApps)
+	_ = loop.Once(t.Context())
+	if !strings.Contains(reported(), "adding 'core'") {
+		t.Fatalf("status error = %q after a tick whose apply failed", reported())
+	}
+
+	rec.setFailAdd("")
+	m.publish(oneApp)
+	if err := loop.pass(t.Context(), false); err != nil {
+		t.Fatalf("a clean woken pass = %v", err)
+	}
+	if !strings.Contains(reported(), "the prune could not finish") {
+		t.Errorf("status error = %q after a clean woken pass, want prune's failure: no pass has pruned since it failed", reported())
+	}
+
+	p.err = nil
+	if err := loop.Once(t.Context()); err != nil {
+		t.Fatalf("Once = %v, want a clean tick", err)
+	}
+	if err := loop.pass(t.Context(), false); err != nil || reported() != "" {
+		t.Errorf("woken pass = %v, status error = %q, want both clean once a tick pruned", err, reported())
+	}
+}
+
+// Two sweeps in a row missing a name used to mean it had been gone a whole
+// interval. A woken pass changes the set between ticks, so a name can leave,
+// come back and leave again just before a tick — and if its sync has outlived
+// Remove's bounded wait it is still reading the clone. So a draining
+// application keeps its cache, and once it stops draining the grace period
+// starts again from there.
+func TestADrainingApplicationsCacheIsNotReclaimed(t *testing.T) {
+	root := t.TempDir()
+	cache := filepath.Join(root, "core")
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := pathMode(t, twoApps)
+	rec := newFakeReconciler(spec("edge", "releases/edge.yaml"), spec("core", "releases/core.yaml"))
+	loop := NewLoop(m.loader, rec, LoopOptions{
+		Log: discard(), Credentials: noCredentials,
+		Reclaimer: reclaim.New(reclaim.Options{Roots: []string{root}, Log: discard()}),
+	})
+	ctx := t.Context()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	exists := func() bool {
+		_, err := os.Stat(cache)
+		return err == nil
+	}
+
+	must(loop.Once(ctx)) // a tick with core in the set
+	m.publish(oneApp)
+	must(loop.pass(ctx, false)) // a push: core leaves
+	must(loop.Once(ctx))        // the next tick misses it once
+	m.publish(twoApps)
+	must(loop.pass(ctx, false)) // a push: core is back, and syncing
+	m.publish(oneApp)
+	must(loop.pass(ctx, false)) // a push moments later: core leaves again
+	rec.stillSyncing("core")    // with its sync outliving Remove's wait
+
+	must(loop.Once(ctx))
+	if !exists() {
+		t.Fatal("the cache of an application still draining was reclaimed")
+	}
+
+	rec.stillSyncing()
+	must(loop.Once(ctx))
+	if !exists() {
+		t.Fatal("reclaimed on the first tick after the drain, want the grace period to start again")
+	}
+	must(loop.Once(ctx))
+	if exists() {
+		t.Error("still there on the second tick missing it, want it reclaimed")
 	}
 }
 

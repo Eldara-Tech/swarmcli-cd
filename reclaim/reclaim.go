@@ -24,11 +24,18 @@
 // fail cleanly; it renders half a repository and deploys the result.
 //
 // So the decision is never taken at the moment of removal. A directory is
-// deleted only once its name has been missing from the set for a whole sweep
-// interval: the first sweep that misses it records it, only a later one removes
+// deleted only once its name has been missing from keep on two consecutive
+// sweeps: the first sweep that misses it records it, only a later one removes
 // it, and a name that comes back in between clears the record. That is what makes
 // this safe while #106 is still open, rather than safe on the condition that it
 // is fixed.
+//
+// Two sweeps were a whole interval of absence while only the sweep's own caller
+// changed the set. They are not once the set can change between sweeps — the
+// app-set loop's webhook passes do — because a name can leave, come back and
+// leave again just before the second. So the caller also keeps every application
+// whose work is still draining, and what holds is that no directory is deleted
+// while its application is in the set or still running.
 //
 // # Why it needs no opt-in
 //

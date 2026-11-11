@@ -97,7 +97,21 @@ const (
 // finds it, which is how an operator finds a condition that needs a human — the
 // same choice appset.Loop makes for a held prune. A variable so a test does not
 // need to run three reconciles to observe the fourth.
+//
+// Attempts are counted at most once per the application's reconcile interval,
+// because that is the spacing "two is within a slow drain" assumed. A webhook
+// refresh, a manual sync and the pass after an edit are each a full reconcile
+// that retries the deletion, and a few of them during one ordinary drain would
+// otherwise spend the whole budget on what is still the same refusal — leaving
+// the resource retained until a restart. They still retry; they do not count.
 var maxPruneAttempts = 3
+
+// pruneTries is one resource's refused deletions as maxPruneAttempts counts
+// them, and when the last counted one was.
+type pruneTries struct {
+	counted int
+	last    time.Time
+}
 
 // Fetcher brings an application's repository to a revision. *git.Sourcer
 // implements it.
@@ -889,7 +903,7 @@ func pruneKey(release string, res departedResource) string {
 // failedPrunes is a copy of an application's consecutive-failure counts, so the
 // caller can work on it without holding the lock. An application that has been
 // removed from the set has none, which is what a fresh map means.
-func (r *Reconciler) failedPrunes(e *appEntry) map[string]int {
+func (r *Reconciler) failedPrunes(e *appEntry) map[string]pruneTries {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.currentLocked(e) {
@@ -902,7 +916,7 @@ func (r *Reconciler) failedPrunes(e *appEntry) map[string]int {
 // merges: the caller has just re-derived the whole candidate set, so a key it
 // left out is a resource that is no longer there — deleted, re-declared by a
 // commit, or removed by hand — and its history is over.
-func (r *Reconciler) recordPruneFailures(e *appEntry, counts map[string]int) {
+func (r *Reconciler) recordPruneFailures(e *appEntry, counts map[string]pruneTries) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.currentLocked(e) {
@@ -1142,7 +1156,7 @@ func (r *Reconciler) departed(ctx context.Context, e *appEntry, spec application
 	// the map from growing a key per resource this application has ever
 	// dropped — and what lets a resource somebody removed by hand start again
 	// from nothing if its name ever comes back.
-	was, still := r.failedPrunes(e), map[string]int{}
+	was, still := r.failedPrunes(e), map[string]pruneTries{}
 	defer func() { r.recordPruneFailures(e, still) }()
 
 	for _, rp := range plan.Releases {
@@ -1210,13 +1224,13 @@ func (r *Reconciler) departed(ctx context.Context, e *appEntry, spec application
 
 // add files one proved resource under whichever of the two lists its history
 // puts it in, and carries that history into the next pass.
-func (d *doomedSet) add(res departedResource, release string, was, still map[string]int) {
+func (d *doomedSet) add(res departedResource, release string, was, still map[string]pruneTries) {
 	key := pruneKey(release, res)
-	n := was[key]
-	if n > 0 {
-		still[key] = n
+	tries := was[key]
+	if tries.counted > 0 {
+		still[key] = tries
 	}
-	if n >= maxPruneAttempts {
+	if tries.counted >= maxPruneAttempts {
 		d.retained = append(d.retained, res)
 		return
 	}
@@ -1751,6 +1765,23 @@ func (r *Reconciler) entry(app string) (*appEntry, error) {
 		return e, nil
 	}
 	return nil, fmt.Errorf("no such application '%s'", app)
+}
+
+// Refresh asks one application's loop to reconcile now rather than when its
+// timer says so. It is what a webhook delivery triggers.
+//
+// A wake rather than SyncNow, because a push says the repository moved, not
+// that anybody decided to deploy it: the pass is the loop's own, so a manual
+// policy plans and reports the drift without applying it, exactly as a tick
+// would. It returns without waiting, and a refresh arriving while one is
+// already pending is the same refresh (see poke).
+func (r *Reconciler) Refresh(app string) error {
+	e, err := r.entry(app)
+	if err != nil {
+		return err
+	}
+	e.poke()
+	return nil
 }
 
 // Sync reconciles one application now, applying if its policy allows.
@@ -2863,7 +2894,7 @@ func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec appli
 
 	counts := r.failedPrunes(e)
 	if counts == nil {
-		counts = map[string]int{}
+		counts = map[string]pruneTries{}
 	}
 	// The same hold as pruneServices, which has already said so — one release
 	// held is one log line, not one per sweep.
@@ -2886,7 +2917,14 @@ func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec appli
 				err = remover.RemoveNetwork(ctx, res.id)
 			}
 			if err != nil {
-				counts[pruneKey(release, res)]++
+				key := pruneKey(release, res)
+				// Counted once an interval at most; see maxPruneAttempts.
+				tries := counts[key]
+				if now := r.now(); tries.counted == 0 || now.Sub(tries.last) >= r.intervalFor(spec) {
+					tries.counted++
+					tries.last = now
+				}
+				counts[key] = tries
 				// Warn, not error: still in use is the expected answer while the
 				// services that referenced it are shutting down. The attempt and
 				// the limit say where this one stands rather than the line
@@ -2895,7 +2933,7 @@ func (r *Reconciler) pruneResources(ctx context.Context, e *appEntry, spec appli
 				r.log.Warn("could not prune a resource the release no longer declares",
 					"application", spec.Name, "release", release,
 					"kind", string(res.kind), "resource", res.name, "error", err,
-					"attempt", counts[pruneKey(release, res)], "limit", maxPruneAttempts)
+					"attempt", tries.counted, "limit", maxPruneAttempts)
 				errs = append(errs, fmt.Errorf("pruning %s '%s' of release '%s': %w", res.kind, res.name, release, err))
 				continue
 			}

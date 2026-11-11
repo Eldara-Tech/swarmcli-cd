@@ -120,6 +120,11 @@ type Loop struct {
 	pruner    Pruner
 	reclaimer Reclaimer
 
+	// wake asks Run for a pass now rather than at the next tick. Capacity one
+	// and never blocking, so a burst of pushes is one pass and a webhook
+	// handler never waits on a loop that is busy loading.
+	wake chan struct{}
+
 	mu sync.RWMutex
 	// lastErr is why the last attempt failed, and stale reports that the load
 	// itself failed over a set that is already running — so what is running is
@@ -139,9 +144,16 @@ type Loop struct {
 	pruneHeldBy []string
 
 	// emptyBefore is whether the last pass that reached the sweep loaded an empty
-	// set. Only Once touches it. In memory, as reclaim's absent set is: a restart
+	// set. Only pass touches it. In memory, as reclaim's absent set is: a restart
 	// holds an empty set for one more pass, which is the safe direction.
 	emptyBefore bool
+
+	// pruneErr and reclaimErr are how each sweep went the last time a pass ran
+	// it, and only pass touches them. Two, because a tick whose apply failed runs
+	// reclaim and not prune, and must not leave prune looking recovered; and a
+	// pass Refresh asked for runs neither, so it reports both beside its own
+	// outcome until a tick that runs them says otherwise.
+	pruneErr, reclaimErr error
 }
 
 // NewLoop returns a Loop driving rec from src.
@@ -159,6 +171,28 @@ func NewLoop(src *Loader, rec Reconciler, o LoopOptions) *Loop {
 		src: src, rec: rec, mode: o.Mode, source: o.Source,
 		interval: o.Interval, log: o.Log, creds: o.Credentials,
 		pruner: o.Pruner, reclaimer: o.Reclaimer,
+		wake: make(chan struct{}, 1),
+	}
+}
+
+// Refresh asks Run for a pass now rather than at the next tick. It is what a
+// webhook delivery for the app set's own repository triggers, and it returns
+// without waiting for the pass.
+//
+// That pass loads and applies, and stops there: no prune and no cache reclaim,
+// and the tick stays where it was. Both sweeps guard against a mistake by
+// counting passes rather than time — prune deletes everything only after a
+// second pass also loads an empty set, and reclaim deletes a cache only if the
+// application was absent from the previous sweep too. Pushes seconds apart
+// would collapse both windows to nothing, and a force-push that briefly showed
+// `applications: []` would then sweep every stack this controller installed.
+// Leaving the timer alone is what keeps the sweeps on their interval however
+// often somebody pushes. For the same reason the pass reports the last sweep's
+// failure rather than clearing it: it never looked.
+func (l *Loop) Refresh() {
+	select {
+	case l.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -173,13 +207,16 @@ func (l *Loop) Run(ctx context.Context) error {
 	defer timer.Stop()
 
 	for {
+		sweep := true
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
+		case <-l.wake:
+			sweep = false
 		}
 
-		if err := l.Once(ctx); err != nil {
+		if err := l.pass(ctx, sweep); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -187,13 +224,19 @@ func (l *Loop) Run(ctx context.Context) error {
 			// reason to stop, which is the entire point of keeping last-good.
 			l.log.Error("app-set reconcile failed", "error", err)
 		}
-		timer.Reset(l.interval)
+		// Only after a tick; see Refresh. A tick that fired during a woken pass
+		// is not lost: since Go 1.23 the receive above still gets it.
+		if sweep {
+			timer.Reset(l.interval)
+		}
 	}
 }
 
 // Once loads the app set and brings the running set to it. It is what Run
-// calls, exported so a caller — a test, or a webhook later — can drive one pass
-// without waiting for a tick.
+// calls on a tick, exported so a test can drive one pass without waiting for
+// one. It must not run beside Run — the empty-set confirmation is state only a
+// pass touches, and two applies would race to add the same application — which
+// is why a webhook goes through Refresh instead.
 //
 // The diff runs on every pass, not only when the file has changed. What is
 // being reconciled towards is the desired state, not the last edit to it: an
@@ -209,7 +252,11 @@ func (l *Loop) Run(ctx context.Context) error {
 // exits. It also matches the per-application recover in reconcile — one bad
 // application must not take the others down — since a panic here would be
 // reached through exactly such an application's spec.
-func (l *Loop) Once(ctx context.Context) (err error) {
+func (l *Loop) Once(ctx context.Context) error { return l.pass(ctx, true) }
+
+// pass is Once, and with sweep false the pass Refresh asks for: the same load
+// and apply, without the two sweeps.
+func (l *Loop) pass(ctx context.Context, sweep bool) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("panic reconciling the app set: %v", p)
@@ -235,11 +282,17 @@ func (l *Loop) Once(ctx context.Context) (err error) {
 	}
 
 	err = l.apply(file.Applications)
+	if !sweep {
+		l.record(errors.Join(err, l.pruneErr, l.reclaimErr), false)
+		return err
+	}
 	// Only behind a clean apply. A set that loaded but could not be brought up
 	// is a set whose running state is not yet the declared one, and deletions
 	// derived from it would be acting on a diff that is still half-applied.
+	var swept error
 	if err == nil {
-		err = l.pruneDeparted(ctx, file.Applications)
+		l.pruneErr = l.pruneDeparted(ctx, file.Applications)
+		swept = l.pruneErr
 	}
 	// Deliberately not behind that gate. What this deletes is a cache rebuilt on
 	// the next fetch, and it is keyed on the set the reconciler actually holds
@@ -247,9 +300,10 @@ func (l *Loop) Once(ctx context.Context) (err error) {
 	// clone, and one whose add failed loses only a cache. Letting the data
 	// directory fill because some unrelated application will not start is the
 	// worse failure by a distance, and the volume it fills is the manager's.
-	if rerr := l.reclaimDeparted(); rerr != nil {
-		err = errors.Join(err, rerr)
+	if l.reclaimErr = l.reclaimDeparted(); l.reclaimErr != nil {
+		swept = errors.Join(swept, l.reclaimErr)
 	}
+	err = errors.Join(err, swept)
 	// Recorded either way, so a pass that succeeded clears a previous failure —
 	// including a pass that found nothing to do, because the set having become
 	// readable again is itself the news.
@@ -360,18 +414,27 @@ func (l *Loop) pruneDeparted(ctx context.Context, desired []application.Spec) er
 // Driven by the running set rather than by the file, and that is what makes it
 // safe rather than merely tidy: an application whose Remove failed is still in
 // it and keeps its checkout, so there is no pass in which the file has dropped a
-// name that something here is still reconciling. The other direction — a sync
-// the API started before the removal, which Remove neither cancels nor waits for
-// (#106) — is covered by the sweep's own grace period, not by this.
+// name that something here is still reconciling.
+//
+// The other direction is an application that has left the set and whose work
+// has not stopped, since Remove's wait is bounded — and that is why the draining
+// ones are kept as well. The sweep's own grace period used to cover it: a name
+// missed by two consecutive sweeps had been gone a whole interval while only a
+// tick changed the set. A pass Refresh asks for changes it between ticks, so a
+// name can leave, come back and leave again moments before the second sweep,
+// and what holds now is that nothing is reclaimed while it is in the set or
+// still draining.
 func (l *Loop) reclaimDeparted() error {
 	if l.reclaimer == nil {
 		return nil
 	}
 	views := l.rec.Views()
-	names := make([]string, 0, len(views))
+	draining := l.rec.Draining()
+	names := make([]string, 0, len(views)+len(draining))
 	for _, view := range views {
 		names = append(names, view.Spec.Name)
 	}
+	names = append(names, draining...)
 	if err := l.reclaimer.Sweep(names); err != nil {
 		return fmt.Errorf("reclaiming the caches of departed applications: %w", err)
 	}
