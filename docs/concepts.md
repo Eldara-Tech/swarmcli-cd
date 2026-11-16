@@ -95,13 +95,19 @@ what is compared and what is not.
 
 The sync state carries two revisions, and they answer different questions. The
 assessment's `revision` is the commit the swarm was *compared against* — the tip
-of the pinned branch, right now. The `lastSync.revision` is the commit that was
-actually *deployed*.
+of the pinned branch, right now. The `lastSync.revision` is the commit the last
+sync *attempted* to deploy, and `lastSync.succeeded` says whether it did.
 
-When they differ, there is a newer commit that has not been applied yet — which
-is a different condition from being out-of-sync against the commit you are on,
-and a UI shows both. A manual application that has drifted, and an automated one
-mid-way between its interval ticks, are both this case.
+`lastSync` moves only when a sync is attempted, and a commit that changes nothing
+this application deploys attempts none. So when the two differ, either there is
+a newer commit that has not been applied yet — a manual application that has
+drifted, or an automated one mid-way between its interval ticks — or the newer
+commit left this application alone; the sync state says which. Either way
+`lastSync` can be days old, and a failed one stays the last word until the next
+sync is attempted. A rollout that timed out is the usual case: the chart engine
+records a release before rolling it out, so the next plan finds the record
+current and has nothing to retry until a later change to that release is synced
+(#357). `app get` and the UI print the result's age for that reason.
 
 Each also carries its commit's `subject`: the first line of the message, with
 control characters turned into spaces and at most 200 characters, because anyone
@@ -109,7 +115,13 @@ who can push writes it and `app get` prints it to a terminal. In a repository
 holding several applications, the two revisions often differ only by commits to
 the others, which the subjects make visible. Both are held in memory with the
 rest of the status: after a restart the assessed one returns on the first pass,
-and the deployed one with the next sync.
+and the last sync's with the next sync.
+
+While a sync is applying, `inProgress` names it — its revision, subject and start
+— and `lastSync` is still the one before it. Under `syncPolicy.wait`, or with a
+chart that rolls its peers out one at a time, that lasts as long as the rollout
+does: `syncPolicy.timeout` bounds each wait, five minutes when unset, and a
+rollout it cuts short fails the sync with the services after it not updated.
 
 ## Automated versus manual
 

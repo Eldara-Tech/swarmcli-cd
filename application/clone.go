@@ -32,6 +32,7 @@ import "slices"
 func (s Status) Clone() Status {
 	out := s
 	out.Sync.LastSync = clonePtr(s.Sync.LastSync)
+	out.Sync.InProgress = clonePtr(s.Sync.InProgress)
 	out.Drift = clonePtr(s.Drift)
 
 	out.Releases = slices.Clone(s.Releases)

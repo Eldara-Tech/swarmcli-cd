@@ -101,3 +101,25 @@ export function destination(dest: Destination): string {
 export function plural(count: number, singular: string): string {
   return `${count} ${singular}${count === 1 ? '' : 's'}`
 }
+
+/**
+ * ago says how long before `now` something happened, in the one unit a reader
+ * judges staleness by — "4 days ago" — and mirrors `ago` in controller/app.go,
+ * so the CLI and the screen give the same answer.
+ *
+ * Empty for a time that was never set or will not parse: an age is a gloss on a
+ * time shown beside it, and that time already says "never" or shows the raw
+ * value (see Instant and formatInstant). A time ahead of now, which is the
+ * controller's clock disagreeing with this one, reads as just now.
+ */
+export function ago(at: Timestamp | undefined, now: number = Date.now()): string {
+  if (isUnset(at)) return ''
+  const then = Date.parse(at)
+  if (Number.isNaN(then)) return ''
+  const minutes = Math.floor((now - then) / 60_000)
+  if (minutes < 1) return 'just now'
+  if (minutes < 60) return `${plural(minutes, 'minute')} ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) return `${plural(hours, 'hour')} ago`
+  return `${plural(Math.floor(hours / 24), 'day')} ago`
+}

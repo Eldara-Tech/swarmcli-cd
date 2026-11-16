@@ -543,6 +543,131 @@ func TestPlanIsGivenTheValuesReader(t *testing.T) {
 	}
 }
 
+// #357: a sync under wait, or one rolling a chart's peers out one at a time,
+// runs for minutes, and a status read during it showed the previous sync's
+// result as though nothing were happening. It says so now, and stops saying so
+// however the sync ends — a cancelled one records no outcome, so only the
+// backstop clears it there.
+func TestStatusSaysASyncIsInProgressWhileItApplies(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		applyErr error
+		outcome  bool
+	}{
+		{"succeeded", nil, true},
+		{"failed", errors.New("timed out waiting for service 'db_db-2' to roll out"), true},
+		{"cancelled", context.Canceled, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}, applyErr: tc.applyErr}
+			r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+			var during *application.SyncAttempt
+			engine.onApply = func() {
+				view, _ := r.View("edge")
+				during = view.Status.Sync.InProgress
+			}
+
+			_ = r.Sync(context.Background(), "edge")
+
+			if during == nil {
+				t.Fatal("inProgress was absent while the apply ran")
+			}
+			if during.Revision != strings.Repeat("a", 40) || during.Subject != fetchedSubject ||
+				!during.StartedAt.Equal(time.Unix(0, 0)) {
+				t.Errorf("inProgress = %+v, want the fetched commit and when the apply began", during)
+			}
+			view, _ := r.View("edge")
+			if got := view.Status.Sync.InProgress; got != nil {
+				t.Errorf("inProgress = %+v once the sync ended, want none", got)
+			}
+			if got := view.Status.Sync.LastSync != nil; got != tc.outcome {
+				t.Errorf("lastSync recorded = %v, want %v", got, tc.outcome)
+			}
+		})
+	}
+}
+
+// snapshotter reads an application's status at the moment each event about it
+// is dispatched — what a screen re-reading on that event would find.
+type snapshotter struct {
+	mu   sync.Mutex
+	r    *Reconciler
+	app  string
+	seen map[notify.EventType]application.Status
+}
+
+func (s *snapshotter) Notify(_ context.Context, e notify.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.r == nil || e.Application != s.app {
+		return
+	}
+	view, _ := s.r.View(s.app)
+	s.seen[e.Type] = view.Status
+}
+
+func (s *snapshotter) at(t notify.EventType) (application.Status, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.seen[t]
+	return st, ok
+}
+
+// snapshot registers a snapshotter for one test. The notifier list is global and
+// append-only, so it is switched off rather than removed when the test ends.
+func snapshot(t *testing.T, r *Reconciler, app string) *snapshotter {
+	t.Helper()
+	s := &snapshotter{r: r, app: app, seen: map[notify.EventType]application.Status{}}
+	notify.Register("snapshot", s)
+	t.Cleanup(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.r = nil
+	})
+	return s
+}
+
+// The events are what make a screen re-read the status, so each has to be
+// dispatched after the write it announces. sync-succeeded and sync-failed used
+// to go out first, and a read racing them found the previous sync's result — and
+// with InProgress, a sync still running that had already ended.
+func TestSyncEventsAreDispatchedAfterTheStatusTheyAnnounce(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		applyErr error
+		event    notify.EventType
+	}{
+		{"succeeded", nil, notify.SyncSucceeded},
+		{"failed", errors.New("swarm said no"), notify.SyncFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}, applyErr: tc.applyErr}
+			r := newTest(t, []application.Spec{spec("announced", true)}, engine, nil)
+			snap := snapshot(t, r, "announced")
+
+			_ = r.Sync(context.Background(), "announced")
+
+			started, ok := snap.at(notify.SyncStarted)
+			if !ok {
+				t.Fatal("no sync-started was dispatched")
+			}
+			if started.Sync.InProgress == nil {
+				t.Error("at sync-started the status did not yet say a sync was running")
+			}
+			ended, ok := snap.at(tc.event)
+			if !ok {
+				t.Fatalf("no %s was dispatched", tc.event)
+			}
+			if last := ended.Sync.LastSync; last == nil || last.Succeeded != (tc.applyErr == nil) {
+				t.Errorf("at %s lastSync = %+v, want this sync's outcome", tc.event, last)
+			}
+			if ended.Sync.InProgress != nil {
+				t.Errorf("at %s inProgress = %+v, want none", tc.event, ended.Sync.InProgress)
+			}
+		})
+	}
+}
+
 func TestFailedApplyRecordsTheResultAndTheError(t *testing.T) {
 	rec := listen(t)
 	engine := &fakeEngine{plans: []*charts.Plan{outOfSync()}, applyErr: errors.New("swarm said no")}

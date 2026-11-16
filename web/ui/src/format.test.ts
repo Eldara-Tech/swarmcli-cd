@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { zeroTimestamp } from './api/types'
-import { chartRef, destination, formatInstant, isUnset, plural, serviceCounts, shortRevision, tasksUp } from './format'
+import { ago, chartRef, destination, formatInstant, isUnset, plural, serviceCounts, shortRevision, tasksUp } from './format'
 
 describe('shortRevision', () => {
   it('abbreviates the way git does and leaves a short one alone', () => {
@@ -68,5 +68,29 @@ describe('tasksUp', () => {
 
   it('counts a global job by its completions too', () => {
     expect(tasksUp({ name: 'warm', mode: 'global job', running: 1, desired: 3, completed: 2, health: 'progressing' as const })).toBe(2)
+  })
+})
+
+describe('ago', () => {
+  const now = Date.parse('2026-11-16T12:00:00Z')
+  const before = (ms: number) => new Date(now - ms).toISOString()
+
+  it.each([
+    [-3_600_000, 'just now'], // the controller's clock ahead of this one
+    [30_000, 'just now'],
+    [60_000, '1 minute ago'],
+    [59 * 60_000, '59 minutes ago'],
+    [3_600_000, '1 hour ago'],
+    [47 * 3_600_000, '47 hours ago'],
+    [48 * 3_600_000, '2 days ago'],
+    [(5 * 24 + 3) * 3_600_000, '5 days ago'],
+  ])('%i ms before now is %s', (ms, want) => {
+    expect(ago(before(ms), now)).toBe(want)
+  })
+
+  it('says nothing about a time that was never set or will not parse', () => {
+    expect(ago(undefined, now)).toBe('')
+    expect(ago(zeroTimestamp, now)).toBe('')
+    expect(ago('yesterday-ish', now)).toBe('')
   })
 })

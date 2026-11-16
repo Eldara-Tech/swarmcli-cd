@@ -353,6 +353,18 @@ policy is automated. It returns as soon as the sync is accepted; the sync itself
 runs detached. Follow it by polling the detail view, or watch `/events`. This is
 the only endpoint that writes, and the only one guarded by the `sync` action.
 
+While a sync applies — this one or an automated one — `status.sync.inProgress`
+names it, and `lastSync` is still the sync before it:
+
+```json
+"sync": { "state": "out-of-sync", "inProgress": { "revision": "2c620cf", "subject": "Upgrade patroni", "startedAt": "2026-11-16T15:24:52Z" },
+          "lastSync": { "revision": "e2bafe8", "succeeded": false, ... } }
+```
+
+`inProgress` is set before `sync-started` is dispatched and gives way to the new
+`lastSync` before `sync-succeeded` or `sync-failed` is, so a client that re-reads
+the detail on those events never finds a sync that has ended still running.
+
 It answers `202` with what it did, and there are two answers:
 
 ```json

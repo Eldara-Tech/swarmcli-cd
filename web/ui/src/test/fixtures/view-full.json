@@ -74,6 +74,11 @@
         "finishedAt": "2026-07-22T09:41:10Z",
         "succeeded": true,
         "error": "error"
+      },
+      "inProgress": {
+        "revision": "revision",
+        "subject": "subject",
+        "startedAt": "2026-07-22T09:41:10Z"
       }
     },
     "health": {
