@@ -643,7 +643,23 @@ type Compat struct {
 type ReleaseDiff struct {
 	Release string     `json:"release"`
 	Action  SyncAction `json:"action"`
-	Diff    string     `json:"diff"`
+	// FromVersion is the chart version deployed now, absent for an install;
+	// ToVersion is the one a sync deploys. A chart bump that renders the same
+	// manifest is still an upgrade, and these are how a reader learns that is
+	// what it is (#356).
+	FromVersion string `json:"fromVersion,omitempty"`
+	ToVersion   string `json:"toVersion"`
+	// ManifestChanged reports whether the rendered manifest differs from the
+	// deployed one. When it does not, Diff is the whole manifest as unchanged
+	// context and the upgrade is for something the manifest does not show:
+	// the chart version, its values, its files or its owner.
+	//
+	// The controller decides it rather than leaving each client to find no
+	// added or removed line in Diff, because "no change" was the one reading
+	// both clients got wrong: they tested for an empty diff, and textdiff never
+	// produces one for a deployed release.
+	ManifestChanged bool   `json:"manifestChanged"`
+	Diff            string `json:"diff"`
 }
 
 // DiffResponse is what the diff endpoint answers with.

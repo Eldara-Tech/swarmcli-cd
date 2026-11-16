@@ -212,7 +212,8 @@ func TestAppDiffBeforeTheFirstReconcile(t *testing.T) {
 
 func TestAppDiff(t *testing.T) {
 	rec := &stubReconciler{view: syncedView(), diffs: []application.ReleaseDiff{
-		{Release: "web", Action: "upgrade", Diff: "-image: nginx:1.0\n+image: nginx:1.1\n"},
+		{Release: "web", Action: "upgrade", FromVersion: "0.1.0", ToVersion: "0.1.1", ManifestChanged: true,
+			Diff: "- image: nginx:1.0\n+ image: nginx:1.1\n"},
 	}}
 	server := start(t, rec)
 
@@ -220,10 +221,40 @@ func TestAppDiff(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
 	}
-	for _, want := range []string{"=== web (upgrade)", "+image: nginx:1.1"} {
+	for _, want := range []string{"=== web (upgrade, chart 0.1.0 → 0.1.1)", "+ image: nginx:1.1"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
 		}
+	}
+}
+
+// #356: an upgrade whose manifest renders unchanged printed the whole manifest
+// with nothing marked, because the test was for an empty diff and a deployed
+// release's diff is never empty. It says what the sync is for instead.
+func TestAppDiffOfAnUnchangedManifestSaysWhatTheSyncIsFor(t *testing.T) {
+	manifest := "  services:\n    db:\n      image: percona:18\n"
+	rec := &stubReconciler{view: syncedView(), diffs: []application.ReleaseDiff{
+		{Release: "postgres-patroni", Action: "upgrade", FromVersion: "0.1.2", ToVersion: "0.1.3", Diff: manifest},
+		{Release: "cache", Action: "upgrade", FromVersion: "1.0.0", ToVersion: "1.0.0", Diff: manifest},
+	}}
+	server := start(t, rec)
+
+	code, stdout, stderr := cli(t, server, "app", "diff", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	for _, want := range []string{
+		"=== postgres-patroni (upgrade, chart 0.1.2 → 0.1.3)",
+		"The sync is for the chart version, 0.1.2 → 0.1.3",
+		"=== cache (upgrade, chart 1.0.0)",
+		"the release's values, the chart's files, or which application owns it",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "percona:18") {
+		t.Errorf("stdout = %q, printed the unchanged manifest", stdout)
 	}
 }
 

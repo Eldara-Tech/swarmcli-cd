@@ -132,8 +132,13 @@ func Diffs(plan *charts.Plan) []application.ReleaseDiff {
 			continue
 		}
 		out = append(out, application.ReleaseDiff{
-			Release: rp.Name,
-			Action:  application.SyncAction(rp.Action),
+			Release:     rp.Name,
+			Action:      application.SyncAction(rp.Action),
+			FromVersion: rp.FromVersion,
+			ToVersion:   rp.ToVersion,
+			// The engine's own test, from charts.unchanged: the manifest is one
+			// of the things an upgrade can be for, and this says whether it is.
+			ManifestChanged: rp.CurrentManifest != rp.Manifest,
 			// CurrentManifest is empty for an install, so the whole manifest
 			// renders as added, which is what an install is.
 			Diff: textdiff.Lines(rp.CurrentManifest, rp.Manifest),

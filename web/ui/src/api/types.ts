@@ -350,6 +350,18 @@ export interface Revision {
 export interface ReleaseDiff {
   release: string
   action: SyncAction
+  /** The chart version deployed now; absent for an install. */
+  fromVersion?: string
+  /** The chart version a sync deploys. */
+  toVersion: string
+  /**
+   * Whether the rendered manifest differs from the deployed one. False means
+   * `diff` is the whole manifest as unchanged context, and the upgrade is for
+   * something it does not show — the chart version, values, files or owner.
+   * Read this rather than looking for an empty `diff`: a deployed release's
+   * diff is never empty (#356).
+   */
+  manifestChanged: boolean
   /**
    * A line-oriented diff with `-`, `+` and space prefixes. Not a unified diff:
    * it has no hunk headers, so every diff carries the whole rendered manifest as

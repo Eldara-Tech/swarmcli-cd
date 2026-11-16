@@ -312,7 +312,7 @@ shows here on the next change.
 ### Diff — `GET /api/v1/applications/{app}/diff`
 
 ```json
-{ "planned": true, "releases": [ { "release": "traefik", "action": "upgrade", "diff": "..." } ] }
+{ "planned": true, "releases": [ { "release": "traefik", "action": "upgrade", "fromVersion": "0.1.1", "toVersion": "0.1.2", "manifestChanged": true, "diff": "..." } ] }
 ```
 
 `planned` distinguishes "nothing would change" from "not reconciled yet, nothing
@@ -329,6 +329,16 @@ The `diff` is a manifest-level text diff, carried here and nowhere else because 
 list view must not drag whole manifests along. It is line-oriented with `-`, `+`
 and space prefixes and has no hunk headers, so each one carries the whole
 rendered manifest as context.
+
+That is also why it is never empty for a deployed release, and why
+`manifestChanged` exists. An upgrade is planned when the chart version, the
+values, the chart's files, the owner stamp or the rendered manifest differ from
+what is deployed, and only the last of those shows in `diff`. A chart bump whose
+template renders the same manifest is an upgrade whose `diff` is every line
+unchanged: `manifestChanged` is `false`, and `fromVersion` → `toVersion` (the
+chart version deployed now, absent for an install, and the one a sync deploys) is
+usually the reason. Read `manifestChanged` rather than looking for an empty
+`diff`.
 
 ### History — `GET /api/v1/applications/{app}/history`
 

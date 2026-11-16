@@ -28,11 +28,13 @@ const glyphs: Record<DiffRow['kind'], string> = {
  * refused by the browser and by eslint before that. See eslint.config.js.
  */
 export function DiffView({ diff }: { diff: string }) {
-  // Trimmed, not compared to "": a diff carrying only unchanged blank lines is
-  // the same answer as an empty one, and both reach here. The engine rendered
-  // the same manifest either side — a release can be planned for an upgrade
-  // because its chart version moved and still render byte-identically — and
-  // drawing nothing at all would read as a screen that failed to load.
+  // Not where an unchanged manifest is caught. That was the intent, and it never
+  // fired: textdiff writes every unchanged line as context, so a release whose
+  // chart version moved and whose manifest did not arrived here as hundreds of
+  // context lines rather than as nothing (#356). The panel now decides on
+  // `manifestChanged` before this is drawn. What is left is a diff with no lines
+  // at all, which the OSS controller never sends and an alternative reconciler
+  // might — and drawing nothing would read as a screen that failed to load.
   if (diff.trim() === '') return <p className="empty">(no manifest change)</p>
 
   const rows = diffRows(diff)
