@@ -197,6 +197,8 @@ export interface SyncSummary {
    * "not asked" and 0 means "asked, none".
    */
   drifted?: number
+  /** Releases the last sync stopped before finishing with. Omitted when none. */
+  interrupted?: number
 }
 
 export interface SyncResult {
@@ -243,6 +245,20 @@ export interface ReleaseStatus {
   /** The release file's wave. Omitted when 0, which is both the default and "explicitly first". */
   wave?: number
   drift?: ReleaseDrift
+  /**
+   * The sync that stopped before it finished rolling this release out. The
+   * release is out of sync while it is set, even when its action is
+   * unchanged: the engine recorded it before the rollout, so the plan finds
+   * nothing to change while services in it may still run the previous spec
+   * (#357). The next sync redeploys it.
+   */
+  interrupted?: Interruption
+}
+
+/** A sync that stopped before it finished with a release. */
+export interface Interruption {
+  revision: string
+  error: string
 }
 
 export interface ReleaseDrift {
@@ -376,6 +392,12 @@ export interface ReleaseDiff {
    * diff is never empty (#356).
    */
   manifestChanged: boolean
+  /**
+   * Listed because the last sync stopped before it finished with this release,
+   * not because the plan would change it: the sync redeploys it so its rollout
+   * can finish.
+   */
+  interrupted?: boolean
   /**
    * A line-oriented diff with `-`, `+` and space prefixes. Not a unified diff:
    * it has no hunk headers, so every diff carries the whole rendered manifest as

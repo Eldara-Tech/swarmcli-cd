@@ -167,10 +167,12 @@ type fakeEngine struct {
 	applyErr  error
 	applied   int
 	planCalls int
-	opts      []charts.InstallOptions
-	planOpts  []charts.PlanOptions
-	history   map[string][]charts.Release
-	histErr   error
+	// appliedPlans is every plan Apply was handed, in order.
+	appliedPlans []*charts.Plan
+	opts         []charts.InstallOptions
+	planOpts     []charts.PlanOptions
+	history      map[string][]charts.Release
+	histErr      error
 
 	// uninstalled records what prune removed, in order, as "<release>" or
 	// "<release>+volumes" so one field carries both the call and its argument.
@@ -238,6 +240,7 @@ func (e *fakeEngine) Apply(_ context.Context, plan *charts.Plan, opts charts.Ins
 	defer e.mu.Unlock()
 	e.applied++
 	e.opts = append(e.opts, opts)
+	e.appliedPlans = append(e.appliedPlans, plan)
 	// What the backend does inside Apply. The real one deploys, which is where a
 	// self release hands its last write back; this is the seam a test uses to say
 	// so without a swarm.
@@ -665,6 +668,186 @@ func TestSyncEventsAreDispatchedAfterTheStatusTheyAnnounce(t *testing.T) {
 				t.Errorf("at %s inProgress = %+v, want none", tc.event, ended.Sync.InProgress)
 			}
 		})
+	}
+}
+
+// rolloutTimeout is the engine's error for a rollout it gave up waiting on —
+// after it had already written the release's record.
+var rolloutTimeout = errors.New("release 'whoami': timed out waiting for service 'whoami_whoami-2' to roll out; the services after it were not updated")
+
+// failFirstApply makes an engine's first Apply fail with err and every later one
+// succeed, the way a rollout that timed out and was then resumed goes.
+func failFirstApply(engine *fakeEngine, err error) {
+	engine.applyErr = err
+	engine.onApply = func() {
+		// Under engine.mu, and after applied is counted.
+		if engine.applied > 1 {
+			engine.applyErr = nil
+		}
+	}
+}
+
+func appliedAction(t *testing.T, engine *fakeEngine, call int, release string) charts.Action {
+	t.Helper()
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if call >= len(engine.appliedPlans) {
+		t.Fatalf("Apply was called %d times, want a call %d", len(engine.appliedPlans), call+1)
+	}
+	for _, rp := range engine.appliedPlans[call].Releases {
+		if rp.Name == release {
+			return rp.Action
+		}
+	}
+	t.Fatalf("Apply call %d had no release '%s'", call+1, release)
+	return ""
+}
+
+// #357. The engine records a release before rolling it out, so after a rollout
+// that timed out the next plan finds the record current and calls the release
+// unchanged — and nothing ever deployed the services after the one that
+// stalled. The next sync now redeploys it, as an upgrade through the engine.
+func TestAnInterruptedRolloutIsResumedByTheNextSync(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced(), synced()}}
+	failFirstApply(engine, rolloutTimeout)
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	if err := r.Sync(context.Background(), "edge"); err == nil {
+		t.Fatal("the first sync succeeded, want the rollout timeout")
+	}
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("the resuming sync = %v, want nil", err)
+	}
+
+	if got := engine.applyCount(); got != 2 {
+		t.Fatalf("applied %d times, want the failed sync and the one resuming it", got)
+	}
+	if got := appliedAction(t, engine, 1, "whoami"); got != charts.ActionUpgrade {
+		t.Errorf("the resuming sync applied whoami as %q, want an upgrade", got)
+	}
+	view, _ := r.View("edge")
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q after the resume, want synced", view.Status.Sync.State)
+	}
+	if rel := view.Status.Releases[0]; rel.Interrupted != nil {
+		t.Errorf("interrupted = %+v after the resume finished, want none", rel.Interrupted)
+	}
+	if last := view.Status.Sync.LastSync; last == nil || !last.Succeeded {
+		t.Errorf("lastSync = %+v, want the resume recorded as a success", last)
+	}
+	if diffs, _ := r.Diffs("edge"); len(diffs) != 0 {
+		t.Errorf("diffs = %+v after the resume, want none", diffs)
+	}
+}
+
+// A manual application is never deployed by a pass on its own, interruption or
+// not — but it has to say the release is out of sync, and why, and the button
+// has to finish the rollout.
+func TestAnInterruptedRolloutIsReportedUntilAManualSyncResumesIt(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced(), synced(), synced()}}
+	failFirstApply(engine, rolloutTimeout)
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	if err := r.SyncNow(context.Background(), "edge"); err == nil {
+		t.Fatal("the first sync succeeded, want the rollout timeout")
+	}
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("the scheduled pass = %v, want nil", err)
+	}
+
+	if got := engine.applyCount(); got != 1 {
+		t.Fatalf("applied %d times, want only the sync that was asked for", got)
+	}
+	view, _ := r.View("edge")
+	if view.Status.Sync.State != application.SyncOutOfSync || view.Status.Sync.Summary.Interrupted != 1 {
+		t.Errorf("sync = %+v, want out of sync with one interrupted release", view.Status.Sync)
+	}
+	rel := view.Status.Releases[0]
+	if rel.Sync != application.SyncOutOfSync || rel.Interrupted == nil ||
+		rel.Interrupted.Revision != strings.Repeat("a", 40) || !strings.Contains(rel.Interrupted.Error, "timed out") {
+		t.Errorf("release = %+v, want it out of sync and naming the sync that stopped", rel)
+	}
+	diffs, err := r.Diffs("edge")
+	if err != nil || len(diffs) != 1 || !diffs[0].Interrupted || diffs[0].Action != application.ActionUpgrade {
+		t.Errorf("diffs = %+v, %v; want the resume listed as an interrupted upgrade", diffs, err)
+	}
+
+	if err := r.SyncNow(context.Background(), "edge"); err != nil {
+		t.Fatalf("the manual sync = %v, want nil", err)
+	}
+	if got := appliedAction(t, engine, 1, "whoami"); got != charts.ActionUpgrade {
+		t.Errorf("the manual sync applied whoami as %q, want an upgrade", got)
+	}
+	view, _ = r.View("edge")
+	if view.Status.Releases[0].Interrupted != nil || view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("status = %+v after the manual sync, want it synced and the mark gone", view.Status.Sync)
+	}
+}
+
+// A resume that fails again keeps the mark, with the newer reason.
+func TestAResumeThatFailsAgainStaysInterrupted(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}, applyErr: rolloutTimeout}
+	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+
+	_ = r.Sync(context.Background(), "edge")
+	engine.mu.Lock()
+	engine.applyErr = errors.New("swarm said no")
+	engine.mu.Unlock()
+	_ = r.Sync(context.Background(), "edge")
+	_ = r.Sync(context.Background(), "edge")
+
+	if got := engine.applyCount(); got != 3 {
+		t.Errorf("applied %d times, want every pass to try again", got)
+	}
+	view, _ := r.View("edge")
+	if in := view.Status.Releases[0].Interrupted; in == nil || !strings.Contains(in.Error, "swarm said no") {
+		t.Errorf("interrupted = %+v, want the latest failure", in)
+	}
+}
+
+// A release the repository stops declaring cannot be resumed.
+func TestAnInterruptedReleaseThatLeavesThePlanIsForgotten(t *testing.T) {
+	other := &charts.Plan{Releases: []charts.ReleasePlan{{Name: "web", Action: charts.ActionUnchanged}}}
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), other}, applyErr: rolloutTimeout}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	_ = r.SyncNow(context.Background(), "edge")
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v", err)
+	}
+
+	if set := r.interruptedSet(r.apps["edge"]); len(set) != 0 {
+		t.Errorf("interrupted = %v, want a departed release forgotten", set)
+	}
+	view, _ := r.View("edge")
+	if view.Status.Sync.State != application.SyncSynced {
+		t.Errorf("state = %q, want synced", view.Status.Sync.State)
+	}
+}
+
+func TestResumingPlansOnlyAnInterruptedUnchangedReleaseAsAnUpgrade(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "a", Action: charts.ActionUnchanged},
+		{Name: "b", Action: charts.ActionUnchanged},
+		{Name: "c", Action: charts.ActionInstall},
+	}}
+
+	got, names := resuming(plan, map[string]bool{"a": true, "c": true})
+
+	if !slices.Equal(names, []string{"a"}) {
+		t.Errorf("resumed %v, want only a", names)
+	}
+	want := []charts.Action{charts.ActionUpgrade, charts.ActionUnchanged, charts.ActionInstall}
+	for i, rp := range got.Releases {
+		if rp.Action != want[i] {
+			t.Errorf("%s = %q, want %q", rp.Name, rp.Action, want[i])
+		}
+	}
+	if plan.Releases[0].Action != charts.ActionUnchanged {
+		t.Error("resuming rewrote the plan it was given")
+	}
+	if same, _ := resuming(plan, nil); same != plan {
+		t.Error("with nothing to resume the plan was copied")
 	}
 }
 

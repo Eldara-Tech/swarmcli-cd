@@ -104,10 +104,18 @@ a newer commit that has not been applied yet — a manual application that has
 drifted, or an automated one mid-way between its interval ticks — or the newer
 commit left this application alone; the sync state says which. Either way
 `lastSync` can be days old, and a failed one stays the last word until the next
-sync is attempted. A rollout that timed out is the usual case: the chart engine
-records a release before rolling it out, so the next plan finds the record
-current and has nothing to retry until a later change to that release is synced
-(#357). `app get` and the UI print the result's age for that reason.
+sync is attempted. `app get` and the UI print the result's age for that reason.
+
+A sync can also stop part-way through a release — usually a rollout that timed
+out. The chart engine records a release before rolling it out, so the next plan
+finds the record current and calls the release unchanged, while the services
+after the one that stalled still run the previous spec. The controller remembers
+such a release as `interrupted`: it is reported out of sync, listed in the diff,
+and redeployed by the next sync — the next pass of an automated application, the
+Sync button of a manual one — as an upgrade through the chart engine, so a chart
+that rolls its services out one at a time carries on that way. A redeploy that
+succeeds clears it. Like `lastSync` it is held in memory, so a controller restart
+forgets it (#357).
 
 Each also carries its commit's `subject`: the first line of the message, with
 control characters turned into spaces and at most 200 characters, because anyone

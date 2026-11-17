@@ -125,15 +125,25 @@ func compatState(s charts.CompatStatus) application.CompatState {
 // serves is character-for-character what `swarmcli charts apply --diff` prints.
 // Two renderings of the same change that disagree in whitespace would be worse
 // than either alone.
-func Diffs(plan *charts.Plan) []application.ReleaseDiff {
+//
+// interrupted names releases the last sync stopped before finishing with. One
+// the plan calls unchanged is listed all the same, as the upgrade a sync will
+// perform to finish its rollout: leaving it out would say a sync touches
+// nothing when it redeploys a release (#357).
+func Diffs(plan *charts.Plan, interrupted map[string]bool) []application.ReleaseDiff {
 	var out []application.ReleaseDiff
 	for _, rp := range plan.Releases {
-		if rp.Action == charts.ActionUnchanged {
-			continue
+		action := rp.Action
+		if action == charts.ActionUnchanged {
+			if !interrupted[rp.Name] {
+				continue
+			}
+			action = charts.ActionUpgrade
 		}
 		out = append(out, application.ReleaseDiff{
 			Release:     rp.Name,
-			Action:      application.SyncAction(rp.Action),
+			Action:      application.SyncAction(action),
+			Interrupted: interrupted[rp.Name],
 			FromVersion: rp.FromVersion,
 			ToVersion:   rp.ToVersion,
 			// The engine's own test, from charts.unchanged: the manifest is one

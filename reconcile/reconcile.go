@@ -1950,6 +1950,19 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 	// which no deploy can remove because applying deletes nothing.
 	drifted := driftedReleases(plan, live, detected)
 	fixable := driftedReleases(plan, live, convergeable)
+	// An interrupted release is redeployed through the engine below, never by a
+	// converge, which would deploy its whole manifest at once — so it is taken
+	// out of what converge acts on, and of the live reading converge re-derives
+	// that from.
+	resumed, resume := resuming(plan, r.interruptedSet(e))
+	applyLive := live
+	if len(resume) > 0 {
+		fixable = slices.DeleteFunc(fixable, func(name string) bool { return slices.Contains(resume, name) })
+		applyLive = maps.Clone(live)
+		for _, name := range resume {
+			delete(applyLive, name)
+		}
+	}
 
 	// Read before recording: record overwrites the states this compares
 	// against, so asking afterwards would always find them equal and drift
@@ -1994,7 +2007,7 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 		// since settled at.
 		r.setUnstable(e, "", nil)
 	}
-	if install+upgrade+len(fixable)+actionable(doomed) == 0 {
+	if install+upgrade+len(fixable)+actionable(doomed)+len(resume) == 0 {
 		return nil
 	}
 	if !spec.SyncPolicy.Automated && !force {
@@ -2008,15 +2021,17 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 			return err
 		}
 	}
-	if err := checkCompat(plan); err != nil {
+	// The resumed plan from here on: what is checked, claimed and applied is
+	// what will be deployed, interrupted releases included.
+	if err := checkCompat(resumed); err != nil {
 		return err
 	}
-	release, err := r.claimInstalls(e, plan)
+	release, err := r.claimInstalls(e, resumed)
 	if err != nil {
 		return err
 	}
 	defer release()
-	if err := r.apply(ctx, e, spec, backend, engine, plan, built, checkout, live, doomed); err != nil {
+	if err := r.apply(ctx, e, spec, backend, engine, resumed, built, checkout, applyLive, doomed); err != nil {
 		return err
 	}
 	return r.replaceSelf(ctx, spec, checkout.Revision, replaceSelf)
@@ -2260,6 +2275,7 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 	if cancelled(applyErr) {
 		return fmt.Errorf("applying: %w", applyErr)
 	}
+	r.noteInterruptions(e, plan, results, checkout.Revision, applyErr)
 
 	result := &application.SyncResult{
 		Revision:   checkout.Revision,
@@ -3103,6 +3119,7 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 	// Carried like LastSync, so that a status rebuilt from a plan cannot drop a
 	// sync that is still running; an outcome ends it, as recordResult's does.
 	sync.InProgress = e.status.Sync.InProgress
+	interrupted := maps.Clone(e.interrupted)
 	last := e.plan
 	r.mu.RUnlock()
 	if !present {
@@ -3173,6 +3190,16 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 			sync.State = application.SyncOutOfSync
 			sync.Summary.Drifted++
 		}
+
+		// Out of sync whatever the plan says: a release the last sync stopped
+		// part-way through can plan as unchanged with services still on the
+		// previous spec, and that is the one reading this must not give (#357).
+		if in, ok := interrupted[rel.Name]; ok {
+			rel.Interrupted = &in
+			rel.Sync = application.SyncOutOfSync
+			sync.State = application.SyncOutOfSync
+			sync.Summary.Interrupted++
+		}
 	}
 
 	status := application.Status{
@@ -3192,6 +3219,13 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 	}
 	e.status = status
 	e.plan = plan
+	// A release the repository no longer declares cannot be resumed, and
+	// pruning it is not this marker's business.
+	for name := range e.interrupted {
+		if !slices.ContainsFunc(plan.Releases, func(rp charts.ReleasePlan) bool { return rp.Name == name }) {
+			delete(e.interrupted, name)
+		}
+	}
 }
 
 // currentRevisions reads the revision every release on the swarm is at, keyed by
@@ -3266,6 +3300,91 @@ func (r *Reconciler) recordResult(e *appEntry, result *application.SyncResult) {
 	e.status.Sync.LastSync = result
 	e.status.Sync.InProgress = nil
 	e.status.ObservedAt = r.now()
+}
+
+// interruptedSet names the releases an application's last sync stopped before
+// finishing with. A copy, so the caller can read it without the lock.
+func (r *Reconciler) interruptedSet(e *appEntry) map[string]bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if !r.currentLocked(e) || len(e.interrupted) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(e.interrupted))
+	for name := range e.interrupted {
+		out[name] = true
+	}
+	return out
+}
+
+// noteInterruptions settles the marker after an apply: every release the apply
+// finished with is cleared, and when it failed, every release it was due to
+// change and did not finish with is marked.
+//
+// Marked without asking the engine whether its record was written. A release
+// whose deploy was refused before the record was written still plans as an
+// upgrade, so the next sync deploys it anyway and the mark only says why; one
+// whose rollout stopped after the record plans as unchanged, and the mark is
+// the only thing that brings it back. Telling the two apart would cost a
+// re-plan to learn something that changes nothing about what to do.
+func (r *Reconciler) noteInterruptions(e *appEntry, plan *charts.Plan, results []charts.ApplyResult, revision string, applyErr error) {
+	finished := make(map[string]bool, len(results))
+	for _, res := range results {
+		// Apply lists the releases it skipped as well, and skipping one is
+		// not finishing it.
+		if res.Action != charts.ActionUnchanged {
+			finished[res.Name] = true
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.currentLocked(e) {
+		return
+	}
+	for name := range finished {
+		delete(e.interrupted, name)
+	}
+	if applyErr == nil {
+		return
+	}
+	for _, rp := range plan.Releases {
+		if rp.Action == charts.ActionUnchanged || finished[rp.Name] {
+			continue
+		}
+		if e.interrupted == nil {
+			e.interrupted = map[string]application.Interruption{}
+		}
+		e.interrupted[rp.Name] = application.Interruption{Revision: revision, Error: applyErr.Error()}
+	}
+}
+
+// resuming returns plan with every interrupted release it calls unchanged
+// planned as an upgrade instead, and the names it changed.
+//
+// An upgrade, through the engine, rather than a converge: the engine's upgrade
+// is what holds a chart's marked services back and rolls them one at a time,
+// so a resumed rollout continues the way it started. converge deploys the
+// whole manifest in one call, which for a clustered database restarts every
+// peer at once. It costs one revision record per resumed release, the price of
+// any upgrade.
+func resuming(plan *charts.Plan, interrupted map[string]bool) (*charts.Plan, []string) {
+	var names []string
+	for _, rp := range plan.Releases {
+		if rp.Action == charts.ActionUnchanged && interrupted[rp.Name] {
+			names = append(names, rp.Name)
+		}
+	}
+	if len(names) == 0 {
+		return plan, nil
+	}
+	out := *plan
+	out.Releases = slices.Clone(plan.Releases)
+	for i := range out.Releases {
+		if slices.Contains(names, out.Releases[i].Name) {
+			out.Releases[i].Action = charts.ActionUpgrade
+		}
+	}
+	return &out, names
 }
 
 // setInProgress records — or, with nil, clears — the sync an application is
@@ -3347,7 +3466,7 @@ func (r *Reconciler) Diffs(app string) ([]application.ReleaseDiff, error) {
 	if plan == nil {
 		return nil, application.ErrNotPlanned
 	}
-	return drift.Diffs(plan), nil
+	return drift.Diffs(plan, r.interruptedSet(e)), nil
 }
 
 // History returns the recorded revisions of every release the application

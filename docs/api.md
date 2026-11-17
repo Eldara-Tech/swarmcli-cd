@@ -287,6 +287,11 @@ revision, planned action, sync state, health, and its services (name, mode,
 `running`/`desired`, health, update state). Absent releases means "not requested"
 here rather than "none" — the engine rejects a release file declaring none.
 
+A release carries `interrupted` — `{ "revision": "…", "error": "…" }` — when the
+last sync stopped before it finished with it. Such a release is `out-of-sync`
+whatever its `action` says, `sync.summary.interrupted` counts them, and the next
+sync redeploys it; see [concepts § revision, and last sync](concepts.md#revision-and-last-sync).
+
 Beside `spec` and `status` it carries what the caller may do to the application:
 
 ```json
@@ -338,7 +343,9 @@ template renders the same manifest is an upgrade whose `diff` is every line
 unchanged: `manifestChanged` is `false`, and `fromVersion` → `toVersion` (the
 chart version deployed now, absent for an install, and the one a sync deploys) is
 usually the reason. Read `manifestChanged` rather than looking for an empty
-`diff`.
+`diff`. A release with `interrupted: true` is listed because the last sync
+stopped before it finished with it: its plan is unchanged, and the sync
+redeploys it as an `upgrade` so its rollout can finish.
 
 ### History — `GET /api/v1/applications/{app}/history`
 

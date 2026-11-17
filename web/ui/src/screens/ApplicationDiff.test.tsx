@@ -133,6 +133,7 @@ describe('the diff itself', () => {
     release.fromVersion = '0.1.2'
     release.toVersion = '0.1.3'
     release.manifestChanged = false
+    delete release.interrupted
     serve(body)
     render(<App />)
 
@@ -151,6 +152,7 @@ describe('the diff itself', () => {
     release.fromVersion = '1.0.0'
     release.toVersion = '1.0.0'
     release.manifestChanged = false
+    delete release.interrupted
     serve(body)
     render(<App />)
 
@@ -159,6 +161,20 @@ describe('the diff itself', () => {
     expect(panel.getByTestId('manifest-unchanged').textContent).toMatch(
       /the release's values, the chart's files, or which application owns it/,
     )
+  })
+
+  it('says an interrupted release is listed to finish its rollout', async () => {
+    const body = withDiff('  line 1\n')
+    const release = (body.releases as ReleaseDiff[])[0]
+    release.fromVersion = '0.1.3'
+    release.toVersion = '0.1.3'
+    release.manifestChanged = false
+    release.interrupted = true
+    serve(body)
+    render(<App />)
+
+    const panel = within(await screen.findByTestId('release-diff'))
+    expect(panel.getByTestId('manifest-unchanged').textContent).toMatch(/so the rollout can finish/)
   })
 
   it('names only the target version for an install', async () => {

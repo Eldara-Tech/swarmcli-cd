@@ -430,6 +430,16 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 	_, _ = fmt.Fprintln(out)
 	table(out, headers, rows)
 
+	// Under the table, because the table says out of sync and unchanged at once
+	// for such a release, and only this says why (#357).
+	for _, r := range view.Status.Releases {
+		if in := r.Interrupted; in != nil {
+			_, _ = fmt.Fprintf(out, "\n%s: the sync of %s stopped before it finished rolling this release out, "+
+				"so services in it may still run the previous spec. The next sync redeploys it.\n  %s\n",
+				r.Name, short(in.Revision), in.Error)
+		}
+	}
+
 	for _, r := range view.Status.Releases {
 		if len(r.Services) == 0 {
 			continue
@@ -623,6 +633,10 @@ func chartMove(r application.ReleaseDiff) string {
 // files, the owner stamp — is named as a group, because the plan says only
 // that one of them differs, not which.
 func unchangedManifest(r application.ReleaseDiff) string {
+	if r.Interrupted {
+		return "The rendered manifest is unchanged. The last sync stopped before it finished rolling this " +
+			"release out, and the sync redeploys it so the rollout can finish."
+	}
 	if r.FromVersion != "" && r.FromVersion != r.ToVersion {
 		return fmt.Sprintf("The rendered manifest is unchanged. The sync is for the chart version, %s → %s: "+
 			"it records a revision at the new version and sends the same specs.", r.FromVersion, r.ToVersion)

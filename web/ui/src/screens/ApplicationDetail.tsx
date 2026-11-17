@@ -500,6 +500,15 @@ function ReleaseNode({ release }: { release: ReleaseStatus }) {
           {release.compat !== undefined && <CompatChip status={release.compat.status} />}
         </div>
       </div>
+      {/* The chips say out of sync and unchanged at once for such a release;
+          this is what says why (#357). */}
+      {release.interrupted !== undefined && (
+        <p className="notice notice-reconcile wrap" role="status" data-testid="release-interrupted">
+          The sync of <code>{shortRevision(release.interrupted.revision)}</code> stopped before it finished
+          rolling this release out, so services in it may still run the previous spec. The next sync
+          redeploys it. <span className="error">{release.interrupted.error}</span>
+        </p>
+      )}
       {services.length === 0 ? (
         // A release with no services, which is a release with no services — a
         // chart may install nothing but a network or a config. Rendering the
