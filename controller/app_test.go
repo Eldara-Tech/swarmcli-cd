@@ -247,6 +247,25 @@ func TestAppDiffNamesTheEnginesReasons(t *testing.T) {
 	}
 }
 
+// #361: an automated sync holds a resume while a service is down; app get says
+// so, and what to do about it.
+func TestAppGetSaysAResumeIsWaitingForEveryServiceToRun(t *testing.T) {
+	view := syncedView()
+	view.Status.Releases[0].Sync = application.SyncOutOfSync
+	view.Status.Releases[0].ResumeWaiting = true
+	server := start(t, &stubReconciler{view: view})
+
+	code, stdout, stderr := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	for _, want := range []string{"resumes automatically once every service in it is running", "A manual sync resumes it now"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout does not contain %q:\n%s", want, stdout)
+		}
+	}
+}
+
 func TestAppDiffSaysAnInterruptedReleaseIsBeingFinished(t *testing.T) {
 	rec := &stubReconciler{view: syncedView(), diffs: []application.ReleaseDiff{
 		{Release: "web", Action: "upgrade", FromVersion: "0.1.1", ToVersion: "0.1.1", Interrupted: true, Diff: "  a\n"},

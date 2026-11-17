@@ -289,7 +289,9 @@ here rather than "none" — the engine rejects a release file declaring none.
 
 A release carries `interrupted` — `{ "revision": "…", "error": "…", "pending": [ … ] }`
 — when the last sync stopped before it finished with it; `pending`, when the
-engine said, names the services the stopped rollout never reached. Such a release is `out-of-sync`
+engine said, names the services the stopped rollout never reached. `resumeWaiting:
+true` means an automated sync will not resume the release until every service in
+it is running; a manual sync does not wait. Such a release is `out-of-sync`
 whatever its `action` says, `sync.summary.interrupted` counts them, and the next
 sync redeploys it; see [concepts § revision, and last sync](concepts.md#revision-and-last-sync).
 

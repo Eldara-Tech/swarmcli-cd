@@ -707,7 +707,10 @@ rule the rest of the controller follows, where manual means "not on a schedule"
 rather than "never".
 
 The correction writes no new chart revision. The desired state did not change;
-the swarm was put back to it. `app get` shows the outcome and a
+the swarm was put back to it. It goes through the chart engine's deploy, so the
+services a chart marks `com.swarmcli.rollout: sequential` are corrected one at a
+time, each waited for before the next — never several peers of a cluster
+together (#361). `app get` shows the outcome and a
 `drift-converged` event records that it happened.
 
 A correction is a deploy, so `syncPolicy.wait` governs it too: with `wait: true`

@@ -512,6 +512,12 @@ function ReleaseNode({ release }: { release: ReleaseStatus }) {
           )}
         </p>
       )}
+      {release.resumeWaiting === true && (
+        <p className="notice wrap" role="status" data-testid="release-waiting">
+          Its rollout resumes automatically once every service in it is running, so the next peer is never
+          restarted while another is down. Sync resumes it now.
+        </p>
+      )}
       {services.length === 0 ? (
         // A release with no services, which is a release with no services — a
         // chart may install nothing but a network or a config. Rendering the

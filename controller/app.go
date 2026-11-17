@@ -441,6 +441,10 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 				_, _ = fmt.Fprintf(out, "  Not updated: %s\n", strings.Join(in.Pending, ", "))
 			}
 		}
+		if r.ResumeWaiting {
+			_, _ = fmt.Fprintf(out, "\n%s: its rollout resumes automatically once every service in it is running, "+
+				"so the next peer is never restarted while another is down. A manual sync resumes it now.\n", r.Name)
+		}
 	}
 
 	for _, r := range view.Status.Releases {

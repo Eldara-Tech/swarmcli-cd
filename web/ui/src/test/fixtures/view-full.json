@@ -163,7 +163,8 @@
           "pending": [
             "pending"
           ]
-        }
+        },
+        "resumeWaiting": true
       }
     ],
     "error": "error",

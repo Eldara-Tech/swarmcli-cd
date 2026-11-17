@@ -710,7 +710,7 @@ func appliedAction(t *testing.T, engine *fakeEngine, call int, release string) c
 func TestAnInterruptedRolloutIsResumedByTheNextSync(t *testing.T) {
 	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced(), synced()}}
 	failFirstApply(engine, rolloutTimeout)
-	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: whoamiUp(true)})
 
 	if err := r.Sync(context.Background(), "edge"); err == nil {
 		t.Fatal("the first sync succeeded, want the rollout timeout")
@@ -806,10 +806,157 @@ func TestAnInterruptionNamesTheServicesTheRolloutNeverReached(t *testing.T) {
 	}
 }
 
+// whoamiUp is a backend whose whoami service is up, or down: what decides whether
+// an automated sync may resume a rollout in it.
+func whoamiUp(up bool) stubBackend {
+	st := charts.ServiceState{Name: "whoami_whoami", Running: 1, Desired: 1, NewestTaskAge: time.Hour}
+	if !up {
+		st.Running = 0
+	}
+	return stubBackend{states: map[string][]charts.ServiceState{"whoami": {st}}}
+}
+
+// unfinished is the plan the engine makes once it has recorded a rollout that
+// stopped: an upgrade whose one reason is that the last rollout did not finish
+// — no mark in this controller needed, so it survives a restart (#730).
+func unfinished() *charts.Plan {
+	return &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "whoami", Ref: "repo/whoami", Action: charts.ActionUpgrade, FromVersion: "0.1.8", ToVersion: "0.1.8",
+			CurrentManifest: "replicas: 3\n", Manifest: "replicas: 3\n",
+			Changes: []charts.Change{{Kind: charts.ChangeUnfinished}}},
+	}}
+}
+
+// #361. The engine holds back only the marked services that are up, so resuming
+// while a peer is still down would roll the next peer with it down. An automated
+// pass waits for every service in the release to run, says so, and resumes once
+// they do — whether the rollout is remembered here or recorded by the engine.
+func TestAnAutomatedSyncResumesARolloutOnlyOnceEveryServiceRuns(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		plans []*charts.Plan
+		fail  bool // the first sync stops, leaving this controller's mark
+	}{
+		{"remembered here", []*charts.Plan{outOfSync(), synced(), synced(), synced()}, true},
+		{"recorded by the engine, after a restart", []*charts.Plan{unfinished(), unfinished(), synced()}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := &fakeEngine{plans: tc.plans}
+			backend := whoamiUp(false)
+			r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: backend})
+			if tc.fail {
+				failFirstApply(engine, rolloutTimeout)
+				_ = r.Sync(context.Background(), "edge")
+			}
+			before := engine.applyCount()
+
+			if err := r.Sync(context.Background(), "edge"); err != nil {
+				t.Fatalf("Sync = %v", err)
+			}
+			if got := engine.applyCount(); got != before {
+				t.Fatalf("applied while a service was down (%d → %d)", before, got)
+			}
+			view, _ := r.View("edge")
+			if rel := view.Status.Releases[0]; !rel.ResumeWaiting || rel.Sync != application.SyncOutOfSync {
+				t.Errorf("release = %+v, want it out of sync and waiting to resume", rel)
+			}
+
+			backend.states["whoami"][0].Running = 1
+			if err := r.Sync(context.Background(), "edge"); err != nil {
+				t.Fatalf("Sync = %v", err)
+			}
+			if got := engine.applyCount(); got != before+1 {
+				t.Fatalf("applied %d times once the service ran, want the resume", got-before)
+			}
+			if got := appliedAction(t, engine, before, "whoami"); got != charts.ActionUpgrade {
+				t.Errorf("resumed whoami as %q, want an upgrade", got)
+			}
+			view, _ = r.View("edge")
+			if view.Status.Releases[0].ResumeWaiting {
+				t.Error("still waiting after the resume")
+			}
+		})
+	}
+}
+
+// An operator pressing Sync is the one who decides a down peer is acceptable;
+// the guard is for what nobody asked for.
+func TestAManualSyncResumesARolloutWithAServiceDown(t *testing.T) {
+	engine := &fakeEngine{plans: []*charts.Plan{unfinished(), synced()}}
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: whoamiUp(false)})
+
+	if err := r.SyncNow(context.Background(), "edge"); err != nil {
+		t.Fatalf("SyncNow = %v", err)
+	}
+	if engine.applyCount() != 1 || appliedAction(t, engine, 0, "whoami") != charts.ActionUpgrade {
+		t.Errorf("applied %d times, want the resume the operator asked for", engine.applyCount())
+	}
+}
+
+// Only a release whose one reason to deploy is the unfinished rollout waits. One
+// with something new to deploy is an ordinary upgrade, guarded by the engine's
+// own rollout, not by this.
+func TestAnUpgradeWithSomethingNewIsNotHeldForADownService(t *testing.T) {
+	plan := unfinished()
+	plan.Releases[0].Changes = append(plan.Releases[0].Changes, charts.Change{Kind: charts.ChangeManifest})
+	engine := &fakeEngine{plans: []*charts.Plan{plan, synced()}}
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: whoamiUp(false)})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v", err)
+	}
+	if engine.applyCount() != 1 {
+		t.Errorf("applied %d times, want the upgrade", engine.applyCount())
+	}
+}
+
+// redeployingEngine is a chart engine that can redeploy a release one service at
+// a time without recording, as charts.Engine does.
+type redeployingEngine struct {
+	*fakeEngine
+	mu    sync.Mutex
+	calls []string
+	opts  []charts.InstallOptions
+}
+
+func (e *redeployingEngine) Redeploy(_ context.Context, release, manifest string, files map[string][]byte, opts charts.InstallOptions) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, release+"|"+manifest)
+	e.opts = append(e.opts, opts)
+	return nil
+}
+
+// #361: a correction deployed a drifted release's whole manifest in one call, so
+// every drifted peer of a clustered database restarted together. It goes through
+// the engine's Redeploy now, which rolls them one at a time and records nothing.
+func TestAConvergeRedeploysThroughTheEngineOneServiceAtATime(t *testing.T) {
+	backend := driftedBackend()
+	engine := &redeployingEngine{fakeEngine: &fakeEngine{plans: []*charts.Plan{synced()}}}
+	app := liveSpec("edge", true)
+	app.SyncPolicy.Timeout = application.Duration(7 * time.Minute)
+	r := newTestWith(t, []application.Spec{app}, engine, nil, fakeRegistry{backend: backend})
+
+	if err := r.Sync(context.Background(), "edge"); err != nil {
+		t.Fatalf("Sync = %v, want nil", err)
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if len(engine.calls) != 1 || !strings.HasPrefix(engine.calls[0], "whoami|") {
+		t.Errorf("redeployed %v through the engine, want the drifted release", engine.calls)
+	}
+	if engine.opts[0].Timeout != 7*time.Minute {
+		t.Errorf("timeout = %v, want the application's", engine.opts[0].Timeout)
+	}
+	if got := backend.converged(); len(got) != 0 {
+		t.Errorf("deployed %v straight through the backend as well", got)
+	}
+}
+
 // A resume that fails again keeps the mark, with the newer reason.
 func TestAResumeThatFailsAgainStaysInterrupted(t *testing.T) {
 	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}, applyErr: rolloutTimeout}
-	r := newTest(t, []application.Spec{spec("edge", true)}, engine, nil)
+	r := newTestWith(t, []application.Spec{spec("edge", true)}, engine, nil, fakeRegistry{backend: whoamiUp(true)})
 
 	_ = r.Sync(context.Background(), "edge")
 	engine.mu.Lock()

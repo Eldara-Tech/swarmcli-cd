@@ -302,9 +302,22 @@ describe('an interrupted rollout', () => {
     expect(note.textContent).toMatch(/Not updated: db_db-3, db_etcd-1\./)
   })
 
+  // #361: the automated resume waits while a service is down, and says so.
+  it('says an automated resume is waiting for every service to run', async () => {
+    const view = detail()
+    firstRelease(view).resumeWaiting = true
+    serve(view)
+    render(<App />)
+
+    expect((await screen.findByTestId('release-waiting')).textContent).toMatch(
+      /resumes automatically once every service in it is running/,
+    )
+  })
+
   it('says nothing for a release no sync stopped in', async () => {
     const view = detail()
     delete firstRelease(view).interrupted
+    delete firstRelease(view).resumeWaiting
     serve(view)
     render(<App />)
 
