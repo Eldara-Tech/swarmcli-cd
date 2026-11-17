@@ -784,6 +784,28 @@ func TestAnInterruptedRolloutIsReportedUntilAManualSyncResumesIt(t *testing.T) {
 	}
 }
 
+// The engine names the services a stopped rollout never reached; the mark
+// carries them, so an operator learns which services still run the old spec.
+func TestAnInterruptionNamesTheServicesTheRolloutNeverReached(t *testing.T) {
+	stopped := &charts.RolloutError{Service: "whoami_whoami-2", TimedOut: true,
+		Pending: []string{"whoami_whoami-3", "whoami_etcd-1"}}
+	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()},
+		applyErr: fmt.Errorf("release 'whoami': %w", stopped)}
+	r := newTest(t, []application.Spec{spec("edge", false)}, engine, nil)
+
+	_ = r.SyncNow(context.Background(), "edge")
+	_ = r.Sync(context.Background(), "edge")
+
+	view, _ := r.View("edge")
+	in := view.Status.Releases[0].Interrupted
+	if in == nil || !slices.Equal(in.Pending, []string{"whoami_whoami-3", "whoami_etcd-1"}) {
+		t.Errorf("interrupted = %+v, want the services after whoami-2", in)
+	}
+	if !strings.Contains(in.Error, "timed out waiting for service 'whoami_whoami-2'") {
+		t.Errorf("error = %q, want the engine's sentence", in.Error)
+	}
+}
+
 // A resume that fails again keeps the mark, with the newer reason.
 func TestAResumeThatFailsAgainStaysInterrupted(t *testing.T) {
 	engine := &fakeEngine{plans: []*charts.Plan{outOfSync(), synced()}, applyErr: rolloutTimeout}

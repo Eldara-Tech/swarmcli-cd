@@ -134,6 +134,7 @@ describe('the diff itself', () => {
     release.toVersion = '0.1.3'
     release.manifestChanged = false
     delete release.interrupted
+    delete release.changes
     serve(body)
     render(<App />)
 
@@ -153,6 +154,7 @@ describe('the diff itself', () => {
     release.toVersion = '1.0.0'
     release.manifestChanged = false
     delete release.interrupted
+    delete release.changes
     serve(body)
     render(<App />)
 
@@ -175,6 +177,20 @@ describe('the diff itself', () => {
 
     const panel = within(await screen.findByTestId('release-diff'))
     expect(panel.getByTestId('manifest-unchanged').textContent).toMatch(/so the rollout can finish/)
+  })
+
+  it("names the engine's reasons when it gives them, instead of guessing", async () => {
+    const body = withDiff('  line 1\n')
+    const release = (body.releases as ReleaseDiff[])[0]
+    release.manifestChanged = false
+    delete release.interrupted
+    release.changes = [{ kind: 'values', paths: ['image.tag'], text: 'values (image.tag)' }]
+    serve(body)
+    render(<App />)
+
+    const panel = within(await screen.findByTestId('release-diff'))
+    expect(panel.getByTestId('change-reasons').textContent).toBe('Why: values (image.tag)')
+    expect(panel.getByTestId('manifest-unchanged').textContent).toMatch(/for the reasons above/)
   })
 
   it('names only the target version for an install', async () => {

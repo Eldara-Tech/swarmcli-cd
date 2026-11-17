@@ -259,6 +259,18 @@ export interface ReleaseStatus {
 export interface Interruption {
   revision: string
   error: string
+  /** The services the stopped rollout never reached, by swarm name. Absent when the engine did not say. */
+  pending?: string[]
+}
+
+/** One reason the chart engine plans an upgrade. `text` is its own wording, e.g. "chart 0.1.2 → 0.1.3". */
+export interface Change {
+  kind: string
+  from?: string
+  to?: string
+  /** File paths or value keys — never values. */
+  paths?: string[]
+  text: string
 }
 
 export interface ReleaseDrift {
@@ -398,6 +410,8 @@ export interface ReleaseDiff {
    * can finish.
    */
   interrupted?: boolean
+  /** Every reason the engine plans this upgrade. Absent for an install. */
+  changes?: Change[]
   /**
    * A line-oriented diff with `-`, `+` and space prefixes. Not a unified diff:
    * it has no hunk headers, so every diff carries the whole rendered manifest as

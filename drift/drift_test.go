@@ -318,3 +318,29 @@ func TestDiffsListAnInterruptedReleaseAsTheUpgradeThatFinishesIt(t *testing.T) {
 		t.Errorf("diff = %+v, want an interrupted upgrade with the manifest unchanged", d)
 	}
 }
+
+// The engine's reasons ride along with the diff in its own wording, so a client
+// can name why an upgrade whose manifest is unchanged is one (#356).
+func TestDiffsCarryTheEnginesReasonsForAnUpgrade(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{{
+		Name: "postgres-patroni", Action: charts.ActionUpgrade, FromVersion: "0.1.2", ToVersion: "0.1.3",
+		CurrentManifest: "a\n", Manifest: "a\n",
+		Changes: []charts.Change{
+			{Kind: charts.ChangeChart, From: "0.1.2", To: "0.1.3"},
+			{Kind: charts.ChangeValues, Paths: []string{"image.tag"}},
+		},
+	}}}
+
+	got := Diffs(plan, nil)
+
+	if len(got) != 1 {
+		t.Fatalf("got %d diffs, want 1", len(got))
+	}
+	want := []application.Change{
+		{Kind: "chart", From: "0.1.2", To: "0.1.3", Text: "chart 0.1.2 → 0.1.3"},
+		{Kind: "values", Paths: []string{"image.tag"}, Text: "values (image.tag)"},
+	}
+	if !reflect.DeepEqual(got[0].Changes, want) {
+		t.Errorf("changes = %+v, want %+v", got[0].Changes, want)
+	}
+}

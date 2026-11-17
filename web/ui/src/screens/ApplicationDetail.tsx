@@ -507,6 +507,9 @@ function ReleaseNode({ release }: { release: ReleaseStatus }) {
           The sync of <code>{shortRevision(release.interrupted.revision)}</code> stopped before it finished
           rolling this release out, so services in it may still run the previous spec. The next sync
           redeploys it. <span className="error">{release.interrupted.error}</span>
+          {release.interrupted.pending !== undefined && release.interrupted.pending.length > 0 && (
+            <> Not updated: {release.interrupted.pending.join(', ')}.</>
+          )}
         </p>
       )}
       {services.length === 0 ? (

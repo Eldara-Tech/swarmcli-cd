@@ -290,6 +290,7 @@ describe('an interrupted rollout', () => {
     release.interrupted = {
       revision: 'e2bafe8aaaaa',
       error: "timed out waiting for service 'db_db-2' to roll out",
+      pending: ['db_db-3', 'db_etcd-1'],
     }
     serve(view)
     render(<App />)
@@ -298,6 +299,7 @@ describe('an interrupted rollout', () => {
     expect(note.textContent).toMatch(/The sync of e2bafe8 stopped before it finished/)
     expect(note.textContent).toMatch(/The next sync redeploys it/)
     expect(note.textContent).toMatch(/timed out waiting/)
+    expect(note.textContent).toMatch(/Not updated: db_db-3, db_etcd-1\./)
   })
 
   it('says nothing for a release no sync stopped in', async () => {

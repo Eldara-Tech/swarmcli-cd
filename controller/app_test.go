@@ -209,6 +209,7 @@ func TestAppGetExplainsAnInterruptedRelease(t *testing.T) {
 	view.Status.Releases[0].Sync = application.SyncOutOfSync
 	view.Status.Releases[0].Interrupted = &application.Interruption{
 		Revision: "e2bafe81", Error: "release 'web': timed out waiting for service 'web_nginx' to roll out",
+		Pending: []string{"web_nginx-2", "web_nginx-3"},
 	}
 	server := start(t, &stubReconciler{view: view})
 
@@ -216,10 +217,33 @@ func TestAppGetExplainsAnInterruptedRelease(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
 	}
-	for _, want := range []string{"the sync of e2bafe8 stopped before it finished", "The next sync redeploys it", "timed out waiting"} {
+	for _, want := range []string{"the sync of e2bafe8 stopped before it finished", "The next sync redeploys it", "timed out waiting", "Not updated: web_nginx-2, web_nginx-3"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("stdout does not contain %q:\n%s", want, stdout)
 		}
+	}
+}
+
+// With the engine's reasons, the diff says exactly why — "values (image.tag)"
+// rather than the group the plan could only gesture at before.
+func TestAppDiffNamesTheEnginesReasons(t *testing.T) {
+	rec := &stubReconciler{view: syncedView(), diffs: []application.ReleaseDiff{
+		{Release: "postgres-patroni", Action: "upgrade", FromVersion: "0.1.3", ToVersion: "0.1.3", Diff: "  a\n",
+			Changes: []application.Change{{Kind: "values", Paths: []string{"image.tag"}, Text: "values (image.tag)"}}},
+	}}
+	server := start(t, rec)
+
+	code, stdout, stderr := cli(t, server, "app", "diff", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	for _, want := range []string{"Why: values (image.tag)\n", "the sync is for the reasons above"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "which application owns it") {
+		t.Errorf("stdout = %q, still guesses at the reason the engine named", stdout)
 	}
 }
 

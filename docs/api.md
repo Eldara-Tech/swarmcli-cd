@@ -287,8 +287,9 @@ revision, planned action, sync state, health, and its services (name, mode,
 `running`/`desired`, health, update state). Absent releases means "not requested"
 here rather than "none" — the engine rejects a release file declaring none.
 
-A release carries `interrupted` — `{ "revision": "…", "error": "…" }` — when the
-last sync stopped before it finished with it. Such a release is `out-of-sync`
+A release carries `interrupted` — `{ "revision": "…", "error": "…", "pending": [ … ] }`
+— when the last sync stopped before it finished with it; `pending`, when the
+engine said, names the services the stopped rollout never reached. Such a release is `out-of-sync`
 whatever its `action` says, `sync.summary.interrupted` counts them, and the next
 sync redeploys it; see [concepts § revision, and last sync](concepts.md#revision-and-last-sync).
 
@@ -343,7 +344,10 @@ template renders the same manifest is an upgrade whose `diff` is every line
 unchanged: `manifestChanged` is `false`, and `fromVersion` → `toVersion` (the
 chart version deployed now, absent for an install, and the one a sync deploys) is
 usually the reason. Read `manifestChanged` rather than looking for an empty
-`diff`. A release with `interrupted: true` is listed because the last sync
+`diff`. `changes` names the chart engine's own reasons — each with a `kind`
+(`chart`, `manifest`, `files`, `values`, `owner`, `reinstall`), `from`/`to` or
+`paths` where they apply (values by key, never by value), and `text`, the
+engine's wording, e.g. `chart 0.1.2 → 0.1.3`. A release with `interrupted: true` is listed because the last sync
 stopped before it finished with it: its plan is unchanged, and the sync
 redeploys it as an `upgrade` so its rollout can finish.
 
