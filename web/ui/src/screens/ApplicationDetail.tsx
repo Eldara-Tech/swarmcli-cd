@@ -14,7 +14,7 @@ import { Icon } from '../components/Icon'
 import { Instant } from '../components/Instant'
 import { CompatChip, DriftCell, HealthChip, SyncChip } from '../components/StateChip'
 import { TopologyTree } from '../components/TopologyTree'
-import { chartRef, destination, serviceCounts, shortRevision, tasksUp } from '../format'
+import { ago, chartRef, destination, serviceCounts, shortRevision, tasksUp } from '../format'
 import { ErrorState, Loading } from '../components/StateBlock'
 import { PageTitle } from '../components/PageTitle'
 
@@ -55,6 +55,13 @@ export function ApplicationDetail() {
         <h1>{spec.name}</h1>
         <p className="header-chips">
           <SyncChip state={status.sync.state} />
+          {/* Beside the sync chip it qualifies: while a sync runs, that chip is
+              the plan being applied, not a verdict on the result (#357). */}
+          {status.sync.inProgress !== undefined && (
+            <span className="chip chip-busy" data-testid="syncing-chip">
+              syncing
+            </span>
+          )}
           <HealthChip state={status.health.state} />
           <DriftCell drift={status.drift} />
         </p>
@@ -336,7 +343,16 @@ export function ApplicationOverview() {
                 <div className="spec-item">
                   <dt className="spec-label">Drift State</dt>
                   <dd className="spec-value">
-                    {status.drift === undefined || status.drift.state === 'none' ? (
+                    {/* Absent is driftDetection: manifest, which never asks
+                        whether the running services match — so it has no
+                        grounds to say they do, and after a sync that stopped
+                        mid-rollout they did not (#357). Same distinction as the
+                        header's dash. */}
+                    {status.drift === undefined ? (
+                      <span className="muted" data-testid="drift-not-checked">
+                        Not checked — driftDetection is manifest
+                      </span>
+                    ) : status.drift.state === 'none' ? (
                       <span className="text-ok font-medium">Invariance Maintained</span>
                     ) : (
                       <span className="chip chip-bad">{status.drift.state}</span>
@@ -346,13 +362,36 @@ export function ApplicationOverview() {
                 <div className="spec-item">
                   <dt className="spec-label">Last sync</dt>
                   <dd className="spec-value">
+                    {/* First, because while it is there the result below is the
+                        sync before this one (#357). */}
+                    {status.sync.inProgress !== undefined && (
+                      <div data-testid="sync-in-progress">
+                        in progress since <Instant at={status.sync.inProgress.startedAt} />{' '}
+                        <code title={status.sync.inProgress.revision}>
+                          {shortRevision(status.sync.inProgress.revision)}
+                        </code>
+                      </div>
+                    )}
                     {status.sync.lastSync === undefined ? (
                       <span className="muted">never</span>
                     ) : (
                       <>
                         {status.sync.lastSync.succeeded ? 'succeeded' : 'failed'} at{' '}
                         <Instant at={status.sync.lastSync.finishedAt} />{' '}
+                        {/* The age, because a result stays until the next sync
+                            is attempted and a commit that changes nothing here
+                            attempts none: a failure can be the last word for
+                            days, and a timestamp alone did not say so (#357). */}
+                        <span className="muted" data-testid="last-sync-age">
+                          ({ago(status.sync.lastSync.finishedAt)})
+                        </span>{' '}
                         <code title={status.sync.lastSync.revision}>{shortRevision(status.sync.lastSync.revision)}</code>
+                        {status.sync.lastSync.revision !== status.sync.revision && (
+                          <span className="muted" data-testid="last-sync-earlier">
+                            {' '}
+                            · an earlier commit
+                          </span>
+                        )}
                         {/* Only for a commit other than the Revision card's, which
                             already names it: the same line twice reads as two
                             commits. Mirrors `app get`. */}

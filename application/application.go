@@ -434,6 +434,25 @@ type Sync struct {
 	Subject  string      `json:"subject,omitempty"`
 	Summary  SyncSummary `json:"summary"`
 	LastSync *SyncResult `json:"lastSync,omitempty"`
+
+	// InProgress is the sync running now, absent when none is. It is set as
+	// the apply starts and cleared as its outcome is recorded, and for as long
+	// as the rollout takes it says what nothing else here can: that LastSync is
+	// the sync before this one, and that State and the releases are the plan
+	// this one is applying.
+	//
+	// Under syncPolicy.wait, or with a chart that rolls its peers out one at a
+	// time, that is many minutes, and a status read during them used to show
+	// the previous sync's outcome as though nothing were happening (#357).
+	InProgress *SyncAttempt `json:"inProgress,omitempty"`
+}
+
+// SyncAttempt is a sync that has started and not finished: the commit it is
+// applying and when it began.
+type SyncAttempt struct {
+	Revision  string    `json:"revision"`
+	Subject   string    `json:"subject,omitempty"`
+	StartedAt time.Time `json:"startedAt"`
 }
 
 // SyncSummary is the plan that made the state OutOfSync, counted by action.

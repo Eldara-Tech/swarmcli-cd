@@ -149,6 +149,74 @@ describe('the header', () => {
     expect(screen.queryAllByText('Fix the scheduler')).toHaveLength(shown)
   })
 
+  // #357: a failed result from days ago, shown while the next sync was rolling
+  // out, read as the current state.
+  it('says a sync is running, above the result it will replace', async () => {
+    const view = detail()
+    view.status.sync.inProgress = { revision: '2c620cf4aaaa', startedAt: '2026-11-16T15:24:52Z' }
+    serve(view)
+    render(<App />)
+
+    const title = await screen.findByRole('heading', { name: 'edge', level: 1 })
+    expect(within(ancestor(title, 'header')).getByTestId('syncing-chip').textContent).toBe('syncing')
+    const running = screen.getByTestId('sync-in-progress')
+    expect(running.textContent).toMatch(/in progress since .* 2c620cf/)
+    // The row's own text, since the result is bare text in the same <dd>.
+    const row = ancestor(running, 'dd').textContent ?? ''
+    expect(row.indexOf('in progress since')).toBeLessThan(row.indexOf('succeeded at'))
+  })
+
+  it('says nothing is running when no sync is', async () => {
+    const view = detail()
+    delete view.status.sync.inProgress
+    serve(view)
+    render(<App />)
+
+    await screen.findByRole('heading', { name: 'edge', level: 1 })
+    expect(screen.queryByTestId('syncing-chip')).toBeNull()
+    expect(screen.queryByTestId('sync-in-progress')).toBeNull()
+  })
+
+  it.each([
+    ['for an earlier commit', 'e2bafe8aaaaa', true],
+    ['for the assessed commit', '2c620cf4aaaa', false],
+  ])('gives the last result its age, and marks it %s', async (_, deployed, earlier) => {
+    const view = detail()
+    view.status.sync.revision = '2c620cf4aaaa'
+    view.status.sync.lastSync = {
+      ...view.status.sync.lastSync!,
+      revision: deployed,
+      finishedAt: new Date(Date.now() - (5 * 24 + 3) * 3_600_000).toISOString(),
+    }
+    serve(view)
+    render(<App />)
+
+    expect((await screen.findByTestId('last-sync-age')).textContent).toBe('(5 days ago)')
+    expect(screen.queryByTestId('last-sync-earlier') !== null).toBe(earlier)
+  })
+
+  // driftDetection: manifest never compares the running services, so claiming
+  // they match was a verdict on a question nobody asked.
+  it('says live drift was not checked rather than that it was maintained', async () => {
+    const view = detail()
+    delete view.status.drift
+    serve(view)
+    render(<App />)
+
+    expect((await screen.findByTestId('drift-not-checked')).textContent).toMatch(/Not checked/)
+    expect(screen.queryByText('Invariance Maintained')).toBeNull()
+  })
+
+  it('says invariance is maintained when live drift was checked and found none', async () => {
+    const view = detail()
+    view.status.drift = { ...view.status.drift!, state: 'none' }
+    serve(view)
+    render(<App />)
+
+    expect(await screen.findByText('Invariance Maintained')).toBeDefined()
+    expect(screen.queryByTestId('drift-not-checked')).toBeNull()
+  })
+
   it('says the whole document is stale when the last reconcile failed', async () => {
     const view = detail()
     view.status.error = 'clone https://git.example/apps: connection refused'

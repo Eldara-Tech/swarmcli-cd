@@ -171,6 +171,20 @@ export interface Sync {
   subject?: string
   summary: SyncSummary
   lastSync?: SyncResult
+  /**
+   * The sync running now, absent when none is. While it is present, `lastSync`
+   * is the sync before this one, and `state` and the releases are the plan this
+   * one is applying — a rollout can take many minutes (#357).
+   */
+  inProgress?: SyncAttempt
+}
+
+/** A sync that has started and not finished. */
+export interface SyncAttempt {
+  revision: string
+  /** The first line of that commit's message, made safe to print. */
+  subject?: string
+  startedAt: Timestamp
 }
 
 export interface SyncSummary {

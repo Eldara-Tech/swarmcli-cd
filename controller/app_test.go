@@ -170,6 +170,59 @@ func TestAppGetNamesEachCommitBySubject(t *testing.T) {
 	}
 }
 
+// #357: a failed result from days ago, shown while the next sync was rolling out,
+// read as the current state. The running sync is named above it, and the result
+// carries its age.
+func TestAppGetSaysASyncIsInProgressAndHowOldTheLastResultIs(t *testing.T) {
+	now := time.Date(2026, 11, 16, 15, 27, 52, 0, time.UTC)
+	was := appNow
+	appNow = func() time.Time { return now }
+	t.Cleanup(func() { appNow = was })
+
+	view := syncedView()
+	view.Status.Sync.Revision = "2c620cf4"
+	view.Status.Sync.InProgress = &application.SyncAttempt{Revision: "2c620cf4", StartedAt: now.Add(-3 * time.Minute)}
+	view.Status.Sync.LastSync = &application.SyncResult{
+		Revision: "e2bafe81", FinishedAt: time.Date(2026, 11, 11, 18, 7, 31, 0, time.UTC),
+		Error: "release 'postgres-patroni': timed out waiting for service 'postgres-patroni_postgres-patroni-2' to roll out",
+	}
+	server := start(t, &stubReconciler{view: view})
+
+	code, stdout, stderr := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	syncing := strings.Index(stdout, "  Syncing      since 2026-11-16T15:24:52Z (3 minutes ago) at 2c620cf\n")
+	last := strings.Index(stdout, "  Last sync    failed at 2026-11-11T18:07:31Z (4 days ago) at e2bafe8\n")
+	if syncing < 0 || last < 0 {
+		t.Fatalf("stdout does not name the running sync and the last result's age:\n%s", stdout)
+	}
+	if syncing > last {
+		t.Errorf("the running sync is printed below the last result:\n%s", stdout)
+	}
+}
+
+func TestAgo(t *testing.T) {
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		before time.Duration
+		want   string
+	}{
+		{-time.Hour, "just now"}, // the controller's clock ahead of this one
+		{30 * time.Second, "just now"},
+		{time.Minute, "1 minute ago"},
+		{59 * time.Minute, "59 minutes ago"},
+		{time.Hour, "1 hour ago"},
+		{47 * time.Hour, "47 hours ago"},
+		{48 * time.Hour, "2 days ago"},
+		{5*24*time.Hour + 3*time.Hour, "5 days ago"},
+	} {
+		if got := ago(now.Add(-tc.before), now); got != tc.want {
+			t.Errorf("ago(%v before) = %q, want %q", tc.before, got, tc.want)
+		}
+	}
+}
+
 // A flag after the application name is the way people actually type it, and the
 // flag package stops parsing at the first positional.
 func TestFlagsMayFollowTheApplicationName(t *testing.T) {

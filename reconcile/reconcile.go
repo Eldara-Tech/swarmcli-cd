@@ -2176,6 +2176,18 @@ func (r *Reconciler) checkReproducible(e *appEntry, revision string) error {
 // the first sync rather than never.
 func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, built *source.Built, checkout git.Checkout, live map[string]*application.ReleaseDrift, doomed map[string]doomedSet) error {
 	started := r.now()
+	// Before sync-started, not after it. The event is what tells a screen to
+	// re-read the status, and a re-read that beat this write would show the
+	// previous sync's result with nothing saying another one is running.
+	r.setInProgress(e, &application.SyncAttempt{
+		Revision:  checkout.Revision,
+		Subject:   checkout.Subject,
+		StartedAt: started,
+	})
+	// Every exit, including the cancelled one that records no outcome. The
+	// outcome paths have already cleared it by then — recordResult does — so
+	// this is the backstop rather than the mechanism.
+	defer r.setInProgress(e, nil)
 	dispatch(ctx, spec, notify.Event{
 		Type:     notify.SyncStarted,
 		Revision: checkout.Revision,
@@ -2269,10 +2281,19 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 		notified.Type = notify.SyncFailed
 		notified.Message = applyErr.Error()
 	}
+	// Recorded before it is announced, on both sides. The outcome event is what
+	// makes a screen re-read the status, and announcing first raced that read
+	// against this write: it could find the previous sync's result and — once
+	// InProgress existed — a sync still running that had already finished.
+	//
+	// On success this is ahead of the sweeps and the confirming re-plan below,
+	// and that is deliberate: the result is the deploy's, and the comments
+	// below already say why neither a stuck sweep nor a failed re-plan changes
+	// it. record publishes the re-planned state over it when that is ready.
+	r.recordResult(e, result)
 	dispatch(ctx, spec, notified)
 
 	if applyErr != nil {
-		r.recordResult(e, result)
 		return fmt.Errorf("applying: %w", applyErr)
 	}
 
@@ -2306,8 +2327,9 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 	// order available rather than a compromise.
 	r.pruneResources(ctx, e, spec, backend, doomed)
 
+	// The result is already recorded, above the sync-succeeded it announces, so
+	// neither of these returns has anything left to write.
 	if swept != nil {
-		r.recordResult(e, result)
 		return swept
 	}
 
@@ -2319,7 +2341,6 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 		// The deploy landed; only the confirmation failed. Reporting the sync
 		// as failed would be wrong, so the result stands and the error is the
 		// reconcile's.
-		r.recordResult(e, result)
 		return fmt.Errorf("re-planning after apply: %w", err)
 	}
 	// The re-plan's other answer, and the acting half of what its comment above
@@ -2369,19 +2390,22 @@ func (r *Reconciler) failSync(ctx context.Context, e *appEntry, spec application
 		Succeeded:  false,
 		Error:      err.Error(),
 	}
-	dispatch(ctx, spec, notify.Event{
-		Type:     notify.SyncFailed,
-		Revision: checkout.Revision,
-		At:       result.FinishedAt,
-		Message:  err.Error(),
-	})
 	// recordResult and not record: reconcileHeld published this pass's plan,
 	// revision, drift and releases before apply was called, and nothing has been
 	// deployed since, so the outcome is the only thing missing. Re-reading the
 	// swarm would ask about a state that has not moved. Health catches up on the
 	// next reconcile, when record reads this result as SyncFailed — exactly how a
 	// failed apply already behaves.
+	//
+	// Before the event, for the reason apply records its own outcome first: the
+	// event is what makes a screen re-read the status.
 	r.recordResult(e, result)
+	dispatch(ctx, spec, notify.Event{
+		Type:     notify.SyncFailed,
+		Revision: checkout.Revision,
+		At:       result.FinishedAt,
+		Message:  err.Error(),
+	})
 }
 
 // converge redeploys the releases whose running services no longer match the
@@ -3076,6 +3100,9 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 	r.mu.RLock()
 	present := r.currentLocked(e)
 	sync.LastSync = e.status.Sync.LastSync
+	// Carried like LastSync, so that a status rebuilt from a plan cannot drop a
+	// sync that is still running; an outcome ends it, as recordResult's does.
+	sync.InProgress = e.status.Sync.InProgress
 	last := e.plan
 	r.mu.RUnlock()
 	if !present {
@@ -3083,6 +3110,7 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 	}
 	if result != nil {
 		sync.LastSync = result
+		sync.InProgress = nil
 	}
 
 	// Read the swarm before taking a view on it. A sync that did not succeed is
@@ -3227,6 +3255,8 @@ func (r *Reconciler) driftState(e *appEntry) application.DriftState {
 	return application.DriftStateUnknown
 }
 
+// recordResult records a sync's outcome, which also ends it: the attempt
+// InProgress described is now LastSync.
 func (r *Reconciler) recordResult(e *appEntry, result *application.SyncResult) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -3234,7 +3264,18 @@ func (r *Reconciler) recordResult(e *appEntry, result *application.SyncResult) {
 		return
 	}
 	e.status.Sync.LastSync = result
+	e.status.Sync.InProgress = nil
 	e.status.ObservedAt = r.now()
+}
+
+// setInProgress records — or, with nil, clears — the sync an application is
+// running now. See Sync.InProgress.
+func (r *Reconciler) setInProgress(e *appEntry, attempt *application.SyncAttempt) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.currentLocked(e) {
+		e.status.Sync.InProgress = attempt
+	}
 }
 
 // setError records why a reconcile failed without discarding what was last

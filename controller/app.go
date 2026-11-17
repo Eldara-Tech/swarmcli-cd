@@ -374,9 +374,22 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 	if d := view.Status.Drift; d != nil {
 		_, _ = fmt.Fprintf(out, "  Drift        %s%s\n", state(d.State), driftMessage(d.Message))
 	}
+	// Above the last result, because while it is there the result below is the
+	// sync before this one, and the state above is the plan this one applies.
+	if run := view.Status.Sync.InProgress; run != nil {
+		_, _ = fmt.Fprintf(out, "  Syncing      since %s (%s)%s\n",
+			run.StartedAt.Format(time.RFC3339), ago(run.StartedAt, appNow()), revisionSuffix(run.Revision))
+		if run.Subject != "" && run.Revision != view.Status.Sync.Revision {
+			_, _ = fmt.Fprintf(out, "               %s\n", run.Subject)
+		}
+	}
 	if last := view.Status.Sync.LastSync; last != nil {
-		_, _ = fmt.Fprintf(out, "  Last sync    %s at %s%s\n",
-			outcome(last.Succeeded), last.FinishedAt.Format(time.RFC3339), revisionSuffix(last.Revision))
+		// With its age, because it stays until the next sync is attempted and a
+		// commit that changes nothing here attempts none: a failure can be the
+		// last word for days, and its timestamp alone did not say so (#357).
+		_, _ = fmt.Fprintf(out, "  Last sync    %s at %s (%s)%s\n",
+			outcome(last.Succeeded), last.FinishedAt.Format(time.RFC3339), ago(last.FinishedAt, appNow()),
+			revisionSuffix(last.Revision))
 		// Only for a commit other than the one above, whose subject is already
 		// printed: the same line twice would read as two commits.
 		if last.Subject != "" && last.Revision != view.Status.Sync.Revision {
@@ -814,6 +827,32 @@ func observed(at time.Time) string {
 		return "never"
 	}
 	return at.Format(time.RFC3339)
+}
+
+// appNow is the clock ago measures against; a variable so a test can fix it.
+var appNow = time.Now
+
+// ago says how long before now something happened, in the one unit a reader
+// judges staleness by. A time ahead of now — the controller's clock is not this
+// machine's — reads as just now rather than as a negative age.
+func ago(at, now time.Time) string {
+	d := now.Sub(at)
+	unit := func(n int, name string) string {
+		if n == 1 {
+			return "1 " + name + " ago"
+		}
+		return fmt.Sprintf("%d %ss ago", n, name)
+	}
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return unit(int(d/time.Minute), "minute")
+	case d < 48*time.Hour:
+		return unit(int(d/time.Hour), "hour")
+	default:
+		return unit(int(d/(24*time.Hour)), "day")
+	}
 }
 
 func outcome(succeeded bool) string {
