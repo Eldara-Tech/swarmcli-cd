@@ -202,6 +202,42 @@ func TestAppGetSaysASyncIsInProgressAndHowOldTheLastResultIs(t *testing.T) {
 	}
 }
 
+// #357: the release table says out of sync and unchanged at once for a release
+// the last sync stopped part-way through; this is what says why.
+func TestAppGetExplainsAnInterruptedRelease(t *testing.T) {
+	view := syncedView()
+	view.Status.Releases[0].Sync = application.SyncOutOfSync
+	view.Status.Releases[0].Interrupted = &application.Interruption{
+		Revision: "e2bafe81", Error: "release 'web': timed out waiting for service 'web_nginx' to roll out",
+	}
+	server := start(t, &stubReconciler{view: view})
+
+	code, stdout, stderr := cli(t, server, "app", "get", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	for _, want := range []string{"the sync of e2bafe8 stopped before it finished", "The next sync redeploys it", "timed out waiting"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("stdout does not contain %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestAppDiffSaysAnInterruptedReleaseIsBeingFinished(t *testing.T) {
+	rec := &stubReconciler{view: syncedView(), diffs: []application.ReleaseDiff{
+		{Release: "web", Action: "upgrade", FromVersion: "0.1.1", ToVersion: "0.1.1", Interrupted: true, Diff: "  a\n"},
+	}}
+	server := start(t, rec)
+
+	code, stdout, stderr := cli(t, server, "app", "diff", "edge")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
+	}
+	if !strings.Contains(stdout, "so the rollout can finish") {
+		t.Errorf("stdout = %q, want it to say the sync finishes an interrupted rollout", stdout)
+	}
+}
+
 func TestAgo(t *testing.T) {
 	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {

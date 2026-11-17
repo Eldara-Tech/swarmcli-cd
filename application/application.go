@@ -472,6 +472,9 @@ type SyncSummary struct {
 	// question is only asked in one mode, and omitting it keeps a manifest-mode
 	// payload exactly what it was before this axis existed.
 	Drifted int `json:"drifted,omitempty"`
+	// Interrupted counts releases whose last sync stopped before it finished
+	// with them. Omitted when zero, like Drifted.
+	Interrupted int `json:"interrupted,omitempty"`
 }
 
 // SyncResult records the outcome of the last sync that was actually attempted.
@@ -531,6 +534,16 @@ type ReleaseStatus struct {
 	// application asked and cannot be answered, which is what Unknown is for, so
 	// that reports a record rather than nothing (#201).
 	Drift *ReleaseDrift `json:"drift,omitempty"`
+
+	// Interrupted is the sync that stopped before it finished with this
+	// release, nil when none did. The chart engine records a release before
+	// rolling it out, so after a rollout that timed out the plan finds the
+	// record current and calls the release unchanged while services after the
+	// one that stalled still run the previous spec. This is what keeps it out
+	// of sync until a sync redeploys it and finishes (#357).
+	//
+	// Held in memory, like LastSync: a controller restart forgets it.
+	Interrupted *Interruption `json:"interrupted,omitempty"`
 }
 
 // Drift is the live-drift rollup for a whole application.
@@ -654,6 +667,13 @@ type Compat struct {
 	Reason   string      `json:"reason,omitempty"`
 }
 
+// Interruption is a sync that stopped before it finished with a release: the
+// commit it was deploying and why it stopped.
+type Interruption struct {
+	Revision string `json:"revision"`
+	Error    string `json:"error"`
+}
+
 // ReleaseDiff is the manifest change one release would undergo.
 //
 // It is deliberately not part of ReleaseStatus: a diff carries whole
@@ -677,8 +697,12 @@ type ReleaseDiff struct {
 	// added or removed line in Diff, because "no change" was the one reading
 	// both clients got wrong: they tested for an empty diff, and textdiff never
 	// produces one for a deployed release.
-	ManifestChanged bool   `json:"manifestChanged"`
-	Diff            string `json:"diff"`
+	ManifestChanged bool `json:"manifestChanged"`
+	// Interrupted marks a release listed because the last sync stopped before
+	// it finished with it, not because the plan would change it: a sync
+	// redeploys it so its rollout can complete. See ReleaseStatus.Interrupted.
+	Interrupted bool   `json:"interrupted,omitempty"`
+	Diff        string `json:"diff"`
 }
 
 // DiffResponse is what the diff endpoint answers with.

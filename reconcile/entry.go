@@ -115,6 +115,20 @@ type appEntry struct {
 	unstable         string
 	unstableReleases []string
 
+	// interrupted holds the releases whose last sync stopped before it finished
+	// with them, keyed by name. The chart engine writes a release's record
+	// before rolling it out, so after a rollout that timed out the next plan
+	// finds the record current and calls the release unchanged — while the
+	// services after the one that stalled still run the previous spec, and
+	// nothing would ever deploy them (#357). A release held here is reported out
+	// of sync and redeployed by the next sync, through the engine so a chart's
+	// one-at-a-time rollout picks up where it stopped.
+	//
+	// Cleared release by release as a sync finishes with each one. In memory,
+	// as LastSync is: a restart forgets it. Not cleared by Replace either — an
+	// edited spec does not finish a rollout.
+	interrupted map[string]application.Interruption
+
 	// failures counts the reconciles that have failed in a row, and is what the
 	// loop's backoff is computed from.
 	//

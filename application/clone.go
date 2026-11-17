@@ -41,6 +41,7 @@ func (s Status) Clone() Status {
 		rel.Services = slices.Clone(rel.Services)
 		rel.Compat = clonePtr(rel.Compat)
 		rel.Drift = cloneReleaseDrift(rel.Drift)
+		rel.Interrupted = clonePtr(rel.Interrupted)
 	}
 	return out
 }

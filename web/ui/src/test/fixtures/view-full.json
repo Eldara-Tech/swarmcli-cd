@@ -65,7 +65,8 @@
         "install": 1,
         "upgrade": 1,
         "unchanged": 1,
-        "drifted": 1
+        "drifted": 1,
+        "interrupted": 1
       },
       "lastSync": {
         "revision": "revision",
@@ -155,6 +156,10 @@
             }
           ],
           "message": "message"
+        },
+        "interrupted": {
+          "revision": "revision",
+          "error": "error"
         }
       }
     ],

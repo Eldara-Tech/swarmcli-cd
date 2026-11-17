@@ -6,6 +6,7 @@
       "fromVersion": "fromVersion",
       "toVersion": "toVersion",
       "manifestChanged": true,
+      "interrupted": true,
       "diff": "diff"
     }
   ],

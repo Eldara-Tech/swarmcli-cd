@@ -279,6 +279,38 @@ describe('the release tree', () => {
   })
 })
 
+describe('an interrupted rollout', () => {
+  // #357: the chips say out of sync and unchanged at once, so the release has to
+  // say why — and that a sync finishes it.
+  it('says the last sync stopped part-way through the release', async () => {
+    const view = detail()
+    const release = firstRelease(view)
+    release.action = 'unchanged'
+    release.sync = 'out-of-sync'
+    release.interrupted = {
+      revision: 'e2bafe8aaaaa',
+      error: "timed out waiting for service 'db_db-2' to roll out",
+    }
+    serve(view)
+    render(<App />)
+
+    const note = await screen.findByTestId('release-interrupted')
+    expect(note.textContent).toMatch(/The sync of e2bafe8 stopped before it finished/)
+    expect(note.textContent).toMatch(/The next sync redeploys it/)
+    expect(note.textContent).toMatch(/timed out waiting/)
+  })
+
+  it('says nothing for a release no sync stopped in', async () => {
+    const view = detail()
+    delete firstRelease(view).interrupted
+    serve(view)
+    render(<App />)
+
+    await screen.findByRole('heading', { name: 'edge', level: 1 })
+    expect(screen.queryByTestId('release-interrupted')).toBeNull()
+  })
+})
+
 describe('the compatibility gate', () => {
   // Blocking, and above everything: reconcile.checkCompat refuses the whole
   // plan rather than the incompatible part of it, so nothing below is going to

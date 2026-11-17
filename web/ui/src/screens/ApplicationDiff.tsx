@@ -147,7 +147,10 @@ function chartVersion({ fromVersion, toVersion }: ReleaseDiff): string {
  * group because the plan says only that one of them differs. Mirrors
  * `unchangedManifest` in controller/app.go, so the CLI and the screen agree.
  */
-function unchangedManifest({ fromVersion, toVersion }: ReleaseDiff): string {
+function unchangedManifest({ fromVersion, toVersion, interrupted }: ReleaseDiff): string {
+  if (interrupted === true) {
+    return 'The rendered manifest is unchanged. The last sync stopped before it finished rolling this release out, and the sync redeploys it so the rollout can finish.'
+  }
   if (fromVersion !== undefined && fromVersion !== '' && fromVersion !== toVersion) {
     return `The rendered manifest is unchanged. The sync is for the chart version, ${fromVersion} → ${toVersion}: it records a revision at the new version and sends the same specs.`
   }

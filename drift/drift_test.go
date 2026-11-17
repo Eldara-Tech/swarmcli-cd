@@ -149,7 +149,7 @@ func TestDiffsSkipUnchangedReleases(t *testing.T) {
 		{Name: "moving", Action: charts.ActionUpgrade, CurrentManifest: "replicas: 1\n", Manifest: "replicas: 3\n"},
 	}}
 
-	got := Diffs(plan)
+	got := Diffs(plan, nil)
 
 	if len(got) != 1 {
 		t.Fatalf("got %d diffs, want only the changed release: %+v", len(got), got)
@@ -171,7 +171,7 @@ func TestDiffForAnInstallShowsTheWholeManifest(t *testing.T) {
 		Manifest: "services:\n  web:\n    image: whoami\n",
 	}}}
 
-	got := Diffs(plan)
+	got := Diffs(plan, nil)
 
 	if len(got) != 1 {
 		t.Fatalf("got %d diffs, want 1", len(got))
@@ -199,7 +199,7 @@ func TestDiffOfAVersionOnlyUpgradeSaysTheManifestIsUnchanged(t *testing.T) {
 		Manifest:        manifest,
 	}}}
 
-	got := Diffs(plan)
+	got := Diffs(plan, nil)
 
 	if len(got) != 1 {
 		t.Fatalf("got %d diffs, want the upgrade", len(got))
@@ -225,7 +225,7 @@ func TestDiffsSayWhenTheManifestChanges(t *testing.T) {
 		{Name: "new", Action: charts.ActionInstall, ToVersion: "2.0.0", Manifest: "replicas: 1\n"},
 	}}
 
-	got := Diffs(plan)
+	got := Diffs(plan, nil)
 
 	if len(got) != 2 {
 		t.Fatalf("got %d diffs, want 2", len(got))
@@ -243,7 +243,7 @@ func TestDiffsSayWhenTheManifestChanges(t *testing.T) {
 func TestDiffsOfASyncedPlanAreEmpty(t *testing.T) {
 	plan := &charts.Plan{Releases: []charts.ReleasePlan{{Name: "steady", Action: charts.ActionUnchanged}}}
 
-	if got := Diffs(plan); len(got) != 0 {
+	if got := Diffs(plan, nil); len(got) != 0 {
 		t.Errorf("Diffs = %+v, want none", got)
 	}
 }
@@ -294,5 +294,27 @@ func TestReleasesCarryTheirWaveInPlanOrder(t *testing.T) {
 			t.Errorf("releases[%d] = %s wave %d, want %s wave %d",
 				i, releases[i].Name, releases[i].Wave, want.name, want.wave)
 		}
+	}
+}
+
+// #357: a release the last sync stopped part-way through plans as unchanged,
+// because its record was written before its rollout. A sync still redeploys it,
+// so the diff lists it as that upgrade rather than leaving it out.
+func TestDiffsListAnInterruptedReleaseAsTheUpgradeThatFinishesIt(t *testing.T) {
+	manifest := "services:\n  db-3:\n    image: percona:18\n"
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "postgres-patroni", Action: charts.ActionUnchanged, FromVersion: "0.1.3", ToVersion: "0.1.3",
+			CurrentManifest: manifest, Manifest: manifest},
+		{Name: "steady", Action: charts.ActionUnchanged, CurrentManifest: "a\n", Manifest: "a\n"},
+	}}
+
+	got := Diffs(plan, map[string]bool{"postgres-patroni": true})
+
+	if len(got) != 1 {
+		t.Fatalf("got %d diffs, want only the interrupted release: %+v", len(got), got)
+	}
+	d := got[0]
+	if d.Release != "postgres-patroni" || d.Action != application.ActionUpgrade || !d.Interrupted || d.ManifestChanged {
+		t.Errorf("diff = %+v, want an interrupted upgrade with the manifest unchanged", d)
 	}
 }
