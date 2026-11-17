@@ -544,6 +544,14 @@ type ReleaseStatus struct {
 	//
 	// Held in memory, like LastSync: a controller restart forgets it.
 	Interrupted *Interruption `json:"interrupted,omitempty"`
+
+	// ResumeWaiting says this release has a rollout to finish and an automated
+	// sync will not finish it yet, because not every service in it is running.
+	// The engine holds back only the marked services that are up, so resuming
+	// while a database peer is still down would restart the next peer with it
+	// down. It resumes on its own once the release is healthy; a manual sync
+	// resumes it now (#361).
+	ResumeWaiting bool `json:"resumeWaiting,omitempty"`
 }
 
 // Drift is the live-drift rollup for a whole application.

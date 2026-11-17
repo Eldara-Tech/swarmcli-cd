@@ -5,7 +5,7 @@ go 1.27
 toolchain go1.27.3
 
 require (
-	github.com/Eldara-Tech/swarmcli/v2 v2.5.0-rc3
+	github.com/Eldara-Tech/swarmcli/v2 v2.5.0-rc3.0.20261117095538-177e0d6ad7c7
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/distribution/reference v0.6.0

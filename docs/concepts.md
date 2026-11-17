@@ -107,15 +107,20 @@ commit left this application alone; the sync state says which. Either way
 sync is attempted. `app get` and the UI print the result's age for that reason.
 
 A sync can also stop part-way through a release — usually a rollout that timed
-out. The chart engine records a release before rolling it out, so the next plan
-finds the record current and calls the release unchanged, while the services
-after the one that stalled still run the previous spec. The controller remembers
-such a release as `interrupted`: it is reported out of sync, listed in the diff,
-and redeployed by the next sync — the next pass of an automated application, the
-Sync button of a manual one — as an upgrade through the chart engine, so a chart
-that rolls its services out one at a time carries on that way. A redeploy that
-succeeds clears it. Like `lastSync` it is held in memory, so a controller restart
-forgets it (#357).
+out, or the controller stopping mid-rollout. The chart engine records a release
+before rolling it out, and then records a `failed` copy on top when the rollout
+does not finish, so the next plan calls the release an upgrade whose reason is
+"the last rollout did not finish" — after a controller restart as well. The
+controller also remembers the sync that stopped, as `interrupted` with its error
+and the services it never reached. Either way the release is out of sync, listed
+in the diff, and redeployed by the next sync as an upgrade through the chart
+engine, so a chart that rolls its services out one at a time carries on that way.
+
+The next sync is the Sync button for a manual application. An automated one
+resumes on its own only once every service in the release is running, and says
+so meanwhile (`resumeWaiting`). The chart engine holds back only the services that
+are up, so resuming while a database peer is still down would restart the next
+peer with it down. Pressing Sync resumes it regardless (#357, #361).
 
 Each also carries its commit's `subject`: the first line of the message, with
 control characters turned into spaces and at most 200 characters, because anyone

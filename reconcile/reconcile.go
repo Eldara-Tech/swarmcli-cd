@@ -2007,7 +2007,16 @@ func (r *Reconciler) reconcileHeld(ctx context.Context, e *appEntry, spec applic
 		// since settled at.
 		r.setUnstable(e, "", nil)
 	}
-	if install+upgrade+len(fixable)+actionable(doomed)+len(resume) == 0 {
+	// An automated pass does not resume a rollout while a service in the
+	// release is not running. The engine holds back only the marked services
+	// that are up, so resuming while a peer is still down rolls the next peer
+	// with it down: two members of a three-node cluster out at once. record has
+	// just decided which releases wait; an explicit sync is not held.
+	if !force {
+		resumed = holding(resumed, r.waitingToResume(e))
+	}
+	rInstall, rUpgrade, _ := resumed.Counts()
+	if rInstall+rUpgrade+len(fixable)+actionable(doomed) == 0 {
 		return nil
 	}
 	if !spec.SyncPolicy.Automated && !force {
@@ -2262,7 +2271,7 @@ func (r *Reconciler) apply(ctx context.Context, e *appEntry, spec application.Sp
 	// install or upgrade is never one this compared — and because a failed
 	// apply is the wrong moment to start correcting something else.
 	if applyErr == nil {
-		applyErr = r.converge(ctx, spec, backend, plan, live)
+		applyErr = r.converge(ctx, spec, backend, engine, plan, live)
 	}
 
 	// A cancelled context is not an outcome and is dispatched as neither. The
@@ -2454,7 +2463,7 @@ func (r *Reconciler) failSync(ctx context.Context, e *appEntry, spec application
 // of the same reading: which *services* each correction is for. Deriving the
 // releases from the report and passing the services beside them would be two
 // parameters that must agree, for a walk over the plan that costs nothing.
-func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backend charts.Backend, plan *charts.Plan, live map[string]*application.ReleaseDrift) error {
+func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, plan *charts.Plan, live map[string]*application.ReleaseDrift) error {
 	drifted := driftedReleases(plan, live, convergeable)
 	if len(drifted) == 0 {
 		return nil
@@ -2485,7 +2494,7 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			if err := backend.DeployStack(ctx, charts.DeployRequest{Name: rp.Name, Manifest: manifests[rp.Name], Resolve: "", Files: rp.Files}); err != nil {
+			if err := redeploy(ctx, spec, backend, engine, rp.Name, manifests[rp.Name], rp.Files); err != nil {
 				errs = append(errs, fmt.Errorf("converging release '%s': %w", rp.Name, err))
 				continue
 			}
@@ -2538,6 +2547,30 @@ func (r *Reconciler) converge(ctx context.Context, spec application.Spec, backen
 		})
 	}
 	return errors.Join(errs...)
+}
+
+// redeployer is the chart engine's deploy of a release that records nothing and
+// rolls the services marked `com.swarmcli.rollout: sequential` one at a time, as
+// its upgrade does. Asserted for, like releaseLister, so an engine without it
+// still converges.
+type redeployer interface {
+	Redeploy(ctx context.Context, release, manifest string, files map[string][]byte, opts charts.InstallOptions) error
+}
+
+var _ redeployer = (*charts.Engine)(nil)
+
+// redeploy puts one drifted release back to its manifest.
+//
+// Through the engine when it can, because a single DeployStack updates every
+// drifted service at once: with several peers of a clustered database changed
+// by hand, the correction restarted all of them together — the outage the
+// sequential label exists to prevent (#361). The resolve mode stays the apply
+// path's, so a correction never re-resolves a moving tag.
+func redeploy(ctx context.Context, spec application.Spec, backend charts.Backend, engine Engine, release, manifest string, files map[string][]byte) error {
+	if rd, ok := engine.(redeployer); ok {
+		return rd.Redeploy(ctx, release, manifest, files, charts.InstallOptions{Timeout: time.Duration(spec.SyncPolicy.Timeout)})
+	}
+	return backend.DeployStack(ctx, charts.DeployRequest{Name: release, Manifest: manifest, Resolve: "", Files: files})
 }
 
 // waveGroups splits a plan's releases into contiguous runs of equal wave.
@@ -3120,8 +3153,13 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 	// sync that is still running; an outcome ends it, as recordResult's does.
 	sync.InProgress = e.status.Sync.InProgress
 	interrupted := maps.Clone(e.interrupted)
+	automated := e.spec.SyncPolicy.Automated
 	last := e.plan
 	r.mu.RUnlock()
+	planned := make(map[string]charts.ReleasePlan, len(plan.Releases))
+	for _, rp := range plan.Releases {
+		planned[rp.Name] = rp
+	}
 	if !present {
 		return
 	}
@@ -3199,6 +3237,13 @@ func (r *Reconciler) record(ctx context.Context, e *appEntry, backend charts.Bac
 			rel.Sync = application.SyncOutOfSync
 			sync.State = application.SyncOutOfSync
 			sync.Summary.Interrupted++
+		}
+		// Decided here because this is where health is known; the gate in
+		// reconcileHeld acts on it. Only for an automated application: nothing
+		// resumes a manual one but the sync button, which does not wait.
+		_, marked := interrupted[rel.Name]
+		if automated && onlyToFinish(planned[rel.Name], marked) && rel.Health.State != application.HealthHealthy {
+			rel.ResumeWaiting = true
 		}
 	}
 
@@ -3392,6 +3437,53 @@ func resuming(plan *charts.Plan, interrupted map[string]bool) (*charts.Plan, []s
 		}
 	}
 	return &out, names
+}
+
+// onlyToFinish reports that the one thing a sync would do to a release is finish
+// a rollout an earlier one stopped part-way through: the engine records that as
+// a failed revision and plans it with the single reason ChangeUnfinished, and a
+// release this controller marked interrupted plans as unchanged. A release with
+// anything new to deploy is an ordinary upgrade, and is not held.
+func onlyToFinish(rp charts.ReleasePlan, marked bool) bool {
+	if marked && rp.Action == charts.ActionUnchanged {
+		return true
+	}
+	return len(rp.Changes) == 1 && rp.Changes[0].Kind == charts.ChangeUnfinished
+}
+
+// waitingToResume names the releases record found waiting for every service to
+// run before an automated sync resumes them.
+func (r *Reconciler) waitingToResume(e *appEntry) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if !r.currentLocked(e) {
+		return nil
+	}
+	var out []string
+	for _, rel := range e.status.Releases {
+		if rel.ResumeWaiting {
+			out = append(out, rel.Name)
+		}
+	}
+	return out
+}
+
+// holding returns plan with the named releases planned as unchanged, so that the
+// engine skips them, and plan itself when none of them would be deployed.
+func holding(plan *charts.Plan, names []string) *charts.Plan {
+	if !slices.ContainsFunc(plan.Releases, func(rp charts.ReleasePlan) bool {
+		return rp.Action != charts.ActionUnchanged && slices.Contains(names, rp.Name)
+	}) {
+		return plan
+	}
+	out := *plan
+	out.Releases = slices.Clone(plan.Releases)
+	for i := range out.Releases {
+		if slices.Contains(names, out.Releases[i].Name) {
+			out.Releases[i].Action = charts.ActionUnchanged
+		}
+	}
+	return &out
 }
 
 // setInProgress records — or, with nil, clears — the sync an application is

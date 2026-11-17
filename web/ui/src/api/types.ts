@@ -253,6 +253,12 @@ export interface ReleaseStatus {
    * (#357). The next sync redeploys it.
    */
   interrupted?: Interruption
+  /**
+   * The release has a rollout to finish, and an automated sync waits until every
+   * service in it is running before resuming it, so the next peer is never
+   * restarted while another is down. A manual sync resumes it now (#361).
+   */
+  resumeWaiting?: boolean
 }
 
 /** A sync that stopped before it finished with a release. */
