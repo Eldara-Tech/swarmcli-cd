@@ -123,6 +123,11 @@ function ReleaseDiffPanel({ release }: { release: ReleaseDiff }) {
           </>
         )}
       </h2>
+      {release.changes !== undefined && release.changes.length > 0 && (
+        <p className="muted" data-testid="change-reasons">
+          Why: {release.changes.map((c) => c.text).join(' · ')}
+        </p>
+      )}
       {release.manifestChanged ? (
         <DiffView diff={release.diff} />
       ) : (
@@ -147,7 +152,11 @@ function chartVersion({ fromVersion, toVersion }: ReleaseDiff): string {
  * group because the plan says only that one of them differs. Mirrors
  * `unchangedManifest` in controller/app.go, so the CLI and the screen agree.
  */
-function unchangedManifest({ fromVersion, toVersion, interrupted }: ReleaseDiff): string {
+function unchangedManifest({ fromVersion, toVersion, interrupted, changes }: ReleaseDiff): string {
+  if (interrupted !== true && changes !== undefined && changes.length > 0) {
+    // The engine named them, and the line above printed them.
+    return 'The rendered manifest is unchanged; the sync is for the reasons above.'
+  }
   if (interrupted === true) {
     return 'The rendered manifest is unchanged. The last sync stopped before it finished rolling this release out, and the sync redeploys it so the rollout can finish.'
   }

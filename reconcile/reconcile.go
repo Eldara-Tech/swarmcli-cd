@@ -3354,7 +3354,14 @@ func (r *Reconciler) noteInterruptions(e *appEntry, plan *charts.Plan, results [
 		if e.interrupted == nil {
 			e.interrupted = map[string]application.Interruption{}
 		}
-		e.interrupted[rp.Name] = application.Interruption{Revision: revision, Error: applyErr.Error()}
+		in := application.Interruption{Revision: revision, Error: applyErr.Error()}
+		// The engine names the services a stopped rollout never reached, and
+		// they belong to the release whose service it stopped at.
+		var re *charts.RolloutError
+		if errors.As(applyErr, &re) && strings.HasPrefix(re.Service, rp.Name+"_") {
+			in.Pending = slices.Clone(re.Pending)
+		}
+		e.interrupted[rp.Name] = in
 	}
 }
 

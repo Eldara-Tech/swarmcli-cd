@@ -672,6 +672,24 @@ type Compat struct {
 type Interruption struct {
 	Revision string `json:"revision"`
 	Error    string `json:"error"`
+	// Pending names the services the stopped rollout never reached, by swarm
+	// name, in the order it would have rolled them. Empty when the engine did
+	// not say — a deploy refused outright, or a rollout that stopped at its
+	// last service.
+	Pending []string `json:"pending,omitempty"`
+}
+
+// Change is one reason the chart engine plans an upgrade: the chart version,
+// the manifest, the chart's files, values (by key, never by value) or the owner
+// stamp. Text is the engine's own wording — "chart 0.1.2 → 0.1.3",
+// "values (image.tag)" — so every client says it the same way; Kind and the
+// rest are there for a client that wants to do more than print it.
+type Change struct {
+	Kind  string   `json:"kind"`
+	From  string   `json:"from,omitempty"`
+	To    string   `json:"to,omitempty"`
+	Paths []string `json:"paths,omitempty"`
+	Text  string   `json:"text"`
 }
 
 // ReleaseDiff is the manifest change one release would undergo.
@@ -701,8 +719,12 @@ type ReleaseDiff struct {
 	// Interrupted marks a release listed because the last sync stopped before
 	// it finished with it, not because the plan would change it: a sync
 	// redeploys it so its rollout can complete. See ReleaseStatus.Interrupted.
-	Interrupted bool   `json:"interrupted,omitempty"`
-	Diff        string `json:"diff"`
+	Interrupted bool `json:"interrupted,omitempty"`
+	// Changes is every reason the engine plans this upgrade, empty for an
+	// install and for an interrupted release it would otherwise leave alone.
+	// It is what names the reason when ManifestChanged is false.
+	Changes []Change `json:"changes,omitempty"`
+	Diff    string   `json:"diff"`
 }
 
 // DiffResponse is what the diff endpoint answers with.

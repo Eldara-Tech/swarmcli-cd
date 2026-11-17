@@ -7,6 +7,17 @@
       "toVersion": "toVersion",
       "manifestChanged": true,
       "interrupted": true,
+      "changes": [
+        {
+          "kind": "kind",
+          "from": "from",
+          "to": "to",
+          "paths": [
+            "paths"
+          ],
+          "text": "text"
+        }
+      ],
       "diff": "diff"
     }
   ],

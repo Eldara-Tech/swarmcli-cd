@@ -19,6 +19,8 @@
 package drift
 
 import (
+	"slices"
+
 	"github.com/Eldara-Tech/swarmcli/v2/charts"
 	"github.com/Eldara-Tech/swarmcli/v2/utils/textdiff"
 
@@ -144,6 +146,7 @@ func Diffs(plan *charts.Plan, interrupted map[string]bool) []application.Release
 			Release:     rp.Name,
 			Action:      application.SyncAction(action),
 			Interrupted: interrupted[rp.Name],
+			Changes:     changes(rp.Changes),
 			FromVersion: rp.FromVersion,
 			ToVersion:   rp.ToVersion,
 			// The engine's own test, from charts.unchanged: the manifest is one
@@ -152,6 +155,21 @@ func Diffs(plan *charts.Plan, interrupted map[string]bool) []application.Release
 			// CurrentManifest is empty for an install, so the whole manifest
 			// renders as added, which is what an install is.
 			Diff: textdiff.Lines(rp.CurrentManifest, rp.Manifest),
+		})
+	}
+	return out
+}
+
+// changes carries the engine's reasons for an upgrade onto the wire, with its
+// own wording for each.
+func changes(in []charts.Change) []application.Change {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]application.Change, 0, len(in))
+	for _, c := range in {
+		out = append(out, application.Change{
+			Kind: string(c.Kind), From: c.From, To: c.To, Paths: slices.Clone(c.Paths), Text: c.String(),
 		})
 	}
 	return out

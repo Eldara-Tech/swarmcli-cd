@@ -159,7 +159,10 @@
         },
         "interrupted": {
           "revision": "revision",
-          "error": "error"
+          "error": "error",
+          "pending": [
+            "pending"
+          ]
         }
       }
     ],

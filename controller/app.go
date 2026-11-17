@@ -437,6 +437,9 @@ func appGet(ctx context.Context, c *client.Client, out io.Writer, format, app st
 			_, _ = fmt.Fprintf(out, "\n%s: the sync of %s stopped before it finished rolling this release out, "+
 				"so services in it may still run the previous spec. The next sync redeploys it.\n  %s\n",
 				r.Name, short(in.Revision), in.Error)
+			if len(in.Pending) > 0 {
+				_, _ = fmt.Fprintf(out, "  Not updated: %s\n", strings.Join(in.Pending, ", "))
+			}
 		}
 	}
 
@@ -603,6 +606,9 @@ func appDiff(ctx context.Context, c *client.Client, out io.Writer, format, app s
 			_, _ = fmt.Fprintln(out)
 		}
 		_, _ = fmt.Fprintf(out, "=== %s (%s%s)\n", r.Release, state(r.Action), chartMove(r))
+		if why := changeTexts(r.Changes); why != "" {
+			_, _ = fmt.Fprintf(out, "Why: %s\n", why)
+		}
 		// Not by looking for an empty diff: a deployed release's diff carries the
 		// whole manifest as context, so it is never empty, and an upgrade whose
 		// manifest is unchanged printed every line of it with nothing marked (#356).
@@ -637,12 +643,26 @@ func unchangedManifest(r application.ReleaseDiff) string {
 		return "The rendered manifest is unchanged. The last sync stopped before it finished rolling this " +
 			"release out, and the sync redeploys it so the rollout can finish."
 	}
+	// The engine named the reasons, and the header printed them: only the
+	// manifest needs saying here.
+	if len(r.Changes) > 0 {
+		return "The rendered manifest is unchanged; the sync is for the reasons above."
+	}
 	if r.FromVersion != "" && r.FromVersion != r.ToVersion {
 		return fmt.Sprintf("The rendered manifest is unchanged. The sync is for the chart version, %s → %s: "+
 			"it records a revision at the new version and sends the same specs.", r.FromVersion, r.ToVersion)
 	}
 	return "The rendered manifest is unchanged. The sync is for something the manifest does not show: " +
 		"the release's values, the chart's files, or which application owns it."
+}
+
+// changeTexts joins the engine's reasons for an upgrade in its own wording.
+func changeTexts(changes []application.Change) string {
+	texts := make([]string, 0, len(changes))
+	for _, c := range changes {
+		texts = append(texts, c.Text)
+	}
+	return strings.Join(texts, "; ")
 }
 
 func appHistory(ctx context.Context, c *client.Client, out io.Writer, format, app string) error {
