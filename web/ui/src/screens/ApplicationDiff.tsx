@@ -96,13 +96,60 @@ export function ApplicationDiff() {
   )
 }
 
+/**
+ * One release a sync would touch.
+ *
+ * # An unchanged manifest is said, not drawn
+ *
+ * A chart bump whose template renders byte-identically is still an upgrade —
+ * the engine compares the chart version, values, files and owner as well as the
+ * manifest — and its diff is the whole manifest with nothing marked. Drawn, that
+ * was "⋯ 725 unchanged lines" and nothing else (#356): true, and no answer to
+ * why the release is listed at all. So `manifestChanged` decides, and the false
+ * case says what the sync is for instead.
+ */
 function ReleaseDiffPanel({ release }: { release: ReleaseDiff }) {
+  const version = chartVersion(release)
   return (
     <section className="diff-release" data-testid="release-diff">
       <h2>
         {release.release} <span className="chip chip-muted">{decodeEnum(release.action, syncActions)}</span>
+        {version !== '' && (
+          <>
+            {' '}
+            <span className="chip chip-muted" data-testid="chart-version">
+              {version}
+            </span>
+          </>
+        )}
       </h2>
-      <DiffView diff={release.diff} />
+      {release.manifestChanged ? (
+        <DiffView diff={release.diff} />
+      ) : (
+        <p className="empty" data-testid="manifest-unchanged">
+          {unchangedManifest(release)}
+        </p>
+      )}
     </section>
   )
+}
+
+/** The chart version a release moves between, or just where it ends up when that is not a move. */
+function chartVersion({ fromVersion, toVersion }: ReleaseDiff): string {
+  if (toVersion === '') return ''
+  if (fromVersion === undefined || fromVersion === '' || fromVersion === toVersion) return `chart ${toVersion}`
+  return `chart ${fromVersion} → ${toVersion}`
+}
+
+/**
+ * What a sync is for when the manifest is not it. The version is the one reason
+ * the diff carries; values, the chart's files and the owner stamp are named as a
+ * group because the plan says only that one of them differs. Mirrors
+ * `unchangedManifest` in controller/app.go, so the CLI and the screen agree.
+ */
+function unchangedManifest({ fromVersion, toVersion }: ReleaseDiff): string {
+  if (fromVersion !== undefined && fromVersion !== '' && fromVersion !== toVersion) {
+    return `The rendered manifest is unchanged. The sync is for the chart version, ${fromVersion} → ${toVersion}: it records a revision at the new version and sends the same specs.`
+  }
+  return "The rendered manifest is unchanged. The sync is for something the manifest does not show: the release's values, the chart's files, or which application owns it."
 }

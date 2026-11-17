@@ -3,6 +3,9 @@
     {
       "release": "release",
       "action": "upgrade",
+      "fromVersion": "fromVersion",
+      "toVersion": "toVersion",
+      "manifestChanged": true,
       "diff": "diff"
     }
   ],

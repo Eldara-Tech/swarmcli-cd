@@ -12,7 +12,7 @@ import { cleanup, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App, queryClient } from '../App'
-import type { DiffResponse, View } from '../api/types'
+import type { DiffResponse, ReleaseDiff, View } from '../api/types'
 import { setToken } from '../auth/session'
 import { clone, controller, json, openStream } from '../test/fakeApi'
 import diffConverged from '../test/fixtures/diff-converged.json'
@@ -123,7 +123,62 @@ describe('the diff itself', () => {
     expect(screen.getByText('line 3')).toBeDefined()
   })
 
-  it('says so when a planned release renders no manifest change at all', async () => {
+  // #356. What textdiff really sends for an upgrade whose manifest renders
+  // unchanged: every line as context, so the diff is long and not empty. The
+  // screen used to test for empty, miss it, and fold all of it into one
+  // "unchanged lines" row that never said why the release was listed.
+  it('says what a sync is for when the chart version moves and the manifest does not', async () => {
+    const body = withDiff(Array.from({ length: 725 }, (_, i) => `  line ${i + 1}\n`).join(''))
+    const release = (body.releases as ReleaseDiff[])[0]
+    release.fromVersion = '0.1.2'
+    release.toVersion = '0.1.3'
+    release.manifestChanged = false
+    serve(body)
+    render(<App />)
+
+    const panel = within(await screen.findByTestId('release-diff'))
+    expect(panel.getByTestId('chart-version').textContent).toBe('chart 0.1.2 → 0.1.3')
+    expect(panel.getByTestId('manifest-unchanged').textContent).toMatch(
+      /manifest is unchanged\. The sync is for the chart version, 0\.1\.2 → 0\.1\.3/,
+    )
+    expect(panel.queryByText('725 unchanged lines')).toBeNull()
+    expect(panel.queryByText('line 1')).toBeNull()
+  })
+
+  it('names the other reasons as a group when the version does not move either', async () => {
+    const body = withDiff('  line 1\n')
+    const release = (body.releases as ReleaseDiff[])[0]
+    release.fromVersion = '1.0.0'
+    release.toVersion = '1.0.0'
+    release.manifestChanged = false
+    serve(body)
+    render(<App />)
+
+    const panel = within(await screen.findByTestId('release-diff'))
+    expect(panel.getByTestId('chart-version').textContent).toBe('chart 1.0.0')
+    expect(panel.getByTestId('manifest-unchanged').textContent).toMatch(
+      /the release's values, the chart's files, or which application owns it/,
+    )
+  })
+
+  it('names only the target version for an install', async () => {
+    const body = withDiff('+ one\n')
+    const release = (body.releases as ReleaseDiff[])[0]
+    release.action = 'install'
+    delete release.fromVersion
+    release.toVersion = '2.0.0'
+    serve(body)
+    render(<App />)
+
+    const panel = within(await screen.findByTestId('release-diff'))
+    expect(panel.getByTestId('chart-version').textContent).toBe('chart 2.0.0')
+    expect(panel.getByText('one')).toBeDefined()
+  })
+
+  // The OSS controller never sends a diff with no lines, but an alternative
+  // reconciler serving this endpoint might, and an empty box reads as a screen
+  // that failed to load.
+  it('still says something for a changed release whose diff has no lines', async () => {
     serve(withDiff('   \n'))
     render(<App />)
 

@@ -592,14 +592,43 @@ func appDiff(ctx context.Context, c *client.Client, out io.Writer, format, app s
 		if i > 0 {
 			_, _ = fmt.Fprintln(out)
 		}
-		_, _ = fmt.Fprintf(out, "=== %s (%s)\n", r.Release, state(r.Action))
-		if strings.TrimSpace(r.Diff) == "" {
-			_, _ = fmt.Fprintln(out, "(no manifest change)")
+		_, _ = fmt.Fprintf(out, "=== %s (%s%s)\n", r.Release, state(r.Action), chartMove(r))
+		// Not by looking for an empty diff: a deployed release's diff carries the
+		// whole manifest as context, so it is never empty, and an upgrade whose
+		// manifest is unchanged printed every line of it with nothing marked (#356).
+		if !r.ManifestChanged {
+			_, _ = fmt.Fprintln(out, unchangedManifest(r))
 			continue
 		}
 		_, _ = fmt.Fprintln(out, strings.TrimRight(r.Diff, "\n"))
 	}
 	return nil
+}
+
+// chartMove is a diff header's chart version: where it moves from and to, or
+// just where it ends up when that is not a move.
+func chartMove(r application.ReleaseDiff) string {
+	switch {
+	case r.ToVersion == "":
+		return ""
+	case r.FromVersion == "" || r.FromVersion == r.ToVersion:
+		return ", chart " + r.ToVersion
+	default:
+		return ", chart " + r.FromVersion + " → " + r.ToVersion
+	}
+}
+
+// unchangedManifest says what a sync is for when the manifest is not it. The
+// version is the one reason the diff carries; any other — values, the chart's
+// files, the owner stamp — is named as a group, because the plan says only
+// that one of them differs, not which.
+func unchangedManifest(r application.ReleaseDiff) string {
+	if r.FromVersion != "" && r.FromVersion != r.ToVersion {
+		return fmt.Sprintf("The rendered manifest is unchanged. The sync is for the chart version, %s → %s: "+
+			"it records a revision at the new version and sends the same specs.", r.FromVersion, r.ToVersion)
+	}
+	return "The rendered manifest is unchanged. The sync is for something the manifest does not show: " +
+		"the release's values, the chart's files, or which application owns it."
 }
 
 func appHistory(ctx context.Context, c *client.Client, out io.Writer, format, app string) error {

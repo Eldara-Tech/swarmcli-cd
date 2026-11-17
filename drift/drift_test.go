@@ -184,6 +184,62 @@ func TestDiffForAnInstallShowsTheWholeManifest(t *testing.T) {
 	}
 }
 
+// The case behind #356: a chart bump whose template renders byte-identically is
+// still an upgrade, and its diff is the whole manifest with nothing added or
+// removed. What the reader needs is the version move and a plain statement that
+// the manifest is not what changes, which is what these fields carry.
+func TestDiffOfAVersionOnlyUpgradeSaysTheManifestIsUnchanged(t *testing.T) {
+	manifest := "services:\n  db:\n    image: percona:18\n"
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{{
+		Name:            "postgres-patroni",
+		Action:          charts.ActionUpgrade,
+		FromVersion:     "0.1.2",
+		ToVersion:       "0.1.3",
+		CurrentManifest: manifest,
+		Manifest:        manifest,
+	}}}
+
+	got := Diffs(plan)
+
+	if len(got) != 1 {
+		t.Fatalf("got %d diffs, want the upgrade", len(got))
+	}
+	d := got[0]
+	if d.ManifestChanged {
+		t.Error("manifestChanged = true for byte-identical manifests")
+	}
+	if d.FromVersion != "0.1.2" || d.ToVersion != "0.1.3" {
+		t.Errorf("versions = %q → %q, want 0.1.2 → 0.1.3", d.FromVersion, d.ToVersion)
+	}
+	// Not empty, which is exactly why a client testing for an empty diff never
+	// noticed: every line arrives as unchanged context.
+	if strings.TrimSpace(d.Diff) == "" || strings.Contains(d.Diff, "\n+ ") || strings.Contains(d.Diff, "\n- ") {
+		t.Errorf("diff = %q, want the manifest as context only", d.Diff)
+	}
+}
+
+func TestDiffsSayWhenTheManifestChanges(t *testing.T) {
+	plan := &charts.Plan{Releases: []charts.ReleasePlan{
+		{Name: "moving", Action: charts.ActionUpgrade, FromVersion: "1.0.0", ToVersion: "1.0.0",
+			CurrentManifest: "replicas: 1\n", Manifest: "replicas: 3\n"},
+		{Name: "new", Action: charts.ActionInstall, ToVersion: "2.0.0", Manifest: "replicas: 1\n"},
+	}}
+
+	got := Diffs(plan)
+
+	if len(got) != 2 {
+		t.Fatalf("got %d diffs, want 2", len(got))
+	}
+	for _, d := range got {
+		if !d.ManifestChanged {
+			t.Errorf("%s: manifestChanged = false, want true", d.Release)
+		}
+	}
+	if got[1].FromVersion != "" || got[1].ToVersion != "2.0.0" {
+		t.Errorf("install versions = %q → %q, want nothing → 2.0.0", got[1].FromVersion, got[1].ToVersion)
+	}
+}
+
 func TestDiffsOfASyncedPlanAreEmpty(t *testing.T) {
 	plan := &charts.Plan{Releases: []charts.ReleasePlan{{Name: "steady", Action: charts.ActionUnchanged}}}
 
