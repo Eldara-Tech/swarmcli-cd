@@ -17,7 +17,7 @@ jobs:
       # v7.6.0 resolves a tag ref to its commit SHA, so the draft no longer
       # asks GitHub to target refs/tags/<tag> ("not supported as release
       # target, falling back to default branch").
-      - uses: release-drafter/release-drafter@978bb0b30c5ee8cdd332ced253758157150d43f0 # v7.10.0
+      - uses: release-drafter/release-drafter@d1a19e60e81a7e650d00a7de9277f87e439117ea # v7.11.0
         with:
           config-name: release_template.yml
           tag: ${{ github.ref_name }}
@@ -35,7 +35,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
