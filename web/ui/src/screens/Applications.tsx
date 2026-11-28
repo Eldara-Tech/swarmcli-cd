@@ -11,12 +11,13 @@ import { decodeEnum, driftStates, healthStates, syncStates } from '../api/enums'
 import { controllerKey, listKey } from '../api/queries'
 import { assess, toneOf } from '../api/severity'
 import type { ApplicationList, ControllerStatus, View } from '../api/types'
+import { Commit } from '../components/Commit'
 import { Dot, type DotTone } from '../components/Dot'
 import { DriftCell, HealthChip, SyncChip } from '../components/StateChip'
 import { Empty, ErrorState, Loading } from '../components/StateBlock'
 import { Instant } from '../components/Instant'
 import { PageTitle } from '../components/PageTitle'
-import { destination, plural, serviceCounts, shortRevision } from '../format'
+import { destination, plural, serviceCounts } from '../format'
 
 /**
  * The applications list: every application the token may see, in one request.
@@ -375,7 +376,7 @@ function Table({ views, showSwarm }: { views: View[]; showSwarm: boolean }) {
               </td>
               <td className="cell-num">{serviceCounts(view.status.health.services)}</td>
               <td>
-                <Revision revision={view.status.sync.revision} />
+                <Revision repoURL={view.spec.source.repoURL} revision={view.status.sync.revision} />
               </td>
               {showError && <td>{stale(view) ? <span className="chip chip-bad">failed</span> : 'ok'}</td>}
             </tr>
@@ -407,7 +408,7 @@ function Cards({ views }: { views: View[] }) {
                 <dd>{serviceCounts(view.status.health.services)}</dd>
                 <dt>Revision</dt>
                 <dd>
-                  <Revision revision={view.status.sync.revision} />
+                  <Revision repoURL={view.spec.source.repoURL} revision={view.status.sync.revision} />
                 </dd>
                 <dt>Repository</dt>
                 <dd className="wrap">{view.spec.source.repoURL}</dd>
@@ -451,9 +452,9 @@ function ReconcileErrors({ views }: { views: View[] }) {
 }
 
 /** An application that has never been reconciled has no revision to abbreviate. */
-function Revision({ revision }: { revision?: string }) {
+function Revision({ repoURL, revision }: { repoURL: string; revision?: string }) {
   if (revision === undefined || revision === '') return <span className="muted">–</span>
-  return <code title={revision}>{shortRevision(revision)}</code>
+  return <Commit repoURL={repoURL} revision={revision} />
 }
 
 function detailPath(name: string): string {

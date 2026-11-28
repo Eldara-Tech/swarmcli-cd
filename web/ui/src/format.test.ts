@@ -4,13 +4,65 @@
 import { describe, expect, it } from 'vitest'
 
 import { zeroTimestamp } from './api/types'
-import { ago, chartRef, destination, formatInstant, isUnset, plural, serviceCounts, shortRevision, tasksUp } from './format'
+import {
+  ago,
+  chartRef,
+  commitURL,
+  destination,
+  formatInstant,
+  isUnset,
+  plural,
+  serviceCounts,
+  shortRevision,
+  tasksUp,
+} from './format'
 
 describe('shortRevision', () => {
   it('abbreviates the way git does and leaves a short one alone', () => {
     expect(shortRevision('9f3c1abd4e5f6789')).toBe('9f3c1ab')
     expect(shortRevision('9f3c1ab')).toBe('9f3c1ab')
     expect(shortRevision('')).toBe('')
+  })
+})
+
+describe('commitURL', () => {
+  const sha = '2545466f1c3a9b0e7d4c2a1f0e9d8c7b6a5f4e3d'
+
+  it.each([
+    ['https://github.com/Eldara-Tech/swarmcli-cd.git', `https://github.com/Eldara-Tech/swarmcli-cd/commit/${sha}`],
+    // The issue's own repository: a self-hosted GitLab, nested group, which
+    // redirects /commit/ to /-/commit/.
+    ['https://gitlab.esix.hu/best-validator/polkadot.git', `https://gitlab.esix.hu/best-validator/polkadot/commit/${sha}`],
+    ['https://git.example.com:8443/team/app/', `https://git.example.com:8443/team/app/commit/${sha}`],
+    ['https://bitbucket.org/team/app.git', `https://bitbucket.org/team/app/commits/${sha}`],
+    // Bitbucket Data Center, with GÉANT's public instance's own clone URLs.
+    [
+      'https://bitbucket.software.geant.org/scm/cat/cat.git',
+      `https://bitbucket.software.geant.org/projects/cat/repos/cat/commits/${sha}`,
+    ],
+    [
+      'https://bitbucket.software.geant.org/scm/~jordi.ortiz_um.es/rare-nix.git',
+      `https://bitbucket.software.geant.org/users/jordi.ortiz_um.es/repos/rare-nix/commits/${sha}`,
+    ],
+    [
+      'https://atlassian.example.com/bitbucket/scm/ops/edge.git',
+      `https://atlassian.example.com/bitbucket/projects/ops/repos/edge/commits/${sha}`,
+    ],
+    // Not Data Center's shape: three segments after scm.
+    [
+      'https://gitlab.example.com/scm/platform/tools/app.git',
+      `https://gitlab.example.com/scm/platform/tools/app/commit/${sha}`,
+    ],
+  ])('links %s to its commit page', (repoURL, want) => {
+    expect(commitURL(repoURL, sha)).toBe(want)
+  })
+
+  it('leaves credentials written into the repository URL out of the link', () => {
+    expect(commitURL('https://deploy:s3cret@github.com/o/r.git?x=1#y', sha)).toBe(`https://github.com/o/r/commit/${sha}`)
+  })
+
+  it.each([['/srv/git/app'], ['http://github.com/o/r.git'], ['https://']])('has no link for %s', (repoURL) => {
+    expect(commitURL(repoURL, sha)).toBeUndefined()
   })
 })
 

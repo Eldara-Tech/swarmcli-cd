@@ -326,6 +326,46 @@ describe('an interrupted rollout', () => {
   })
 })
 
+// #367: every commit the overview names opens on the forge that holds it.
+describe('a commit', () => {
+  const commits = ['0435e70aaaaa', '2c620cf4aaaa', 'e2bafe8aaaaa', '9f3c1abaaaaa']
+
+  /** Assessed, in progress, last synced and interrupted: one commit each. */
+  function naming(repoURL: string): View {
+    const view = detail()
+    view.spec.source.repoURL = repoURL
+    view.status.sync.revision = commits[0]
+    view.status.sync.inProgress = { revision: commits[1], startedAt: '2026-11-16T15:24:52Z' }
+    view.status.sync.lastSync = { ...view.status.sync.lastSync!, revision: commits[2] }
+    firstRelease(view).interrupted = { revision: commits[3], error: 'timed out' }
+    return view
+  }
+
+  it('links each one to its page in the repository, in a new tab', async () => {
+    serve(naming('https://gitlab.esix.hu/best-validator/polkadot.git'))
+    render(<App />)
+
+    await screen.findByRole('heading', { name: 'edge', level: 1 })
+    for (const commit of commits) {
+      const link = screen.getByRole('link', { name: commit.slice(0, 7) })
+      expect(link.getAttribute('href')).toBe(`https://gitlab.esix.hu/best-validator/polkadot/commit/${commit}`)
+      expect(link.getAttribute('target')).toBe('_blank')
+      expect(link.getAttribute('rel')).toBe('noreferrer')
+    }
+  })
+
+  it('names each one without a link when the repository is a local path', async () => {
+    serve(naming('/srv/git/edge'))
+    render(<App />)
+
+    await screen.findByRole('heading', { name: 'edge', level: 1 })
+    for (const commit of commits) {
+      expect(screen.getByTitle(commit).textContent).toBe(commit.slice(0, 7))
+      expect(screen.queryByRole('link', { name: commit.slice(0, 7) })).toBeNull()
+    }
+  })
+})
+
 describe('the compatibility gate', () => {
   // Blocking, and above everything: reconcile.checkCompat refuses the whole
   // plan rather than the incompatible part of it, so nothing below is going to

@@ -29,6 +29,40 @@ export function shortRevision(revision: string): string {
 }
 
 /**
+ * commitURL is the forge's page for a commit, or undefined for a repository
+ * that has none: the controller takes https:// or an absolute path (supportedURL
+ * in git/git.go), and only the first is served by anything with a browser.
+ *
+ * `/commit/` is what GitHub, Gitea and Forgejo serve and GitLab redirects to its
+ * own `/-/commit/`, so one rule covers a self-hosted forge whose host names no
+ * product (#367). Bitbucket alone differs: Cloud says `/commits/`, and Data
+ * Center clones from `<context>/scm/<project>/<repo>`, or `scm/~<user>/<repo>`
+ * for a personal one, but shows commits under `projects/` or `users/`. Another
+ * forge's repository at exactly `…/scm/<x>/<y>` is misread as Data Center.
+ * Built from origin and path, so credentials written into the URL stay out of
+ * the link.
+ */
+export function commitURL(repoURL: string, revision: string): string | undefined {
+  let url: URL
+  try {
+    url = new URL(repoURL)
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== 'https:') return undefined
+  // The trim webhook/match.go's normalise applies to the same field.
+  const repo = url.pathname.replace(/\/+$/, '').replace(/\.git$/, '')
+  const dataCenter = /^(.*)\/scm\/(~?)([^/]+)\/([^/]+)$/.exec(repo)
+  if (dataCenter !== null) {
+    const [, context, personal, owner, name] = dataCenter
+    const scope = personal === '' ? 'projects' : 'users'
+    return `${url.origin}${context}/${scope}/${owner}/repos/${name}/commits/${revision}`
+  }
+  const commit = url.hostname === 'bitbucket.org' ? 'commits' : 'commit'
+  return `${url.origin}${repo}/${commit}/${revision}`
+}
+
+/**
  * isUnset reports whether a timestamp was never set.
  *
  * The one guard on this file worth reading twice. Go's zero time marshals as
