@@ -35,6 +35,24 @@ describe('commitURL', () => {
     ['https://gitlab.esix.hu/best-validator/polkadot.git', `https://gitlab.esix.hu/best-validator/polkadot/commit/${sha}`],
     ['https://git.example.com:8443/team/app/', `https://git.example.com:8443/team/app/commit/${sha}`],
     ['https://bitbucket.org/team/app.git', `https://bitbucket.org/team/app/commits/${sha}`],
+    // Bitbucket Data Center, with GÉANT's public instance's own clone URLs.
+    [
+      'https://bitbucket.software.geant.org/scm/cat/cat.git',
+      `https://bitbucket.software.geant.org/projects/cat/repos/cat/commits/${sha}`,
+    ],
+    [
+      'https://bitbucket.software.geant.org/scm/~jordi.ortiz_um.es/rare-nix.git',
+      `https://bitbucket.software.geant.org/users/jordi.ortiz_um.es/repos/rare-nix/commits/${sha}`,
+    ],
+    [
+      'https://atlassian.example.com/bitbucket/scm/ops/edge.git',
+      `https://atlassian.example.com/bitbucket/projects/ops/repos/edge/commits/${sha}`,
+    ],
+    // Not Data Center's shape: three segments after scm.
+    [
+      'https://gitlab.example.com/scm/platform/tools/app.git',
+      `https://gitlab.example.com/scm/platform/tools/app/commit/${sha}`,
+    ],
   ])('links %s to its commit page', (repoURL, want) => {
     expect(commitURL(repoURL, sha)).toBe(want)
   })
