@@ -29,6 +29,30 @@ export function shortRevision(revision: string): string {
 }
 
 /**
+ * commitURL is the forge's page for a commit, or undefined for a repository
+ * that has none: the controller takes https:// or an absolute path (supportedURL
+ * in git/git.go), and only the first is served by anything with a browser.
+ *
+ * `/commit/` is what GitHub, Gitea and Forgejo serve and GitLab redirects to its
+ * own `/-/commit/`, so one rule covers a self-hosted forge whose host names no
+ * product; Bitbucket Cloud alone says `/commits/` (#367). Built from origin and
+ * path, so credentials written into the URL stay out of the link.
+ */
+export function commitURL(repoURL: string, revision: string): string | undefined {
+  let url: URL
+  try {
+    url = new URL(repoURL)
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== 'https:') return undefined
+  // The trim webhook/match.go's normalise applies to the same field.
+  const repo = url.pathname.replace(/\/+$/, '').replace(/\.git$/, '')
+  const commit = url.hostname === 'bitbucket.org' ? 'commits' : 'commit'
+  return `${url.origin}${repo}/${commit}/${revision}`
+}
+
+/**
  * isUnset reports whether a timestamp was never set.
  *
  * The one guard on this file worth reading twice. Go's zero time marshals as

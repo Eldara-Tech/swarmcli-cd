@@ -13,8 +13,9 @@ import { Forbidden } from '../components/Forbidden'
 import { Icon } from '../components/Icon'
 import { Instant } from '../components/Instant'
 import { CompatChip, DriftCell, HealthChip, SyncChip } from '../components/StateChip'
+import { Commit } from '../components/Commit'
 import { TopologyTree } from '../components/TopologyTree'
-import { ago, chartRef, destination, serviceCounts, shortRevision, tasksUp } from '../format'
+import { ago, chartRef, destination, serviceCounts, tasksUp } from '../format'
 import { ErrorState, Loading } from '../components/StateBlock'
 import { PageTitle } from '../components/PageTitle'
 
@@ -314,7 +315,7 @@ export function ApplicationOverview() {
                     {status.sync.revision === undefined || status.sync.revision === '' ? (
                       <span className="muted">–</span>
                     ) : (
-                      <code title={status.sync.revision}>{shortRevision(status.sync.revision)}</code>
+                      <Commit repoURL={spec.source.repoURL} revision={status.sync.revision} />
                     )}
                     {status.sync.subject !== undefined && status.sync.subject !== '' && (
                       <div className="muted">{status.sync.subject}</div>
@@ -367,9 +368,7 @@ export function ApplicationOverview() {
                     {status.sync.inProgress !== undefined && (
                       <div data-testid="sync-in-progress">
                         in progress since <Instant at={status.sync.inProgress.startedAt} />{' '}
-                        <code title={status.sync.inProgress.revision}>
-                          {shortRevision(status.sync.inProgress.revision)}
-                        </code>
+                        <Commit repoURL={spec.source.repoURL} revision={status.sync.inProgress.revision} />
                       </div>
                     )}
                     {status.sync.lastSync === undefined ? (
@@ -385,7 +384,7 @@ export function ApplicationOverview() {
                         <span className="muted" data-testid="last-sync-age">
                           ({ago(status.sync.lastSync.finishedAt)})
                         </span>{' '}
-                        <code title={status.sync.lastSync.revision}>{shortRevision(status.sync.lastSync.revision)}</code>
+                        <Commit repoURL={spec.source.repoURL} revision={status.sync.lastSync.revision} />
                         {status.sync.lastSync.revision !== status.sync.revision && (
                           <span className="muted" data-testid="last-sync-earlier">
                             {' '}
@@ -443,7 +442,7 @@ export function ApplicationOverview() {
               ) : (
                 <ul className="tree">
                   {releases.map((release) => (
-                    <ReleaseNode key={release.name} release={release} />
+                    <ReleaseNode key={release.name} release={release} repoURL={spec.source.repoURL} />
                   ))}
                 </ul>
               )}
@@ -480,7 +479,7 @@ export function ApplicationTopology() {
   return <TopologyTree view={detail.data} />
 }
 
-function ReleaseNode({ release }: { release: ReleaseStatus }) {
+function ReleaseNode({ release, repoURL }: { release: ReleaseStatus; repoURL: string }) {
   const services = release.services ?? []
   return (
     <li className="tree-release">
@@ -504,7 +503,7 @@ function ReleaseNode({ release }: { release: ReleaseStatus }) {
           this is what says why (#357). */}
       {release.interrupted !== undefined && (
         <p className="notice notice-reconcile wrap" role="status" data-testid="release-interrupted">
-          The sync of <code>{shortRevision(release.interrupted.revision)}</code> stopped before it finished
+          The sync of <Commit repoURL={repoURL} revision={release.interrupted.revision} /> stopped before it finished
           rolling this release out, so services in it may still run the previous spec. The next sync
           redeploys it. <span className="error">{release.interrupted.error}</span>
           {release.interrupted.pending !== undefined && release.interrupted.pending.length > 0 && (

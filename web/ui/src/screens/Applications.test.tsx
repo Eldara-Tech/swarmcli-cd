@@ -179,6 +179,19 @@ describe('the filters, which are a link and not a preference', () => {
     expect(screen.getByRole('link', { name: 'ingress' })).toBeDefined()
   })
 
+  // #367
+  it.each([['table'], ['cards']])('links the revision to its commit in the %s view', async (mode) => {
+    window.history.pushState({}, '', `/?view=${mode}`)
+    const view = healthy('edge')
+    view.spec.source.repoURL = 'https://github.com/Eldara-Tech/edge.git'
+    view.status.sync.revision = '0435e70aaaaa'
+    serve([view])
+    render(<App />)
+
+    const link = await screen.findByRole('link', { name: '0435e70' })
+    expect(link.getAttribute('href')).toBe('https://github.com/Eldara-Tech/edge/commit/0435e70aaaaa')
+  })
+
   it('filters on the text of a name, a repository or a revision', async () => {
     serve([healthy('edge'), healthy('ingress')])
     render(<App />)
